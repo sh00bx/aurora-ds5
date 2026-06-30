@@ -46,6 +46,9 @@ typedef struct stream_input_t {
     bool view_only, no_sdl_mouse;
     bool hid_passthrough;
     uint16_t moonlightExcludedMask;
+    // Runtime overlay override: 0 = native (DS5 bridged via CTM / reported as PlayStation),
+    // 1 = force an Xbox/XInput pad for games that reject a DualSense (e.g. Forza Horizon).
+    uint8_t forced_gamepad_type;
     uint8_t stick_deadzone;
     session_input_vmouse_t vmouse;
 #if FEATURE_INPUT_EVMOUSE
@@ -74,6 +77,12 @@ void stream_input_flush_pressed_keys(stream_input_t *input);
 void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t *gamepad);
 
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad);
+
+// Switch the emulated controller type for all active gamepads at runtime via a host-side
+// free -> re-arrive cycle (DS5 <-> Xbox). The caller (session_set_controller_mode) is
+// responsible for pausing/resuming CTM passthrough and toggling the Moonlight exclusion so
+// SDL actually owns the pad while it is forwarded.
+void stream_input_set_gamepad_type(stream_input_t *input, uint8_t forced_type);
 
 void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *event);
 

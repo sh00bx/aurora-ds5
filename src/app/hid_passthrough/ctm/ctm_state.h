@@ -172,6 +172,10 @@ extern char g_agent_host[64];
 extern int g_agent_port;
 extern bool g_agent_online;
 extern bool g_running;
+/* Set while the session is in forced-Xbox mode: the DS5 is intentionally released to SDL, so
+ * the auto-plug reconcile must NOT re-grab it (survives a physical reconnect, unlike the
+ * per-key AUTOPLUG_DONE pin). Owned by session_set_controller_mode (host app). */
+extern bool g_xbox_suppress_ds5;
 extern pthread_t g_stop_sniff_thread;
 extern bool g_stop_sniff_thread_started;
 extern pthread_mutex_t g_bt_mac_mutex;
@@ -309,6 +313,9 @@ void hid_pt_autoplug_reconcile(struct stream_input_t *input);
 /* Mark a device key as user-/manager-owned so the reconcile leaves it alone (e.g.
  * after a manual plug-out). Cleared when the device disconnects. */
 void autoplug_mark_done(const char *key);
+/* Re-arm a device key for auto-plug (PENDING + fail_count reset) so the reconcile re-bridges it
+ * via its proven retry path — e.g. when returning from forced-Xbox mode to native CTM. */
+void autoplug_mark_pending(const char *key);
 /* Forget all auto-plug bookkeeping (called when the passthrough session stops). */
 void autoplug_reset(void);
 void node_session_key(const logical_device_t *item, int scan_index, char *out, size_t out_len);

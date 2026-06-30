@@ -437,8 +437,45 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
         commons_log_info("Input", "  controller capability: RGB LED");
     }
 #endif
+    if (input->forced_gamepad_type == 1) {
+        // Overlay override: force an Xbox/XInput pad for games that reject a DualSense
+        // (e.g. Forza Horizon). Strip the PS-only capabilities so the host emulates a clean
+        // Xbox 360 controller (motion/touchpad/RGB are meaningless over XInput anyway). Rumble
+        // and analog triggers stay so force feedback still reaches the real DS5 via SDL.
+        type = LI_CTYPE_XBOX;
+        capabilities &= ~(uint16_t) (LI_CCAP_TOUCHPAD | LI_CCAP_ACCEL | LI_CCAP_GYRO | LI_CCAP_RGB_LED);
+        commons_log_info("Input", "  overlay override: emulating Xbox controller");
+    }
     LiSendControllerArrivalEvent(gamepad->gs_id, stream_input_moonlight_active_mask(input), type, 0xFFFFFFFF,
                                  capabilities);
+}
+
+void stream_input_set_gamepad_type(stream_input_t *input, uint8_t forced_type) {
+    if (input->forced_gamepad_type == forced_type) {
+        return;
+    }
+    input->forced_gamepad_type = forced_type;
+    commons_log_info("Input", "Switching emulated controller type to %s",
+                     forced_type == 1 ? "Xbox" : "native");
+    if (!input->started || input->view_only) {
+        return;
+    }
+    for (int i = 0, j = app_input_get_max_gamepads(input->input); i < j; ++i) {
+        app_gamepad_state_t *gamepad = app_input_gamepad_state_by_index(input->input, i);
+        if (gamepad == NULL) {
+            continue;
+        }
+        // Apollo only re-evaluates the emulated device type on a fresh controller arrival, and it
+        // rejects an arrival while the slot is still allocated. So free the host's current virtual
+        // pad first (a transient multi-controller event with this controller's bit cleared), then
+        // re-announce arrival with the new type. The exclusion/active mask is left intact.
+        short activeGamepadMask =
+                (short) (stream_input_moonlight_active_mask(input) & (uint16_t) ~(1u << (unsigned) gamepad->gs_id));
+        LiSendMultiControllerEvent(gamepad->gs_id, activeGamepadMask, 0, 0, 0, 0, 0, 0, 0);
+        // arrive dedups on announcedGamepadMask; clear this bit so the re-announce actually fires.
+        input->announcedGamepadMask &= ~(1 << gamepad->gs_id);
+        stream_input_send_gamepad_arrive(input, gamepad);
+    }
 }
 
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad) {

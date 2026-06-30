@@ -33,6 +33,7 @@ char g_agent_host[64];
 int g_agent_port = CTM_AGENT_PORT;
 bool g_agent_online;
 bool g_running = true;
+bool g_xbox_suppress_ds5 = false;
 pthread_t g_stop_sniff_thread;
 bool g_stop_sniff_thread_started;
 pthread_mutex_t g_bt_mac_mutex = PTHREAD_MUTEX_INITIALIZER;

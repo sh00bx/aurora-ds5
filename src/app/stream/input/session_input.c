@@ -40,6 +40,7 @@ void session_input_init(stream_input_t *input, session_t *session, app_input_t *
     input->view_only = config->view_only;
     input->hid_passthrough = config->hid_passthrough;
     input->moonlightExcludedMask = 0;
+    input->forced_gamepad_type = 0; // always start native; flipped at runtime via the CTM panel
     input->stick_deadzone = config->stick_deadzone;
     input->no_sdl_mouse = config->hardware_mouse;
 #if FEATURE_INPUT_EVMOUSE

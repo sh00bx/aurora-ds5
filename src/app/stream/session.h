@@ -109,6 +109,12 @@ typedef struct hid_passthrough_manager hid_passthrough_manager_t;
 hid_passthrough_manager_t *session_get_hid_passthrough(session_t *session);
 
 void session_ensure_hid_passthrough(session_t *session);
+
+// Flip the active session between native CTM DualSense passthrough (forced_type 0) and a
+// forced Xbox/XInput pad (forced_type 1). Pauses/resumes the DS5's CTM bridge, toggles the
+// Moonlight exclusion for the DS5's SDL slot, AND re-announces the gamepad to the host.
+// Called from the in-stream CTM device panel. LVGL-thread only.
+void session_set_controller_mode(session_t *session, uint8_t forced_type);
 #endif
 
 void streaming_display_size(session_t *session, short width, short height);

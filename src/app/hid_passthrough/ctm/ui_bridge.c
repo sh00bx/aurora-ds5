@@ -750,6 +750,15 @@ void autoplug_mark_done(const char *key)
     }
 }
 
+void autoplug_mark_pending(const char *key)
+{
+    autoplug_entry_t *e = autoplug_entry_for(key, true);
+    if (e) {
+        e->state = AUTOPLUG_PENDING;
+        e->fail_count = 0;
+    }
+}
+
 void autoplug_reset(void)
 {
     g_autoplug_count = 0;
@@ -869,6 +878,9 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             continue;
         }
         const char *kind = bridge_kind_for_item(item);
+        if (g_xbox_suppress_ds5 && strcmp(kind, "ds5") == 0) {
+            continue;   /* forced-Xbox mode: DS5 is intentionally released to SDL, never re-grab */
+        }
         if (strcmp(kind, "hid") == 0) {
             continue;   /* only known controllers (ds5/ds4/xbox/puck), never generic HID */
         }
