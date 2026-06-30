@@ -122,10 +122,19 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     session = context;
     player = session->player;
     buffer_initial_size = vdec_buffer_initial_bytes();
-    buffer_size = buffer_initial_size;
-    buffer = malloc(buffer_size);
+    /* P15: reuse a persistent reassembly buffer across streams so the malloc
+     * stays off this connection-setup hot path. Allocate only on the first
+     * stream; a prior grow-on-demand keeps the larger capacity for reuse
+     * (the buffer is retained by vdec_delegate_cleanup, freed at process exit). */
+    if (buffer == NULL) {
+        buffer_size = buffer_initial_size;
+        buffer = malloc(buffer_size);
+    }
     if (!buffer) {
+        /* Pre-alloc/fallback malloc failed: bail with a decoder error instead of
+         * NULL-dereferencing in the reassembly memcpy on the first frame. */
         commons_log_error("Session", "Failed to allocate video reassembly buffer (%zu bytes)", buffer_size);
+        buffer_size = 0;
         return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
     memset(&vdec_temp_stats, 0, sizeof(vdec_temp_stats));
@@ -185,10 +194,9 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
 
 void vdec_delegate_cleanup() {
     assert(player != NULL);
-    free(buffer);
-    buffer = NULL;
-    buffer_size = 0;
-    buffer_initial_size = 0;
+    /* P15: keep the reassembly buffer allocated across streams so the malloc
+     * stays off the connection-setup hot path; it is reused by the next
+     * vdec_delegate_setup and released at process exit. */
     SS4S_PlayerVideoClose(player);
     session = NULL;
 }
@@ -241,7 +249,10 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     vdec_temp_stats.receivedBytes += (uint64_t) decodeUnit->fullLength;
 
     vdec_temp_stats.totalCaptureLatency += decodeUnit->frameHostProcessingLatency;
-    vdec_temp_stats.totalReassemblyTime += decodeUnit->enqueueTimeMs - decodeUnit->receiveTimeMs;
+    // mcc moved DECODE_UNIT timestamps from ms to us (upstream e356b2c/a3ebaaf, pulled
+    // in by the nanors rebase); convert back to the ms unit the uint32_t accumulator and
+    // the stats UI (streaming.controller "submitMs") expect.
+    vdec_temp_stats.totalReassemblyTime += (uint32_t) ((decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs) / 1000);
     vdec_stream_info.has_host_latency |= decodeUnit->frameHostProcessingLatency > 0;
     if (!vdec_warned_near_buffer_limit && buffer_initial_size > 0 &&
         (size_t) decodeUnit->fullLength > (buffer_initial_size * 9 / 10)) {
@@ -282,7 +293,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         if (vdec_stream_info.width == 0 || vdec_stream_info.height == 0) {
             stream_info_parse_size(decodeUnit, &vdec_stream_info);
         }
-        vdec_temp_stats.totalSubmitTime += LiGetMillis() - decodeUnit->enqueueTimeMs;
+        vdec_temp_stats.totalSubmitTime += (uint32_t) ((LiGetMicroseconds() - decodeUnit->enqueueTimeUs) / 1000);
         vdec_temp_stats.submittedFrames++;
         if (need_idr_on_resume) {
             need_idr_on_resume = false;
