@@ -16,7 +16,7 @@ else ()
         set(MOONLIGHT_VERSION "0.0.0")
     endif ()
 endif ()
-set(MOONLIGHT_VERSION "1.0.10")
+set(MOONLIGHT_VERSION "1.0.14")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
@@ -107,6 +107,26 @@ if (TARGET_WEBOS)
 
     set(WEBOS_APPINFO_ID "com.aurora.gamestream")
     set(CMAKE_INSTALL_RPATH "$ORIGIN/lib/backports:$ORIGIN/../lib/backports:$ORIGIN")
+
+    # Hot-path performance flags. Target: LG G4 — 4x Cortex-A78 @ 1.4 GHz
+    # (CPU part 0xd41), single-cluster. webOS userspace is ARMv7, so -march
+    # stays armv7-a for the ABI; -mtune=cortex-a78 reflects the real pipeline.
+    # NEON-vfpv4 unlocks NEON-optimized libc memcpy/memset paths.
+    set(MOONLIGHT_WEBOS_PERF_FLAGS "-O3 -march=armv7-a -mtune=cortex-a78 -mfpu=neon-vfpv4 -fomit-frame-pointer")
+    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${MOONLIGHT_WEBOS_PERF_FLAGS}")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${MOONLIGHT_WEBOS_PERF_FLAGS}")
+
+    # LTO: enabled per-target further down (after the targets exist). A full
+    # -O3+LTO build crashed on first stream connect — GCC 12.2 buildroot
+    # mis-handles a GOT load in moonlight-common-c::performRtspHandshake
+    # (write targets a .text address → SIGSEGV). Workaround: LTO on for our
+    # own app code (moonlight + moonlight-lib), explicitly off for the
+    # moonlight-common-c and ss4s submodules.
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT MOONLIGHT_WEBOS_LTO_AVAILABLE OUTPUT _ipo_err)
+    if (NOT MOONLIGHT_WEBOS_LTO_AVAILABLE)
+        message(STATUS "IPO/LTO not supported by toolchain: ${_ipo_err}")
+    endif ()
 elseif (TARGET_STEAMLINK)
     set(OS_LINUX TRUE)
     set(CMAKE_INSTALL_PREFIX moonlight-tv)
@@ -230,6 +250,30 @@ set_target_properties(moonlight-lib PROPERTIES
         C_STANDARD 11
         C_STANDARD_REQUIRED TRUE
         )
+
+# Selective LTO: enable for our own targets, force-off for the submodules whose
+# hot-path code (GOT-resolved globals in moonlight-common-c, atomic-heavy
+# structs in ss4s) the GCC 12.2 buildroot LTO mis-handles (see perf-flags
+# block above). The if(TARGET ...) guards make absent module names harmless.
+if (TARGET_WEBOS AND MOONLIGHT_WEBOS_LTO_AVAILABLE)
+    foreach (_lto_tgt moonlight moonlight-lib)
+        if (TARGET ${_lto_tgt})
+            set_target_properties(${_lto_tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif ()
+    endforeach ()
+    foreach (_no_lto_tgt moonlight-common-c
+                         ss4s
+                         ss4s-module-smp-webos
+                         ss4s-module-smp-webos3
+                         ss4s-module-smp-webos4
+                         ss4s-module-ndl-webos4
+                         ss4s-module-ndl-webos5
+                         ss4s-module-lgnc)
+        if (TARGET ${_no_lto_tgt})
+            set_target_properties(${_no_lto_tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+        endif ()
+    endforeach ()
+endif ()
 
 target_compile_definitions(moonlight-lib PUBLIC "$<$<CONFIG:DEBUG>:DEBUG>")
 string(LENGTH ${CMAKE_SOURCE_DIR} SOURCE_DIR_LENGTH)

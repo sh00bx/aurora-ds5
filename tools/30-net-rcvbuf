@@ -1,0 +1,16 @@
+#!/bin/sh
+# webosbrew boot hook (run-parts /var/lib/webosbrew/init.d): raise the kernel
+# UDP receive-buffer ceiling so Aurora's SO_RCVBUF=4 MiB request is actually
+# granted instead of being silently clamped to the stock webOS rmem_max
+# (512 KiB). Without this, the moonlight-common-c P21 bump (1 -> 4 MiB) is a
+# no-op: a 60-100 ms 4K60 HEVC WiFi burst is ~1 MB of in-flight payload and
+# overflows the socket -> packet loss -> reassembly stalls.
+#
+# Filename has NO dot on purpose (busybox run-parts skips names with dots).
+# Idempotent and safe to fail: a failing boot hook would trip webosbrew
+# failsafe, so we never error out. /proc write is preferred (busybox may lack
+# a full sysctl). rmem_max is a global cap applied to sockets created after
+# this runs; the Aurora app is launched well after boot, so ordering is fine.
+echo 4194304 > /proc/sys/net/core/rmem_max 2>/dev/null \
+  || sysctl -w net.core.rmem_max=4194304 2>/dev/null \
+  || true

@@ -1,0 +1,8 @@
+#!/bin/sh
+# webosbrew boot hook (run-parts /var/lib/webosbrew/init.d): start the Moonlight
+# game-mode guard as a detached daemon. Non-blocking and safe to fail: a hung
+# or crashing boot hook would trip webosbrew failsafe, so we only fire-and-forget.
+# Filename has NO dot on purpose (busybox run-parts skips names with dots).
+# NB: --exec must be the unique script path, NOT /bin/sh: matching /bin/sh would
+# false-positive against every other shell and refuse to start ("already running").
+start-stop-daemon --start --background --exec /var/lib/webosbrew/moonlight-guard.sh

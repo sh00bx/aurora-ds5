@@ -46,7 +46,10 @@ endif ()
 # Will use all cores on CMake 3.20+
 set(CPACK_THREADS 0)
 
-set(CPACK_STRIP_FILES FALSE)
+# P6: strip the release binary — roughly halves the packaged IPK size and
+# drops debug symbols not useful on-device. Debug builds keep symbols via
+# CMAKE_BUILD_TYPE, this only affects the packaged (release) artifact.
+set(CPACK_STRIP_FILES TRUE)
 
 add_custom_target(webos-package-aurora COMMAND cpack DEPENDS moonlight)
 
