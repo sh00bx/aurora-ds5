@@ -1815,6 +1815,10 @@ static void *session_main(void *arg)
     }
     if (c->hid_fd < 0) {
         ctl_log(c, "hid open failed path=%s errno=%d", c->dev.path, errno);
+        if (c->acl_tx) {
+            ds5_acl_tx_stop(c->acl_tx);
+            c->acl_tx = NULL;
+        }
         c->stop = 1;
         return NULL;
     }
@@ -1958,6 +1962,10 @@ void ctm_controller_plug_out(ctm_controller_t *c)
     if (c->session_started) {
         pthread_join(c->session_thread, NULL);
         c->session_started = 0;
+    }
+    if (c->acl_tx) { /* defensive: session_main normally stops it before exit */
+        ds5_acl_tx_stop(c->acl_tx);
+        c->acl_tx = NULL;
     }
     ctm_transport_disconnect(&c->xport);
     ctm_transport_destroy(&c->xport);
