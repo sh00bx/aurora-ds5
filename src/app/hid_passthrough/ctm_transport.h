@@ -70,6 +70,12 @@ int ctm_transport_recv_msg(ctm_transport_t *t, ctmb_header_t *h, uint8_t **paylo
  * no-op returning 0. Returns -1 if the ENet link dropped. */
 int ctm_transport_service(ctm_transport_t *t, unsigned int timeout_ms);
 
+/* ENet only: poll-driven variant of ctm_transport_service. Waits (up to a
+ * capped max_timeout_ms) on the ENet socket + an internal eventfd so a report
+ * queued by the input thread wakes the pump immediately. TCP is a no-op
+ * returning 0. Returns -1 if the ENet link dropped. Owning thread only. */
+int ctm_transport_service_wait(ctm_transport_t *t, unsigned int max_timeout_ms);
+
 /* 1 if connected (TCP fd open / ENet peer up), else 0. */
 int ctm_transport_connected(const ctm_transport_t *t);
 

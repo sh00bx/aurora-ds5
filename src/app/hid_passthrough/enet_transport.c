@@ -1,12 +1,18 @@
+#define _GNU_SOURCE
+
 #include "enet_transport.h"
 
 #include <enet/enet.h>
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <time.h>
+#include <unistd.h>
 
 #define CTM_ENET_CHANNEL 0
 #define CTM_ENET_CHANNEL_COUNT 1
@@ -23,6 +29,11 @@ struct ctm_enet_client {
     ENetPeer *peer;
     int connected;
     uint32_t send_sequence;
+
+    /* Written (8 bytes) by enet_client_send_msg from the reader thread to wake
+     * the session thread that owns the host; polled by enet_client_service_wait.
+     * -1 if eventfd creation failed (falls back to a short poll tick). */
+    int wake_efd;
 
     pthread_mutex_t out_mutex;
     ctm_enet_msg_t outbox[CTM_ENET_OUTBOX_CAP];
@@ -59,6 +70,7 @@ ctm_enet_client_t *enet_client_create(void) {
         free(client);
         return NULL;
     }
+    client->wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     pthread_mutex_init(&client->out_mutex, NULL);
     pthread_mutex_init(&client->in_mutex, NULL);
     return client;
@@ -98,6 +110,10 @@ void enet_client_destroy(ctm_enet_client_t *client) {
     if (client->host) {
         enet_host_destroy(client->host);
         client->host = NULL;
+    }
+    if (client->wake_efd >= 0) {
+        close(client->wake_efd);
+        client->wake_efd = -1;
     }
     pthread_mutex_destroy(&client->out_mutex);
     pthread_mutex_destroy(&client->in_mutex);
@@ -313,6 +329,73 @@ int enet_client_service(ctm_enet_client_t *client, unsigned int timeout_ms) {
     return dropped ? -1 : 0;
 }
 
+int enet_client_service_wait(ctm_enet_client_t *client, unsigned int max_timeout_ms) {
+    if (!client || !client->host) {
+        return -1;
+    }
+    int dropped = 0;
+
+    /* Queue any pending outbound reports as peer commands first. */
+    enet_client_flush_outbox(client);
+
+    /* Sleep until the host socket is readable (inbound), the reader thread
+     * enqueued a report (eventfd), or the cap elapses. The cap keeps ENet's
+     * retransmit/keepalive timers firing; without the eventfd (creation
+     * failed) fall back to the previous short tick so sends stay responsive. */
+    unsigned int cap = (client->wake_efd >= 0) ? 10u : 1u;
+    if (max_timeout_ms > cap) {
+        max_timeout_ms = cap;
+    }
+    struct pollfd pfds[2];
+    int nfds = 0;
+    pfds[nfds].fd = client->host->socket;
+    pfds[nfds].events = POLLIN;
+    pfds[nfds].revents = 0;
+    nfds++;
+    int efd_idx = -1;
+    if (client->wake_efd >= 0) {
+        efd_idx = nfds;
+        pfds[nfds].fd = client->wake_efd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+    }
+    int pr = poll(pfds, (nfds_t) nfds, (int) max_timeout_ms);
+    if (pr < 0 && errno != EINTR) {
+        return -1;
+    }
+    if (pr > 0 && efd_idx >= 0 && (pfds[efd_idx].revents & POLLIN)) {
+        uint64_t drain;
+        while (read(client->wake_efd, &drain, sizeof(drain)) == (ssize_t) sizeof(drain)) {
+            /* drain the accumulated wake count */
+        }
+    }
+
+    /* Non-blocking pump: sends the queued commands, receives inbound, drives
+     * acks/resends. All ENet host access stays on this (the session) thread. */
+    ENetEvent event;
+    int rc = enet_host_service(client->host, &event, 0);
+    if (rc < 0) {
+        return -1;
+    }
+    if (rc > 0) {
+        if (enet_client_handle_event(client, &event) < 0) {
+            dropped = 1;
+        }
+        while (enet_host_check_events(client->host, &event) > 0) {
+            if (enet_client_handle_event(client, &event) < 0) {
+                dropped = 1;
+            }
+        }
+    }
+
+    /* Flush anything the reader thread enqueued during the pump, and push it on
+     * the wire now rather than waiting for the next service. */
+    enet_client_flush_outbox(client);
+    enet_host_flush(client->host);
+    return dropped ? -1 : 0;
+}
+
 int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flags, uint32_t request_id,
                          const void *payload, size_t len) {
     if (!client || !client->connected) {
@@ -352,6 +435,15 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
     client->outbox[idx].payload = copy;
     client->out_count++;
     pthread_mutex_unlock(&client->out_mutex);
+
+    /* Wake the session thread (which owns the host) so this message is put on
+     * the wire on the next service instead of waiting for the poll tick. The
+     * reader thread only ever touches wake_efd here; it never calls into ENet. */
+    if (client->wake_efd >= 0) {
+        uint64_t one = 1;
+        ssize_t wr = write(client->wake_efd, &one, sizeof(one));
+        (void) wr; /* EAGAIN just means the counter is already pending a drain */
+    }
     return 0;
 }
 

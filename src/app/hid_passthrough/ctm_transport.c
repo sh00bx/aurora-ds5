@@ -188,6 +188,14 @@ int ctm_transport_service(ctm_transport_t *t, unsigned int timeout_ms)
     return 0;
 }
 
+int ctm_transport_service_wait(ctm_transport_t *t, unsigned int max_timeout_ms)
+{
+    if (t && t->kind == CTM_TRANSPORT_ENET) {
+        return enet_client_service_wait(t->enet, max_timeout_ms);
+    }
+    return 0;
+}
+
 int ctm_transport_connected(const ctm_transport_t *t)
 {
     if (!t) return 0;

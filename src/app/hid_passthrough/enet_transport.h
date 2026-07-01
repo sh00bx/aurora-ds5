@@ -52,6 +52,13 @@ int enet_client_connected(const ctm_enet_client_t *client);
  * disconnect). */
 int enet_client_service(ctm_enet_client_t *client, unsigned int timeout_ms);
 
+/* Like enet_client_service, but instead of blocking enet_host_service for
+ * timeout_ms it poll()s the host socket and an internal eventfd (written by
+ * enet_client_send_msg) so a queued report wakes the pump immediately, then
+ * services the host non-blocking. max_timeout_ms is capped internally (<=10ms)
+ * so ENet's retransmit/keepalive timers still fire. Owning thread only. */
+int enet_client_service_wait(ctm_enet_client_t *client, unsigned int max_timeout_ms);
+
 /* Build and queue one framed message (header + payload) for reliable delivery.
  * Thread-safe: callable from the input thread. The bytes are actually put on the
  * wire by the next enet_client_service() on the owning thread. Returns 0 on

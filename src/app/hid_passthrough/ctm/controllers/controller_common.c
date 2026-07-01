@@ -1722,7 +1722,12 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             if (timeout_ms > 50) timeout_ms = 50;
         }
         if (c->xport.kind == CTM_TRANSPORT_ENET) {
-            if (ctm_transport_service(&c->xport, 1) < 0) {
+            /* Poll-driven pump: the reader thread wakes us via the client's
+             * eventfd the instant it enqueues a report, so input no longer waits
+             * for a blind 1ms tick; the timeout (paced deadline, capped <=10ms
+             * inside) still bounds the idle sleep so ENet timers fire. All host
+             * access stays on this session thread. */
+            if (ctm_transport_service_wait(&c->xport, (unsigned int)timeout_ms) < 0) {
                 ctl_log(c, "ENet link lost");
                 link_alive = 0;
             } else {
