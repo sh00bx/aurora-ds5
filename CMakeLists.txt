@@ -16,7 +16,7 @@ else ()
         set(MOONLIGHT_VERSION "0.0.0")
     endif ()
 endif ()
-set(MOONLIGHT_VERSION "1.0.14")
+set(MOONLIGHT_VERSION "1.0.15")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
