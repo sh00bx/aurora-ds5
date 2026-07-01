@@ -113,6 +113,15 @@ void inspect_hidraw(device_info_t *dev)
         return;
     }
 
+    /* Idempotent: enumerate_devices inspects every hidraw node once in the
+     * /dev loop and again in the all-devices loop. Once the identifying fields
+     * are populated the re-open/ioctl work is redundant, so skip it. Devices
+     * not yet fully populated (e.g. jail /dev-gap nodes only seen via sysfs)
+     * still fall through and get inspected normally. */
+    if (dev->vid[0] && dev->pid[0] && dev->iface[0]) {
+        return;
+    }
+
     struct stat st;
     if (stat(dev->node, &st) != 0) {
         return;
@@ -1795,6 +1804,9 @@ void enumerate_devices(scan_result_t *result)
         }
     }
 
+    /* Catch-all for devices not covered by the /dev loop above (e.g. hidraw
+     * nodes only visible via sysfs when the jail /dev is missing them). This is
+     * now cheap: inspect_hidraw early-returns for devices already populated. */
     for (int i = 0; i < result->count; ++i) {
         inspect_hidraw(&result->devices[i]);
     }
