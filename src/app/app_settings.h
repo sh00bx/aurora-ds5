@@ -95,8 +95,10 @@ extern const size_t audio_config_len;
 #define RES_1800P RES_MERGE(3200, 1800)
 #define RES_4K RES_MERGE(3840, 2160)
 
-/** Fixed decode-unit reassembly buffer (megabytes). */
-#define VDEC_REASSEMBLY_BUFFER_MB 2
+/** Fixed decode-unit reassembly buffer (megabytes). 4K IDR frames at high
+ *  bitrate routinely exceed 2 MB (see session_video.c), so start at 4 to
+ *  avoid a mid-stream realloc on the first big keyframe. */
+#define VDEC_REASSEMBLY_BUFFER_MB 4
 
 void settings_initialize(app_settings_t *config, char *conf_dir);
 
