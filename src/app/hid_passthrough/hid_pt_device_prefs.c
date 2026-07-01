@@ -183,6 +183,17 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
     return 1;
 }
 
+void hid_pt_prefs_write_section(FILE *fp)
+{
+    if (!fp || g_hid_pt_pref_count <= 0) {
+        return;
+    }
+    ini_write_section(fp, "hid_pt_devices");
+    for (int i = 0; i < g_hid_pt_pref_count; ++i) {
+        ini_write_bool(fp, g_hid_pt_prefs[i].id, g_hid_pt_prefs[i].auto_plugin);
+    }
+}
+
 void hid_pt_prefs_flush(void)
 {
     if (!app_configuration || !app_configuration->ini_path) {
@@ -248,10 +259,7 @@ void hid_pt_prefs_flush(void)
     }
     free(lines);
 
-    ini_write_section(fp, "hid_pt_devices");
-    for (int i = 0; i < g_hid_pt_pref_count; ++i) {
-        ini_write_bool(fp, g_hid_pt_prefs[i].id, g_hid_pt_prefs[i].auto_plugin);
-    }
+    hid_pt_prefs_write_section(fp);
     fclose(fp);
 }
 

@@ -231,6 +231,14 @@ bool settings_save(app_settings_t *config) {
         ini_write_int(fp, "height", config->window_state.h);
     }
 
+#if defined(TARGET_WEBOS)
+    /* settings_save() truncates and rewrites the whole ini from known fields, so
+     * without this the per-device HID auto-plug prefs written by
+     * hid_pt_prefs_flush() are silently dropped on the next full save (e.g. app
+     * exit) — the DualSense would then fail to auto-bridge on the next launch. */
+    hid_pt_prefs_write_section(fp);
+#endif
+
     return fclose(fp) == 0;
 }
 
