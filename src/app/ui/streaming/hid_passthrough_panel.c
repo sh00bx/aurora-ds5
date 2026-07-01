@@ -46,8 +46,6 @@ typedef struct {
     lv_obj_t *reset_settings_btn;
     lv_obj_t *refresh_btn;
     lv_obj_t *close_btn;
-    lv_obj_t *ctype_btn;
-    lv_obj_t *ctype_label;
     lv_group_t *group;
     session_t *session;
     hid_passthrough_panel_close_cb on_close;
@@ -290,9 +288,6 @@ static void panel_setup_focus_order(hid_pt_panel_t *panel)
     }
     if (panel->reset_settings_btn) {
         lv_group_add_obj(panel->group, panel->reset_settings_btn);
-    }
-    if (panel->ctype_btn) {
-        lv_group_add_obj(panel->group, panel->ctype_btn);
     }
     if (panel->refresh_btn) {
         lv_group_add_obj(panel->group, panel->refresh_btn);
@@ -813,27 +808,6 @@ static void row_clicked_cb(lv_event_t *event) {
     }
 }
 
-// Toggle the active session between native CTM DualSense passthrough and a forced Xbox/XInput
-// pad (for games that reject a DualSense, e.g. Forza Horizon). The button label shows the
-// CURRENT mode; one press flips it.
-static void ctype_button_cb(lv_event_t *event) {
-    hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    if (!panel || !panel->session) {
-        return;
-    }
-    stream_input_t *input = session_get_input(panel->session);
-    if (!input) {
-        return;
-    }
-    uint8_t next = input->forced_gamepad_type ? 0 : 1;
-    session_set_controller_mode(panel->session, next);
-    if (panel->ctype_label) {
-        lv_label_set_text(panel->ctype_label,
-                          next ? locstr("Mode: Xbox 360") : locstr("Mode: Native DS5"));
-    }
-    hid_passthrough_panel_refresh(panel->container);
-}
-
 static void plug_button_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
     int index = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_current_target(event));
@@ -842,20 +816,6 @@ static void plug_button_cb(lv_event_t *event) {
     }
 
     logical_device_t *item = &g_devices.items[index];
-    // In forced-Xbox mode the DS5 is deliberately unplugged from CTM so SDL owns it. A manual
-    // "Plug in" here must go through the mode flip (restore native + clear Xbox), not re-bridge
-    // underneath the announced Xbox pad — that would duplicate the controller on the host.
-    if (strcmp(bridge_kind_for_item(item), "ds5") == 0) {
-        stream_input_t *in = session_get_input(panel->session);
-        if (in && in->forced_gamepad_type == 1) {
-            session_set_controller_mode(panel->session, 0);
-            if (panel->ctype_label) {
-                lv_label_set_text(panel->ctype_label, locstr("Mode: Native DS5"));
-            }
-            hid_passthrough_panel_refresh(panel->container);
-            return;
-        }
-    }
     bool requested_state = !item->plugged;
     if (requested_state) {
         ctm_clear_plug_error();
@@ -1197,21 +1157,6 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, locstr("Close"));
     lv_obj_center(close_lbl);
-
-    lv_obj_t *ctype_btn = lv_btn_create(header);
-    panel->ctype_btn = ctype_btn;
-    lv_obj_set_size(ctype_btn, LV_DPX(210), LV_DPX(36));
-    lv_obj_align(ctype_btn, LV_ALIGN_LEFT_MID, LV_DPX(150), 0);
-    lv_obj_add_event_cb(ctype_btn, ctype_button_cb, LV_EVENT_CLICKED, panel);
-    lv_obj_add_event_cb(ctype_btn, control_key_cb, LV_EVENT_KEY, panel);
-    panel->ctype_label = lv_label_create(ctype_btn);
-    {
-        stream_input_t *cur = session_get_input(session);
-        lv_label_set_text(panel->ctype_label,
-                          (cur && cur->forced_gamepad_type == 1) ? locstr("Mode: Xbox 360")
-                                                                 : locstr("Mode: Native DS5"));
-    }
-    lv_obj_center(panel->ctype_label);
 
     lv_obj_t *status_row = lv_obj_create(sheet);
     lv_obj_remove_style_all(status_row);

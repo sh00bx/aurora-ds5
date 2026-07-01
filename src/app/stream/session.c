@@ -188,68 +188,6 @@ hid_passthrough_manager_t *session_get_hid_passthrough(session_t *session) {
     return session ? &session->hid_pt : NULL;
 }
 
-// Native mode keeps the DS5 bridged to the host as a real DualSense (adaptive triggers +
-// haptics) and excluded from Moonlight's SDL gamepad forwarding. Xbox mode releases CTM's grab
-// on the DS5 so SDL owns it again, un-excludes its SDL slot so events reach the host, then
-// announces a forced Xbox/XInput pad (for games that reject a DualSense, e.g. Forza Horizon).
-// Runs on the LVGL thread, same as the autoplug reconcile and every other CTM plug op, so no
-// locking is needed. Only DS5-kind devices are touched; rumble still reaches the pad via SDL.
-//
-// Two distinct layers are toggled in concert: (1) the Moonlight EXCLUSION mask
-// (hid_pt_moonlight_restore/exclude) governs whether the DS5's SDL slot is forwarded to the
-// host; (2) g_xbox_suppress_ds5 keeps the CTM auto-plug reconcile from re-grabbing the DS5 to
-// re-bridge it via usbip (it survives a physical reconnect, which the AUTOPLUG_DONE pin alone
-// does not).
-void session_set_controller_mode(session_t *session, uint8_t forced_type) {
-    if (!session) {
-        return;
-    }
-    stream_input_t *input = &session->input;
-    if (forced_type == 1) {
-        // Enter Xbox: drop CTM's evdev grab + the host's virtual DualSense FIRST so SDL can read
-        // the pad, un-exclude the DS5's SDL slot so Moonlight forwards it, then re-announce it to
-        // the host as Xbox. The suppress flag keeps the 1s autoplug reconcile from re-grabbing the
-        // DS5 across a physical reconnect.
-        g_xbox_suppress_ds5 = true;
-        for (int i = 0; i < g_devices.count; ++i) {
-            logical_device_t *item = &g_devices.items[i];
-            if (strcmp(bridge_kind_for_item(item), "ds5") != 0) {
-                continue;
-            }
-            if (item->plugged) {
-                stop_session(item->key); // plug_out -> EVIOCGRAB 0 -> BRIDGE_STOP
-            }
-            item->plugged = false;
-            set_plug_key(item->key, false);
-            autoplug_mark_done(item->key);          // pin so the 1s reconcile poll won't re-grab it
-            hid_pt_moonlight_restore(input, item);  // un-exclude: the DS5's SDL slot now forwards
-        }
-        stream_input_set_gamepad_type(input, 1);
-    } else {
-        // Back to native. Re-exclude the DS5's SDL slot (drops the announced Xbox pad on the host
-        // via a gamepad_remove and gates any retype arrive below), reset the forced type, then
-        // hand the DS5 back to the auto-plug reconcile — the SAME proven path that bridges it at
-        // stream start — rather than a one-shot plug_in_item. The 1s reconcile poll rescans (so a
-        // changed hidraw node is picked up) and re-plugs WITH retry/GIVEUP (re-excluding on
-        // success), so a single silent host-side usbip re-attach failure self-heals on the next
-        // tick instead of sticking.
-        g_xbox_suppress_ds5 = false;
-        for (int i = 0; i < g_devices.count; ++i) {
-            logical_device_t *item = &g_devices.items[i];
-            if (strcmp(bridge_kind_for_item(item), "ds5") != 0) {
-                continue;
-            }
-            hid_pt_moonlight_exclude(input, item);  // drop the Xbox pad + stop SDL forwarding
-            if (item->plugged) {
-                stop_session(item->key); // clean teardown of any stale session before re-attach
-            }
-            item->plugged = false;
-            set_plug_key(item->key, false);
-            autoplug_mark_pending(item->key); // reconcile re-plugs next poll, with retry
-        }
-        stream_input_set_gamepad_type(input, 0);
-    }
-}
 #endif
 
 void session_ensure_hid_passthrough(session_t *session) {

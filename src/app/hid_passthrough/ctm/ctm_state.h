@@ -172,10 +172,6 @@ extern char g_agent_host[64];
 extern int g_agent_port;
 extern bool g_agent_online;
 extern bool g_running;
-/* Set while the session is in forced-Xbox mode: the DS5 is intentionally released to SDL, so
- * the auto-plug reconcile must NOT re-grab it (survives a physical reconnect, unlike the
- * per-key AUTOPLUG_DONE pin). Owned by session_set_controller_mode (host app). */
-extern bool g_xbox_suppress_ds5;
 extern pthread_t g_stop_sniff_thread;
 extern bool g_stop_sniff_thread_started;
 extern pthread_mutex_t g_bt_mac_mutex;
