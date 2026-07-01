@@ -375,7 +375,9 @@ static void control_key_cb(lv_event_t *event)
             return;
         case LV_KEY_ENTER:
             if (lv_obj_has_class(target, &lv_slider_class)) {
-                lv_group_set_editing(panel->group, true);
+                /* Toggle edit mode: first OK enters (LEFT/RIGHT adjust value),
+                 * a second OK leaves it again (like ESC). */
+                lv_group_set_editing(panel->group, !editing);
                 lv_event_stop_processing(event);
                 return;
             }
@@ -424,6 +426,9 @@ static void control_key_cb(lv_event_t *event)
             if (panel_dropdown_is_open(panel, target)) {
                 return;
             }
+            if (panel_item_needs_lrkey(target) && editing) {
+                return;   /* edit mode: UP adjusts the slider value, don't navigate */
+            }
             if (panel_is_plug_button(panel, target)) {
                 int idx = panel_plug_button_index(panel, target);
                 for (int j = idx - 1; j >= 0; --j) {
@@ -441,6 +446,9 @@ static void control_key_cb(lv_event_t *event)
         case LV_KEY_DOWN:
             if (panel_dropdown_is_open(panel, target)) {
                 return;
+            }
+            if (panel_item_needs_lrkey(target) && editing) {
+                return;   /* edit mode: DOWN adjusts the slider value, don't navigate */
             }
             if (panel_is_plug_button(panel, target)) {
                 int idx = panel_plug_button_index(panel, target);
@@ -1283,7 +1291,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_set_style_text_color(panel->composite_cb, lv_color_hex(0xdbe4ea), 0);
     lv_obj_align(panel->composite_cb, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_add_event_cb(panel->composite_cb, composite_toggle_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->composite_cb, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->composite_cb, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
 
     panel->auto_plugin_row = lv_obj_create(right_pane);
     lv_obj_remove_style_all(panel->auto_plugin_row);
@@ -1298,7 +1306,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_set_style_text_color(panel->auto_plugin_cb, lv_color_hex(0xdbe4ea), 0);
     lv_obj_set_width(panel->auto_plugin_cb, LV_PCT(100));
     lv_obj_add_event_cb(panel->auto_plugin_cb, auto_plugin_toggle_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->auto_plugin_cb, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->auto_plugin_cb, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
     lv_obj_t *auto_plugin_hint = lv_label_create(panel->auto_plugin_row);
     lv_label_set_text(auto_plugin_hint,
                       locstr("When unchecked, the controller uses normal Moonlight emulation until you Plug in."));
@@ -1335,7 +1343,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_slider_set_range(panel->latency_slider, DS_LATENCY_MIN, DS_LATENCY_MAX);
     lv_obj_set_width(panel->latency_slider, LV_PCT(100));
     lv_obj_add_event_cb(panel->latency_slider, latency_slider_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->latency_slider, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->latency_slider, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
 
     lv_obj_t *audio_lbl = lv_label_create(panel->customize_panel);
     lv_label_set_text(audio_lbl, locstr("Audio output"));
@@ -1361,7 +1369,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_slider_set_range(panel->speaker_slider, 0, DS_VOLUME_MAX);
     lv_obj_set_width(panel->speaker_slider, LV_PCT(100));
     lv_obj_add_event_cb(panel->speaker_slider, speaker_slider_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->speaker_slider, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->speaker_slider, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
 
     panel->headset_label = lv_label_create(panel->customize_panel);
     lv_obj_set_style_text_color(panel->headset_label, lv_color_hex(0xdbe4ea), 0);
@@ -1369,7 +1377,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_slider_set_range(panel->headset_slider, 0, DS_VOLUME_MAX);
     lv_obj_set_width(panel->headset_slider, LV_PCT(100));
     lv_obj_add_event_cb(panel->headset_slider, headset_slider_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->headset_slider, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->headset_slider, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
 
     panel->haptics_row = lv_obj_create(panel->customize_panel);
     lv_obj_remove_style_all(panel->haptics_row);
@@ -1383,7 +1391,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_slider_set_range(panel->haptics_slider, 0, DS_HAPTICS_MAX);
     lv_obj_set_width(panel->haptics_slider, LV_PCT(100));
     lv_obj_add_event_cb(panel->haptics_slider, haptics_slider_cb, LV_EVENT_VALUE_CHANGED, panel);
-    lv_obj_add_event_cb(panel->haptics_slider, control_key_cb, LV_EVENT_KEY, panel);
+    lv_obj_add_event_cb(panel->haptics_slider, control_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, panel);
 
     panel->reset_settings_btn = lv_btn_create(panel->customize_panel);
     lv_obj_set_size(panel->reset_settings_btn, LV_DPX(180), LV_DPX(40));
