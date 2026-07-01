@@ -269,36 +269,6 @@ bool discover_agent_once(void)
     return g_agent_online;
 }
 
-static bool agent_tcp_reachable(void)
-{
-    if (!g_agent_host[0] && !discover_agent_once()) {
-        return false;
-    }
-    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd < 0) {
-        return false;
-    }
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)g_agent_port);
-    if (inet_aton(g_agent_host, &addr.sin_addr) == 0 ||
-        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        g_agent_online = false;
-        return false;
-    }
-    close(fd);
-    g_agent_online = true;
-    return true;
-}
-
 int send_agent_command(const char *command, char *response, size_t response_len)
 {
     if (!g_agent_host[0] && !discover_agent_once()) {
@@ -548,11 +518,11 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         ctm_set_plug_error("Windows agent not found");
         return false;
     }
-    if (!agent_tcp_reachable()) {
-        ctm_set_plug_error("Cannot reach agent at %s:%d", g_agent_host, g_agent_port);
-        return false;
-    }
-
+    /* No separate agent_tcp_reachable() probe here: the BRIDGE_START
+     * send_agent_command below does its own bounded non-blocking connect and
+     * flips g_agent_online on failure, so a probe just costs an extra LAN RTT +
+     * socket on every hot-plug. The BRIDGE_START failure path reports the
+     * unreachable host. */
     const device_info_t *dev = &g_scan.devices[scan_index];
     char response[512];
     int port = next_bridge_port();
