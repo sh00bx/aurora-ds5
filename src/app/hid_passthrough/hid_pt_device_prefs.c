@@ -217,6 +217,7 @@ void hid_pt_prefs_flush(void)
                 *end = '\0';
                 const char *sec = line + 1;
                 in_section = (strcmp(sec, "hid_pt_devices") == 0);
+                *end = ']'; /* restore: line is stored verbatim below */
                 skip_section = in_section;
                 if (in_section) {
                     continue;
