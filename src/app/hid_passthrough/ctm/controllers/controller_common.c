@@ -1419,7 +1419,11 @@ static void *input_thread_main(void *arg)
         struct pollfd pfds[2];
         pfds[0].fd = c->hid_fd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = c->wake_pipe[0]; pfds[1].events = POLLIN; pfds[1].revents = 0;
-        int pr = poll(pfds, 2, 1);
+        /* hid_fd + wake_pipe cover every wake source (reports arrive on hid_fd;
+         * stop setters write the wake pipe), so this timeout is only a belt-and-
+         * braces backstop, not the input latency path. 1ms burned ~870 empty
+         * wakeups/s; 250ms keeps a safety poll without the idle spin. */
+        int pr = poll(pfds, 2, 250);
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) continue;
         if (pfds[1].revents & POLLIN) break;
