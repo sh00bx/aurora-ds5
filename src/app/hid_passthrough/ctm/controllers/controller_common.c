@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -82,6 +83,23 @@ struct hidraw_devinfo { unsigned int bustype; short vendor; short product; };
 #define BUS_USB 0x03
 
 typedef struct { uint8_t data[MAX_REPORT]; size_t len; } queued_report_t;
+
+/* One queued host feature request, executed on the feature worker thread so
+ * the blocking BT round trip (HIDIOCGFEATURE/HIDIOCSFEATURE = full
+ * TV->controller->TV transaction, 10-100+ ms) never stalls the session
+ * thread, which is the only ENet pump: while a feature ioctl blocked there,
+ * every input report sat in the outbox (measured as the burst-signature
+ * arrival gaps at the host). fd is dup()'d by the session thread so the
+ * worker survives the original being closed on unplug (ioctl then fails
+ * with ENODEV instead of touching a reused descriptor). */
+#define FEAT_QUEUE_CAP 8
+typedef struct {
+    uint16_t type;                 /* CTMB_MSG_FEATURE_GET / _SET */
+    uint32_t request_id;
+    uint32_t len;
+    int fd;                        /* dup'd; owned (closed) by the worker */
+    uint8_t payload[MAX_REPORT];
+} feat_req_t;
 typedef struct { int fd; char path[64]; } evdev_grab_t;
 
 /* Composite (puck): one forwarded sibling HID interface. The primary is c->hid_fd;
@@ -130,6 +148,16 @@ struct ctm_controller {
     pthread_t input_thread;
     int input_thread_started;
     volatile int stop;
+
+    /* Feature worker (lazy-started per session, joined in run_session teardown
+     * BEFORE the transport is released so its c_send replies stay valid). */
+    pthread_t feat_thread;
+    int feat_started;
+    pthread_mutex_t feat_mutex;
+    pthread_cond_t feat_cv;
+    feat_req_t feat_q[FEAT_QUEUE_CAP];
+    int feat_head, feat_count;
+    int feat_run;
 
     pthread_mutex_t hid_mutex;
     pthread_mutex_t settings_mutex;
@@ -1499,9 +1527,106 @@ static int feature_fd_for(ctm_controller_t *c, uint32_t request_id)
     return c->hid_fd;
 }
 
+/* Feature worker: executes queued GET/SET feature ioctls and sends the reply.
+ * Deliberately does NOT take c->hid_mutex around the ioctl - holding it for a
+ * blocked BT transaction would stall the session thread's output writes on
+ * that same mutex, recreating the very stall this thread removes. The kernel
+ * hidraw/hidp layer serializes raw-report transactions internally, and this
+ * single worker already serializes feature ops among themselves. */
+static void *feature_worker_main(void *arg)
+{
+    ctm_controller_t *c = (ctm_controller_t *)arg;
+    prctl(PR_SET_NAME, (unsigned long)"ctm-feature", 0, 0, 0);
+    for (;;) {
+        pthread_mutex_lock(&c->feat_mutex);
+        while (c->feat_run && c->feat_count == 0)
+            pthread_cond_wait(&c->feat_cv, &c->feat_mutex);
+        if (!c->feat_run && c->feat_count == 0) {
+            pthread_mutex_unlock(&c->feat_mutex);
+            break;
+        }
+        feat_req_t req;
+        memcpy(&req, &c->feat_q[c->feat_head], sizeof(req));
+        c->feat_head = (c->feat_head + 1) % FEAT_QUEUE_CAP;
+        c->feat_count--;
+        int running = c->feat_run;
+        pthread_mutex_unlock(&c->feat_mutex);
+
+        if (!running) {            /* shutting down: drop without BT traffic */
+            if (req.fd >= 0) close(req.fd);
+            continue;
+        }
+        int ok = 0;
+        if (req.type == CTMB_MSG_FEATURE_GET) {
+            if (req.fd >= 0 && ioctl(req.fd, HIDIOCGFEATURE(req.len), req.payload) >= 0)
+                ok = c_send(c, CTMB_MSG_FEATURE_REPORT, CTMB_FLAG_OK,
+                            req.request_id, req.payload, req.len) == 0;
+            if (!ok) (void)c_send(c, CTMB_MSG_FEATURE_REPORT, 0, req.request_id, NULL, 0);
+        } else {
+            if (req.fd >= 0)
+                ok = ioctl(req.fd, HIDIOCSFEATURE((int)req.len), req.payload) >= 0;
+            (void)c_send(c, CTMB_MSG_FEATURE_REPORT, ok ? CTMB_FLAG_OK : 0,
+                         req.request_id, NULL, 0);
+        }
+        if (req.fd >= 0) close(req.fd);
+    }
+    return NULL;
+}
+
+/* Queue a feature request for the worker (lazy-starting it on first use).
+ * Runs on the session thread; resolves + dup()s the target fd here because
+ * feature_fd_for reads composite state owned by this thread. Returns 0 when
+ * queued; -1 lets the caller send the failure reply immediately. */
+static int feature_enqueue(ctm_controller_t *c, uint16_t type, uint32_t request_id,
+                           const uint8_t *payload, uint32_t len)
+{
+    if (len == 0 || len > MAX_REPORT) return -1;
+    int fd = dup(feature_fd_for(c, request_id));
+    if (fd < 0) return -1;
+    if (!c->feat_started) {
+        c->feat_run = 1;
+        c->feat_head = c->feat_count = 0;
+        if (pthread_create(&c->feat_thread, NULL, feature_worker_main, c) != 0) {
+            c->feat_run = 0;
+            close(fd);
+            return -1;
+        }
+        c->feat_started = 1;
+    }
+    pthread_mutex_lock(&c->feat_mutex);
+    if (c->feat_count == FEAT_QUEUE_CAP) {
+        pthread_mutex_unlock(&c->feat_mutex);
+        close(fd);
+        return -1;
+    }
+    feat_req_t *req = &c->feat_q[(c->feat_head + c->feat_count) % FEAT_QUEUE_CAP];
+    req->type = type;
+    req->request_id = request_id;
+    req->len = len;
+    req->fd = fd;
+    memcpy(req->payload, payload, len);
+    c->feat_count++;
+    pthread_cond_signal(&c->feat_cv);
+    pthread_mutex_unlock(&c->feat_mutex);
+    return 0;
+}
+
+/* Stop + join the feature worker. When: run_session teardown, BEFORE the
+ * transport is released (the worker replies through c_send). */
+static void feature_worker_stop(ctm_controller_t *c)
+{
+    if (!c->feat_started) return;
+    pthread_mutex_lock(&c->feat_mutex);
+    c->feat_run = 0;
+    pthread_cond_broadcast(&c->feat_cv);
+    pthread_mutex_unlock(&c->feat_mutex);
+    pthread_join(c->feat_thread, NULL);
+    c->feat_started = 0;
+}
+
 /* Dispatch one inbound message: OUTPUT (paced or direct write), FEATURE_GET/SET
- * (hidraw ioctl + reply), HOST_CONFIG (pacing params). When: per message
- * decoded in the session loop. */
+ * (queued to the feature worker + async reply), HOST_CONFIG (pacing params).
+ * When: per message decoded in the session loop. */
 static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
                            queued_report_t *paced_q, int *paced_head, int *paced_count,
                            const ctmb_header_t *h, uint8_t *payload)
@@ -1532,32 +1657,11 @@ static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
         } else {
             (void)hid_write_report(c, payload, h->payload_len);
         }
-    } else if (h->type == CTMB_MSG_FEATURE_GET) {
-        int ok = 0;
-        if (h->payload_len > 0 && h->payload_len <= MAX_REPORT) {
-            uint8_t feature[MAX_REPORT];
-            memcpy(feature, payload, h->payload_len);
-            int fd = feature_fd_for(c, h->request_id);
-            pthread_mutex_lock(&c->hid_mutex);
-            int rc = ioctl(fd, HIDIOCGFEATURE(h->payload_len), feature);
-            pthread_mutex_unlock(&c->hid_mutex);
-            if (rc >= 0) {
-                ok = c_send(c, CTMB_MSG_FEATURE_REPORT, CTMB_FLAG_OK,
-                            h->request_id, feature, h->payload_len) == 0;
-            }
-        }
-        if (!ok) (void)c_send(c, CTMB_MSG_FEATURE_REPORT, 0, h->request_id, NULL, 0);
-    } else if (h->type == CTMB_MSG_FEATURE_SET) {
-        int ok = 0;
-        if (h->payload_len > 0 && h->payload_len <= MAX_REPORT) {
-            uint8_t feature[MAX_REPORT];
-            memcpy(feature, payload, h->payload_len);
-            int fd = feature_fd_for(c, h->request_id);
-            pthread_mutex_lock(&c->hid_mutex);
-            ok = ioctl(fd, HIDIOCSFEATURE(h->payload_len), feature) >= 0;
-            pthread_mutex_unlock(&c->hid_mutex);
-        }
-        (void)c_send(c, CTMB_MSG_FEATURE_REPORT, ok ? CTMB_FLAG_OK : 0, h->request_id, NULL, 0);
+    } else if (h->type == CTMB_MSG_FEATURE_GET || h->type == CTMB_MSG_FEATURE_SET) {
+        /* Async: the blocking ioctl runs on the feature worker so the input
+         * pump keeps flowing; the worker sends the (success or failure) reply. */
+        if (feature_enqueue(c, h->type, h->request_id, payload, h->payload_len) != 0)
+            (void)c_send(c, CTMB_MSG_FEATURE_REPORT, 0, h->request_id, NULL, 0);
     } else if (h->type == CTMB_MSG_HOST_CONFIG && h->payload_len >= sizeof(*host_cfg)) {
         memcpy(host_cfg, payload, sizeof(*host_cfg));
         if (host_cfg->bt_pace_us == 0) host_cfg->bt_pace_us = 10667;
@@ -1768,6 +1872,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
 
     c->comp_run = 0;
     if (c->wake_pipe[1] >= 0) (void)write(c->wake_pipe[1], "x", 1);
+    feature_worker_stop(c);   /* joins BEFORE the transport goes away below */
     stop_evdev_gamepad_feeder(c);
     if (c->input_thread_started) {
         pthread_join(c->input_thread, NULL);
@@ -1896,6 +2001,8 @@ ctm_controller_t *ctm_controller_create(const ctm_controller_dev_t *dev)
     pthread_mutex_init(&c->hid_mutex, NULL);
     pthread_mutex_init(&c->settings_mutex, NULL);
     pthread_mutex_init(&c->status_mutex, NULL);
+    pthread_mutex_init(&c->feat_mutex, NULL);
+    pthread_cond_init(&c->feat_cv, NULL);
     return c;
 }
 
@@ -2035,6 +2142,8 @@ void ctm_controller_destroy(ctm_controller_t *c)
     pthread_mutex_destroy(&c->hid_mutex);
     pthread_mutex_destroy(&c->settings_mutex);
     pthread_mutex_destroy(&c->status_mutex);
+    pthread_mutex_destroy(&c->feat_mutex);
+    pthread_cond_destroy(&c->feat_cv);
     free(c->enum_payload);
     free(c);
 }
