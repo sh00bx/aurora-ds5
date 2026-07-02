@@ -6,6 +6,9 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <sys/socket.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -69,6 +72,18 @@ ctm_enet_client_t *enet_client_create(void) {
     if (!client->host) {
         free(client);
         return NULL;
+    }
+    /* Mark input traffic as WMM voice class. Measured 2026-07-03 (pcap at the
+     * host NIC): TV->host input loses ~1%/burst (122 loss-gaps >=50ms per 5min)
+     * while host->TV is clean - the tiny input uplink loses the airtime race
+     * against our own 60Mbps video downlink on the same channel. DSCP EF +
+     * SO_PRIORITY 6 map to AC_VO (shorter AIFS/contention window), letting
+     * these ~120B packets win medium access against the video bursts. */
+    {
+        int tos = 0xB8;      /* DSCP EF */
+        int prio = 6;        /* TC_PRIO_INTERACTIVE -> 802.11 AC_VO */
+        setsockopt(client->host->socket, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+        setsockopt(client->host->socket, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
     }
     client->wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     pthread_mutex_init(&client->out_mutex, NULL);
