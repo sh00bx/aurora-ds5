@@ -244,11 +244,27 @@ int enet_client_connect(ctm_enet_client_t *client, const char *host, int port, u
         if (rc > 0 && event.type == ENET_EVENT_TYPE_CONNECT) {
             client->peer = event.peer;
             client->connected = 1;
+            /* Deceleration 0 pins the packet throttle at full: ENet's default
+             * throttle (decel 2 per bad RTT sample, ~2 samples/s from pings)
+             * walks down under WiFi RTT jitter and then SILENTLY DESTROYS
+             * unreliable-sequenced packets before they hit the wire — our
+             * input reports are the only unreliable traffic, so every
+             * throttle step is uncounted input loss (no drop counter fires
+             * on either end). Streaming already saturates the link; ENet's
+             * politeness throttle only hurts here. */
+            enet_peer_throttle_configure(client->peer,
+                                         ENET_PEER_PACKET_THROTTLE_INTERVAL,
+                                         ENET_PEER_PACKET_THROTTLE_ACCELERATION,
+                                         0);
             return 0;
         }
         if (rc > 0) {
             (void) enet_client_handle_event(client, &event);
             if (client->connected) {
+                enet_peer_throttle_configure(client->peer,
+                                             ENET_PEER_PACKET_THROTTLE_INTERVAL,
+                                             ENET_PEER_PACKET_THROTTLE_ACCELERATION,
+                                             0);
                 return 0;
             }
         }
