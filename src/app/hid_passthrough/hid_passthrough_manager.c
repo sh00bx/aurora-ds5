@@ -66,6 +66,13 @@ void hid_passthrough_manager_stop(hid_passthrough_manager_t *manager) {
     if (!manager || !manager->running) {
         return;
     }
+    /* The stopSniff worker previously outlived every stop (nothing ever
+     * cleared g_running), spawning luna-send-pub 2x/s per pad until app exit. */
+    g_running = false;
+    if (g_stop_sniff_thread_started) {
+        pthread_join(g_stop_sniff_thread, NULL);
+        g_stop_sniff_thread_started = false;
+    }
     release_local_sessions_on_exit();
     g_plugged_key_count = 0;
     g_expanded_key_count = 0;

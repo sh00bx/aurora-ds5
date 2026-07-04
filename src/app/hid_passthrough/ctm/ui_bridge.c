@@ -159,6 +159,21 @@ void stop_sniff_once(const char *mac)
     (void)run_child_wait(argv);
 }
 
+/* ds5_txd pins the bound DS5 link out of sniff at HCI level (re-asserts every
+ * 5 s), so the 2 Hz luna churn buys nothing while a DS5 session runs; keep
+ * 500 ms only when another (unpinned) session needs it, or nothing is bridged
+ * yet (menu-nav pads). Advisory read; a stale answer shifts one tick. */
+static unsigned stop_sniff_interval_ms(void)
+{
+    bool ds5 = false, other = false;
+    for (int i = 0; i < g_session_count; ++i) {
+        if (!g_sessions[i].controller) continue;
+        if (starts_with(g_sessions[i].busid, "ctm-ds5-")) ds5 = true;
+        else other = true;
+    }
+    return (ds5 && !other) ? 5000u : 500u;
+}
+
 void *stop_sniff_worker(void *arg)
 {
     (void)arg;
@@ -176,7 +191,11 @@ void *stop_sniff_worker(void *arg)
         for (int i = 0; i < count; ++i) {
             stop_sniff_once(macs[i]);
         }
-        usleep(500000);
+        /* Sliced sleep so manager_stop's join returns promptly. */
+        unsigned interval_ms = stop_sniff_interval_ms();
+        for (unsigned slept = 0; slept < interval_ms && g_running; slept += 100) {
+            usleep(100000);
+        }
     }
     return NULL;
 }
