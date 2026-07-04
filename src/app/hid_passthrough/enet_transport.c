@@ -447,7 +447,27 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
 
     pthread_mutex_lock(&client->out_mutex);
     if (client->out_count >= CTM_ENET_OUTBOX_CAP) {
-        free(client->outbox[client->out_head].payload);
+        /* Prefer dropping the oldest (stale) input report: the ring also holds
+         * reliable control messages (FEATURE_REPORT replies) that must not be
+         * silently destroyed. Only drop the head if no input report is queued. */
+        int rel = 0;
+        for (int i = 0; i < client->out_count; i++) {
+            int probe = (client->out_head + i) % CTM_ENET_OUTBOX_CAP;
+            if (client->outbox[probe].header.type == CTMB_MSG_INPUT_REPORT) {
+                rel = i;
+                break;
+            }
+        }
+        int drop = (client->out_head + rel) % CTM_ENET_OUTBOX_CAP;
+        free(client->outbox[drop].payload);
+        client->outbox[drop].payload = NULL;
+        /* Close the gap by shifting the entries between head and the victim up
+         * one slot, then advance the head past the vacated slot. */
+        for (int i = rel; i > 0; i--) {
+            int dst = (client->out_head + i) % CTM_ENET_OUTBOX_CAP;
+            int src = (client->out_head + i - 1) % CTM_ENET_OUTBOX_CAP;
+            client->outbox[dst] = client->outbox[src];
+        }
         client->outbox[client->out_head].payload = NULL;
         client->out_head = (client->out_head + 1) % CTM_ENET_OUTBOX_CAP;
         client->out_count--;
