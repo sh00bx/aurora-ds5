@@ -51,6 +51,12 @@ static void tune_tcp(int fd)
     int yes = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    /* Same AC_VO marking as the ENet socket (enet_transport.c): without it a
+     * TCP-fallback session rides AC_BE against our own video downlink. */
+    int tos = 0xB8;      /* DSCP EF */
+    int prio = 6;        /* TC_PRIO_INTERACTIVE -> 802.11 AC_VO */
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 }
 
 static int connect_tcp(const char *host, int port)

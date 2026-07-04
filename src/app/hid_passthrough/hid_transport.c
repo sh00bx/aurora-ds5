@@ -8,7 +8,10 @@
 
 static int ctmb_connect(void *ctx, const char *host, int port) {
     ctmb_hid_transport_ctx_t *c = (ctmb_hid_transport_ctx_t *) ctx;
-    return ctm_transport_connect_once(&c->transport, host, port, 400);
+    /* >=1200ms: the vendored enet's initial RTO is 500ms, so a 400ms budget
+     * could never retransmit a lost connect datagram - one lost packet meant
+     * instant TCP fallback. 1200ms fits two retransmit opportunities. */
+    return ctm_transport_connect_once(&c->transport, host, port, 1200);
 }
 
 static int ctmb_send(void *ctx, uint16_t type, uint32_t flags, uint32_t request_id, const void *payload, size_t len) {

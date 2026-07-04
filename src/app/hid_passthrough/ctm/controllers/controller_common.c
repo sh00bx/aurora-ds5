@@ -1970,12 +1970,18 @@ static void *session_main(void *arg)
     (void)fcntl(c->wake_pipe[1], F_SETFL, fcntl(c->wake_pipe[1], F_GETFL, 0) | O_NONBLOCK);
 
     while (!c->stop) {
+        /* ENet budget >=1200ms: the vendored enet's initial RTO is 500ms, so the
+         * old 400ms window could never retransmit a lost connect datagram - one
+         * lost UDP packet silently pinned the whole session to TCP fallback. */
         while (!c->stop &&
-               ctm_transport_connect_once(&c->xport, c->host, c->port, 400) != 0) {
+               ctm_transport_connect_once(&c->xport, c->host, c->port, 1200) != 0) {
             for (int slept = 0; slept < 500 && !c->stop; slept += 50) usleep(50000);
         }
         if (c->stop) break;
         ctl_log(c, "connected via %s", c->xport.kind == CTM_TRANSPORT_ENET ? "ENet/UDP" : "TCP");
+        if (c->xport.kind != CTM_TRANSPORT_ENET) {
+            ctl_log(c, "WARN: TCP fallback transport (retransmit head-of-line blocking); check UDP path to host");
+        }
 
         if (c->ops->grab_evdev) grab_matching_evdev(c);
         if (c->ops->on_plug_init) c->ops->on_plug_init(c, &c->xport);
