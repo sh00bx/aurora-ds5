@@ -18,7 +18,12 @@
 #include <unistd.h>
 
 #define CTM_ENET_CHANNEL 0
-#define CTM_ENET_CHANNEL_COUNT 1
+/* 2 channels: 0 = control + input (both directions), 1 = haptics ISO audio
+ * host->TV, so bulk audio can't head-of-line-block reliable control traffic.
+ * ENet negotiates min(client, agent) channels, so an old 1-channel agent
+ * keeps everything on 0; the receive path dispatches by message type and
+ * ignores the channel either way. */
+#define CTM_ENET_CHANNEL_COUNT 2
 #define CTM_ENET_INBOX_CAP 256
 #define CTM_ENET_OUTBOX_CAP 256
 
