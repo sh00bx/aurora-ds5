@@ -48,6 +48,14 @@ static int lastFrameNumber;
 // can resync from a known-good keyframe instead of decoding the next
 // P-frame against a discontinuity.
 static bool need_idr_on_resume = false;
+// Escalating recovery for SS4S_VIDEO_FEED_ERROR: a single transient NDL
+// error drops the frame and requests an IDR; only N consecutive failures
+// within a short window interrupt the session (a wedged decoder fails
+// every Feed, so escalation still fires within a few frames).
+#define VDEC_FEED_ERROR_LIMIT 3
+#define VDEC_FEED_ERROR_WINDOW_MS 2000
+static int feed_error_count = 0;
+static unsigned long feed_error_first_ms = 0;
 static struct VIDEO_STATS vdec_temp_stats;
 static int vdec_stream_format = 0;
 static bool vdec_warned_near_buffer_limit;
@@ -150,6 +158,8 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     vdec_stream_info.format = video_format_name(videoFormat);
     lastFrameNumber = 0;
     need_idr_on_resume = false;
+    feed_error_count = 0;
+    feed_error_first_ms = 0;
     frames_since_idr = 0;
     vdec_stream_target_fps = redrawRate > 0 ? redrawRate : 60;
     vdec_warned_near_buffer_limit = false;
@@ -284,6 +294,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     }
     SS4S_VideoFeedResult result = SS4S_PlayerVideoFeed(player, buffer, length, flags);
     if (result == SS4S_VIDEO_FEED_OK) {
+        feed_error_count = 0;
         if (decodeUnit->frameType == FRAME_TYPE_IDR) {
             frames_since_idr = 0;
         } else {
@@ -313,9 +324,20 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         need_idr_on_resume = true;
         return DR_OK;
     } else {
-        commons_log_error("Session", "Video feed error %d", result);
-        session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
-        return DR_OK;
+        unsigned long now = SDL_GetTicks();
+        if (feed_error_count == 0 || now - feed_error_first_ms > VDEC_FEED_ERROR_WINDOW_MS) {
+            feed_error_count = 0;
+            feed_error_first_ms = now;
+        }
+        feed_error_count++;
+        if (feed_error_count >= VDEC_FEED_ERROR_LIMIT) {
+            commons_log_error("Session", "Video feed error %d (%d consecutive)", result, feed_error_count);
+            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+            return DR_OK;
+        }
+        commons_log_warn("Session", "Video feed error %d; dropping frame, requesting IDR (%d/%d)",
+                         result, feed_error_count, VDEC_FEED_ERROR_LIMIT);
+        return DR_NEED_IDR;
     }
 }
 
