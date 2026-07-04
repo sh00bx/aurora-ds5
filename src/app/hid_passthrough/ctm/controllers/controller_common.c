@@ -1307,7 +1307,10 @@ static void *evdev_gamepad_thread_main(void *arg)
     memset(&st, 0, sizeof(st));
     xpad_send_report(c, &st);
 
-    while (!c->stop && c->evdev_gamepad_fd >= 0) {
+    /* comp_run gate: on link loss run_session exits with stop still 0; teardown
+     * clears comp_run before the join, so without it this loop never terminates
+     * and the join wedges the session thread (no reconnect until unplug). */
+    while (c->comp_run && !c->stop && c->evdev_gamepad_fd >= 0) {
         struct pollfd pfd;
         pfd.fd = c->evdev_gamepad_fd;
         pfd.events = POLLIN;
@@ -1746,12 +1749,17 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     if (c->ops->composite) {
         open_composite_siblings(c);
     }
+    c->comp_run = 1;   /* before the feeder starts: its loop gates on comp_run */
     if (c->ops->composite_evdev_gamepad) {
         if (start_evdev_gamepad_feeder(c) != 0 &&
             c->ops->kind && strcmp(c->ops->kind, "flydigi") == 0 &&
             (flydigi_is_xinput_evdev_only_for_busid(c->dev.usb_busid) ||
              flydigi_is_xinput_mode_for_busid(c->dev.usb_busid))) {
             ctl_log(c, "xpad evdev feeder failed; aborting xinput session");
+            c->comp_run = 0;
+            for (int i = 0; i < c->comp_count; ++i)
+                if (c->comp[i].fd >= 0) { close(c->comp[i].fd); c->comp[i].fd = -1; }
+            c->comp_count = 0;
             return;
         }
     }
@@ -1762,12 +1770,13 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
         c->input_thread_started = 1;
     } else {
         ctl_log(c, "input thread failed errno=%d", errno);
+        c->comp_run = 0;
+        stop_evdev_gamepad_feeder(c);
         for (int i = 0; i < c->comp_count; ++i)
             if (c->comp[i].fd >= 0) { close(c->comp[i].fd); c->comp[i].fd = -1; }
         c->comp_count = 0;
         return;
     }
-    c->comp_run = 1;
     if (c->ops->composite && !c->flydigi_xinput_evdev_only) {
         for (int i = 0; i < c->comp_count; ++i) {
             if (pthread_create(&c->comp[i].thread, NULL, composite_reader_main, &c->comp[i]) == 0)
