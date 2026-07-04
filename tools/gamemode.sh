@@ -198,9 +198,36 @@ show_status() {
 			esac
 		done
 	done
+	echo "--- cpu hotplug ---"
+	echo "mp_enable: $(cat /proc/lg/pm/mp_enable 2>/dev/null || echo n/a)"
+	for c in 1 2 3; do printf 'cpu%s=%s ' "$c" "$(cat /sys/devices/system/cpu/cpu$c/online 2>/dev/null)"; done; echo
 	echo "--- memory ---"
 	free -m | awk '/Mem:/{print "mem: "$4"MB free, "$7"MB avail"} /Swap:/{print "swap: "$3"MB used"}'
 	echo "--- load ---"; uptime
+}
+
+# LG's MP governor (LGDTV-PMDRV-TAS kernel thread, knobs in /proc/lg/pm)
+# offlines CPU2/3 on low load and back every 2-4s; each offline transition is a
+# stop_machine() pause across ALL cores (measured 2026-07-04: online-mask
+# flapped every ~2s idle AND in-stream, zero flaps for >3min with mp_enable=0).
+# freq control (freq_enable) and thermal scaling (ts_enable) are separate knobs
+# and stay untouched. Idempotent: safe from the enforce tick; onlining a core
+# does not stop_machine (only offlining does).
+pin_cpus() {
+	[ -e /proc/lg/pm/mp_enable ] || { log "pin_cpus: no /proc/lg/pm/mp_enable on this fw"; return; }
+	changed=""
+	[ "$(cat /proc/lg/pm/mp_enable 2>/dev/null)" = "0" ] || { echo 0 > /proc/lg/pm/mp_enable 2>/dev/null && changed=1; }
+	for c in 1 2 3; do
+		f=/sys/devices/system/cpu/cpu$c/online
+		[ "$(cat "$f" 2>/dev/null)" = "1" ] || { echo 1 > "$f" 2>/dev/null && changed=1; }
+	done
+	[ -n "$changed" ] && log "cpus pinned online (LG MP governor off)"
+}
+
+unpin_cpus() {
+	[ -e /proc/lg/pm/mp_enable ] || return 0
+	echo 1 > /proc/lg/pm/mp_enable 2>/dev/null
+	log "LG MP governor restored (cores scale down on their own)"
 }
 
 case "$1" in
@@ -208,6 +235,7 @@ on)
 	log "=== GAME MODE ON ==="
 	stop_services
 	quiet_p2p
+	pin_cpus
 	# close_apps is DISABLED. It killed shared infrastructure: blocklisted
 	# WebApp ids (e.g. com.webos.app.browser) are hosted IN the main WebAppMgr
 	# process = the ExecStart of webapp-mgr.service. Killing it (SIGTERM) took
@@ -224,6 +252,7 @@ enforce)
 	# idempotent quiet variant for the guard loop (close_apps is disabled; only
 	# safe re-assertions here -- they don't touch other apps).
 	quiet_p2p >/dev/null 2>&1
+	pin_cpus >/dev/null 2>&1
 	boost_game >/dev/null 2>&1
 	tame_quickset >/dev/null 2>&1
 	;;
@@ -232,6 +261,7 @@ off)
 	restore_game
 	restore_quickset
 	start_services
+	unpin_cpus
 	log "off: done (background apps not relaunched - open them yourself)"
 	;;
 status)
