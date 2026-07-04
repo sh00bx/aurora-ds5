@@ -145,9 +145,12 @@ struct ctm_controller {
 
     pthread_t session_thread;
     int session_started;
+    volatile int session_finished;  /* session thread exited; reconcile re-plugs */
     pthread_t input_thread;
     int input_thread_started;
     volatile int stop;
+    volatile int link_down;         /* input thread saw a send failure; run_session
+                                     * exits so session_main retries the connect */
 
     /* Feature worker (lazy-started per session, joined in run_session teardown
      * BEFORE the transport is released so its c_send replies stay valid). */
@@ -1443,7 +1446,7 @@ static void *input_thread_main(void *arg)
     static __thread uint8_t coal_buf[CTM_COAL_MAX_IDS][MAX_REPORT];
     size_t  coal_len[CTM_COAL_MAX_IDS];
     uint8_t coal_id[CTM_COAL_MAX_IDS];
-    while (!c->stop) {
+    while (!c->stop && !c->link_down) {
         struct pollfd pfds[2];
         pfds[0].fd = c->hid_fd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = c->wake_pipe[0]; pfds[1].events = POLLIN; pfds[1].revents = 0;
@@ -1479,7 +1482,11 @@ static void *input_thread_main(void *arg)
         for (int i = 0; i < coal_n && !c->stop; ++i) {
             if (c_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, c->primary_in_ep,
                        coal_buf[i], coal_len[i]) != 0) {
-                c->stop = 1;
+                /* Send failure = link down, NOT stop: stop=1 here races the
+                 * session thread's own disconnect handling and permanently
+                 * exits session_main's reconnect loop. Signal link_down so
+                 * run_session tears down and session_main retries. */
+                c->link_down = 1;
                 break;
             }
             if (c->ops->on_input_report) {
@@ -1728,6 +1735,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     uint64_t next_paced_us = 0;
     memset(&host_cfg, 0, sizeof(host_cfg));
     memset(paced_q, 0, sizeof(paced_q));
+    c->link_down = 0;
 
     if (handshake(c, caps, report_desc, report_desc_len, &host_cfg) != 0) return;
 
@@ -1778,7 +1786,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     pthread_mutex_unlock(&c->status_mutex);
 
     int link_alive = 1;
-    while (!c->stop && link_alive) {
+    while (!c->stop && !c->link_down && link_alive) {
         /* The ~10.6ms host pace (~94/s) was sized for the BT one-outstanding wall
          * on the hidraw write path. The raw-ACL injector bypasses that wall, but at
          * ~94/s the pace barely lags the ~100/s DS5 audio source, so the paced queue
@@ -1934,6 +1942,7 @@ static void *session_main(void *arg)
             c->acl_tx = NULL;
         }
         c->stop = 1;
+        c->session_finished = 1;
         return NULL;
     }
     /* Composite primary endpoints are resolved in open_composite_siblings()
@@ -1945,6 +1954,7 @@ static void *session_main(void *arg)
             c->acl_tx = NULL;
         }
         c->stop = 1;
+        c->session_finished = 1;
         return NULL;
     }
     (void)fcntl(c->wake_pipe[0], F_SETFL, fcntl(c->wake_pipe[0], F_GETFL, 0) | O_NONBLOCK);
@@ -1974,6 +1984,7 @@ static void *session_main(void *arg)
         c->acl_tx = NULL;
     }
     c->stop = 1;
+    c->session_finished = 1;
     return NULL;
 }
 
@@ -2046,6 +2057,8 @@ int ctm_controller_plug_in(ctm_controller_t *c, const char *host, int port)
     snprintf(c->host, sizeof(c->host), "%s", host);
     c->port = port;
     c->stop = 0;
+    c->link_down = 0;
+    c->session_finished = 0;
     open_log(c);
 
     pthread_once(&g_enet_once, enet_global_init_once);
@@ -2111,6 +2124,14 @@ void ctm_controller_get_settings(ctm_controller_t *c, tv_bridge_worker_settings_
 {
     if (!c || !out) return;
     *out = copy_settings(c);
+}
+
+/* True once the session thread has exited while the controller is still
+ * plugged (send-failure race, hid open failure). When: the autoplug reconcile,
+ * to tear down + re-plug a zombie session the device-vanish reap can't see. */
+bool ctm_controller_finished(ctm_controller_t *c)
+{
+    return c && c->session_started && c->session_finished;
 }
 
 /* Snapshot live bridging status for the UI panel. When: the UI status timer

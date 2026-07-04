@@ -838,6 +838,18 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
     for (int i = 0; i < g_devices.count; ++i) {
         logical_device_t *item = &g_devices.items[i];
         if (item->plugged) {
+            /* Session thread exited while the device stayed present (send-failure
+             * race, hid open failure): the vanish reap can't see it, so tear down
+             * and re-arm here — the next tick re-plugs via the normal retry path. */
+            int si = session_index_for_key(item->key);
+            if (si >= 0 && ctm_controller_finished(g_sessions[si].controller)) {
+                log_append("auto-plug: dead session for %s; re-plugging", item->name);
+                stop_session(item->key);
+                item->plugged = false;
+                set_plug_key(item->key, false);
+                autoplug_mark_pending(item->key);
+                continue;
+            }
             /* Already bridged (by us or manually): remember it so a later manual
              * plug-out is respected instead of being re-plugged on the next poll. */
             autoplug_mark_done(item->key);

@@ -98,6 +98,8 @@ void ctm_controller_set_enum_payload(ctm_controller_t *c, const uint8_t *payload
 void ctm_controller_set_settings(ctm_controller_t *c, const tv_bridge_worker_settings_t *s);
 void ctm_controller_get_settings(ctm_controller_t *c, tv_bridge_worker_settings_t *out);
 void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out);
+/* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
+bool ctm_controller_finished(ctm_controller_t *c);
 int  ctm_controller_write_feature(ctm_controller_t *c, const uint8_t *feature, size_t len);
 void ctm_controller_update_battery(ctm_controller_t *c, uint8_t level, uint8_t status);
 void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw);
