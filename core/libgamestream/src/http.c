@@ -129,6 +129,45 @@ int http_request(HTTP *http, char *url, HTTP_DATA *data) {
     return ret;
 }
 
+int http_post_json(HTTP *http, char *url, const char *payload, HTTP_DATA *data) {
+    assert(http != NULL);
+    assert(data != NULL);
+    if (data->size > 0) {
+        void *allocated = realloc(data->memory, 1);
+        assert(allocated != NULL);
+        data->memory = allocated;
+        data->memory[0] = 0;
+        data->size = 0;
+    }
+    pthread_mutex_lock(&http->mutex);
+    CURL *curl = http->curl;
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, data);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) strlen(payload));
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    int ret = GS_FAILED;
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+
+    if (res == CURLE_HTTP_RETURNED_ERROR) {
+        goto finish;
+    } else if (res != CURLE_OK) {
+        ret = gs_set_error(GS_IO_ERROR, "cURL error: %s", curl_easy_strerror(res));
+        goto finish;
+    }
+    ret = GS_OK;
+    finish:
+    pthread_mutex_unlock(&http->mutex);
+    return ret;
+}
+
 void http_destroy(HTTP *http) {
     assert(http != NULL);
     pthread_mutex_lock(&http->mutex);

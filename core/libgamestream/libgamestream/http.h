@@ -35,6 +35,8 @@ HTTP *http_create(const char *keydir);
 
 int http_request(HTTP *http, char *url, HTTP_DATA * data);
 
+int http_post_json(HTTP *http, char *url, const char *payload, HTTP_DATA *data);
+
 void http_destroy(HTTP *http);
 
 void http_set_timeout(HTTP *http, int timeout);

@@ -1066,3 +1066,118 @@ static bool append_params_raw(char *url, size_t ulen, const char *params) {
 static uint16_t server_port(const SERVER_DATA *server, bool secure) {
     return secure ? server->httpsPort : server->extPort;
 }
+
+#define WAKE_METHOD_WOL 0
+#define WAKE_METHOD_HTTP 1
+
+static bool json_bool_field(const char *json, const char *field) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":true", field);
+    return strstr(json, pattern) != NULL;
+}
+
+static int json_int_field(const char *json, const char *field, int fallback) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", field);
+    const char *pos = strstr(json, pattern);
+    if (!pos) {
+        return fallback;
+    }
+    pos += strlen(pattern);
+    return (int) strtol(pos, NULL, 10);
+}
+
+int gs_set_bitrate(GS_CLIENT hnd, const SERVER_DATA *server, int bitrate_kbps) {
+    char url[4096];
+    HTTP_DATA *data = http_data_alloc();
+    if (!data) {
+        return GS_OUT_OF_MEMORY;
+    }
+    char args[64];
+    snprintf(args, sizeof(args), "bitrate=%d", bitrate_kbps);
+    construct_url(hnd, url, sizeof(url), true, server->serverInfo.address, server_port(server, true), "bitrate", args);
+    int ret = http_request(hnd->http, url, data);
+    http_data_free(data);
+    return ret;
+}
+
+int gs_get_abr_capabilities(GS_CLIENT hnd, const SERVER_DATA *server, GS_ABR_CAPABILITIES *caps) {
+    char url[4096];
+    HTTP_DATA *data = http_data_alloc();
+    if (!data || !caps) {
+        http_data_free(data);
+        return GS_INVALID;
+    }
+    construct_url(hnd, url, sizeof(url), true, server->serverInfo.address, server_port(server, true),
+                  "api/abr/capabilities", NULL);
+    int ret = http_request(hnd->http, url, data);
+    if (ret == GS_OK && data->memory) {
+        caps->supported = json_bool_field(data->memory, "supported");
+        caps->version = json_int_field(data->memory, "version", 0);
+    } else {
+        caps->supported = false;
+        caps->version = 0;
+    }
+    http_data_free(data);
+    return ret;
+}
+
+int gs_set_abr_mode(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_CONFIG *config) {
+    char url[4096];
+    HTTP_DATA *data = http_data_alloc();
+    if (!data || !config) {
+        http_data_free(data);
+        return GS_INVALID;
+    }
+    construct_url(hnd, url, sizeof(url), true, server->serverInfo.address, server_port(server, true), "api/abr", NULL);
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"enabled\":%s,\"minBitrate\":%d,\"maxBitrate\":%d,\"mode\":\"%s\"}",
+             config->enabled ? "true" : "false", config->min_bitrate, config->max_bitrate,
+             config->mode ? config->mode : "balanced");
+    int ret = http_post_json(hnd->http, url, payload, data);
+    http_data_free(data);
+    return ret;
+}
+
+int gs_report_abr_feedback(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_FEEDBACK *feedback,
+                           GS_ABR_ACTION *action) {
+    char url[4096];
+    HTTP_DATA *data = http_data_alloc();
+    if (!data || !feedback || !action) {
+        http_data_free(data);
+        return GS_INVALID;
+    }
+    memset(action, 0, sizeof(*action));
+    construct_url(hnd, url, sizeof(url), true, server->serverInfo.address, server_port(server, true),
+                  "api/abr/feedback", NULL);
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"packetLoss\":%.2f,\"rttMs\":%d,\"decodeFps\":%.1f,\"droppedFrames\":%d,\"currentBitrate\":%d}",
+             feedback->packet_loss, feedback->rtt_ms, feedback->decode_fps, feedback->dropped_frames,
+             feedback->current_bitrate);
+    int ret = http_post_json(hnd->http, url, payload, data);
+    if (ret == GS_OK && data->memory) {
+        int new_bitrate = json_int_field(data->memory, "newBitrate", -1);
+        if (new_bitrate > 0) {
+            action->has_new_bitrate = true;
+            action->new_bitrate = new_bitrate;
+        }
+    }
+    http_data_free(data);
+    return ret;
+}
+
+int gs_http_wake(GS_CLIENT hnd, const char *url) {
+    if (!hnd || !url || !url[0]) {
+        return GS_INVALID;
+    }
+    HTTP_DATA *data = http_data_alloc();
+    if (!data) {
+        return GS_OUT_OF_MEMORY;
+    }
+    http_set_timeout(hnd->http, 10);
+    int ret = http_request(hnd->http, (char *) url, data);
+    http_data_free(data);
+    return ret;
+}

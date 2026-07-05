@@ -135,6 +135,22 @@ struct ctm_controller {
     unsigned long st_audio_conceal;
     unsigned long st_audio_capdrop;
     uint64_t plc_log_next_us;
+    /* Timer-driven PLC: conceal 0x36 audio frames LOST in transit (unreliable
+     * ENet over WiFi) — the arrived-report PLC above only covers 0x36 that
+     * arrived without an audio block, never a frame the air dropped entirely.
+     * When a real audio frame is overdue we re-inject the last one so the DS5's
+     * rate-matched speaker buffer does not drain. Off = classic behaviour. */
+    int plc_fill_enabled;
+    int plc_have36;               /* plc_last36 holds a valid cached report */
+    uint8_t plc_seq;              /* rolling 4-bit seq for synthesized frames */
+    uint16_t plc_last36_len;
+    uint8_t plc_last36[260];      /* last real 0x36-with-audio report, verbatim */
+    uint64_t plc_last_real_us;    /* arrival time of the last real audio frame */
+    uint64_t plc_fill_next_us;    /* when the next audio frame is due (0 = idle) */
+    uint32_t plc_fill_interval_us;/* target inter-frame period (~DS5 100 Hz) */
+    unsigned long st_audio_fill;  /* synthesized (transport-loss) conceal frames */
+    /* Diagnostic: per-report-id output histogram (what actually flows out). */
+    unsigned long st_out_36, st_out_31, st_out_32, st_out_other;
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
     int hid_wait_ms;
     int dedup_enabled;
@@ -764,6 +780,18 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
     }
     if (audio_present) {
         c->plc_repeat = 0;
+        /* Cache the whole frame for timer-driven loss concealment and rearm the
+         * "next frame due" clock. Runs only for real arrivals (synth frames
+         * bypass this path), so the cache never feeds on itself. */
+        if (c->plc_fill_enabled && len <= sizeof(c->plc_last36)) {
+            memcpy(c->plc_last36, data, len);
+            c->plc_last36_len = (uint16_t)len;
+            c->plc_have36 = 1;
+            c->plc_seq = (uint8_t)(data[1] >> 4);
+            uint64_t now = now_us();
+            c->plc_last_real_us = now;
+            c->plc_fill_next_us = now + c->plc_fill_interval_us;
+        }
         return;
     }
     c->st_audio_omit++;
@@ -788,11 +816,53 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
     c->st_audio_conceal++;
 }
 
+/* Re-inject the last real 0x36 audio frame to fill a transport gap (a frame the
+ * air dropped), keeping the DS5's rate-matched speaker buffer topped up. Bumps
+ * the 4-bit BT sequence (byte 1 high nibble) so the DS5 accepts it as fresh,
+ * re-signs, and rides the same raw-ACL path as real reports. Capped by
+ * plc_repeat so a sustained outage (>~12 frames) stops repeating stale audio.
+ * When: the pump loop, once per overdue audio slot. Returns 1 if injected. */
+static int plc_inject_synth(ctm_controller_t *c)
+{
+    if (!c->plc_fill_enabled || !c->plc_have36 || c->plc_last36_len < 12) return 0;
+    if (c->plc_repeat >= 12) return 0;
+    size_t n = c->plc_last36_len;
+    uint8_t rep[260];
+    if (n > sizeof(rep)) return 0;
+    memcpy(rep, c->plc_last36, n);
+    c->plc_seq = (uint8_t)((c->plc_seq + 1u) & 0x0fu);
+    rep[1] = (uint8_t)(c->plc_seq << 4);
+    ctm_bt_sign_output(rep, n);
+
+    int sent = 0;
+    if (c->acl_tx && ds5_acl_is_injectable(rep[0])) {
+        if (ds5_acl_tx_send(c->acl_tx, rep, n) == DS5_ACL_TX_SENT) sent = 1;
+    }
+    if (!sent && c->hid_fd >= 0) {
+        pthread_mutex_lock(&c->hid_mutex);
+        ssize_t w = write(c->hid_fd, rep, n);
+        pthread_mutex_unlock(&c->hid_mutex);
+        if (w == (ssize_t)n) sent = 1;
+    }
+    if (sent) {
+        c->plc_repeat++;
+        c->st_reports_out++;
+        c->st_audio_fill++;
+    }
+    return sent;
+}
+
 /* Patch (via the ops hook) then write one report to the device, mutex-guarded.
  * When: every direct OUTPUT write and every paced-queue drain. */
 static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len)
 {
     if (!c || c->hid_fd < 0 || !data || len == 0) return -1;
+    switch (data[0]) {
+        case 0x36: c->st_out_36++; break;
+        case 0x31: c->st_out_31++; break;
+        case 0x32: c->st_out_32++; break;
+        default:   c->st_out_other++; break;
+    }
     uint8_t patched[MAX_REPORT];
     if (len > sizeof(patched)) return -1;
     memcpy(patched, data, len);
@@ -1816,6 +1886,29 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             eff_pace_us = 8000;
         }
         drain_paced(c, paced_q, &paced_head, &paced_count, &next_paced_us, eff_pace_us);
+        /* Timer-driven audio-loss concealment. While the game's audio stream is
+         * active but a real 0x36 is overdue (the air dropped it) and none waits
+         * in the queue, re-inject the last frame so the DS5's rate-matched
+         * speaker buffer stays topped up instead of draining into a dropout.
+         * Idle >150 ms of real audio -> disarm (genuine silence, not loss). */
+        if (c->plc_fill_enabled && c->plc_have36 && paced_count == 0) {
+            const uint64_t active_us = 150000ull;
+            uint64_t fnow = now_us();
+            if (fnow - c->plc_last_real_us < active_us) {
+                if (c->plc_fill_next_us == 0)
+                    c->plc_fill_next_us = c->plc_last_real_us + c->plc_fill_interval_us;
+                int guard = 0;
+                while (fnow >= c->plc_fill_next_us && guard++ < 4) {
+                    if (!plc_inject_synth(c)) break;
+                    c->plc_fill_next_us += c->plc_fill_interval_us;
+                    if (c->plc_fill_next_us + c->plc_fill_interval_us < fnow)
+                        c->plc_fill_next_us = fnow + c->plc_fill_interval_us;
+                    fnow = now_us();
+                }
+            } else {
+                c->plc_fill_next_us = 0;
+            }
+        }
         if (c->plc_enabled) {
             uint64_t pnow = now_us();
             if (c->plc_log_next_us == 0) {
@@ -1826,11 +1919,14 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 if (c->acl_tx) {
                     ds5_acl_tx_stats(c->acl_tx, &inj, &drp, &rdy);
                 }
-                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu capdrop=%lu | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
-                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_capdrop, rdy, inj, drp,
+                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu capdrop=%lu | out36=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
+                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_audio_capdrop,
+                        c->st_out_36, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
+                        rdy, inj, drp,
                         c->st_hid_ok, c->st_hid_eagain, c->st_hid_recovered, c->st_hid_dropped,
                         c->st_dedup_skipped, c->st_reports_in, c->st_coalesced);
-                c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = 0;
+                c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = c->st_audio_fill = 0;
+                c->st_out_36 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
                 c->plc_log_next_us = pnow + 60000000ull;
@@ -1841,6 +1937,17 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             uint64_t now = now_us();
             timeout_ms = next_paced_us <= now ? 0 : (int)((next_paced_us - now) / 1000u);
             if (timeout_ms > 50) timeout_ms = 50;
+        }
+        /* Bound the idle sleep by the next audio-fill deadline so a run of lost
+         * frames (no ENet wakeups to ride on) still gets concealed on time
+         * instead of in a late burst when the poll finally times out. */
+        if (c->plc_fill_enabled && c->plc_have36 && c->plc_fill_next_us != 0) {
+            uint64_t now = now_us();
+            if (now - c->plc_last_real_us < 150000ull) {
+                int fto = c->plc_fill_next_us <= now
+                              ? 0 : (int)((c->plc_fill_next_us - now) / 1000u);
+                if (fto < timeout_ms) timeout_ms = fto;
+            }
         }
         if (c->xport.kind == CTM_TRANSPORT_ENET) {
             /* Poll-driven pump: the reader thread wakes us via the client's
@@ -1922,6 +2029,18 @@ static void *session_main(void *arg)
         const char *penv = getenv("CTM_AUDIO_PLC");
         c->plc_enabled = (!penv || strcmp(penv, "0") != 0);
         ctl_log(c, "audio PLC %s", c->plc_enabled ? "enabled" : "disabled");
+        /* Timer-driven loss concealment: on by default when PLC is on. The
+         * interval targets the DS5's ~100 Hz audio clock (10 ms); a lost frame
+         * that leaves a slot unfilled past one interval is re-injected. */
+        const char *fenv = getenv("CTM_AUDIO_PLC_FILL");
+        c->plc_fill_enabled = c->plc_enabled && (!fenv || strcmp(fenv, "0") != 0);
+        const char *fienv = getenv("CTM_AUDIO_PLC_FILL_US");
+        int fival = fienv ? atoi(fienv) : 10000;
+        if (fival < 5000) fival = 5000;
+        if (fival > 20000) fival = 20000;
+        c->plc_fill_interval_us = (uint32_t)fival;
+        ctl_log(c, "audio PLC fill %s (%u us)",
+                c->plc_fill_enabled ? "enabled" : "disabled", c->plc_fill_interval_us);
         const char *wenv = getenv("CTM_HID_WAIT_MS");
         c->hid_wait_ms = wenv ? atoi(wenv) : 3;
         if (c->hid_wait_ms < 0) {

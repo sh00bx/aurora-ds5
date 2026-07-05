@@ -28,6 +28,9 @@
 #define MIN_SUPPORTED_GFE_VERSION 3
 #define MAX_SUPPORTED_GFE_VERSION 7
 
+#define WAKE_METHOD_WOL 0
+#define WAKE_METHOD_HTTP 1
+
 typedef struct _SERVER_DATA {
     const char *uuid;
     const char *mac;
@@ -45,6 +48,8 @@ typedef struct _SERVER_DATA {
     int currentGame;
     int serverMajorVersion;
     const char *gsVersion;
+    int wake_method;
+    char *wake_url;
     PDISPLAY_MODE modes;
     SERVER_INFORMATION serverInfo;
 } SERVER_DATA, *PSERVER_DATA;
@@ -73,3 +78,39 @@ int gs_pair(GS_CLIENT hnd, PSERVER_DATA server, const char *pin);
 int gs_quit_app(GS_CLIENT hnd, PSERVER_DATA server);
 
 int gs_download_cover(GS_CLIENT hnd, const SERVER_DATA *server, int appId, const char *path);
+
+typedef struct {
+    bool supported;
+    int version;
+} GS_ABR_CAPABILITIES;
+
+typedef struct {
+    bool enabled;
+    int min_bitrate;
+    int max_bitrate;
+    const char *mode;
+} GS_ABR_CONFIG;
+
+typedef struct {
+    float packet_loss;
+    int rtt_ms;
+    float decode_fps;
+    int dropped_frames;
+    int current_bitrate;
+} GS_ABR_FEEDBACK;
+
+typedef struct {
+    bool has_new_bitrate;
+    int new_bitrate;
+} GS_ABR_ACTION;
+
+int gs_set_bitrate(GS_CLIENT hnd, const SERVER_DATA *server, int bitrate_kbps);
+
+int gs_get_abr_capabilities(GS_CLIENT hnd, const SERVER_DATA *server, GS_ABR_CAPABILITIES *caps);
+
+int gs_set_abr_mode(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_CONFIG *config);
+
+int gs_report_abr_feedback(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_FEEDBACK *feedback,
+                           GS_ABR_ACTION *action);
+
+int gs_http_wake(GS_CLIENT hnd, const char *url);
