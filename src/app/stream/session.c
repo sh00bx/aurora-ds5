@@ -328,6 +328,8 @@ void session_config_init(app_t *app, session_config_t *config, const SERVER_DATA
     config->hid_passthrough = app_config->hid_passthrough;
     config->hid_passthrough_port = app_config->hid_passthrough_port > 0 ? app_config->hid_passthrough_port : 48054;
     config->hid_passthrough_autoplug = app_config->hid_passthrough_autoplug;
+    config->auto_adjust_bitrate = app_config->auto_adjust_bitrate;
+    config->abr_mode = app_config->abr_mode;
 
     SS4S_VideoCapabilities video_cap = app->ss4s.video_cap;
     SS4S_AudioCapabilities audio_cap = app->ss4s.audio_cap;

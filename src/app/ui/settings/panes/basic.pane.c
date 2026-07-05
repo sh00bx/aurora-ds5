@@ -20,6 +20,8 @@ typedef struct {
     lv_obj_t *bitrate_label;
     lv_obj_t *bitrate_slider;
     lv_obj_t *bitrate_warning;
+    lv_obj_t *abr_checkbox;
+    lv_obj_t *abr_mode_dropdown;
 
     pref_dropdown_string_entry_t *lang_entries;
     int lang_entries_len;
@@ -44,6 +46,8 @@ static void init_locale_entries(basic_pane_t *pane);
 static void pref_mark_restart_cb(lv_event_t *e);
 
 static void update_bitrate_hint(basic_pane_t *pane);
+
+static void on_abr_mode_changed(lv_event_t *e);
 
 const lv_fragment_class_t settings_pane_basic_cls = {
     .constructor_cb = pane_ctor,
@@ -75,6 +79,15 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *view = pref_pane_container(container);
     lv_obj_set_layout(view, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(view, LV_FLEX_FLOW_ROW_WRAP);
+    pane->abr_checkbox = pref_checkbox(view, locstr("Adaptive bitrate"), &app_configuration->auto_adjust_bitrate, false);
+
+    pref_title_label(view, locstr("ABR mode"));
+    pane->abr_mode_dropdown = lv_dropdown_create(view);
+    lv_dropdown_set_options(pane->abr_mode_dropdown, "Balanced\nQuality\nLow latency");
+    lv_dropdown_set_selected(pane->abr_mode_dropdown, app_configuration->abr_mode);
+    lv_obj_set_width(pane->abr_mode_dropdown, LV_PCT(100));
+    lv_obj_add_event_cb(pane->abr_mode_dropdown, on_abr_mode_changed, LV_EVENT_VALUE_CHANGED, self);
+
     pref_title_label(view, locstr("Resolution and FPS"));
 
 
@@ -249,4 +262,12 @@ static void pref_mark_restart_cb(lv_event_t *e) {
     basic_pane_t *pane = (basic_pane_t *) lv_event_get_user_data(e);
     settings_controller_t *parent = pane->parent;
     parent->needs_locale_reapply |= strcasecmp(i18n_locale(), app_configuration->language) != 0;
+}
+
+static void on_abr_mode_changed(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    app_configuration->abr_mode = (int) lv_dropdown_get_selected(pane->abr_mode_dropdown);
+    if (app_configuration->abr_mode < 0 || app_configuration->abr_mode > 2) {
+        app_configuration->abr_mode = 0;
+    }
 }

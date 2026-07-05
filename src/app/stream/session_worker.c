@@ -9,6 +9,7 @@
 #include "stream/connection/session_connection.h"
 #include "stream/audio/session_audio.h"
 #include "stream/video/session_video.h"
+#include "stream/adaptive_bitrate.h"
 #include "app_session.h"
 #include "backend/pcmanager/worker/worker.h"
 
@@ -115,6 +116,15 @@ int session_worker(session_t *session) {
     }
     session_set_state(session, STREAMING_STREAMING);
     bus_pushevent(USER_STREAM_OPEN, NULL, NULL);
+    if (session->config.auto_adjust_bitrate) {
+        adaptive_bitrate_config_t abr_config = {
+                .gs_client = client,
+                .server = server,
+                .initial_bitrate = session->config.stream.bitrate,
+                .mode = (abr_mode_t) session->config.abr_mode,
+        };
+        session->abr = adaptive_bitrate_start(&abr_config);
+    }
     SDL_LockMutex(session->mutex);
     while (!session->interrupted) {
         // Wait until interrupted
@@ -140,6 +150,8 @@ int session_worker(session_t *session) {
     // Don't always reset status as error state should be kept
     session_set_state(session, STREAMING_NONE);
     thread_cleanup:
+    adaptive_bitrate_stop(session->abr);
+    session->abr = NULL;
     session_connection_callbacks_reset(session);
     if (session->player != NULL) {
         SS4S_PlayerClose(session->player);

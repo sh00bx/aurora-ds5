@@ -66,6 +66,8 @@ typedef struct app_settings_t {
      * 0 = omit (host default frame pacing).
      */
     int client_refresh_rate_x100;
+    bool auto_adjust_bitrate;
+    int abr_mode;
     char *conf_dir;
     char *ini_path;
     char *condb_path;

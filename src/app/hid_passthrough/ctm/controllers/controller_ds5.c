@@ -65,6 +65,8 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 
     if (settings->audio_mode == TV_BRIDGE_AUDIO_AUTO) {
         uint8_t auto_latency = (uint8_t)settings->latency_ms;
+        uint8_t auto_headset = ds5_volume_raw_byte(settings->headset_volume_percent);
+        uint8_t auto_speaker = ds5_volume_raw_byte(settings->speaker_volume_percent);
         if (auto_latency < 20) auto_latency = 20;
         while (pos + 2 <= limit) {
             uint8_t block_id = data[pos];
@@ -78,6 +80,26 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
                         data[pos + i] = auto_latency;
                         patched = 1;
                     }
+                }
+            } else if (block_id == 0x90 && payload_len >= 8) {
+                /* AUTO leaves route/audio-control to the game, but the volume
+                 * sliders must still work: games practically never set the
+                 * volume-valid flags, so the firmware default (full volume)
+                 * always won and the UI sliders were inert (2026-07-05).
+                 * Patch ONLY the volume bytes + their valid bits (flags0
+                 * 0x10=headset, 0x20=speaker); no 0x80 audio-control, no
+                 * payload[9] route byte -- those stay the game's. */
+                if ((data[pos + 2] & 0x30u) != 0x30u) {
+                    data[pos + 2] = (uint8_t)(data[pos + 2] | 0x30u);
+                    patched = 1;
+                }
+                if (data[pos + 6] != auto_headset) {
+                    data[pos + 6] = auto_headset;
+                    patched = 1;
+                }
+                if (data[pos + 7] != auto_speaker) {
+                    data[pos + 7] = auto_speaker;
+                    patched = 1;
                 }
             }
             pos += block_len;

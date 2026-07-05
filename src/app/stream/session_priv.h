@@ -9,6 +9,7 @@
 #include "stream/session.h"
 #include "embed_wrapper.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
+#include "stream/adaptive_bitrate.h"
 
 typedef struct app_t app_t;
 
@@ -38,6 +39,7 @@ struct session_t {
     SDL_mutex *mutex;
     SDL_Thread *thread;
     SS4S_Player *player;
+    adaptive_bitrate_service_t *abr;
 };
 
 void session_set_state(session_t *session, STREAMING_STATE state);

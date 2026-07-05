@@ -127,6 +127,8 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->autoresume = false;
     config->viewonly = false;
     config->rotate = 0;
+    config->auto_adjust_bitrate = false;
+    config->abr_mode = 0;
     config->absmouse = true;
     config->virtual_mouse = false;
     config->hdr = false;
@@ -184,6 +186,8 @@ bool settings_save(app_settings_t *config) {
     ini_write_int(fp, "bitrate", config->stream.bitrate);
     ini_write_int(fp, "packetsize", config->stream.packetSize);
     ini_write_int(fp, "rotate", config->rotate);
+    ini_write_bool(fp, "auto_adjust_bitrate", config->auto_adjust_bitrate);
+    ini_write_int(fp, "abr_mode", config->abr_mode);
 
     ini_write_section(fp, "host");
     ini_write_bool(fp, "sops", config->sops);
@@ -315,6 +319,13 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         set_int(&config->stream.packetSize, value);
     } else if (INI_FULL_MATCH("streaming", "rotate")) {
         set_int(&config->rotate, value);
+    } else if (INI_FULL_MATCH("streaming", "auto_adjust_bitrate")) {
+        config->auto_adjust_bitrate = INI_IS_TRUE(value);
+    } else if (INI_FULL_MATCH("streaming", "abr_mode")) {
+        set_int(&config->abr_mode, value);
+        if (config->abr_mode < 0 || config->abr_mode > 2) {
+            config->abr_mode = 0;
+        }
     } else if (INI_FULL_MATCH("video", "idr_refresh_interval_sec")) {
         set_int(&config->idr_refresh_interval_sec, value);
         if (config->idr_refresh_interval_sec < 0) {
