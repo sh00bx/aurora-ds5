@@ -60,6 +60,9 @@ static struct VIDEO_STATS vdec_temp_stats;
 static int vdec_stream_format = 0;
 static bool vdec_warned_near_buffer_limit;
 VIDEO_STATS vdec_summary_stats;
+/* Seqlock for vdec_summary_stats: odd while vdec_stat_submit is mid-write.
+ * Single writer (session thread); cross-thread readers use vdec_stats_snapshot. */
+static unsigned vdec_stats_seq;
 VIDEO_INFO vdec_stream_info;
 
 static int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, void *context, int drFlags);
@@ -341,11 +344,35 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     }
 }
 
+static inline void vdec_stats_write_begin(void) {
+    vdec_stats_seq++; /* odd: write in progress */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+static inline void vdec_stats_write_end(void) {
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    vdec_stats_seq++; /* even: consistent */
+}
+
+void vdec_stats_snapshot(struct VIDEO_STATS *out) {
+    unsigned s1, s2;
+    do {
+        s1 = __atomic_load_n(&vdec_stats_seq, __ATOMIC_ACQUIRE);
+        memcpy(out, &vdec_summary_stats, sizeof(*out));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        s2 = __atomic_load_n(&vdec_stats_seq, __ATOMIC_RELAXED);
+    } while ((s1 & 1u) != 0 || s1 != s2);
+}
+
 void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     struct VIDEO_STATS *dst = &vdec_summary_stats;
+    vdec_stats_write_begin();
     memcpy(dst, src, sizeof(struct VIDEO_STATS));
     unsigned long delta = now - dst->measurementStartTimestamp;
-    if (delta <= 0) { return; }
+    if (delta <= 0) {
+        vdec_stats_write_end();
+        return;
+    }
     dst->totalFps = (float) dst->totalFrames / ((float) delta / 1000);
     dst->receivedFps = (float) dst->receivedFrames / ((float) delta / 1000);
     dst->decodedFps = (float) dst->submittedFrames / ((float) delta / 1000);
@@ -355,6 +382,7 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
         LiGetEstimatedRttInfo(&dst->rtt, &dst->rttVariance);
     }
     if (!show_stats) {
+        vdec_stats_write_end();
         return;
     }
     int latencyUs = 0;
@@ -364,6 +392,7 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     } else {
         dst->avgDecoderLatency = 0;
     }
+    vdec_stats_write_end();
     app_bus_post(session->app, (bus_actionfunc) streaming_refresh_stats, NULL);
 }
 
