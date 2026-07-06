@@ -106,6 +106,9 @@ typedef struct {
     char busid[32];
     int port;
     ctm_controller_t *controller;   /* owns the in-process bridging session */
+    uint64_t plug_ms;               /* CLOCK_MONOTONIC ms at plug: lets the dead-
+                                     * session reconcile tell an instant death
+                                     * from a session that ran for a while */
 } bridge_session_t;
 
 typedef struct {

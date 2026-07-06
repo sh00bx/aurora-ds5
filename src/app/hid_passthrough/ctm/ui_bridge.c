@@ -405,6 +405,14 @@ void make_bridge_busid(const logical_device_t *item, char *out, size_t out_len)
     snprintf(out, out_len, "ctm-%s-%u", kind, ++seq);
 }
 
+/* CLOCK_MONOTONIC in ms (reboot-safe, unaffected by NTP steps). */
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
 bool add_session(const char *key, const char *busid, ctm_controller_t *controller, int port)
 {
     int index = session_index_for_key(key);
@@ -416,6 +424,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
         snprintf(g_sessions[index].busid, sizeof(g_sessions[index].busid), "%s", busid ? busid : "");
         g_sessions[index].port = port;
         g_sessions[index].controller = controller;
+        g_sessions[index].plug_ms = mono_ms();
         return true;
     }
     if (g_session_count >= MAX_SESSIONS) {
@@ -425,6 +434,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
     snprintf(g_sessions[g_session_count].busid, sizeof(g_sessions[0].busid), "%s", busid ? busid : "");
     g_sessions[g_session_count].port = port;
     g_sessions[g_session_count].controller = controller;
+    g_sessions[g_session_count].plug_ms = mono_ms();
     g_session_count++;
     return true;
 }
@@ -859,14 +869,30 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
         if (item->plugged) {
             /* Session thread exited while the device stayed present (send-failure
              * race, hid open failure): the vanish reap can't see it, so tear down
-             * and re-arm here — the next tick re-plugs via the normal retry path. */
+             * and re-arm here — the next tick re-plugs via the normal retry path.
+             * Instant deaths (< 5s, e.g. a persistently failing hidraw open) count
+             * against fail_count so the GIVEUP path engages instead of an endless
+             * plug/unplug churn loop; a session that survived a while resets it. */
             int si = session_index_for_key(item->key);
             if (si >= 0 && ctm_controller_finished(g_sessions[si].controller)) {
-                log_append("auto-plug: dead session for %s; re-plugging", item->name);
+                bool instant = mono_ms() - g_sessions[si].plug_ms < 5000ull;
                 stop_session(item->key);
                 item->plugged = false;
                 set_plug_key(item->key, false);
-                autoplug_mark_pending(item->key);
+                autoplug_entry_t *de = autoplug_entry_for(item->key, true);
+                if (de) {
+                    if (!instant) {
+                        de->fail_count = 0;
+                    }
+                    if (instant && ++de->fail_count >= AUTOPLUG_MAX_FAILS) {
+                        de->state = AUTOPLUG_GIVEUP;
+                        log_append("auto-plug: %s died instantly %d times; giving up",
+                                   item->name, de->fail_count);
+                    } else {
+                        de->state = AUTOPLUG_PENDING;
+                        log_append("auto-plug: dead session for %s; re-plugging", item->name);
+                    }
+                }
                 continue;
             }
             /* Already bridged (by us or manually): remember it so a later manual
