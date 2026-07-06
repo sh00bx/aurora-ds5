@@ -69,6 +69,18 @@ foreground_is_moonlight() {
 }
 
 log "started (poll=${POLL}s, pidof trigger, off-debounce=${OFF_DEBOUNCE})"
+
+# Startup reconcile: a previous guard instance may have died AFTER "on" (OOM,
+# init.d re-run) leaving the CPUs pinned (mp_enable=0) with aurora already
+# gone — a fresh instance starts at state=off and would never call "off". If
+# aurora is absent but the pin is active, restore now.
+if ! foreground_is_moonlight; then
+	if [ "$(cat /proc/lg/pm/mp_enable 2>/dev/null)" = "0" ]; then
+		log "stale game mode from a previous guard (mp_enable=0, no aurora) -> GAME MODE OFF"
+		sh "$GM" off
+	fi
+fi
+
 state=off
 off_cnt=0
 while true; do
