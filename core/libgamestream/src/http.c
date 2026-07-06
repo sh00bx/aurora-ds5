@@ -184,6 +184,16 @@ void http_set_timeout(HTTP *http, int timeout) {
     pthread_mutex_unlock(&http->mutex);
 }
 
+/* Whole-transfer ceiling (CURLOPT_TIMEOUT), not just connect: without one, a
+ * host that accepts the TCP connection and then hangs stalls the caller
+ * forever. 0 restores curl's default (no total timeout). */
+void http_set_total_timeout(HTTP *http, int timeout) {
+    assert(http != NULL);
+    pthread_mutex_lock(&http->mutex);
+    curl_easy_setopt(http->curl, CURLOPT_TIMEOUT, (long) timeout);
+    pthread_mutex_unlock(&http->mutex);
+}
+
 HTTP_DATA *http_data_alloc() {
     HTTP_DATA *data = malloc(sizeof(HTTP_DATA));
     assert(data != NULL);

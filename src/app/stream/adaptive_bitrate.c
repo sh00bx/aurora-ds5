@@ -30,6 +30,11 @@ struct adaptive_bitrate_service {
     int stable_seconds;
     int loss_streak;
     Uint32 last_adjust_ticks;
+    /* Backoff for failing gs_set_bitrate calls (host without the /bitrate
+     * endpoint, or transiently unreachable): each failed set doubles the pause
+     * up to 30s so we don't burn a fresh TLS handshake every adjust attempt. */
+    int set_fail_streak;
+    Uint32 set_backoff_until;
 };
 
 const char *abr_mode_to_string(abr_mode_t mode) {
@@ -72,16 +77,37 @@ static void abr_apply_mode_preset(adaptive_bitrate_service_t *service) {
             }
             break;
     }
+    /* Low initial bitrates can invert the presets (e.g. QUALITY at 3000 kbps
+     * gives min=5000 > max=4500); the tick's clamp order would then RAISE the
+     * bitrate above the user's setting. Normalize so max always wins. */
+    if (service->min_bitrate > service->max_bitrate) {
+        service->min_bitrate = service->max_bitrate;
+    }
 }
 
 static bool abr_set_bitrate(adaptive_bitrate_service_t *service, int kbps, const char *source) {
     if (kbps == service->current_bitrate) {
         return false;
     }
-    int from = service->current_bitrate;
-    if (gs_set_bitrate(service->gs_client, &service->server_copy, kbps) != GS_OK) {
+    Uint32 now = SDL_GetTicks();
+    if (service->set_backoff_until != 0 && now < service->set_backoff_until) {
         return false;
     }
+    int from = service->current_bitrate;
+    if (gs_set_bitrate(service->gs_client, &service->server_copy, kbps) != GS_OK) {
+        if (service->set_fail_streak < 5) {
+            service->set_fail_streak++;
+        }
+        Uint32 delay = 2000u << (service->set_fail_streak - 1);   /* 2/4/8/16/30s */
+        if (delay > 30000u) {
+            delay = 30000u;
+        }
+        service->set_backoff_until = now + delay;
+        commons_log_warn("ABR", "[%s] set %d kbps failed; backing off %u ms", source, kbps, delay);
+        return false;
+    }
+    service->set_fail_streak = 0;
+    service->set_backoff_until = 0;
     service->current_bitrate = kbps;
     commons_log_info("ABR", "[%s] %d kbps -> %d kbps", source, from, kbps);
     return true;
@@ -153,6 +179,11 @@ static int abr_thread(void *userdata) {
             continue;
         }
 
+        /* Unsynchronized cross-thread read: the decode thread memcpy()s a new
+         * 1-2s window into vdec_summary_stats while we read it. A torn read can
+         * yield one bogus packet_loss tick (worst case a spurious 30% cut that
+         * the probe path recovers from within seconds) — accepted, matches
+         * upstream; a seqlock is not worth it here. */
         const struct VIDEO_STATS *stats = &vdec_summary_stats;
         float packet_loss = stats->totalFrames > 0
             ? (float) stats->networkDroppedFrames / (float) stats->totalFrames * 100.0f
@@ -222,6 +253,10 @@ adaptive_bitrate_service_t *adaptive_bitrate_start(const adaptive_bitrate_config
     service->current_bitrate = config->initial_bitrate;
     service->mode = config->mode;
     abr_apply_mode_preset(service);
+    /* The GS_CLIENT only has a connect timeout; cap whole transfers too so an
+     * in-flight ABR tick can never stall stop's SDL_WaitThread for long (a
+     * half-open host would otherwise hang a request indefinitely). */
+    gs_set_total_timeout(service->gs_client, 5);
     SDL_AtomicSet(&service->stop, 0);
     service->thread = SDL_CreateThread(abr_thread, "abr", service);
     if (!service->thread) {
@@ -236,7 +271,7 @@ adaptive_bitrate_service_t *adaptive_bitrate_start(const adaptive_bitrate_config
     return service;
 }
 
-void adaptive_bitrate_stop(adaptive_bitrate_service_t *service) {
+void adaptive_bitrate_stop(adaptive_bitrate_service_t *service, bool restore) {
     if (!service) {
         return;
     }
@@ -244,12 +279,21 @@ void adaptive_bitrate_stop(adaptive_bitrate_service_t *service) {
     if (service->thread) {
         SDL_WaitThread(service->thread, NULL);
     }
-    if (service->current_bitrate != service->initial_bitrate) {
-        abr_set_bitrate(service, service->initial_bitrate, "restore");
-    }
-    if (service->server_supported) {
-        GS_ABR_CONFIG config = {.enabled = false, .min_bitrate = 0, .max_bitrate = 0, .mode = "balanced"};
-        gs_set_abr_mode(service->gs_client, &service->server_copy, &config);
+    /* This runs on the session thread during teardown: only talk to the host
+     * on a clean exit (error/disconnect means it is likely unreachable and
+     * every call below would block on a timeout), and keep even the clean
+     * path short — the host resets per-session bitrate on the next launch
+     * anyway, so a missed restore is harmless. */
+    if (restore) {
+        gs_set_total_timeout(service->gs_client, 2);
+        service->set_backoff_until = 0;   /* restore must not be skipped by backoff */
+        if (service->current_bitrate != service->initial_bitrate) {
+            abr_set_bitrate(service, service->initial_bitrate, "restore");
+        }
+        if (service->server_supported) {
+            GS_ABR_CONFIG config = {.enabled = false, .min_bitrate = 0, .max_bitrate = 0, .mode = "balanced"};
+            gs_set_abr_mode(service->gs_client, &service->server_copy, &config);
+        }
     }
     free((void *) service->server_copy.uuid);
     free((void *) service->server_copy.mac);

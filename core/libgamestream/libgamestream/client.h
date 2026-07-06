@@ -64,6 +64,10 @@ void gs_destroy(GS_CLIENT hnd);
 
 void gs_set_timeout(GS_CLIENT hnd, int timeout_secs);
 
+/* Whole-transfer ceiling on every request made through this client (see
+ * http_set_total_timeout); 0 = no ceiling (curl default). */
+void gs_set_total_timeout(GS_CLIENT hnd, int timeout_secs);
+
 int gs_get_status(GS_CLIENT hnd, PSERVER_DATA server, const char *address, uint16_t port, bool unsupported);
 
 int gs_start_app(GS_CLIENT hnd, PSERVER_DATA server, PSTREAM_CONFIGURATION config, int appId, bool is_gfe, bool sops,

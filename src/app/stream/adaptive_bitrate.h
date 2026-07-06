@@ -22,6 +22,9 @@ typedef struct {
 
 adaptive_bitrate_service_t *adaptive_bitrate_start(const adaptive_bitrate_config_t *config);
 
-void adaptive_bitrate_stop(adaptive_bitrate_service_t *service);
+/* restore=false skips the bitrate-restore / server-disable HTTP round-trips —
+ * used when the session ended in error/disconnect and the host is likely
+ * unreachable (each call would otherwise block teardown on a timeout). */
+void adaptive_bitrate_stop(adaptive_bitrate_service_t *service, bool restore);
 
 const char *abr_mode_to_string(abr_mode_t mode);

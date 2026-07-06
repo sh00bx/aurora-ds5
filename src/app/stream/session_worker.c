@@ -150,7 +150,10 @@ int session_worker(session_t *session) {
     // Don't always reset status as error state should be kept
     session_set_state(session, STREAMING_NONE);
     thread_cleanup:
-    adaptive_bitrate_stop(session->abr);
+    /* Restore only on a clean exit: streaming_errno != GS_OK means the session
+     * ended in error/disconnect and the host is likely unreachable -- the
+     * restore round-trips would just block teardown on timeouts. */
+    adaptive_bitrate_stop(session->abr, streaming_errno == GS_OK);
     session->abr = NULL;
     session_connection_callbacks_reset(session);
     if (session->player != NULL) {
