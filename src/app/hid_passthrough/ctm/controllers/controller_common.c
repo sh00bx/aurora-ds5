@@ -144,11 +144,15 @@ struct ctm_controller {
     int plc_have36;               /* plc_last36 holds a valid cached report */
     uint8_t plc_seq;              /* rolling 4-bit seq for synthesized frames */
     uint16_t plc_last36_len;
-    uint8_t plc_last36[260];      /* last real 0x36-with-audio report, verbatim */
+    /* Whole-frame cache. 260 was too small for a full 0x36 (config blocks +
+     * >=100-byte audio block(s) + CRC easily exceed it), which silently kept
+     * plc_have36 at 0 and made the fill a no-op; 1024 covers any BT 0x36. */
+    uint8_t plc_last36[1024];     /* last real 0x36-with-audio report, verbatim */
     uint64_t plc_last_real_us;    /* arrival time of the last real audio frame */
     uint64_t plc_fill_next_us;    /* when the next audio frame is due (0 = idle) */
     uint32_t plc_fill_interval_us;/* target inter-frame period (~DS5 100 Hz) */
     unsigned long st_audio_fill;  /* synthesized (transport-loss) conceal frames */
+    unsigned long st_fill_skip;   /* real 0x36 too big for plc_last36 (not cached) */
     /* Diagnostic: per-report-id output histogram (what actually flows out). */
     unsigned long st_out_36, st_out_31, st_out_32, st_out_other;
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
@@ -783,14 +787,20 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
         /* Cache the whole frame for timer-driven loss concealment and rearm the
          * "next frame due" clock. Runs only for real arrivals (synth frames
          * bypass this path), so the cache never feeds on itself. */
-        if (c->plc_fill_enabled && len <= sizeof(c->plc_last36)) {
-            memcpy(c->plc_last36, data, len);
-            c->plc_last36_len = (uint16_t)len;
-            c->plc_have36 = 1;
-            c->plc_seq = (uint8_t)(data[1] >> 4);
-            uint64_t now = now_us();
-            c->plc_last_real_us = now;
-            c->plc_fill_next_us = now + c->plc_fill_interval_us;
+        if (c->plc_fill_enabled) {
+            if (len <= sizeof(c->plc_last36)) {
+                memcpy(c->plc_last36, data, len);
+                c->plc_last36_len = (uint16_t)len;
+                c->plc_have36 = 1;
+                c->plc_seq = (uint8_t)(data[1] >> 4);
+                uint64_t now = now_us();
+                c->plc_last_real_us = now;
+                c->plc_fill_next_us = now + c->plc_fill_interval_us;
+            } else {
+                /* Frame bigger than the cache: fill silently degrades to off.
+                 * Counted so the 60s PLC line makes that visible. */
+                c->st_fill_skip++;
+            }
         }
         return;
     }
@@ -827,11 +837,18 @@ static int plc_inject_synth(ctm_controller_t *c)
     if (!c->plc_fill_enabled || !c->plc_have36 || c->plc_last36_len < 12) return 0;
     if (c->plc_repeat >= 12) return 0;
     size_t n = c->plc_last36_len;
-    uint8_t rep[260];
+    uint8_t rep[sizeof(c->plc_last36)];
     if (n > sizeof(rep)) return 0;
     memcpy(rep, c->plc_last36, n);
+    /* Sequence nibble (byte 1 high): continue +1 from the LAST REAL frame's
+     * seq. The host's counter keeps advancing for frames the air dropped, so
+     * when real audio resumes its seq is (last_real + lost + 1) — always ahead
+     * of our synths (we inject at most one per lost slot, and start a slot
+     * late), so the resumed real frame never collides with a synth seq and
+     * always wins. Preserve the low nibble verbatim (it is part of the frame
+     * the host signed, not ours to zero). */
     c->plc_seq = (uint8_t)((c->plc_seq + 1u) & 0x0fu);
-    rep[1] = (uint8_t)(c->plc_seq << 4);
+    rep[1] = (uint8_t)((c->plc_seq << 4) | (rep[1] & 0x0fu));
     ctm_bt_sign_output(rep, n);
 
     int sent = 0;
@@ -1899,7 +1916,15 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                     c->plc_fill_next_us = c->plc_last_real_us + c->plc_fill_interval_us;
                 int guard = 0;
                 while (fnow >= c->plc_fill_next_us && guard++ < 4) {
-                    if (!plc_inject_synth(c)) break;
+                    if (!plc_inject_synth(c)) {
+                        /* Inject failed (send error during a blackout, or the
+                         * repeat cap): still advance the deadline. Leaving it
+                         * in the past makes the poll-timeout bound below 0 and
+                         * busy-spins this RT thread until the 150ms activity
+                         * window expires. */
+                        c->plc_fill_next_us = fnow + c->plc_fill_interval_us;
+                        break;
+                    }
                     c->plc_fill_next_us += c->plc_fill_interval_us;
                     if (c->plc_fill_next_us + c->plc_fill_interval_us < fnow)
                         c->plc_fill_next_us = fnow + c->plc_fill_interval_us;
@@ -1919,13 +1944,14 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 if (c->acl_tx) {
                     ds5_acl_tx_stats(c->acl_tx, &inj, &drp, &rdy);
                 }
-                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu capdrop=%lu | out36=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
-                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_audio_capdrop,
+                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu fillskip=%lu capdrop=%lu | out36=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
+                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_fill_skip, c->st_audio_capdrop,
                         c->st_out_36, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
                         rdy, inj, drp,
                         c->st_hid_ok, c->st_hid_eagain, c->st_hid_recovered, c->st_hid_dropped,
                         c->st_dedup_skipped, c->st_reports_in, c->st_coalesced);
                 c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = c->st_audio_fill = 0;
+                c->st_fill_skip = 0;
                 c->st_out_36 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
