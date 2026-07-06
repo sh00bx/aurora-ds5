@@ -1071,9 +1071,6 @@ static uint16_t server_port(const SERVER_DATA *server, bool secure) {
     return secure ? server->httpsPort : server->extPort;
 }
 
-#define WAKE_METHOD_WOL 0
-#define WAKE_METHOD_HTTP 1
-
 static bool json_bool_field(const char *json, const char *field) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "\"%s\":true", field);
@@ -1168,20 +1165,6 @@ int gs_report_abr_feedback(GS_CLIENT hnd, const SERVER_DATA *server, const GS_AB
             action->new_bitrate = new_bitrate;
         }
     }
-    http_data_free(data);
-    return ret;
-}
-
-int gs_http_wake(GS_CLIENT hnd, const char *url) {
-    if (!hnd || !url || !url[0]) {
-        return GS_INVALID;
-    }
-    HTTP_DATA *data = http_data_alloc();
-    if (!data) {
-        return GS_OUT_OF_MEMORY;
-    }
-    http_set_timeout(hnd->http, 10);
-    int ret = http_request(hnd->http, (char *) url, data);
     http_data_free(data);
     return ret;
 }
