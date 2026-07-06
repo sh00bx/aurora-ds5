@@ -52,10 +52,19 @@ static void tune_tcp(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
     /* Same AC_VO marking as the ENet socket (enet_transport.c): without it a
-     * TCP-fallback session rides AC_BE against our own video downlink. */
+     * TCP-fallback session rides AC_BE against our own video downlink.
+     * connect_tcp resolves AF_UNSPEC, so mark per family — IP_TOS fails
+     * silently on an IPv6 socket (that needs IPV6_TCLASS). SO_PRIORITY is
+     * what maps skb->priority to the WMM AC and is family-agnostic. */
     int tos = 0xB8;      /* DSCP EF */
     int prio = 6;        /* TC_PRIO_INTERACTIVE -> 802.11 AC_VO */
-    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0 && ss.ss_family == AF_INET6) {
+        setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));
+    } else {
+        setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    }
     setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 }
 

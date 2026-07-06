@@ -456,12 +456,23 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
          * reliable control messages (FEATURE_REPORT replies) that must not be
          * silently destroyed. Only drop the head if no input report is queued. */
         int rel = 0;
+        int found_input = 0;
         for (int i = 0; i < client->out_count; i++) {
             int probe = (client->out_head + i) % CTM_ENET_OUTBOX_CAP;
             if (client->outbox[probe].header.type == CTMB_MSG_INPUT_REPORT) {
                 rel = i;
+                found_input = 1;
                 break;
             }
+        }
+        if (!found_input && type == CTMB_MSG_INPUT_REPORT) {
+            /* Ring is all reliable control traffic and the NEW message is a
+             * (stale-in-milliseconds) input report: drop the incoming report
+             * instead of destroying a reliable message. Report success — the
+             * caller treats a send failure as link-down. */
+            pthread_mutex_unlock(&client->out_mutex);
+            free(copy);
+            return 0;
         }
         int drop = (client->out_head + rel) % CTM_ENET_OUTBOX_CAP;
         free(client->outbox[drop].payload);
