@@ -62,7 +62,7 @@ typedef struct {
     bool have_rendered;
 } hid_pt_panel_t;
 
-#define DS_LATENCY_MIN 20
+#define DS_LATENCY_MIN 0
 #define DS_LATENCY_MAX 200
 #define DS_VOLUME_MAX 100
 #define DS_HAPTICS_MAX 200

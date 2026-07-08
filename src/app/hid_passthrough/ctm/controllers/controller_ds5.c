@@ -67,7 +67,7 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
         uint8_t auto_latency = (uint8_t)settings->latency_ms;
         uint8_t auto_headset = ds5_volume_raw_byte(settings->headset_volume_percent);
         uint8_t auto_speaker = ds5_volume_raw_byte(settings->speaker_volume_percent);
-        if (auto_latency < 20) auto_latency = 20;
+        /* latency floor lowered to 0 (was 20) for low-latency testing */
         while (pos + 2 <= limit) {
             uint8_t block_id = data[pos];
             size_t payload_len = data[pos + 1];
@@ -115,7 +115,7 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     uint8_t target_headset_volume = 0;
     uint8_t target_speaker_volume = 0;
     uint8_t target_audio_flags = 0;
-    if (latency < 20) latency = 20;
+    /* latency floor lowered to 0 (was 20) for low-latency testing */
 
     switch (settings->audio_mode) {
         case TV_BRIDGE_AUDIO_HEADSET:
