@@ -2059,7 +2059,12 @@ static void *session_main(void *arg)
          * interval targets the DS5's ~100 Hz audio clock (10 ms); a lost frame
          * that leaves a slot unfilled past one interval is re-injected. */
         const char *fenv = getenv("CTM_AUDIO_PLC_FILL");
-        c->plc_fill_enabled = c->plc_enabled && (!fenv || strcmp(fenv, "0") != 0);
+        /* DEFAULT OFF (2026-07-08, bisect regression from 82bd673f): once the
+         * 0x36 cache grew 260->1024 the timer-driven synth actually fires, and
+         * on links with frequent BT coex gaps its bumped seq nibble overtakes
+         * the real frames' seq -> the DS5 rejects the real audio as out-of-order
+         * -> valid-CRC-but-silent speaker/haptics. Opt-in only (CTM_AUDIO_PLC_FILL=1). */
+        c->plc_fill_enabled = c->plc_enabled && fenv && strcmp(fenv, "1") == 0;
         const char *fienv = getenv("CTM_AUDIO_PLC_FILL_US");
         int fival = fienv ? atoi(fienv) : 10000;
         if (fival < 5000) fival = 5000;
