@@ -510,7 +510,7 @@ static void update_latency_label(hid_pt_panel_t *panel)
         return;
     }
     int ms = (int) lv_slider_get_value(panel->latency_slider);
-    lv_label_set_text_fmt(panel->latency_label, locstr("Audio/haptics latency — %d ms (default: 48 ms)"), ms);
+    lv_label_set_text_fmt(panel->latency_label, locstr("Audio/haptics latency — %d ms (default: 100 ms)"), ms);
 }
 
 static void update_speaker_label(hid_pt_panel_t *panel)

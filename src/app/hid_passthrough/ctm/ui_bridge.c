@@ -30,10 +30,10 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     memset(&settings, 0, sizeof(settings));
     settings.kind = TV_BRIDGE_KIND_HID;
     settings.audio_mode = TV_BRIDGE_AUDIO_AUTO;
-    settings.latency_ms = 48;
+    settings.latency_ms = 100;
     settings.haptics_gain_centi = 100;
-    settings.headset_volume_percent = 100;
-    settings.speaker_volume_percent = 100;
+    settings.headset_volume_percent = 90;
+    settings.speaker_volume_percent = 90;
     settings.ds5_patch_high_nibble = 0xf;
     settings.ds5_patch_low_nibble = 0xd;
     settings.ds5_patch2_high_nibble = 0xf;
