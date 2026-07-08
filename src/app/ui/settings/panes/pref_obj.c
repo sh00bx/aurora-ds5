@@ -46,7 +46,9 @@ static void pref_attrs_free(lv_event_t *event);
 
 static void pref_checkable_value_write_back(lv_event_t *event);
 
-static void pref_checkable_dpad_check_restore(lv_event_t *event);
+static void pref_checkable_activate(lv_event_t *event);
+
+static bool pref_checkable_is_activate_event(lv_event_t *event);
 
 static void pref_dropdown_int_change_cb(lv_event_t *event);
 
@@ -76,8 +78,9 @@ lv_obj_t *pref_checkbox(lv_obj_t *parent, const char *title, bool *value, bool r
     pref_attrs_t *attrs = lv_mem_alloc(sizeof(pref_attrs_t));
     attrs->checkbox.ref = value;
     attrs->checkbox.reverse = reverse;
-    lv_obj_add_event_cb(checkbox, pref_checkable_value_write_back, LV_EVENT_CLICKED, attrs);
-    lv_obj_add_event_cb(checkbox, pref_checkable_dpad_check_restore, LV_EVENT_KEY, attrs);
+    lv_obj_clear_flag(checkbox, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_add_event_cb(checkbox, pref_checkable_activate, LV_EVENT_CLICKED, attrs);
+    lv_obj_add_event_cb(checkbox, pref_checkable_activate, LV_EVENT_KEY, attrs);
     lv_obj_add_event_cb(checkbox, pref_attrs_free, LV_EVENT_DELETE, attrs);
     if (*value ^ reverse) {
         lv_obj_add_state(checkbox, LV_STATE_CHECKED);
@@ -85,6 +88,10 @@ lv_obj_t *pref_checkbox(lv_obj_t *parent, const char *title, bool *value, bool r
         lv_obj_clear_state(checkbox, LV_STATE_CHECKED);
     }
     return checkbox;
+}
+
+void pref_checkbox_prepare_for_dpad(lv_obj_t *checkbox) {
+    lv_obj_clear_flag(checkbox, LV_OBJ_FLAG_CHECKABLE);
 }
 
 lv_obj_t *pref_dropdown_int(lv_obj_t *parent, const pref_dropdown_int_entry_t *entries, size_t num_entries,
@@ -252,18 +259,25 @@ static void pref_checkable_value_write_back(lv_event_t *event) {
     lv_event_send(target, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
-static void pref_checkable_dpad_check_restore(lv_event_t *event) {
-    uint32_t key = lv_event_get_key(event);
-    if (key != LV_KEY_UP && key != LV_KEY_DOWN && key != LV_KEY_LEFT && key != LV_KEY_RIGHT) {
+static bool pref_checkable_is_activate_event(lv_event_t *event) {
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_CLICKED) {
+        return true;
+    }
+    return code == LV_EVENT_KEY && lv_event_get_key(event) == LV_KEY_ENTER;
+}
+
+static void pref_checkable_activate(lv_event_t *event) {
+    if (!pref_checkable_is_activate_event(event)) {
         return;
     }
-    pref_attrs_t *attrs = lv_event_get_user_data(event);
     lv_obj_t *target = lv_event_get_current_target(event);
-    if (*attrs->checkbox.ref ^ attrs->checkbox.reverse) {
-        lv_obj_add_state(target, LV_STATE_CHECKED);
-    } else {
+    if (lv_obj_has_state(target, LV_STATE_CHECKED)) {
         lv_obj_clear_state(target, LV_STATE_CHECKED);
+    } else {
+        lv_obj_add_state(target, LV_STATE_CHECKED);
     }
+    pref_checkable_value_write_back(event);
 }
 
 static void pref_dropdown_int_change_cb(lv_event_t *event) {

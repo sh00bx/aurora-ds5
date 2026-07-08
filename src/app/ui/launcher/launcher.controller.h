@@ -16,6 +16,9 @@ typedef struct launcher_fragment_args_t {
     const app_launch_params_t *params;
 } launcher_fragment_args_t;
 
+/** Height of the home top bar (dp); settings overlay sits below this band. */
+#define LAUNCHER_TOPBAR_DPX 60
+
 typedef struct launcher_fragment_t {
     lv_fragment_t base;
 

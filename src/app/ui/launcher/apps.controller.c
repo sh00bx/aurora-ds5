@@ -22,6 +22,14 @@
 #include "pair.dialog.h"
 #include "ui/common/progress_dialog.h"
 
+#include "lvgl/theme/lv_theme_moonlight_colors.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#define APPS_GRID_COLS 8
+#define APPS_GRID_ROWS 3
+
 typedef void (*action_cb_t)(apps_fragment_t *controller, lv_obj_t *buttons, uint16_t index);
 
 static lv_obj_t *apps_view(lv_fragment_t *self, lv_obj_t *container);
@@ -116,11 +124,15 @@ static void set_actions(apps_fragment_t *controller, const char **labels, const 
 static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t *old_list,
                                                           const apploader_list_t *new_list, int *num_changes);
 
+static void applist_key_up_to_topbar(lv_event_t *event);
+
 static void show_progress(apps_fragment_t *fragment);
 
 static void show_ok(apps_fragment_t *fragment);
 
 static void show_error(apps_fragment_t *fragment, const char *title, const char *hint, const char *detail);
+
+static int apps_raw_visible_count(apps_fragment_t *controller, apploader_list_t *list);
 
 static apps_fragment_t *current_instance = NULL;
 
@@ -183,18 +195,24 @@ static lv_obj_t *apps_view(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_add_flag(view, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_size(view, LV_PCT(100), LV_PCT(100));
     lv_obj_set_scroll_dir(view, LV_DIR_NONE);
+    lv_obj_set_style_bg_color(view, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(view, LV_OPA_COVER, 0);
 
     lv_obj_t *applist = controller->applist = lv_gridview_create(view);
     lv_obj_add_flag(applist, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_scroll_dir(applist, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(applist, LV_SCROLLBAR_MODE_ACTIVE);
-    lv_obj_set_style_pad_hor(applist, lv_dpx(32), 0);
-    lv_obj_set_style_pad_ver(applist, lv_dpx(28), 0);
-    lv_obj_set_style_pad_gap(applist, lv_dpx(20), 0);
+    lv_obj_clear_flag(applist, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
+    lv_obj_set_scrollbar_mode(applist, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_pad_hor(applist, lv_dpx(24), 0);
+    lv_obj_set_style_pad_ver(applist, lv_dpx(16), 0);
+    lv_obj_set_style_pad_gap(applist, lv_dpx(12), 0);
     lv_obj_set_style_radius(applist, 0, 0);
     lv_obj_set_style_border_side(applist, LV_BORDER_SIDE_NONE, 0);
-    lv_obj_set_style_bg_opa(applist, 0, 0);
+    lv_obj_set_style_bg_opa(applist, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_anim_time(applist, 220, 0);
     lv_obj_set_size(applist, LV_PCT(100), LV_PCT(100));
+    lv_obj_align(applist, LV_ALIGN_TOP_MID, 0, 0);
+    lv_gridview_set_key_focus_clamp(applist, true);
     lv_obj_update_layout(applist);
 
     lv_gridview_set_adapter(applist, &apps_adapter);
@@ -252,6 +270,7 @@ static void on_view_created(lv_fragment_t *self, lv_obj_t *view) {
     lv_obj_add_event_cb(applist, applist_focus_enter, LV_EVENT_FOCUSED, controller);
     lv_obj_add_event_cb(applist, applist_focus_leave, LV_EVENT_DEFOCUSED, controller);
     lv_obj_add_event_cb(applist, applist_focus_leave, LV_EVENT_LEAVE, controller);
+    lv_obj_add_event_cb(applist, applist_key_up_to_topbar, LV_EVENT_KEY | LV_EVENT_PREPROCESS, controller);
     lv_obj_add_event_cb(controller->actions, actions_click_cb, LV_EVENT_VALUE_CHANGED, controller);
 
     update_grid_config(controller);
@@ -277,17 +296,39 @@ static void obj_will_delete(lv_fragment_t *self, lv_obj_t *obj) {
 
 static void update_grid_config(apps_fragment_t *controller) {
     lv_obj_t *applist = controller->applist;
+    if (!applist) {
+        return;
+    }
+    lv_obj_t *view = lv_obj_get_parent(applist);
+    lv_obj_update_layout(view);
     lv_obj_update_layout(applist);
-    lv_coord_t applist_width = lv_obj_get_width(applist);
-    int col_count = LV_CLAMP(4, applist_width / lv_dpx(150), 8);
-    lv_coord_t col_width = (applist_width - lv_obj_get_style_pad_left(applist, 0) -
-                            lv_obj_get_style_pad_right(applist, 0) -
-                            lv_obj_get_style_pad_column(applist, 0) * (col_count - 1)) / col_count;
+    lv_coord_t view_w = lv_obj_get_width(view);
+    lv_coord_t view_h = lv_obj_get_height(view);
+    if (view_w <= 0) {
+        view_w = lv_disp_get_hor_res(NULL);
+    }
+    if (view_h <= 0) {
+        view_h = lv_disp_get_ver_res(NULL);
+    }
+    const int col_count = APPS_GRID_COLS;
+    lv_coord_t pad_l = lv_obj_get_style_pad_left(applist, 0);
+    lv_coord_t pad_r = lv_obj_get_style_pad_right(applist, 0);
+    lv_coord_t pad_t = lv_obj_get_style_pad_top(applist, 0);
+    lv_coord_t pad_b = lv_obj_get_style_pad_bottom(applist, 0);
+    lv_coord_t gap_col = lv_obj_get_style_pad_column(applist, 0);
+    lv_coord_t gap_row = lv_obj_get_style_pad_row(applist, 0);
+    lv_coord_t col_width = (view_w - pad_l - pad_r - gap_col * (col_count - 1)) / col_count;
+    lv_coord_t row_height = (view_h - pad_t - pad_b - gap_row * (APPS_GRID_ROWS - 1)) / APPS_GRID_ROWS;
+    if (col_width < LV_DPX(40)) {
+        col_width = LV_MAX(LV_DPX(40), view_w / col_count);
+    }
+    if (row_height < LV_DPX(40)) {
+        row_height = LV_MAX(LV_DPX(40), view_h / APPS_GRID_ROWS);
+    }
     controller->col_count = col_count;
     controller->col_width = col_width;
-    /* Vertical box art (Moonlight / GeForce NOW covers are ~130×180, ratio 3:4). */
-    lv_coord_t row_height = (col_width * 4) / 3;
     controller->col_height = row_height;
+    lv_obj_set_size(applist, LV_PCT(100), LV_PCT(100));
     lv_gridview_set_config(applist, col_count, row_height, LV_GRID_ALIGN_CENTER, LV_GRID_ALIGN_CENTER);
 
     controller->appitem_style.defcover_src.header.w = col_width;
@@ -506,14 +547,16 @@ static void appload_loaded(apploader_list_t *apps, void *userdata) {
     lv_gridview_data_change_t *changes = apps_list_detect_change(fragment->apploader_apps, apps, &num_changes);
     if (num_changes != 0) {
         fragment->focus_backup = 0;
+    }
+    apploader_list_free(fragment->apploader_apps);
+    fragment->apploader_apps = apps;
+    if (num_changes != 0) {
         lv_gridview_focus(fragment->applist, 0);
     }
     lv_gridview_set_data_advanced(fragment->applist, apps, changes, num_changes);
     if (changes != NULL) {
         free(changes);
     }
-    apploader_list_free(fragment->apploader_apps);
-    fragment->apploader_apps = apps;
     update_view_state(fragment);
 
     if (fragment->def_app > 0 && !fragment->def_app_launched) {
@@ -633,18 +676,7 @@ static void launcher_quit_game(apps_fragment_t *controller) {
 static int adapter_item_count(lv_obj_t *grid, void *data) {
     if (data == NULL) { return 0; }
     apps_fragment_t *controller = lv_obj_get_user_data(grid);
-    apploader_list_t *list = data;
-    // LVGL can only display up to 255 rows/columns, but I don't think anyone has library that big (1275 items)
-    int count = LV_MIN(list->count, 255 * controller->col_count);
-    if (!controller->show_hidden_apps) {
-        for (int i = 0; i < count; i++) {
-            if (list->items[i].hidden) {
-                count = i;
-                break;
-            }
-        }
-    }
-    return count;
+    return apps_raw_visible_count(controller, data);
 }
 
 static lv_obj_t *adapter_create_view(lv_obj_t *parent) {
@@ -655,11 +687,10 @@ static lv_obj_t *adapter_create_view(lv_obj_t *parent) {
 static void adapter_bind_view(lv_obj_t *grid, lv_obj_t *item_view, void *data, int position) {
     apps_fragment_t *controller = lv_obj_get_user_data(grid);
     apploader_list_t *list = data;
+    if (list == NULL || position < 0 || position >= apps_raw_visible_count(controller, list)) {
+        return;
+    }
     appitem_bind(controller, item_view, &list->items[position]);
-
-    // IDE seems to be pretty confused...
-    LV_UNUSED(list);
-    LV_UNUSED(position);
 }
 
 
@@ -854,4 +885,43 @@ static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t
     }
     *num_changes = 0;
     return NULL;
+}
+
+static int apps_raw_visible_count(apps_fragment_t *controller, apploader_list_t *list) {
+    int count = LV_MIN(list->count, 255 * controller->col_count);
+    if (!controller->show_hidden_apps) {
+        for (int i = 0; i < count; i++) {
+            if (list->items[i].hidden) {
+                count = i;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+void apps_focus_rail(apps_fragment_t *controller) {
+    if (!controller || !controller->applist) {
+        return;
+    }
+    if (lv_obj_has_flag(controller->applist, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    lv_group_focus_obj(controller->applist);
+    int idx = controller->focus_backup >= 0 ? controller->focus_backup : 0;
+    lv_gridview_focus(controller->applist, idx);
+}
+
+static void applist_key_up_to_topbar(lv_event_t *event) {
+    if (lv_event_get_code(event) != LV_EVENT_KEY || lv_event_get_key(event) != LV_KEY_UP) {
+        return;
+    }
+    apps_fragment_t *controller = lv_event_get_user_data(event);
+    int idx = lv_gridview_get_focused_index(controller->applist);
+    if (idx < 0 || idx >= controller->col_count) {
+        return;
+    }
+    launcher_fragment_t *launcher = (launcher_fragment_t *) lv_fragment_get_parent(&controller->base);
+    launcher_restore_nav_focus(launcher);
+    lv_event_stop_processing(event);
 }

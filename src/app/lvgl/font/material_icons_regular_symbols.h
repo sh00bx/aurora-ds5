@@ -10,6 +10,7 @@
 #define MAT_SYMBOL_HELP "\xee\xa2\x87"
 #define MAT_SYMBOL_INFO "\xee\xa2\x8e"
 #define MAT_SYMBOL_LOCK "\xee\xa2\x97"
+#define MAT_SYMBOL_MENU "\xee\x97\x92"
 #define MAT_SYMBOL_ONDEMAND_VIDEO "\xee\x98\xba"
 #define MAT_SYMBOL_PLAY_ARROW "\xee\x80\xb7"
 #define MAT_SYMBOL_PUSH_PIN "\xef\x84\x8d"

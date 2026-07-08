@@ -12,7 +12,7 @@
 
 lv_obj_t *settings_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     settings_controller_t *controller = (settings_controller_t *) self;
-    /* Embedded under the launcher top bar: second AppBar row + dimmed area (popups per pane). */
+    /* Embedded under the launcher top bar: single scrollable settings page. */
     if (controller->launcher_host) {
         return settings_launcher_embedded_create(self, parent);
     }

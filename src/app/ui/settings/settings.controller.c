@@ -17,6 +17,7 @@
 #include "lvgl/theme/lv_theme_moonlight_colors.h"
 
 #include "../launcher/launcher.controller.h"
+#include "panes/pref_obj.h"
 
 typedef struct {
     const char *icon;
@@ -101,6 +102,8 @@ static void embed_popup_add_objs_recursive(lv_obj_t *parent, lv_group_t *g);
 static lv_obj_t *embed_popup_first_focusable(lv_obj_t *parent);
 
 static void embed_popup_attach_key_handlers(lv_obj_t *parent, settings_controller_t *c);
+
+static void embed_section_child_added(lv_event_t *e);
 
 static void settings_pane_fragment_destroy(settings_controller_t *c);
 
@@ -236,7 +239,21 @@ static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
 
     if (controller->launcher_host) {
         settings_close_pane_popup(controller);
+        if (controller->detail) {
+            uint32_t n = lv_obj_get_child_cnt(controller->detail);
+            for (uint32_t i = 0; i < n; i++) {
+                lv_obj_t *ch = lv_obj_get_child(controller->detail, i);
+                lv_fragment_t *pane = lv_obj_get_user_data(ch);
+                if (pane != NULL) {
+                    lv_fragment_del(pane);
+                }
+            }
+        }
+        app_input_remove_modal_group(&controller->app->ui.input, controller->detail_group);
         launcher_restore_nav_focus(controller->launcher_host);
+        if (controller->detail_group) {
+            lv_group_del(controller->detail_group);
+        }
         lv_group_del(controller->nav_group);
         return;
     }
@@ -479,7 +496,11 @@ static void on_detail_key(lv_event_t *e) {
                 lv_event_stop_bubbling(e);
                 break;
             }
-            detail_defocus(controller, e);
+            if (controller->launcher_host) {
+                (void) settings_try_close(controller);
+            } else {
+                detail_defocus(controller, e);
+            }
             lv_event_stop_bubbling(e);
             break;
         }
@@ -532,6 +553,10 @@ static void on_back_request(lv_event_t *e) {
     settings_controller_t *controller = e->user_data;
     lv_obj_t *target = lv_event_get_target(e);
     if (settings_close_dropdown_on_back(controller, target)) {
+        return;
+    }
+    if (controller->launcher_host) {
+        (void) settings_try_close(controller);
         return;
     }
     if (lv_obj_has_state(controller->detail, LV_STATE_FOCUS_KEY)) {
@@ -1193,113 +1218,164 @@ static void settings_show_pane_popup(settings_controller_t *c, const lv_fragment
     lv_obj_center(mbox);
 }
 
-static void embed_entry_btn_cb(lv_event_t *e) {
-    settings_controller_t *controller = lv_event_get_user_data(e);
-    lv_obj_t *btn = lv_event_get_target(e);
-    const lv_fragment_class_t *cls = lv_obj_get_user_data(btn);
-    if (cls) {
-        settings_show_pane_popup(controller, cls);
+static void settings_style_embed_panel(lv_obj_t *panel) {
+    lv_obj_set_style_bg_color(panel, ml_color_hex(ML_COLOR_SURFACE), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, ml_color_hex(ML_COLOR_BORDER), 0);
+    lv_obj_set_style_border_width(panel, LV_DPX(1), 0);
+    lv_obj_set_style_radius(panel, LV_DPX(12), 0);
+    lv_obj_set_style_shadow_width(panel, LV_DPX(20), 0);
+    lv_obj_set_style_shadow_color(panel, ml_color_hex(ML_COLOR_BG), 0);
+    lv_obj_set_style_shadow_opa(panel, LV_OPA_50, 0);
+    lv_obj_set_style_clip_corner(panel, true, 0);
+}
+
+static void embed_backdrop_cb(lv_event_t *e) {
+    if (lv_event_get_target(e) != lv_event_get_current_target(e)) {
+        return;
     }
+    settings_controller_t *c = lv_event_get_user_data(e);
+    (void) settings_try_close(c);
+}
+
+static void embed_backdrop_key_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_KEY || lv_event_get_key(e) != LV_KEY_ESC) {
+        return;
+    }
+    settings_controller_t *c = lv_event_get_user_data(e);
+    lv_obj_t *focused = c->detail_group ? lv_group_get_focused(c->detail_group) : NULL;
+    if (settings_close_dropdown_on_back(c, focused)) {
+        return;
+    }
+    (void) settings_try_close(c);
 }
 
 static void embed_fechar_btn_cb(lv_event_t *e) {
     settings_close(e);
 }
 
-static void embed_backdrop_cb(lv_event_t *e) {
-    settings_controller_t *c = lv_event_get_user_data(e);
-    settings_request_close_pane_popup(c);
+static void embed_focus_first_setting(settings_controller_t *c) {
+    if (!c->detail_group || !c->detail) {
+        return;
+    }
+    uint32_t n = lv_obj_get_child_cnt(c->detail);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *first = embed_popup_first_focusable(lv_obj_get_child(c->detail, i));
+        if (first != NULL) {
+            app_input_set_group(&c->app->ui.input, c->detail_group);
+            lv_group_focus_obj(first);
+            if (app_ui_get_input_mode(&c->app->ui.input) & UI_INPUT_MODE_BUTTON_FLAG) {
+                lv_obj_add_state(first, LV_STATE_FOCUS_KEY);
+            }
+            return;
+        }
+    }
 }
 
 static void embed_appbar_key(lv_event_t *e) {
     settings_controller_t *controller = lv_event_get_user_data(e);
     switch (lv_event_get_key(e)) {
-        case LV_KEY_LEFT:
-        case LV_KEY_UP:
-            lv_group_focus_prev(controller->nav_group);
-            break;
-        case LV_KEY_RIGHT:
         case LV_KEY_DOWN:
-            lv_group_focus_next(controller->nav_group);
+            embed_focus_first_setting(controller);
             break;
         default:
             break;
     }
 }
 
+static void embed_section_child_added(lv_event_t *e) {
+    settings_controller_t *c = lv_event_get_user_data(e);
+    lv_obj_t *child = lv_event_get_param(e);
+    embed_popup_attach_key_handlers(child, c);
+    embed_popup_add_objs_recursive(child, c->detail_group);
+}
+
 static void on_launcher_embedded_view_created(settings_controller_t *controller) {
     controller->nav_group = lv_group_create();
-    lv_group_set_wrap(controller->nav_group, true);
-    lv_group_set_editing(controller->nav_group, false);
+    controller->detail_group = lv_group_create();
+    lv_group_set_wrap(controller->detail_group, false);
+    lv_group_set_editing(controller->detail_group, false);
+
     lv_obj_add_event_cb(controller->embed_appbar, embed_appbar_key, LV_EVENT_KEY, controller);
+    lv_obj_add_event_cb(controller->detail, on_back_request, LV_EVENT_CANCEL, controller);
+    lv_obj_add_event_cb(controller->detail, on_detail_key, LV_EVENT_KEY, controller);
 
-    uint32_t n = lv_obj_get_child_cnt(controller->embed_appbar);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *ch = lv_obj_get_child(controller->embed_appbar, i);
-        if (lv_obj_check_type(ch, &lv_btn_class)) {
-            lv_group_add_obj(controller->nav_group, ch);
-        }
+    lv_group_add_obj(controller->nav_group, controller->close_btn);
+    lv_obj_add_event_cb(controller->close_btn, embed_cancel_cb, LV_EVENT_CANCEL, controller);
+
+    for (int i = 0; i < entries_len; i++) {
+        pref_title_label(controller->detail, locstr(entries[i].name));
+        lv_obj_t *section = lv_obj_create(controller->detail);
+        lv_obj_remove_style_all(section);
+        lv_obj_set_width(section, LV_PCT(100));
+        lv_obj_set_height(section, LV_SIZE_CONTENT);
+        lv_obj_clear_flag(section, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(section, embed_section_child_added, LV_EVENT_CHILD_CREATED, controller);
+        lv_fragment_t *pane = lv_fragment_create(entries[i].cls, controller);
+        lv_fragment_create_obj(pane, section);
+        lv_obj_set_user_data(section, pane);
+        embed_popup_attach_key_handlers(section, controller);
+        embed_popup_add_objs_recursive(section, controller->detail_group);
     }
 
-    app_input_set_group(&controller->app->ui.input, controller->nav_group);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *ch = lv_obj_get_child(controller->embed_appbar, i);
-        if (lv_obj_check_type(ch, &lv_btn_class)) {
-            lv_group_focus_obj(ch);
-            lv_obj_add_state(ch, LV_STATE_FOCUS_KEY);
-            break;
-        }
-    }
+    app_input_push_modal_group(&controller->app->ui.input, controller->detail_group);
+    embed_focus_first_setting(controller);
 }
 
 lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *parent) {
     settings_controller_t *c = (settings_controller_t *) self;
 
-    lv_obj_t *root = lv_obj_create(parent);
-    c->embed_root = root;
-    lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(root, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(root, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_bg_color(root, ml_color_hex(ML_COLOR_BG), 0);
-    lv_obj_set_style_bg_opa(root, LV_OPA_70, 0);
+    lv_coord_t hor = lv_obj_get_width(parent);
+    lv_coord_t ver = lv_obj_get_height(parent);
+    if (hor <= 0 || ver <= 0) {
+        lv_disp_t *disp = lv_disp_get_default();
+        hor = lv_disp_get_hor_res(disp);
+        ver = lv_disp_get_ver_res(disp);
+    }
 
-    lv_obj_t *bar = lv_obj_create(root);
+    lv_obj_t *backdrop = lv_obj_create(parent);
+    c->embed_root = backdrop;
+    lv_obj_remove_style_all(backdrop);
+    lv_obj_set_size(backdrop, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(backdrop, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_60, 0);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(backdrop, embed_backdrop_cb, LV_EVENT_CLICKED, c);
+    lv_obj_add_event_cb(backdrop, embed_cancel_cb, LV_EVENT_CANCEL, c);
+    lv_obj_add_event_cb(backdrop, embed_backdrop_key_cb, LV_EVENT_KEY, c);
+
+    lv_obj_t *panel = lv_obj_create(backdrop);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, hor * 92 / 100, ver * 92 / 100);
+    lv_obj_center(panel);
+    lv_obj_set_layout(panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    settings_style_embed_panel(panel);
+
+    lv_obj_t *bar = lv_obj_create(panel);
     c->embed_appbar = bar;
     c->nav = bar;
     lv_obj_remove_style_all(bar);
     lv_obj_set_width(bar, LV_PCT(100));
-    lv_obj_set_height(bar, LV_DPX(44));
+    lv_obj_set_height(bar, LV_DPX(48));
     lv_obj_set_layout(bar, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_hor(bar, LV_DPX(8), 0);
-    lv_obj_set_style_pad_gap(bar, LV_DPX(4), 0);
+    lv_obj_set_style_pad_hor(bar, LV_DPX(16), 0);
+    lv_obj_set_style_pad_gap(bar, LV_DPX(8), 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(bar, ml_color_hex(ML_COLOR_BG), 0);
     lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_width(bar, LV_DPX(1), 0);
     lv_obj_set_style_border_color(bar, ml_color_hex(ML_COLOR_BORDER), 0);
-    lv_obj_set_scroll_dir(bar, LV_DIR_HOR);
-    lv_obj_set_style_pad_ver(bar, LV_DPX(4), 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    for (int i = 0; i < entries_len; i++) {
-        lv_obj_t *btn = lv_btn_create(bar);
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-        lv_obj_set_size(btn, LV_DPX(36), LV_DPX(36));
-        lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_t *lab = lv_label_create(btn);
-        lv_label_set_text_static(lab, entries[i].icon);
-        lv_obj_set_style_text_font(lab, lv_theme_moonlight_get_iconfont_small(bar), 0);
-        lv_obj_set_style_text_color(lab, ml_color_hex(ML_COLOR_TEXT), 0);
-        lv_obj_center(lab);
-        lv_obj_clear_flag(lab, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_user_data(btn, (void *) entries[i].cls);
-        lv_obj_add_event_cb(btn, embed_entry_btn_cb, LV_EVENT_CLICKED, c);
-        lv_obj_add_event_cb(btn, embed_cancel_cb, LV_EVENT_CANCEL, c);
-    }
+    lv_obj_t *title = lv_label_create(bar);
+    lv_obj_set_style_text_font(title, lv_theme_get_font_large(bar), 0);
+    lv_obj_set_style_text_color(title, ml_color_hex(ML_COLOR_TEXT), 0);
+    lv_label_set_text(title, locstr("Settings"));
 
     lv_obj_t *sp = lv_obj_create(bar);
     lv_obj_remove_style_all(sp);
@@ -1316,18 +1392,27 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_t *clab = lv_label_create(close_btn);
     lv_label_set_text_static(clab, MAT_SYMBOL_CLOSE);
     lv_obj_set_style_text_font(clab, lv_theme_moonlight_get_iconfont_small(bar), 0);
-    lv_obj_set_style_text_color(clab, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_set_style_text_color(clab, ml_color_hex(ML_COLOR_TEXT), 0);
     lv_obj_center(clab);
     lv_obj_clear_flag(clab, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(close_btn, embed_fechar_btn_cb, LV_EVENT_CLICKED, c);
     lv_obj_add_event_cb(close_btn, embed_cancel_cb, LV_EVENT_CANCEL, c);
 
-    lv_obj_t *backdrop = lv_obj_create(root);
-    lv_obj_remove_style_all(backdrop);
-    lv_obj_set_width(backdrop, LV_PCT(100));
-    lv_obj_set_flex_grow(backdrop, 1);
-    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(backdrop, embed_backdrop_cb, LV_EVENT_CLICKED, c);
+    lv_obj_t *scroll = lv_obj_create(panel);
+    c->detail = scroll;
+    lv_obj_remove_style_all(scroll);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_layout(scroll, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_hor(scroll, LV_DPX(24), 0);
+    lv_obj_set_style_pad_top(scroll, LV_DPX(12), 0);
+    lv_obj_set_style_pad_bottom(scroll, LV_DPX(24), 0);
+    lv_obj_set_style_pad_gap(scroll, LV_DPX(8), 0);
+    lv_obj_set_style_bg_opa(scroll, LV_OPA_TRANSP, 0);
+    lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_AUTO);
 
-    return root;
+    return backdrop;
 }

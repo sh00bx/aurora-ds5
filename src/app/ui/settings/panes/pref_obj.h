@@ -26,6 +26,9 @@ lv_obj_t *pref_pane_container(lv_obj_t *parent);
 
 lv_obj_t *pref_checkbox(lv_obj_t *parent, const char *title, bool *value, bool reverse);
 
+/** Disable LVGL arrow-key toggling; use click/Enter to change state. */
+void pref_checkbox_prepare_for_dpad(lv_obj_t *checkbox);
+
 lv_obj_t *pref_dropdown_int(lv_obj_t *parent, const pref_dropdown_int_entry_t *entries, size_t num_entries, int *value,
                             bool(*write_predicate)(int));
 

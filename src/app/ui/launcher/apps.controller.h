@@ -61,3 +61,6 @@ typedef struct {
 } apps_fragment_arg_t;
 
 extern const lv_fragment_class_t apps_controller_class;
+
+/** Move focus into the game grid. */
+void apps_focus_rail(apps_fragment_t *controller);

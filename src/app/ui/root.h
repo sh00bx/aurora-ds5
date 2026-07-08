@@ -41,7 +41,7 @@ typedef struct {
 } ui_userevent_t;
 
 #define NAV_WIDTH_COLLAPSED 44
-#define NAV_LOGO_SIZE 24
+#define NAV_LOGO_SIZE 28
 
 const lv_img_dsc_t *ui_logo_src();
 

@@ -169,7 +169,7 @@ static void launcher_view_init(lv_fragment_t *self, lv_obj_t *view) {
     pcmanager_register_listener(pcmanager, &pcmanager_callbacks, fragment);
 
     /* Top-bar input wiring: focus enters → switch to nav_group; KEY handled for
-     * LEFT/RIGHT (move between buttons) and UP (enter game rail above the bar);
+     * LEFT/RIGHT (move between buttons) and DOWN (descend into the game grid below the bar);
      * CANCEL on the bar surfaces the standard quit confirmation. */
     lv_obj_add_event_cb(fragment->nav, cb_topbar_focused, LV_EVENT_FOCUSED, fragment);
     lv_obj_add_event_cb(fragment->nav, cb_topbar_key, LV_EVENT_KEY, fragment);
@@ -367,8 +367,7 @@ static void cb_detail_cancel(lv_event_t *event) {
 
 static void cb_detail_key(lv_event_t *event) {
     launcher_fragment_t *fragment = lv_event_get_user_data(event);
-    /* Games sit above the bar in the column layout; the bar is below, so use DOWN to reach it. */
-    if (lv_event_get_key(event) == LV_KEY_DOWN) {
+    if (lv_event_get_key(event) == LV_KEY_UP) {
         focus_topbar(fragment);
     }
 }
@@ -390,13 +389,8 @@ static void cb_topbar_key(lv_event_t *event) {
             lv_group_focus_next(fragment->nav_group);
             break;
         }
-        case LV_KEY_UP: {
-            /* Games are above the bar; move focus up into the rail. */
-            lv_fragment_t *detail_fragment = lv_fragment_manager_find_by_container(fragment->base.child_manager,
-                                                                                   fragment->detail);
-            if (detail_fragment) {
-                focus_detail(fragment);
-            }
+        case LV_KEY_DOWN: {
+            focus_detail(fragment);
             break;
         }
     }
@@ -490,6 +484,7 @@ static void open_settings(lv_event_t *event) {
     lv_fragment_create_obj(fragment, self->settings_layer);
     self->settings_fragment = fragment;
     lv_obj_clear_flag(self->settings_layer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(self->settings_layer);
 }
 
 static void show_decoder_error() {

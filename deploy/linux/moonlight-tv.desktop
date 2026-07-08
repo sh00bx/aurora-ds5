@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Moonlight TV
-Comment=Open Source NVIDIA GameStream Client
+Name=Aurora
+Comment=GameStream client for LG webOS and desktop
 Exec=moonlight-tv
 Icon=moonlight-tv
 Terminal=false

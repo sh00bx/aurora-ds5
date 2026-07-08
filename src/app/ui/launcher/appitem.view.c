@@ -9,9 +9,9 @@ static void appitem_holder_free_cb(lv_event_t *event);
 
 static void appitem_draw_decor(lv_event_t *e);
 
-static void appitem_selected(lv_event_t *e);
-
 static void appitem_deselected(lv_event_t *e);
+
+#define APPITEM_TRANSIT_MS 220
 
 lv_obj_t *appitem_view(apps_fragment_t *controller, lv_obj_t *parent) {
     appitem_styles_t *styles = &controller->appitem_style;
@@ -23,16 +23,14 @@ lv_obj_t *appitem_view(apps_fragment_t *controller, lv_obj_t *parent) {
     lv_img_set_antialias(item, true);
 
     lv_obj_set_style_outline_opa(item, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
-
     lv_obj_set_style_transform_pivot_x(item, controller->col_width / 2, 0);
     lv_obj_set_style_transform_pivot_y(item, controller->col_height / 2, 0);
 
-    lv_obj_set_style_transform_zoom(item, 256 * 99 / 100, LV_STATE_PRESSED);
-    lv_obj_set_style_transform_zoom(item, 256 * 102 / 100, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_transform_zoom(item, 256 * 98 / 100, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_zoom(item, 256 * 106 / 100, LV_STATE_FOCUS_KEY);
     lv_obj_set_style_transition(item, &styles->tr_pressed, LV_STATE_PRESSED | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_transition(item, &styles->tr_released, LV_STATE_DEFAULT);
     lv_obj_add_event_cb(item, appitem_draw_decor, LV_EVENT_DRAW_MAIN, styles);
-    lv_obj_add_event_cb(item, appitem_selected, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(item, appitem_deselected, LV_EVENT_DEFOCUSED, NULL);
 
     lv_obj_t *play_indicator = lv_label_create(item);
@@ -51,8 +49,7 @@ lv_obj_t *appitem_view(apps_fragment_t *controller, lv_obj_t *parent) {
     lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_pad_hor(title, LV_DPX(8), 0);
     lv_obj_set_style_pad_ver(title, LV_DPX(4), 0);
-    lv_obj_set_style_bg_color(title, ml_color_hex(ML_COLOR_BG), 0);
-    lv_obj_set_style_bg_opa(title, (lv_opa_t) ((255 * 72) / 100), 0);
+    lv_obj_add_flag(title, LV_OBJ_FLAG_HIDDEN);
     lv_obj_align(title, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     appitem_viewholder_t *holder = (appitem_viewholder_t *) malloc(sizeof(appitem_viewholder_t));
@@ -80,9 +77,11 @@ void appitem_style_init(appitem_styles_t *style) {
     lv_style_set_shadow_ofs_y(&style->cover, LV_DPX(6));
     lv_style_set_shadow_color(&style->cover, ml_color_hex(ML_COLOR_BG));
     lv_style_set_outline_color(&style->cover, ml_color_hex(ML_COLOR_PRIMARY));
-    lv_style_set_outline_width(&style->cover, LV_DPX(3));
+    lv_style_set_outline_width(&style->cover, LV_DPX(4));
     lv_style_set_outline_opa(&style->cover, LV_OPA_TRANSP);
-    lv_style_set_outline_pad(&style->cover, LV_DPX(2));
+    lv_style_set_outline_pad(&style->cover, LV_DPX(3));
+    lv_style_set_shadow_width(&style->cover, LV_DPX(24));
+    lv_style_set_shadow_opa(&style->cover, LV_OPA_50);
 
     lv_style_init(&style->btn);
     lv_style_set_width(&style->btn, LV_DPX(44));
@@ -103,10 +102,10 @@ void appitem_style_init(appitem_styles_t *style) {
     static const lv_style_prop_t trans_props[] = {
             LV_STYLE_OUTLINE_OPA, LV_STYLE_TRANSFORM_WIDTH, LV_STYLE_TRANSFORM_HEIGHT, LV_STYLE_TRANSFORM_ZOOM, 0
     };
-    lv_style_transition_dsc_init(&style->tr_pressed, trans_props, lv_anim_path_linear, LV_THEME_DEFAULT_TRANSITON_TIME,
+    lv_style_transition_dsc_init(&style->tr_pressed, trans_props, lv_anim_path_ease_out, APPITEM_TRANSIT_MS,
                                  0, NULL);
-    lv_style_transition_dsc_init(&style->tr_released, trans_props, lv_anim_path_linear, LV_THEME_DEFAULT_TRANSITON_TIME,
-                                 70, NULL);
+    lv_style_transition_dsc_init(&style->tr_released, trans_props, lv_anim_path_ease_out, APPITEM_TRANSIT_MS,
+                                 40, NULL);
 
     style->fav_indicator_src.header.w = LV_DPX(48);
     style->fav_indicator_src.header.h = LV_DPX(48);
@@ -150,14 +149,7 @@ static void appitem_draw_decor(lv_event_t *e) {
     lv_draw_img(ctx, &dsc, &coords, &styles->fav_indicator_src);
 }
 
-static void appitem_selected(lv_event_t *e) {
-    lv_obj_t *item = lv_event_get_current_target(e);
-    appitem_viewholder_t *holder = lv_obj_get_user_data(item);
-    lv_label_set_long_mode(holder->title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-}
-
 static void appitem_deselected(lv_event_t *e) {
     lv_obj_t *item = lv_event_get_current_target(e);
-    appitem_viewholder_t *holder = lv_obj_get_user_data(item);
-    lv_label_set_long_mode(holder->title, LV_LABEL_LONG_DOT);
+    lv_obj_clear_state(item, LV_STATE_FOCUS_KEY);
 }
