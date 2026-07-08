@@ -29,8 +29,25 @@
 // from exhausting memory.
 #define DECODER_BUFFER_MAX_SIZE (32 * 1024 * 1024)
 
-/** Slices hint for pipeline decode while later slices still arrive (high bitrate / 120 Hz). */
-#define VDEC_STREAM_SLICES_PER_FRAME 4
+/** Slices hint for pipeline decode while later slices still arrive (high bitrate / 120 Hz).
+ * Scale the count with resolution x fps (ported from upstream 0efdb0ea): more slices let the
+ * decoder pipeline earlier slices while later ones still arrive, stabilizing high-load streams. */
+#define VDEC_STREAM_SLICES_MIN 4
+#define VDEC_STREAM_SLICES_MAX 8
+
+static unsigned vdec_slices_for_stream(int width, int height, int fps) {
+    if (fps <= 0) {
+        fps = 60;
+    }
+    const int64_t load = (int64_t) width * (int64_t) height * (int64_t) fps;
+    if (load >= (int64_t) 3840 * 2160 * 90) {
+        return VDEC_STREAM_SLICES_MAX;
+    }
+    if (load >= (int64_t) 2560 * 1440 * 90) {
+        return 6;
+    }
+    return VDEC_STREAM_SLICES_MIN;
+}
 
 static int vdec_stream_target_fps = 60;
 
@@ -97,11 +114,15 @@ void session_video_prepare_stream(void) {
         caps |= CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
     }
     if (hevc || av1) {
-        caps |= CAPABILITY_SLICES_PER_FRAME(VDEC_STREAM_SLICES_PER_FRAME);
-    }
-    if (hevc || av1) {
+        unsigned slices = VDEC_STREAM_SLICES_MIN;
+        if (app_configuration != NULL) {
+            slices = vdec_slices_for_stream(app_configuration->stream.width,
+                                            app_configuration->stream.height,
+                                            app_configuration->stream.fps);
+        }
+        caps |= CAPABILITY_SLICES_PER_FRAME(slices);
         commons_log_info("Session", "Video SDP caps: RFI + %u slices/frame (HEVC=%d AV1=%d)",
-                         (unsigned) VDEC_STREAM_SLICES_PER_FRAME, hevc ? 1 : 0, av1 ? 1 : 0);
+                         slices, hevc ? 1 : 0, av1 ? 1 : 0);
     } else {
         commons_log_info("Session", "Video SDP caps: direct submit only (H.264)");
     }
