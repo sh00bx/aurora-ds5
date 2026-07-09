@@ -90,7 +90,10 @@ static bool abr_set_bitrate(adaptive_bitrate_service_t *service, int kbps, const
         return false;
     }
     Uint32 now = SDL_GetTicks();
-    if (service->set_backoff_until != 0 && now < service->set_backoff_until) {
+    /* Signed-difference compare so the backoff survives the ~49.7-day SDL_GetTicks
+     * wrap; a plain `now < set_backoff_until` would suppress or never suppress
+     * retries once `now + delay` wraps past UINT32_MAX. */
+    if (service->set_backoff_until != 0 && (Sint32) (service->set_backoff_until - now) > 0) {
         return false;
     }
     int from = service->current_bitrate;

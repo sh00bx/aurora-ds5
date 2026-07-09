@@ -465,14 +465,21 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
                 break;
             }
         }
-        if (!found_input && type == CTMB_MSG_INPUT_REPORT) {
-            /* Ring is all reliable control traffic and the NEW message is a
-             * (stale-in-milliseconds) input report: drop the incoming report
-             * instead of destroying a reliable message. Report success — the
-             * caller treats a send failure as link-down. */
+        if (!found_input) {
+            /* Ring holds only reliable control traffic — there is no stale input
+             * report to sacrifice, and a reliable message must never be silently
+             * destroyed. */
             pthread_mutex_unlock(&client->out_mutex);
             free(copy);
-            return 0;
+            if (type == CTMB_MSG_INPUT_REPORT) {
+                /* Incoming is a (stale-in-milliseconds) input report: drop it and
+                 * report success — the caller treats a send failure as link-down. */
+                return 0;
+            }
+            /* Incoming is itself a reliable control message and the outbox is full
+             * of reliable messages: the uplink is stalled. Fail the send so the
+             * caller surfaces link-down instead of us evicting queued reliable data. */
+            return -1;
         }
         int drop = (client->out_head + rel) % CTM_ENET_OUTBOX_CAP;
         free(client->outbox[drop].payload);

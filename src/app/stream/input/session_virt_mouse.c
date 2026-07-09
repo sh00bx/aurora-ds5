@@ -116,5 +116,12 @@ static short calc_scroll_delta(short axis) {
     double normalized = axis / 32767.0;
     double scaled = normalized * (VMOUSE_SCROLL_SENSITIVITY / 4.0) * 2.0;
     double curved = (scaled >= 0 ? 1.0 : -1.0) * pow(SDL_fabs(scaled), 3.0);
+    /* |scaled| can exceed 1.0 (sensitivity > 2), so the cube can too; clamp
+     * before scaling to the short range or the cast wraps at large deflection. */
+    if (curved > 1.0) {
+        curved = 1.0;
+    } else if (curved < -1.0) {
+        curved = -1.0;
+    }
     return (short) (curved * 32767.0);
 }

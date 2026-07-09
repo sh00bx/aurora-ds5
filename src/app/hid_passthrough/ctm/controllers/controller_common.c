@@ -852,10 +852,13 @@ static int plc_inject_synth(ctm_controller_t *c)
     ctm_bt_sign_output(rep, n);
 
     int sent = 0;
+    int skip_hidraw = 0;
     if (c->acl_tx && ds5_acl_is_injectable(rep[0])) {
-        if (ds5_acl_tx_send(c->acl_tx, rep, n) == DS5_ACL_TX_SENT) sent = 1;
+        int rc = ds5_acl_tx_send(c->acl_tx, rep, n);
+        if (rc == DS5_ACL_TX_SENT) sent = 1;
+        else if (rc == DS5_ACL_TX_DROP) skip_hidraw = 1; /* congested — don't HOL-block hidraw */
     }
-    if (!sent && c->hid_fd >= 0) {
+    if (!sent && !skip_hidraw && c->hid_fd >= 0) {
         pthread_mutex_lock(&c->hid_mutex);
         ssize_t w = write(c->hid_fd, rep, n);
         pthread_mutex_unlock(&c->hid_mutex);
@@ -906,6 +909,15 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
             c->st_reports_out++;
             return 0;
         }
+        if (rc == DS5_ACL_TX_DROP) {
+            /* Transient injector congestion: skip this frame rather than falling
+             * back to the slow flow-controlled hidraw path, which would head-of-line
+             * block subsequent rumble/trigger/LED writes precisely when congested. */
+            c->st_hid_dropped++;
+            return -1;
+        }
+        /* DS5_ACL_TX_HIDRAW: injector not ready/disabled — fall through to the
+         * hidraw write below (which also seeds template capture). */
     }
     pthread_mutex_lock(&c->hid_mutex);
     ssize_t n = write(c->hid_fd, patched, patched_len);

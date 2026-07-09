@@ -182,9 +182,9 @@ void stream_input_handle_cbutton(stream_input_t *input, const SDL_ControllerButt
     if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
         return;
     }
-    LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, gamepad->leftTrigger,
-                               gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY, gamepad->rightStickX,
-                               gamepad->rightStickY);
+    LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), gamepad->buttons,
+                               gamepad->leftTrigger, gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY,
+                               gamepad->rightStickX, gamepad->rightStickY);
 }
 
 void stream_input_handle_caxis(stream_input_t *input, const SDL_ControllerAxisEvent *event) {
@@ -239,10 +239,10 @@ void stream_input_handle_caxis(stream_input_t *input, const SDL_ControllerAxisEv
     }
 
     if (vmouse_intercepted(input, gamepad)) {
-        LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, 0, 0,
-                                   0, 0, 0, 0);
+        LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), gamepad->buttons,
+                                   0, 0, 0, 0, 0, 0);
     } else {
-        LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons,
+        LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), gamepad->buttons,
                                    gamepad->leftTrigger,
                                    gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY,
                                    gamepad->rightStickX, gamepad->rightStickY);
@@ -484,9 +484,9 @@ static void release_buttons(stream_input_t *input, app_gamepad_state_t *gamepad)
     if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
         return;
     }
-    LiSendMultiControllerEvent(gamepad->gs_id, input->input->activeGamepadMask, gamepad->buttons, gamepad->leftTrigger,
-                               gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY, gamepad->rightStickX,
-                               gamepad->rightStickY);
+    LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), gamepad->buttons,
+                               gamepad->leftTrigger, gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY,
+                               gamepad->rightStickX, gamepad->rightStickY);
 }
 
 

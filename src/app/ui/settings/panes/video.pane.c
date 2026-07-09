@@ -47,6 +47,8 @@ static void idr_refresh_state_update(video_pane_t *controller);
 
 static void idr_refresh_checkbox_cb(lv_event_t *e);
 
+static void idr_refresh_checkbox_toggle_cb(lv_event_t *e);
+
 static void idr_refresh_hevc_cb(lv_event_t *e);
 
 static void idr_refresh_slider_cb(lv_event_t *e);
@@ -147,6 +149,10 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 
     lv_obj_t *idr_checkbox = lv_checkbox_create(view);
     lv_checkbox_set_text(idr_checkbox, locstr("Periodic decoder refresh (HEVC)"));
+    /* Clear CHECKABLE so D-pad arrow navigation does not flip the box via LVGL's
+     * default key handler (which would silently toggle IDR refresh just by scrolling
+     * past this row); toggling is driven explicitly from CLICKED below. */
+    pref_checkbox_prepare_for_dpad(idr_checkbox);
     if (app_configuration->idr_refresh_interval_sec >= 2) {
         lv_obj_add_state(idr_checkbox, LV_STATE_CHECKED);
     }
@@ -161,6 +167,7 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                "Off by default; use 10–30 s if you see blockiness or color smearing."),
         false);
     controller->idr_refresh_hint = idr_hint;
+    lv_obj_add_event_cb(idr_checkbox, idr_refresh_checkbox_toggle_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(idr_checkbox, idr_refresh_checkbox_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(idr_slider, idr_refresh_slider_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hevc_checkbox, idr_refresh_hevc_cb, LV_EVENT_VALUE_CHANGED, controller);
@@ -262,6 +269,19 @@ static void idr_refresh_checkbox_cb(lv_event_t *e) {
         app_configuration->idr_refresh_interval_sec = 0;
     }
     idr_refresh_state_update(controller);
+}
+
+static void idr_refresh_checkbox_toggle_cb(lv_event_t *e) {
+    lv_obj_t *cb = lv_event_get_current_target(e);
+    if (lv_obj_has_state(cb, LV_STATE_DISABLED)) {
+        return;
+    }
+    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
+        lv_obj_clear_state(cb, LV_STATE_CHECKED);
+    } else {
+        lv_obj_add_state(cb, LV_STATE_CHECKED);
+    }
+    lv_event_send(cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 static void idr_refresh_slider_cb(lv_event_t *e) {

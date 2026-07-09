@@ -43,7 +43,18 @@ void settings_reconcile_refresh_rate(app_settings_t *config) {
 #if defined(TARGET_WEBOS)
     int ntsc = settings_ntsc_refresh_rate_x100_for_fps(config->stream.fps);
     if (ntsc > 0) {
-        config->client_refresh_rate_x100 = ntsc;
+        /* Preserve an explicit rate that already matches the current fps — this is
+         * either the NTSC preset value or a user-entered custom fractional rate (e.g.
+         * 119.94). Only fall back to the panel NTSC rate when the stored value is unset
+         * or stale (rounds to a different fps after an fps change). Preset selection
+         * forces NTSC via settings_apply_ntsc_preset_refresh, so load/save/session must
+         * not clobber a custom rate here. */
+        int implied = config->client_refresh_rate_x100 > 0
+                          ? (config->client_refresh_rate_x100 + 50) / 100
+                          : 0;
+        if (implied != config->stream.fps) {
+            config->client_refresh_rate_x100 = ntsc;
+        }
         return;
     }
 #endif
@@ -82,7 +93,14 @@ void settings_apply_ntsc_preset_refresh(app_settings_t *config, int nominal_fps)
 {
 #if defined(TARGET_WEBOS)
     (void) nominal_fps;
-    settings_reconcile_refresh_rate(config);
+    if (!config) {
+        return;
+    }
+    /* Explicit preset selection (or init): force the panel NTSC rate for a standard
+     * fps — overriding any previously-entered custom rate — or clear it for a non-NTSC
+     * fps. reconcile() alone would now preserve a stale custom value, so force here. */
+    int ntsc = settings_ntsc_refresh_rate_x100_for_fps(config->stream.fps);
+    config->client_refresh_rate_x100 = ntsc > 0 ? ntsc : 0;
 #else
     (void) config;
     (void) nominal_fps;

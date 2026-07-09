@@ -45,7 +45,10 @@ typedef struct stream_input_t {
     int pointerGestureStartY;
     bool view_only, no_sdl_mouse;
     bool hid_passthrough;
-    uint16_t moonlightExcludedMask;
+    /* Written on the worker thread at start and mutated by the UI-thread autoplug
+     * reconcile; read on moonlight-common-c's connection-callback thread (rumble/
+     * LED/motion). _Atomic makes every access a lock-free atomic load/store/RMW. */
+    _Atomic uint16_t moonlightExcludedMask;
     uint8_t stick_deadzone;
     session_input_vmouse_t vmouse;
 #if FEATURE_INPUT_EVMOUSE

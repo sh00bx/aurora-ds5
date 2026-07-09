@@ -79,8 +79,11 @@ lv_obj_t *pref_checkbox(lv_obj_t *parent, const char *title, bool *value, bool r
     attrs->checkbox.ref = value;
     attrs->checkbox.reverse = reverse;
     lv_obj_clear_flag(checkbox, LV_OBJ_FLAG_CHECKABLE);
+    /* Only bind CLICKED: on a keypad/remote, ENTER already produces CLICKED on
+     * release (lv_indev.c), so also handling LV_EVENT_KEY(ENTER) on press would
+     * toggle twice per press — net no-op — making every checkbox impossible to
+     * toggle with the remote (the shipping input). CLICKED covers pointer too. */
     lv_obj_add_event_cb(checkbox, pref_checkable_activate, LV_EVENT_CLICKED, attrs);
-    lv_obj_add_event_cb(checkbox, pref_checkable_activate, LV_EVENT_KEY, attrs);
     lv_obj_add_event_cb(checkbox, pref_attrs_free, LV_EVENT_DELETE, attrs);
     if (*value ^ reverse) {
         lv_obj_add_state(checkbox, LV_STATE_CHECKED);

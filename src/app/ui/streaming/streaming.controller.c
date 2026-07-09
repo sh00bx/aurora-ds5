@@ -143,7 +143,9 @@ static void network_test_timer_cb(lv_timer_t *timer) {
         controller->network_test_timer = NULL;
     }
 
-    const VIDEO_STATS *dst = &vdec_summary_stats;
+    VIDEO_STATS stats_snap;
+    vdec_stats_snapshot(&stats_snap);
+    const VIDEO_STATS *dst = &stats_snap;
     const VIDEO_INFO *info = &vdec_stream_info;
     (void) info;
 
@@ -373,7 +375,9 @@ bool streaming_refresh_stats() {
         return false;
     }
     app_t *app = controller->global;
-    const struct VIDEO_STATS *dst = &vdec_summary_stats;
+    struct VIDEO_STATS stats_snap;
+    vdec_stats_snapshot(&stats_snap);
+    const struct VIDEO_STATS *dst = &stats_snap;
     const struct VIDEO_INFO *info = &vdec_stream_info;
 
     if (controller->stats_compact_label != NULL) {

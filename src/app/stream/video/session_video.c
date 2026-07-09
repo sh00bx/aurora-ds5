@@ -73,6 +73,12 @@ static bool need_idr_on_resume = false;
 #define VDEC_FEED_ERROR_WINDOW_MS 2000
 static int feed_error_count = 0;
 static unsigned long feed_error_first_ms = 0;
+// A transient NOT_READY (HDR toggle / resolution change) is expected and must
+// not tear down the stream. But a decoder that stays NOT_READY forever would
+// silently freeze with no recovery, so a generous watchdog still interrupts if
+// NOT_READY persists continuously well beyond any legitimate exclusive op.
+#define VDEC_NOT_READY_WEDGE_MS 5000
+static unsigned long not_ready_first_ms = 0;
 static struct VIDEO_STATS vdec_temp_stats;
 static int vdec_stream_format = 0;
 static bool vdec_warned_near_buffer_limit;
@@ -319,6 +325,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     SS4S_VideoFeedResult result = SS4S_PlayerVideoFeed(player, buffer, length, flags);
     if (result == SS4S_VIDEO_FEED_OK) {
         feed_error_count = 0;
+        not_ready_first_ms = 0;
         if (decodeUnit->frameType == FRAME_TYPE_IDR) {
             frames_since_idr = 0;
         } else {
@@ -346,6 +353,15 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         return DR_NEED_IDR;
     } else if (result == SS4S_VIDEO_FEED_NOT_READY) {
         need_idr_on_resume = true;
+        unsigned long now = SDL_GetTicks();
+        if (not_ready_first_ms == 0) {
+            not_ready_first_ms = now;
+        } else if (now - not_ready_first_ms > VDEC_NOT_READY_WEDGE_MS) {
+            commons_log_error("Session", "Video decoder wedged in NOT_READY for %lu ms; interrupting",
+                              now - not_ready_first_ms);
+            not_ready_first_ms = 0;
+            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+        }
         return DR_OK;
     } else {
         unsigned long now = SDL_GetTicks();
@@ -366,13 +382,16 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
 }
 
 static inline void vdec_stats_write_begin(void) {
-    vdec_stats_seq++; /* odd: write in progress */
+    /* Atomic increment so the odd (write-in-progress) value is always published
+     * to readers; a plain ++ may be register-coalesced with write_end's ++ under
+     * -O2/LTO, hiding the odd state the reader's seqlock relies on. */
+    __atomic_add_fetch(&vdec_stats_seq, 1, __ATOMIC_RELAXED); /* odd: write in progress */
     __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
 static inline void vdec_stats_write_end(void) {
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    vdec_stats_seq++; /* even: consistent */
+    __atomic_add_fetch(&vdec_stats_seq, 1, __ATOMIC_RELAXED); /* even: consistent */
 }
 
 void vdec_stats_snapshot(struct VIDEO_STATS *out) {

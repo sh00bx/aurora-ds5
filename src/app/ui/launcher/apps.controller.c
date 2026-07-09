@@ -548,15 +548,20 @@ static void appload_loaded(apploader_list_t *apps, void *userdata) {
     if (num_changes != 0) {
         fragment->focus_backup = 0;
     }
-    apploader_list_free(fragment->apploader_apps);
+    apploader_list_t *old_apps = fragment->apploader_apps;
     fragment->apploader_apps = apps;
-    if (num_changes != 0) {
-        lv_gridview_focus(fragment->applist, 0);
-    }
+    /* Bind the gridview to the NEW list before focusing: lv_gridview_focus may
+     * bind_view against grid->data, so it must not run while grid->data still
+     * points at the old list, and the old list must only be freed once the
+     * gridview no longer references it. */
     lv_gridview_set_data_advanced(fragment->applist, apps, changes, num_changes);
     if (changes != NULL) {
         free(changes);
     }
+    if (num_changes != 0) {
+        lv_gridview_focus(fragment->applist, 0);
+    }
+    apploader_list_free(old_apps);
     update_view_state(fragment);
 
     if (fragment->def_app > 0 && !fragment->def_app_launched) {

@@ -140,9 +140,11 @@ static const short sym_vks[] = {
 #define BTN_CTRLL_A    49
 #define BTN_WINL_A     50
 #define BTN_ALTL_A     51
-#define BTN_CTRLL_S    49
-#define BTN_WINL_S     50
-#define BTN_ALTL_S     51
+/* Symbols (&123) layer row 3 has 13 keys (indices 36-48), so row 4 starts at
+ * index 49 ('abc'); Ctrl/Win/Alt follow at 50/51/52 (see sym_vks). */
+#define BTN_CTRLL_S    50
+#define BTN_WINL_S     51
+#define BTN_ALTL_S     52
 #define BTN_MIC_A      53
 #define BTN_MIC_S      53
 
@@ -407,7 +409,15 @@ lv_obj_t *soft_keyboard_create(lv_obj_t *parent, session_t *session,
 
     kbd_data_t *kd = malloc(sizeof(kbd_data_t));
     if (!kd) {
-        lv_obj_del(cont);
+        /* container_delete_cb is not attached yet, so deleting cont would NOT
+         * free kbd/kbd->group. Release them explicitly and return the still-valid
+         * (empty) container — mirrors the !kbd path above and avoids returning a
+         * pointer to a deleted object. */
+        lv_obj_set_user_data(cont, NULL);
+        if (kbd->group) {
+            lv_group_del(kbd->group);
+        }
+        free(kbd);
         return cont;
     }
     kd->kbd = kbd;

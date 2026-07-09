@@ -37,6 +37,8 @@ static const int entries_len = sizeof(entries) / sizeof(settings_entry_t);
 
 static void on_view_created(lv_fragment_t *self, lv_obj_t *view);
 
+static void on_will_destroy_view(lv_fragment_t *self, lv_obj_t *view);
+
 static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view);
 
 static void on_entry_focus(lv_event_t *event);
@@ -135,6 +137,7 @@ const lv_fragment_class_t settings_controller_cls = {
         .constructor_cb = settings_controller_ctor,
         .create_obj_cb = settings_win_create,
         .obj_created_cb = on_view_created,
+        .obj_will_delete_cb = on_will_destroy_view,
         .obj_deleted_cb = on_destroy_view,
         .event_cb = on_event,
         .instance_size = sizeof(settings_controller_t),
@@ -231,6 +234,32 @@ static void on_view_created(lv_fragment_t *self, lv_obj_t *view) {
     }
 }
 
+/* Runs BEFORE lv_obj_del(view) frees the view tree (obj_deleted_cb runs AFTER).
+ * The launcher-embedded panes are unmanaged fragments whose objects live inside
+ * controller->detail; they must be deleted here, while their objects are still
+ * alive. Doing it in on_destroy_view (obj_deleted_cb) walked a freed controller->detail
+ * (use-after-free) and lv_fragment_del'd panes whose ->obj was already freed by the
+ * recursive lv_obj_del (double free), corrupting the heap on every settings close. */
+static void on_will_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
+    settings_controller_t *controller = (settings_controller_t *) self;
+    LV_UNUSED(view);
+    if (!controller->launcher_host) {
+        return;
+    }
+    settings_close_pane_popup(controller);
+    if (controller->detail) {
+        uint32_t n = lv_obj_get_child_cnt(controller->detail);
+        for (uint32_t i = 0; i < n; i++) {
+            lv_obj_t *ch = lv_obj_get_child(controller->detail, i);
+            lv_fragment_t *pane = lv_obj_get_user_data(ch);
+            if (pane != NULL) {
+                lv_obj_set_user_data(ch, NULL);
+                lv_fragment_del(pane);
+            }
+        }
+    }
+}
+
 static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     settings_controller_t *controller = (settings_controller_t *) self;
     LV_UNUSED(view);
@@ -238,17 +267,9 @@ static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     settings_apply_locale_if_needed(controller);
 
     if (controller->launcher_host) {
-        settings_close_pane_popup(controller);
-        if (controller->detail) {
-            uint32_t n = lv_obj_get_child_cnt(controller->detail);
-            for (uint32_t i = 0; i < n; i++) {
-                lv_obj_t *ch = lv_obj_get_child(controller->detail, i);
-                lv_fragment_t *pane = lv_obj_get_user_data(ch);
-                if (pane != NULL) {
-                    lv_fragment_del(pane);
-                }
-            }
-        }
+        /* Embedded panes + pane popup were already torn down in on_will_destroy_view,
+         * while their objects were still alive. Only group/modal-stack cleanup remains
+         * here (safe post-deletion: LVGL auto-removes freed objects from groups). */
         app_input_remove_modal_group(&controller->app->ui.input, controller->detail_group);
         launcher_restore_nav_focus(controller->launcher_host);
         if (controller->detail_group) {
