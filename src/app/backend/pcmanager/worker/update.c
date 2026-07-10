@@ -29,7 +29,20 @@ int pcmanager_update_by_host(worker_context_t *context, const char *ip, uint16_t
     // Fetch server info
     GS_CLIENT client = app_gs_client_new(manager->app);
     SERVER_DATA *server = serverdata_new();
+    Uint32 t0 = SDL_GetTicks();
     ret = gs_get_status(client, server, strdup(ip), port, app_configuration->unsupported);
+    Uint32 dt = SDL_GetTicks() - t0;
+    if (dt > 150) {
+        /* Connect-latency instrumentation: a serverinfo query slower than 150ms
+         * is part of why the host tile takes long to become clickable — record
+         * it in the same jail-visible file the session worker marks. */
+        FILE *cf = fopen("/tmp/aurora-connect.log", "a");
+        if (cf) {
+            fprintf(cf, "%lu host_update %s took %lums ret=%d\n",
+                    (unsigned long) SDL_GetTicks(), ip, (unsigned long) dt, ret);
+            fclose(cf);
+        }
+    }
     if (ret == GS_OK) {
         SERVER_STATE state = {.code = server->paired ? SERVER_STATE_AVAILABLE : SERVER_STATE_NOT_PAIRED};
         pclist_upsert(manager, (const uuidstr_t *) server->uuid, &state, server);

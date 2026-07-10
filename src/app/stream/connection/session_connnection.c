@@ -9,6 +9,20 @@
 
 static session_t *current_session = NULL;
 
+/* Per-stage timing into the same jail-visible file session_worker.c writes its
+ * milestones to — breaks LiStartConnection's internal cost down by stage
+ * (RTSP handshake, control/video/audio stream setup, input). */
+static void connection_stage_mark(int stage, const char *what) {
+    FILE *f = fopen("/tmp/aurora-connect.log", "a");
+    if (!f) { return; }
+    fprintf(f, "%lu stage:%s %s\n", (unsigned long) SDL_GetTicks(), LiGetStageName(stage), what);
+    fclose(f);
+}
+
+static void connection_stage_starting(int stage) { connection_stage_mark(stage, "starting"); }
+
+static void connection_stage_complete(int stage) { connection_stage_mark(stage, "complete"); }
+
 static void connection_terminated(int errorCode) {
     if (!current_session) {
         return;
@@ -114,8 +128,8 @@ static void connection_set_hdr(bool hdrEnabled) {
 }
 
 CONNECTION_LISTENER_CALLBACKS connection_callbacks = {
-        .stageStarting = NULL,
-        .stageComplete = NULL,
+        .stageStarting = connection_stage_starting,
+        .stageComplete = connection_stage_complete,
         .stageFailed = connection_stage_failed,
         .connectionStarted = NULL,
         .connectionTerminated = connection_terminated,

@@ -51,8 +51,10 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     const char *kind = bridge_kind_for_item(item);
     if (strcmp(kind, "ds5") == 0) {
         settings.kind = TV_BRIDGE_KIND_DS5;
-        settings.headset_volume_percent = 0x4d;
-        settings.speaker_volume_percent = 0x41;
+        /* No volume override: inherit the 90% defaults above. The old 0x4d/0x41
+         * here were RAW BYTES from the verbatim tv_bridge_worker port sitting in
+         * what is now a PERCENT field (DS5 raw volume range is 0..0x64 = percent
+         * 1:1), so DS5 pads silently defaulted to 77%/65% instead of 90%. */
         settings.block_bt_audio_sink = true;
     } else if (strcmp(kind, "ds4") == 0) {
         settings.kind = TV_BRIDGE_KIND_DS4;

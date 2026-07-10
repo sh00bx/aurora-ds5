@@ -17,6 +17,17 @@
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #endif
 
+/* Connect-phase instrumentation: append "<ms-since-app-start> <phase>" to a
+ * jail-visible file so connect latency can be broken down per phase without a
+ * console (app stdout goes to /dev/null under the system launcher). Cheap
+ * (one open/write per milestone, only during connects), always on. */
+static void connect_mark(const char *phase) {
+    FILE *f = fopen("/tmp/aurora-connect.log", "a");
+    if (!f) { return; }
+    fprintf(f, "%lu %s\n", (unsigned long) SDL_GetTicks(), phase);
+    fclose(f);
+}
+
 int session_worker(session_t *session) {
     app_t *app = session->app;
     session_set_state(session, STREAMING_CONNECTING);
@@ -32,6 +43,7 @@ int session_worker(session_t *session) {
     }
 #endif
 
+    connect_mark("worker_start");
     commons_log_info("Session", "Launch app %d (host currentGame=%d)...", appId, server->currentGame);
     if (session->config.stream.clientRefreshRateX100 > 0) {
         commons_log_info("Session",
@@ -62,6 +74,7 @@ int session_worker(session_t *session) {
 #endif
     int ret = gs_start_app(client, server, &session->config.stream, appId, server->isGfe, session->config.sops,
                            session->config.local_audio, gamepad_mask, surround_params);
+    connect_mark(ret == GS_OK ? "gs_start_app ok" : "gs_start_app FAILED");
     if (ret != GS_OK) {
         session_set_state(session, STREAMING_ERROR);
         const char *gs_error = NULL;
@@ -78,6 +91,7 @@ int session_worker(session_t *session) {
     commons_log_info("Session", "Audio %d channels",
                      CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(session->config.stream.audioConfiguration));
 
+    connect_mark("player_open");
     session->player = SS4S_PlayerOpen();
     SS4S_PlayerSetWaitAudioVideoReady(session->player, true);
     SS4S_PlayerSetViewportSize(session->player, app->ui.width, app->ui.height);
@@ -85,9 +99,11 @@ int session_worker(session_t *session) {
 
     session_video_prepare_stream();
 
+    connect_mark("li_start");
     int startResult = LiStartConnection(&server->serverInfo, &session->config.stream,
                                         session_connection_callbacks_prepare(session),
                                         &ss4s_dec_callbacks, &ss4s_aud_callbacks, session, 0, session, 0);
+    connect_mark(startResult == 0 ? "li_connected (STREAMING)" : "li_start FAILED");
     if (startResult != 0) {
         session_set_state(session, STREAMING_ERROR);
         switch (startResult) {
