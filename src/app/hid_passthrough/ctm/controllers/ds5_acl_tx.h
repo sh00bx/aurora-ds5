@@ -38,7 +38,12 @@ static inline int ds5_acl_is_injectable(unsigned char report_id)
 
 typedef void (*ds5_acl_log_fn)(void *ctx, const char *msg);
 
-ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, ds5_acl_log_fn log_fn, void *log_ctx);
+/* bt_mac (may be NULL/"") is the controller's BT address "aa:bb:cc:dd:ee:ff". When
+ * present the transport is multi-controller: each report is tagged with the target
+ * address so the daemon routes it to that pad's own inject link, and readiness is
+ * per-address. NULL/empty => legacy untagged wire (daemon primary link). */
+ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
+                               ds5_acl_log_fn log_fn, void *log_ctx);
 int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len);
 void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);

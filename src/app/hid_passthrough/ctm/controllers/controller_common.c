@@ -2061,8 +2061,14 @@ static void *session_main(void *arg)
     if (c->ops && c->ops->raw_acl_output) {
         const char *env = getenv("CTM_RAW_ACL");
         if (!env || strcmp(env, "0") != 0) {
-            c->acl_tx = ds5_acl_tx_start(0, acl_log_cb, c);
-            ctl_log(c, "raw-ACL output %s", c->acl_tx ? "enabled" : "unavailable (hidraw)");
+            /* Pass the controller's BT address so the forwarder tags each report
+             * to THIS pad's inject link (multi-controller: each DS5 gets its own
+             * daemon credit window / template). Empty for USB pads -> legacy
+             * untagged wire (daemon primary link), unchanged single-pad path. */
+            c->acl_tx = ds5_acl_tx_start(0, c->dev.mac, acl_log_cb, c);
+            ctl_log(c, "raw-ACL output %s%s%s", c->acl_tx ? "enabled" : "unavailable (hidraw)",
+                    (c->acl_tx && c->dev.mac[0]) ? " mac=" : "",
+                    (c->acl_tx && c->dev.mac[0]) ? c->dev.mac : "");
         }
         const char *penv = getenv("CTM_AUDIO_PLC");
         c->plc_enabled = (!penv || strcmp(penv, "0") != 0);
