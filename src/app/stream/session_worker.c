@@ -22,8 +22,16 @@
  * console (app stdout goes to /dev/null under the system launcher). Cheap
  * (one open/write per milestone, only during connects), always on. */
 static void connect_mark(const char *phase) {
-    FILE *f = fopen("/tmp/aurora-connect.log", "a");
+    /* Timestamps are ms since THIS app run's SDL init, but jail /tmp survives
+     * app restarts and instant-on standby — truncate on the first mark of each
+     * run so the file never mixes runs with backwards-jumping timestamps. */
+    static int fresh_run = 1;
+    FILE *f = fopen("/tmp/aurora-connect.log", fresh_run ? "w" : "a");
     if (!f) { return; }
+    if (fresh_run) {
+        fprintf(f, "# run %s\n", APP_VERSION);
+        fresh_run = 0;
+    }
     fprintf(f, "%lu %s\n", (unsigned long) SDL_GetTicks(), phase);
     fclose(f);
 }

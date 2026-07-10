@@ -190,6 +190,11 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     need_idr_on_resume = false;
     feed_error_count = 0;
     feed_error_first_ms = 0;
+    not_ready_first_ms = 0;   /* the NOT_READY wedge watchdog must not carry a
+                               * stale epoch from a stream that ended mid-
+                               * NOT_READY: the next stream's first transient
+                               * NOT_READY (normal at HDR start) would read as
+                               * a >5s wedge -> spurious decoder interrupt */
     frames_since_idr = 0;
     vdec_stream_target_fps = redrawRate > 0 ? redrawRate : 60;
     vdec_warned_near_buffer_limit = false;

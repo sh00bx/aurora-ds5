@@ -912,7 +912,12 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
         if (rc == DS5_ACL_TX_DROP) {
             /* Transient injector congestion: skip this frame rather than falling
              * back to the slow flow-controlled hidraw path, which would head-of-line
-             * block subsequent rumble/trigger/LED writes precisely when congested. */
+             * block subsequent rumble/trigger/LED writes precisely when congested.
+             * The dedup cache was filled BEFORE this send attempt — invalidate it,
+             * or the host's identical resends of this very frame (a rumble OFF, a
+             * trigger effect) would all dedup-match a frame that never reached the
+             * pad: rumble stuck on until a byte-different 0x31 happens to arrive. */
+            c->last31_len = 0;
             c->st_hid_dropped++;
             return -1;
         }
@@ -942,6 +947,7 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
         c->st_reports_out++;
         return 0;
     }
+    c->last31_len = 0;   /* frame not delivered: never let it satisfy future dedup */
     c->st_hid_dropped++;
     return -1;
 }

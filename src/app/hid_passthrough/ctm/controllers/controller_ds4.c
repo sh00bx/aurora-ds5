@@ -29,11 +29,14 @@ static uint8_t ds4_audio_target_for_mode(tv_bridge_audio_mode_t mode)
     }
 }
 
-/* Clamp a volume percent to the DS4 raw byte range (0..0x4F firmware ceiling
- * per the controller wiki). */
+/* Scale a volume percent onto the DS4 raw byte range (0..0x4F firmware ceiling
+ * per the controller wiki). Unlike the DS5 (raw 0..0x64 = percent 1:1) the DS4
+ * ceiling is 79, so clamping percent instead of scaling made every slider value
+ * >=79% identical (max) and skewed everything below it. */
 static uint8_t ds4_volume_raw_byte(unsigned int value)
 {
-    return (uint8_t)(value > 0x4fu ? 0x4fu : value);
+    if (value > 100u) value = 100u;
+    return (uint8_t)((value * 0x4fu + 50u) / 100u);
 }
 
 /* patch_output: rewrite a DS4 0x15 BT output report in place per the live

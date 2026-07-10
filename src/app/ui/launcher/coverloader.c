@@ -37,6 +37,13 @@ typedef struct img_loader_req_t {
     int id;
     lv_obj_t *target;
     lv_coord_t target_width, target_height;
+    /* Latched ONCE on the UI thread in coverloader_display. The worker thread
+     * (filecache_get) must never derive this from req->target: the target is a
+     * UI-thread-owned lv_obj that target_deleted_cb can free/NULL concurrently
+     * (use-after-free), and re-deriving it at memcache_put time after a delete
+     * flipped it to "not appitem" inserted textures under a key no appitem
+     * lookup ever matches (unreachable 32MB-LRU entries). */
+    uint8_t cover_fill;
     memcache_item_t *src;
     bool finished;
     SDL_Surface *cached;
@@ -191,6 +198,7 @@ void coverloader_display(coverloader_t *loader, const uuidstr_t *uuid, int id, l
     req->target = target;
     req->target_width = target_width;
     req->target_height = target_height;
+    req->cover_fill = !coverloader_is_appitem(target);   /* latched: see struct */
     req->finished = false;
     lv_obj_add_event_cb(target, target_deleted_cb, LV_EVENT_DELETE, req);
     loader->reqlist = reqlist_append(loader->reqlist, req);
@@ -224,7 +232,7 @@ static bool coverloader_memcache_get(coverloader_req_t *req) {
     key.id = req->id;
     key.target_width = req->target_width;
     key.target_height = req->target_height;
-    key.cover_fill = !coverloader_is_appitem(req->target);
+    key.cover_fill = req->cover_fill;
 
     lv_lru_get(req->loader->mem_cache, &key, sizeof(key), (void **) &result);
     req->src = result;
@@ -242,7 +250,7 @@ static void coverloader_memcache_put(coverloader_req_t *req) {
             .id = req->id,
             .target_width = req->target_width,
             .target_height = req->target_height,
-            .cover_fill = !coverloader_is_appitem(req->target),
+            .cover_fill = req->cover_fill,
     };
     lv_lru_get(req->loader->mem_cache, &key, sizeof(key), (void **) &result);
     if (result == NULL) {
@@ -340,7 +348,7 @@ static bool coverloader_filecache_get(coverloader_req_t *req) {
     const double scale_w = tex_w / (double) sw;
     const double scale_h = tex_h / (double) sh;
     /* Grid tiles: letterbox (contain). Hero background: crop to fill the viewport. */
-    const bool cover_fill = !coverloader_is_appitem(req->target);
+    const bool cover_fill = req->cover_fill;   /* worker thread: never touch req->target */
     const double scale = cover_fill
                                  ? (scale_w > scale_h ? scale_w : scale_h)
                                  : (scale_w < scale_h ? scale_w : scale_h);
