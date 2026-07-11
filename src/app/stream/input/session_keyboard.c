@@ -452,6 +452,9 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
             case SDL_SCANCODE_APOSTROPHE:
                 keyCode = VK_OEM_7;
                 break;
+            case SDL_SCANCODE_INTERNATIONAL1:
+                keyCode = VK_ABNT_C1;
+                break;
             case SDL_SCANCODE_NONUSBACKSLASH:
                 keyCode = VK_OEM_102;
                 break;
@@ -484,9 +487,14 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
         } else if (event->state == SDL_RELEASED) {
             keydown_count--;
         }
-        LiSendKeyboardEvent(0x8000 | keyCode,
-                            event->state == SDL_PRESSED ? KEY_ACTION_DOWN : KEY_ACTION_UP,
-                            modifiers);
+        char keyFlags = 0;
+        if (event->keysym.scancode == SDL_SCANCODE_INTERNATIONAL1 ||
+            event->keysym.scancode == SDL_SCANCODE_NONUSBACKSLASH) {
+            keyFlags = SS_KBE_FLAG_NON_NORMALIZED;
+        }
+        LiSendKeyboardEvent2(0x8000 | keyCode,
+                             event->state == SDL_PRESSED ? KEY_ACTION_DOWN : KEY_ACTION_UP,
+                             modifiers, keyFlags);
     }
 
     if (_pending_key_combo != KeyComboMax && keys_len(_pressed_keys) == 0) {
