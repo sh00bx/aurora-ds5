@@ -78,6 +78,9 @@ struct hidraw_devinfo { unsigned int bustype; short vendor; short product; };
 #define MAX_REPORT 4096
 #define MAX_REPORT_DESCRIPTOR 4096
 #define PACED_QUEUE_CAP 32
+/* 0x31 dedup match lifetime: bounds a stuck rumble from an invisible daemon-side
+ * drop to one refresh interval; ~1 extra 0x31 per 250ms is negligible vs 94/s audio. */
+#define DEDUP31_TTL_US 250000
 #define MAX_EVDEV_GRABS 16
 #define BUS_BLUETOOTH 0x05
 #define BUS_USB 0x03
@@ -180,6 +183,7 @@ struct ctm_controller {
     int dedup_enabled;
     size_t last31_len;
     uint8_t last31[80];
+    uint64_t last31_ts_us;   /* when the cached 0x31 was last actually sent */
     unsigned long st_dedup_skipped;
     int wake_pipe[2];
 
@@ -912,15 +916,24 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
     }
     ds5_audio_plc(c, patched, patched_len);
     if (c->dedup_enabled && patched_len >= 8 && patched[0] == 0x31) {
+        /* TTL on the dedup match: DS5_ACL_TX_SENT only means the datagram reached
+         * the root daemon; the daemon can still drop the frame latest-wins on a
+         * full credit window with no feedback channel. Without a TTL one such
+         * invisible drop of a rumble OFF strands the pad buzzing forever (host
+         * resends differ only in seq+CRC, both outside the memcmp window). The
+         * TTL bounds that to one resend interval while still deduping the
+         * high-rate identical resends. */
         size_t cmp = patched_len - 4;
         if (patched_len == c->last31_len &&
-            memcmp(patched + 2, c->last31 + 2, cmp - 2) == 0) {
+            memcmp(patched + 2, c->last31 + 2, cmp - 2) == 0 &&
+            now_us() - c->last31_ts_us < DEDUP31_TTL_US) {
             c->st_dedup_skipped++;
             return 0;
         }
         if (patched_len <= sizeof(c->last31)) {
             memcpy(c->last31, patched, patched_len);
             c->last31_len = patched_len;
+            c->last31_ts_us = now_us();
         }
     }
     if (c->acl_tx && patched_len > 0 && ds5_acl_is_injectable(patched[0])) {
@@ -936,8 +949,11 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
              * The dedup cache was filled BEFORE this send attempt — invalidate it,
              * or the host's identical resends of this very frame (a rumble OFF, a
              * trigger effect) would all dedup-match a frame that never reached the
-             * pad: rumble stuck on until a byte-different 0x31 happens to arrive. */
-            c->last31_len = 0;
+             * pad: rumble stuck on until a byte-different 0x31 happens to arrive.
+             * Scoped to 0x31: the cache only ever holds a 0x31, and a dropped 0x36
+             * audio frame says nothing about the delivered rumble state — clearing
+             * on it would defeat dedup exactly under congestion. */
+            if (patched[0] == 0x31) c->last31_len = 0;
             c->st_hid_dropped++;
             return -1;
         }
@@ -967,7 +983,7 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
         c->st_reports_out++;
         return 0;
     }
-    c->last31_len = 0;   /* frame not delivered: never let it satisfy future dedup */
+    if (patched[0] == 0x31) c->last31_len = 0;   /* frame not delivered: never let it satisfy future dedup (0x31-scoped: the cache only holds a 0x31) */
     c->st_hid_dropped++;
     return -1;
 }

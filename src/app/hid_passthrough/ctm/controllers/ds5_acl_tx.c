@@ -47,6 +47,7 @@ struct ds5_acl_tx {
 
     pthread_t poll_thread;
     int poll_started;
+    int wake_pipe[2];       /* stop() -> mon thread: wake the blocking poll() */
     volatile int running;
     volatile int ready;
 
@@ -139,9 +140,15 @@ static void *acl_mon_thread(void *arg)
             last = valid;
         }
         if (ifd >= 0) {
-            struct pollfd pf = {.fd = ifd, .events = POLLIN, .revents = 0};
-            int pr = poll(&pf, 1, 1000);
-            if (pr > 0 && (pf.revents & POLLIN)) {
+            /* Wake pipe in the set: without it stop()'s pthread_join stalls up
+             * to the full poll timeout on every controller teardown (plug-out,
+             * session exit) — the old 50ms-sliced loop honored running quickly. */
+            struct pollfd pf[2] = {
+                {.fd = ifd, .events = POLLIN, .revents = 0},
+                {.fd = t->wake_pipe[0], .events = POLLIN, .revents = 0},
+            };
+            int pr = poll(pf, t->wake_pipe[0] >= 0 ? 2 : 1, 1000);
+            if (pr > 0 && (pf[0].revents & POLLIN)) {
                 /* Drain everything queued; the loop re-reads the template. */
                 char evbuf[512];
                 while (read(ifd, evbuf, sizeof evbuf) > 0) {
@@ -171,6 +178,9 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
     t->log_ctx = log_ctx;
     t->unixfd = -1;
     t->running = 1;
+    if (pipe2(t->wake_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        t->wake_pipe[0] = t->wake_pipe[1] = -1;
+    }
 
     uint8_t addr[6];
     char machex[13];
@@ -308,10 +318,16 @@ void ds5_acl_tx_stop(ds5_acl_tx_t *t)
         return;
     }
     t->running = 0;
+    if (t->wake_pipe[1] >= 0) {
+        ssize_t wr = write(t->wake_pipe[1], "x", 1);
+        (void)wr;
+    }
     if (t->poll_started) {
         pthread_join(t->poll_thread, NULL);
         t->poll_started = 0;
     }
+    if (t->wake_pipe[0] >= 0) close(t->wake_pipe[0]);
+    if (t->wake_pipe[1] >= 0) close(t->wake_pipe[1]);
     if (t->unixfd >= 0) {
         close(t->unixfd);
         t->unixfd = -1;

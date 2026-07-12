@@ -113,13 +113,14 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     }
 
     uint8_t audio_block = ds5_audio_block_for_mode(settings->audio_mode);
-    uint8_t latency = (uint8_t)settings->latency_ms;
+    /* Same 1ms floor as the AUTO branch: 0x00 in the 0x91 latency block is
+     * unverified against the DS5 firmware (possible sentinel) — review S6. */
+    uint8_t latency = (uint8_t)(settings->latency_ms < 1 ? 1 : settings->latency_ms);
     uint8_t headset_volume = ds5_volume_raw_byte(settings->headset_volume_percent);
     uint8_t speaker_volume = ds5_volume_raw_byte(settings->speaker_volume_percent);
     uint8_t target_headset_volume = 0;
     uint8_t target_speaker_volume = 0;
     uint8_t target_audio_flags = 0;
-    /* latency floor lowered to 0 (was 20) for low-latency testing */
 
     switch (settings->audio_mode) {
         case TV_BRIDGE_AUDIO_HEADSET:

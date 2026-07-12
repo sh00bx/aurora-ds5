@@ -44,6 +44,11 @@ typedef struct img_loader_req_t {
      * flipped it to "not appitem" inserted textures under a key no appitem
      * lookup ever matches (unreachable 32MB-LRU entries). */
     uint8_t cover_fill;
+    /* Latched with cover_fill for the same reason: derived from a NULLed
+     * target at memcache_put time it comes back 0, and purge_corners_cache
+     * then removes the wrong (radius 0) corner-cache key on eviction while
+     * the entry was drawn/cached under the appitem's real radius. */
+    lv_coord_t target_radius;
     memcache_item_t *src;
     bool finished;
     SDL_Surface *cached;
@@ -199,6 +204,7 @@ void coverloader_display(coverloader_t *loader, const uuidstr_t *uuid, int id, l
     req->target_width = target_width;
     req->target_height = target_height;
     req->cover_fill = !coverloader_is_appitem(target);   /* latched: see struct */
+    req->target_radius = lv_obj_get_style_radius(target, 0);
     req->finished = false;
     lv_obj_add_event_cb(target, target_deleted_cb, LV_EVENT_DELETE, req);
     loader->reqlist = reqlist_append(loader->reqlist, req);
@@ -260,7 +266,7 @@ static void coverloader_memcache_put(coverloader_req_t *req) {
         result = memcache_item_new();
         result->target_width = req->target_width;
         result->target_height = req->target_height;
-        result->target_radius = lv_obj_get_style_radius(req->target, 0);
+        result->target_radius = req->target_radius;
         lv_img_dsc_t *src = &result->src;
         lv_sdl_img_data_t *data = &result->data;
         data->type = LV_SDL_IMG_TYPE_TEXTURE;

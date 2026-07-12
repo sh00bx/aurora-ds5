@@ -43,6 +43,7 @@ enum KeyCombo _pending_key_combo = KeyComboMax;
 
 struct KeysDown {
     short keyCode;
+    char keyFlags;
     struct KeysDown *prev;
     struct KeysDown *next;
 };
@@ -468,10 +469,17 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
         }
     }
 
+    char keyFlags = 0;
+    if (event->keysym.scancode == SDL_SCANCODE_INTERNATIONAL1 ||
+        event->keysym.scancode == SDL_SCANCODE_NONUSBACKSLASH) {
+        keyFlags = SS_KBE_FLAG_NON_NORMALIZED;
+    }
+
     // Track the key state, so we always know which keys are down
     if (event->state == SDL_PRESSED) {
         struct KeysDown *node = keys_new();
         node->keyCode = keyCode;
+        node->keyFlags = keyFlags;
         _pressed_keys = keys_append(_pressed_keys, node);
     } else {
         struct KeysDown *node = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
@@ -486,11 +494,6 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
             keydown_count++;
         } else if (event->state == SDL_RELEASED) {
             keydown_count--;
-        }
-        char keyFlags = 0;
-        if (event->keysym.scancode == SDL_SCANCODE_INTERNATIONAL1 ||
-            event->keysym.scancode == SDL_SCANCODE_NONUSBACKSLASH) {
-            keyFlags = SS_KBE_FLAG_NON_NORMALIZED;
         }
         LiSendKeyboardEvent2(0x8000 | keyCode,
                              event->state == SDL_PRESSED ? KEY_ACTION_DOWN : KEY_ACTION_UP,
@@ -554,7 +557,10 @@ void stream_input_flush_pressed_keys(stream_input_t *input) {
     while (_pressed_keys) {
         struct KeysDown *n = _pressed_keys;
         short kc = n->keyCode;
-        LiSendKeyboardEvent(0x8000 | kc, KEY_ACTION_UP, 0);
+        // Release with the same flags byte the press went out with: Sunshine keys
+        // its pressed-key map on the (vk, flags) pair, so a flags=0 release for a
+        // NON_NORMALIZED press is discarded and the key auto-repeats forever.
+        LiSendKeyboardEvent2(0x8000 | kc, KEY_ACTION_UP, 0, n->keyFlags);
         _pressed_keys = keys_remove(_pressed_keys, n);
         free(n);
     }
