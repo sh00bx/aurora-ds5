@@ -521,6 +521,19 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
     return 0;
 }
 
+int enet_client_peer_stats(const ctm_enet_client_t *client, ctm_enet_peer_stats_t *out) {
+    if (!client || !out || !client->peer || !client->connected) {
+        return -1;
+    }
+    const ENetPeer *peer = client->peer;
+    out->rtt_ms = peer->roundTripTime;
+    out->rtt_variance_ms = peer->roundTripTimeVariance;
+    out->packets_sent = peer->packetsSent;
+    out->packets_lost = peer->packetsLost;
+    out->packet_throttle = peer->packetThrottle;
+    return 0;
+}
+
 int enet_client_recv_msg(ctm_enet_client_t *client, ctmb_header_t *h, uint8_t **payload) {
     if (!client || !h || !payload) {
         return 0;

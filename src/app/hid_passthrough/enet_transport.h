@@ -71,6 +71,21 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
  * message was available; returns 0 if the inbox is empty. */
 int enet_client_recv_msg(ctm_enet_client_t *client, ctmb_header_t *h, uint8_t **payload);
 
+/* Snapshot of ENet's link-health counters for the connected peer (cumulative
+ * since connect; rtt is ENet's smoothed estimate in ms). packets_lost counts
+ * OUR reliable sends that needed a retransmit — the uplink-loss view. The
+ * downlink (agent->TV) stall view comes from the NET/60s arrival tracking in
+ * controller_common.c instead. Owning (session) thread only, like every other
+ * host access. Returns 0, or -1 when no peer is connected. */
+typedef struct {
+    uint32_t rtt_ms;
+    uint32_t rtt_variance_ms;
+    uint32_t packets_sent;
+    uint32_t packets_lost;
+    uint32_t packet_throttle;      /* 0..32 = ENET_PEER_PACKET_THROTTLE_SCALE */
+} ctm_enet_peer_stats_t;
+int enet_client_peer_stats(const ctm_enet_client_t *client, ctm_enet_peer_stats_t *out);
+
 #ifdef __cplusplus
 }
 #endif

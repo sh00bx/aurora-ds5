@@ -153,6 +153,26 @@ struct ctm_controller {
     uint32_t plc_fill_interval_us;/* target inter-frame period (~DS5 100 Hz) */
     unsigned long st_audio_fill;  /* synthesized (transport-loss) conceal frames */
     unsigned long st_fill_skip;   /* real 0x36 too big for plc_last36 (not cached) */
+    /* Diagnostic: host->TV OUTPUT_REPORT arrival pattern (HOL-blocking probe).
+     * The agent sends ALL its output (0x36 haptics, 0x31 rumble, feature
+     * replies) RELIABLE on ONE ENet channel, so a WiFi loss stalls every later
+     * output until the retransmit lands, then flushes them at once. Signature:
+     * arrival gap >30ms followed by a catch-up burst (inter-arrival <2ms).
+     * A gap WITHOUT a burst means loss/idle instead — that distinction is the
+     * whole point of this probe. h->timestamp_us (agent send-time, host clock)
+     * additionally gives per-packet transit delay over the window minimum,
+     * which cancels the unknown clock offset. Logged as NET/60s. */
+    uint64_t net_last_out_us;      /* arrival time of the previous OUTPUT report */
+    unsigned net_burst_cur;        /* >0: inside the flush after a >30ms gap */
+    uint64_t net_log_next_us;
+    unsigned long st_net_out;      /* OUTPUT reports this window */
+    unsigned long st_net_gaps30;   /* gaps 30ms..1s (stall-like) */
+    unsigned long st_net_idle;     /* gaps >1s (stream idle, not counted as stall) */
+    uint64_t st_net_gap_max_us;    /* largest stall-like gap (<=1s) */
+    unsigned st_net_burst_max;     /* largest post-gap flush */
+    int64_t st_net_skew_min;       /* min(now - host_ts): clock offset + best transit */
+    int64_t st_net_skew_max;       /* max(now - host_ts) */
+    int64_t st_net_skew_sum;
     /* Diagnostic: per-report-id output histogram (what actually flows out). */
     unsigned long st_out_36, st_out_31, st_out_32, st_out_other;
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
@@ -1742,11 +1762,46 @@ static void feature_worker_stop(ctm_controller_t *c)
 /* Dispatch one inbound message: OUTPUT (paced or direct write), FEATURE_GET/SET
  * (queued to the feature worker + async reply), HOST_CONFIG (pacing params).
  * When: per message decoded in the session loop. */
+/* Track one host->TV OUTPUT_REPORT arrival for the NET/60s HOL probe (see the
+ * struct fields for the theory). When: handle_message, before any dispatch. */
+static void net_track_output(ctm_controller_t *c, const ctmb_header_t *h)
+{
+    uint64_t now = now_us();
+    int64_t skew = (int64_t)now - (int64_t)h->timestamp_us;
+    if (c->st_net_out == 0 || skew < c->st_net_skew_min) c->st_net_skew_min = skew;
+    if (c->st_net_out == 0 || skew > c->st_net_skew_max) c->st_net_skew_max = skew;
+    c->st_net_skew_sum += skew;
+    c->st_net_out++;
+
+    if (c->net_last_out_us != 0) {
+        uint64_t gap = now - c->net_last_out_us;
+        if (gap > 1000000ull) {
+            /* Stream idle (no game audio/rumble), not a transport stall. */
+            c->st_net_idle++;
+            c->net_burst_cur = 0;
+        } else if (gap > 30000ull) {
+            c->st_net_gaps30++;
+            if (gap > c->st_net_gap_max_us) c->st_net_gap_max_us = gap;
+            c->net_burst_cur = 1;          /* this packet ends the gap = flush #1 */
+            if (c->st_net_burst_max == 0) c->st_net_burst_max = 1;
+        } else if (gap < 2000ull && c->net_burst_cur) {
+            c->net_burst_cur++;            /* catch-up flush after the stall */
+            if (c->net_burst_cur > c->st_net_burst_max)
+                c->st_net_burst_max = c->net_burst_cur;
+        } else {
+            if (gap > c->st_net_gap_max_us) c->st_net_gap_max_us = gap;
+            c->net_burst_cur = 0;          /* normal cadence resumed */
+        }
+    }
+    c->net_last_out_us = now;
+}
+
 static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
                            queued_report_t *paced_q, int *paced_head, int *paced_count,
                            const ctmb_header_t *h, uint8_t *payload)
 {
     if (h->type == CTMB_MSG_OUTPUT_REPORT) {
+        net_track_output(c, h);
         if (c->ops && c->ops->composite_evdev_gamepad && c->evdev_gamepad_fd >= 0) {
             uint8_t ep = (uint8_t)h->request_id;
             if (ep == 0 || ep == c->xpad_out_ep || ep == c->primary_out_ep) {
@@ -1974,6 +2029,42 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
                 c->plc_log_next_us = pnow + 60000000ull;
+            }
+        }
+        {
+            /* NET/60s: downlink arrival pattern + ENet link health (HOL probe,
+             * see net_track_output). delay_* = transit over the window's best
+             * case (skew minimum cancels the TV<->host clock offset); drift
+             * between the two monotonic clocks is ~ppm-scale, negligible per
+             * window against the >=30ms signal we are looking for. */
+            uint64_t nnow = now_us();
+            if (c->net_log_next_us == 0) {
+                c->net_log_next_us = nnow + 60000000ull;
+            } else if (nnow >= c->net_log_next_us) {
+                if (c->st_net_out > 0) {
+                    int64_t davg = c->st_net_skew_sum / (int64_t)c->st_net_out - c->st_net_skew_min;
+                    int64_t dmax = c->st_net_skew_max - c->st_net_skew_min;
+                    ctm_enet_peer_stats_t ps;
+                    int have_ps = (c->xport.kind == CTM_TRANSPORT_ENET && c->enet &&
+                                   enet_client_peer_stats(c->enet, &ps) == 0);
+                    ctl_log(c, "NET/60s: out=%lu gaps30=%lu gap_max=%.1fms burst_max=%u idle=%lu delay_avg=%.1fms delay_max=%.1fms | rtt=%u+-%ums sent=%lu lost=%lu thr=%u/32",
+                            c->st_net_out, c->st_net_gaps30,
+                            (double)c->st_net_gap_max_us / 1000.0,
+                            c->st_net_burst_max, c->st_net_idle,
+                            (double)davg / 1000.0, (double)dmax / 1000.0,
+                            have_ps ? ps.rtt_ms : 0u,
+                            have_ps ? ps.rtt_variance_ms : 0u,
+                            have_ps ? (unsigned long)ps.packets_sent : 0ul,
+                            have_ps ? (unsigned long)ps.packets_lost : 0ul,
+                            have_ps ? ps.packet_throttle : 0u);
+                }
+                c->st_net_out = 0;
+                c->st_net_gaps30 = 0;
+                c->st_net_idle = 0;
+                c->st_net_gap_max_us = 0;
+                c->st_net_burst_max = 0;
+                c->st_net_skew_min = c->st_net_skew_max = c->st_net_skew_sum = 0;
+                c->net_log_next_us = nnow + 60000000ull;
             }
         }
         int timeout_ms = 50;
