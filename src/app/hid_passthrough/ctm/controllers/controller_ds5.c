@@ -64,10 +64,14 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     size_t limit = len - 4;
 
     if (settings->audio_mode == TV_BRIDGE_AUDIO_AUTO) {
-        uint8_t auto_latency = (uint8_t)settings->latency_ms;
+        /* Floor 1, not 0: 0x00 in the 0x91 latency block is unverified against
+         * the DS5 firmware (possible sentinel/ignore value) — review S6. Every
+         * user-visible setting >=1ms stays byte-identical; only the unverified
+         * 0x00 is never emitted. (The old floor of 20 had been lowered to 0 for
+         * low-latency testing.) */
+        uint8_t auto_latency = (uint8_t)(settings->latency_ms < 1 ? 1 : settings->latency_ms);
         uint8_t auto_headset = ds5_volume_raw_byte(settings->headset_volume_percent);
         uint8_t auto_speaker = ds5_volume_raw_byte(settings->speaker_volume_percent);
-        /* latency floor lowered to 0 (was 20) for low-latency testing */
         while (pos + 2 <= limit) {
             uint8_t block_id = data[pos];
             size_t payload_len = data[pos + 1];

@@ -6,11 +6,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -94,6 +96,29 @@ static void *acl_mon_thread(void *arg)
 {
     ds5_acl_tx_t *t = (ds5_acl_tx_t *)arg;
     acl_log(t, "forwarder readiness watching %s", t->tmpl_path);
+
+    /* inotify on the template's directory (review S5): a valid<->invalid flip
+     * used to cost up to 200ms of discarded output (daemon drops INJECTs, the
+     * client skips hidraw) on the old fixed 200ms poll. Watch for the daemon's
+     * writes/renames and re-check immediately; the 1s poll() timeout keeps the
+     * old polling as a fallback when inotify is unavailable in the jail. */
+    int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (ifd >= 0) {
+        char dir[sizeof t->tmpl_path];
+        snprintf(dir, sizeof dir, "%s", t->tmpl_path);
+        char *slash = strrchr(dir, '/');
+        if (slash && slash != dir) {
+            *slash = '\0';
+        } else {
+            snprintf(dir, sizeof dir, "/tmp");
+        }
+        if (inotify_add_watch(ifd, dir, IN_MOVED_TO | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE) < 0) {
+            acl_log(t, "inotify watch on %s failed errno=%d -> 1s poll fallback", dir, errno);
+            close(ifd);
+            ifd = -1;
+        }
+    }
+
     int last = -1;
     while (t->running) {
         int valid = 0;
@@ -113,9 +138,23 @@ static void *acl_mon_thread(void *arg)
                              : "daemon template not ready -> hidraw seeding");
             last = valid;
         }
-        for (int i = 0; i < 4 && t->running; i++) {
-            usleep(50000);
+        if (ifd >= 0) {
+            struct pollfd pf = {.fd = ifd, .events = POLLIN, .revents = 0};
+            int pr = poll(&pf, 1, 1000);
+            if (pr > 0 && (pf.revents & POLLIN)) {
+                /* Drain everything queued; the loop re-reads the template. */
+                char evbuf[512];
+                while (read(ifd, evbuf, sizeof evbuf) > 0) {
+                }
+            }
+        } else {
+            for (int i = 0; i < 4 && t->running; i++) {
+                usleep(50000);
+            }
         }
+    }
+    if (ifd >= 0) {
+        close(ifd);
     }
     return NULL;
 }
