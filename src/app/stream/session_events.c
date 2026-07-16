@@ -1,8 +1,38 @@
 #include "session_events.h"
 #include "session_priv.h"
 
+#if defined(TARGET_WEBOS)
+#include "input/input_gamepad.h"
+#include "hid_passthrough/hid_pt_gamepad_match.h"
+#endif
 
 bool session_handle_input_event(session_t *session, const SDL_Event *event) {
+#if defined(TARGET_WEBOS)
+    /* HID-passthrough exclusion must NOT sit behind the accepting_input gate.
+     * A pad that SDL-enumerates while input is still blocked (connect/loading
+     * overlay, display-topology settle — or a DS5 that BT-connects seconds
+     * after stream start because it slept between runs) never reaches the
+     * gated JOYDEVICEADDED handler, so it is never reconciled/excluded; its
+     * first button press then leaks a MultiController event and the host
+     * spawns a parallel default Xbox pad next to the bridged DS5 — the
+     * Xbox<->DS5 input flap (RCA 2026-07-17: session-start reconcile at +0s
+     * logged "No Moonlight gamepad match", SDL connect at +2.3s was swallowed
+     * by this gate, Xbox pad appeared at first input +10s). */
+    if (event->type == SDL_JOYDEVICEADDED) {
+        SDL_JoystickID iid = SDL_JoystickGetDeviceInstanceID(event->jdevice.which);
+        stream_input_t *in = &session->input;
+        app_gamepad_state_t *gp =
+            iid >= 0 ? app_input_gamepad_state_by_instance_id(in->input, iid) : NULL;
+        if (gp != NULL && hid_pt_gamepad_is_autoplug(in->input, gp)) {
+            hid_passthrough_manager_t *mgr = session_get_hid_passthrough(session);
+            if (mgr != NULL && hid_passthrough_manager_active(mgr)) {
+                hid_passthrough_manager_rescan(mgr);
+                hid_passthrough_manager_reconcile(mgr, in);
+                return true;  /* passthrough owns this pad; never announce it */
+            }
+        }
+    }
+#endif
     if (!session_accepting_input(session)) {
         return false;
     }

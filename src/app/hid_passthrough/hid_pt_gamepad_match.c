@@ -198,6 +198,32 @@ logical_device_t *hid_pt_find_logical_for_gamepad(app_input_t *input,
     return NULL;
 }
 
+bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad) {
+        return false;
+    }
+    // Primary: pref keyed by the gamepad's live SDL serial/MAC stable-id.
+    if (hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
+        return true;
+    }
+    // Fallback for the stream-churn / mid-session re-enumeration race: the SDL
+    // serial can be transiently unreadable right after a (re)connect, so the
+    // stable-id degrades to sdl:vid:pid:guid and misses the MAC-keyed pref.
+    // Match to a known logical device (hid_pt_match_gamepad_to_logical also
+    // matches by VID:PID + name, robust to a missing serial) and check the
+    // auto-plug pref on the LOGICAL device (keyed by its own stored MAC). Without
+    // this a bridged DS5 leaks a parallel ViGEm/Xbox pad to the host and the game
+    // flaps between Xbox and DS5. Non-CTM pads have no auto-plug logical device.
+    logical_device_t *item = hid_pt_find_logical_for_gamepad(input, gamepad);
+    if (item && hid_pt_prefs_auto_plugin_for_logical(item)) {
+        commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (serial-less gamepad)",
+                         item->name);
+        return true;
+    }
+    return false;
+}
+
 uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
 {
     uint16_t mask = 0;
@@ -209,7 +235,7 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
         if (!gp) {
             continue;
         }
-        if (hid_pt_prefs_auto_plugin_for_gamepad(gp)) {
+        if (hid_pt_gamepad_is_autoplug(input, gp)) {
             mask |= (uint16_t) (1u << gp->gs_id);
             logical_device_t *item = hid_pt_find_logical_for_gamepad(input, gp);
             if (item) {
