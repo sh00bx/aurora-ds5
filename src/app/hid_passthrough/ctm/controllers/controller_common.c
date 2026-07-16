@@ -1970,6 +1970,15 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     c->st_transport_enet = (c->xport.kind == CTM_TRANSPORT_ENET) ? 1 : 0;
     pthread_mutex_unlock(&c->status_mutex);
 
+    /* Rate-servo feedback: forward the daemon's inject-queue telemetry
+     * (ds5_acl_tx_qstats <- "<tmpl>.st") to the host ~4/s so its pacer can
+     * shed TV-side backlog. Capability-gated on HOST_CONFIG reserved[0] — a
+     * CTM host advertises nothing and never sees the message type. */
+    int fb_enabled = (host_cfg.reserved[0] & CTMB_HOSTCFG_PACE_FEEDBACK) != 0;
+    uint64_t fb_next_us = 0;
+    uint32_t fb_last_seq = 0;
+    int fb_have_seq = 0;
+
     int link_alive = 1;
     while (!c->stop && !c->link_down && link_alive) {
         /* The ~10.6ms host pace (~94/s) was sized for the BT one-outstanding wall
@@ -1992,6 +2001,32 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             eff_pace_us = 8000;
         }
         drain_paced(c, paced_q, &paced_head, &paced_count, &next_paced_us, eff_pace_us);
+        if (fb_enabled && c->acl_tx) {
+            uint64_t fnow = now_us();
+            if (fb_next_us == 0) {
+                fb_next_us = fnow + 250000ull;
+            } else if (fnow >= fb_next_us) {
+                fb_next_us = fnow + 250000ull;
+                ds5_acl_qstats_t qs;
+                /* Only a record the daemon advanced since our last send is
+                 * news; a frozen seq (unbound link, old daemon) sends nothing
+                 * and the host falls back to its static pace margin. */
+                if (ds5_acl_tx_qstats(c->acl_tx, &qs) &&
+                    (!fb_have_seq || qs.seq != fb_last_seq)) {
+                    fb_last_seq = qs.seq;
+                    fb_have_seq = 1;
+                    ctmb_pace_feedback_t fb;
+                    memset(&fb, 0, sizeof fb);
+                    fb.outstanding = qs.outstanding;
+                    fb.fifo_count = qs.fifo_count;
+                    fb.maxq = qs.maxq;
+                    fb.fifo_cap = qs.fifo_cap;
+                    fb.inj_total = qs.inj_total;
+                    fb.drop_total = qs.drop_total;
+                    c_send(c, CTMB_MSG_PACE_FEEDBACK, CTMB_FLAG_OK, 0, &fb, sizeof fb);
+                }
+            }
+        }
         /* Timer-driven audio-loss concealment. While the game's audio stream is
          * active but a real 0x36 is overdue (the air dropped it) and none waits
          * in the queue, re-inject the last frame so the DS5's rate-matched

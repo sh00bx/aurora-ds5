@@ -48,4 +48,21 @@ int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len);
 void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 
+/* Daemon inject-queue telemetry (v9 "<tmpl>.st" record): the session loop
+ * forwards this to the host as CTMB_MSG_PACE_FEEDBACK for its rate servo. */
+typedef struct {
+    uint8_t valid;         /* link bound (record is only written while live) */
+    uint8_t outstanding;   /* in-flight TX (NOCP credit window occupancy) */
+    uint8_t fifo_count;    /* parked behind the window (elastic FIFO depth) */
+    uint16_t maxq;         /* credit window cap */
+    uint16_t fifo_cap;     /* elastic FIFO cap */
+    uint32_t inj_total;    /* daemon lifetime counters (monotonic) */
+    uint32_t drop_total;
+    uint32_t seq;          /* advances per daemon write; stale file = frozen seq */
+} ds5_acl_qstats_t;
+
+/* Read the daemon's queue-stats record. 1 = valid record read, 0 = none/invalid
+ * (old daemon, no traffic yet, or torn write — just skip this tick). */
+int ds5_acl_tx_qstats(ds5_acl_tx_t *t, ds5_acl_qstats_t *out);
+
 #endif /* DS5_ACL_TX_H */

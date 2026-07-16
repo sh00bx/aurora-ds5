@@ -287,6 +287,38 @@ int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len)
     return DS5_ACL_TX_HIDRAW;
 }
 
+int ds5_acl_tx_qstats(ds5_acl_tx_t *t, ds5_acl_qstats_t *out)
+{
+    if (!t || !out || !t->tmpl_path[0]) {
+        return 0;
+    }
+    char path[280];
+    snprintf(path, sizeof path, "%s.st", t->tmpl_path);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    uint8_t rec[24];
+    ssize_t n = read(fd, rec, sizeof rec);
+    close(fd);
+    if (n != 24 || rec[0] != 'D' || rec[1] != 'S' || rec[2] != '5' || rec[3] != 'Q' ||
+        rec[4] != 1) {
+        return 0;
+    }
+    out->valid       = rec[5];
+    out->outstanding = rec[6];
+    out->fifo_count  = rec[7];
+    out->maxq        = (uint16_t)(rec[8] | (rec[9] << 8));
+    out->fifo_cap    = (uint16_t)(rec[10] | (rec[11] << 8));
+    out->inj_total   = (uint32_t)rec[12] | ((uint32_t)rec[13] << 8) |
+                       ((uint32_t)rec[14] << 16) | ((uint32_t)rec[15] << 24);
+    out->drop_total  = (uint32_t)rec[16] | ((uint32_t)rec[17] << 8) |
+                       ((uint32_t)rec[18] << 16) | ((uint32_t)rec[19] << 24);
+    out->seq         = (uint32_t)rec[20] | ((uint32_t)rec[21] << 8) |
+                       ((uint32_t)rec[22] << 16) | ((uint32_t)rec[23] << 24);
+    return out->valid ? 1 : 0;
+}
+
 void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready)
 {
     if (!t) {

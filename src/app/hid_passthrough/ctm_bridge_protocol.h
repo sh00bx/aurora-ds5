@@ -19,8 +19,15 @@ enum ctmb_message_type {
     CTMB_MSG_LOG = 7,
     CTMB_MSG_ERROR = 8,
     CTMB_MSG_FEATURE_SET = 9,
-    CTMB_MSG_ENUM = 10           /* forwarded composite USB enumeration (puck) */
+    CTMB_MSG_ENUM = 10,          /* forwarded composite USB enumeration (puck) */
+    CTMB_MSG_PACE_FEEDBACK = 11  /* TV -> host inject-queue telemetry (rate servo).
+                                    Sent ONLY when HOST_CONFIG advertised
+                                    CTMB_HOSTCFG_PACE_FEEDBACK, so a CTM host
+                                    never sees the type. */
 };
+
+/* ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host). */
+#define CTMB_HOSTCFG_PACE_FEEDBACK 0x01u
 
 #pragma pack(push, 1)
 typedef struct {
@@ -63,6 +70,21 @@ typedef struct {
     uint8_t paced_report_ids[16];
     uint8_t reserved[31];
 } ctmb_host_config_t;
+
+/* CTMB_MSG_PACE_FEEDBACK payload: snapshot of ds5_txd's raw-ACL inject queue
+ * for this pad's link (from the "<tmpl>.<mac>.st" record), forwarded ~4/s.
+ * The host pacer's rate servo keys on fifo_count (true backlog: frames parked
+ * behind a FULL credit window) and drop_total deltas. */
+typedef struct {
+    uint8_t outstanding;   /* in-flight TX (NOCP credit window occupancy) */
+    uint8_t fifo_count;    /* parked behind the window (elastic FIFO depth) */
+    uint16_t maxq;         /* credit window cap */
+    uint16_t fifo_cap;     /* elastic FIFO cap */
+    uint16_t reserved0;
+    uint32_t inj_total;    /* daemon lifetime counters (monotonic) */
+    uint32_t drop_total;
+    uint8_t reserved[16];
+} ctmb_pace_feedback_t;
 
 /* CTMB_MSG_ENUM payload (puck composite): the device's OWN enumeration, read
  * from sysfs on the TV and forwarded verbatim. Windows replays it (no parsing
