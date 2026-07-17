@@ -22,6 +22,12 @@ void tearDown() {
     free(settings.conf_dir);
 }
 
+void testSmoothPacingDefault() {
+    /* A/B baseline: host-PTS pacing must default OFF (ss4s env default is ON,
+     * session_worker sets the env explicitly from this flag). */
+    TEST_ASSERT_FALSE(settings.smooth_frame_pacing);
+}
+
 void testReadINI() {
     char *ini_backup = settings.ini_path;
     settings.ini_path = FIXTURES_PATH_PREFIX "settings_read.ini";

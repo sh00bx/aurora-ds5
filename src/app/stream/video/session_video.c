@@ -327,7 +327,10 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     if (decodeUnit->frameType == FRAME_TYPE_IDR) {
         flags |= SS4S_VIDEO_FEED_DATA_KEYFRAME;
     }
-    SS4S_VideoFeedResult result = SS4S_PlayerVideoFeed(player, buffer, length, flags);
+    /* Host capture PTS (RTP 90kHz → µs); -1 = no host PTS, ss4s falls back to
+     * arrival wall-clock. Only takes effect when smooth pacing env is ON. */
+    const int64_t pts_us = decodeUnit->presentationTimeUs > 0 ? (int64_t) decodeUnit->presentationTimeUs : -1;
+    SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(player, buffer, length, flags, pts_us);
     if (result == SS4S_VIDEO_FEED_OK) {
         feed_error_count = 0;
         not_ready_first_ms = 0;

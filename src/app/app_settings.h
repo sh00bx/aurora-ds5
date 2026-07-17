@@ -66,6 +66,11 @@ typedef struct app_settings_t {
      * 0 = omit (host default frame pacing).
      */
     int client_refresh_rate_x100;
+    /**
+     * Feed decoder with host capture PTS (ss4s FeedWithPTS smooth pacing) instead of
+     * arrival wall-clock. A/B toggle: NDL is believed to present ASAP ignoring PTS.
+     */
+    bool smooth_frame_pacing;
     bool auto_adjust_bitrate;
     int abr_mode;
     char *conf_dir;

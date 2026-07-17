@@ -17,6 +17,41 @@
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #endif
 
+#include "app_settings.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+
+/* Host-PTS smooth pacing (ss4s FeedWithPTS): the env must ALWAYS be set
+ * explicitly — ss4s defaults to ON when the variable is absent, our default
+ * is OFF (A/B baseline; NDL is believed to present ASAP ignoring PTS). Read
+ * by the ss4s module in VideoOpen, so it takes effect per stream start. */
+static void session_apply_smooth_pacing_env(const session_t *session) {
+#if TARGET_WEBOS
+    const app_settings_t *cfg = app_configuration;
+    bool smooth = cfg != NULL && cfg->smooth_frame_pacing;
+    const char *smooth_val = smooth ? "1" : "0";
+    /* Shared names for SMP + NDL; NDL_* aliases for older module builds. */
+    setenv("SS4S_SMOOTH_PACING", smooth_val, 1);
+    setenv("SS4S_NDL_SMOOTH_PACING", smooth_val, 1);
+
+    int x100 = session->config.stream.clientRefreshRateX100;
+    if (x100 > 0) {
+        /* interval_us = 1e6 * 100 / x100  (e.g. 11988 → ~8341 µs) */
+        long interval_us = (100000000L + (x100 / 2)) / x100;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%ld", interval_us);
+        setenv("SS4S_SMOOTH_PACING_INTERVAL_US", buf, 1);
+        setenv("SS4S_NDL_PACING_INTERVAL_US", buf, 1);
+    } else {
+        unsetenv("SS4S_SMOOTH_PACING_INTERVAL_US");
+        unsetenv("SS4S_NDL_PACING_INTERVAL_US");
+    }
+#else
+    (void) session;
+#endif
+}
+
 /* Connect-phase instrumentation: append "<ms-since-app-start> <phase>" to a
  * jail-visible file so connect latency can be broken down per phase without a
  * console (app stdout goes to /dev/null under the system launcher). Cheap
@@ -105,6 +140,7 @@ int session_worker(session_t *session) {
     SS4S_PlayerSetViewportSize(session->player, app->ui.width, app->ui.height);
     SS4S_PlayerSetUserdata(session->player, app);
 
+    session_apply_smooth_pacing_env(session);
     session_video_prepare_stream();
 
     connect_mark("li_start");

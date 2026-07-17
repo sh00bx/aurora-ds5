@@ -173,6 +173,14 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_add_event_cb(hevc_checkbox, idr_refresh_hevc_cb, LV_EVENT_VALUE_CHANGED, controller);
     idr_refresh_state_update(controller);
 
+#if TARGET_WEBOS
+    pref_checkbox(view, locstr("Smooth frame pacing (host PTS)"), &app_configuration->smooth_frame_pacing, false);
+    pref_desc_label(view,
+                    locstr("Pace video presentation from the host capture clock instead of packet "
+                           "arrival time. Experimental A/B test; takes effect on the next stream."),
+                    false);
+#endif
+
     pref_header(view, locstr("Color"));
     pref_checkbox(view, locstr("Full range YUV (SDR only)"), &app_configuration->force_full_color_range, false);
     pref_desc_label(view,
