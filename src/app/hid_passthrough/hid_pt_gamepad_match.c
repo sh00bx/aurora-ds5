@@ -198,8 +198,27 @@ logical_device_t *hid_pt_find_logical_for_gamepad(app_input_t *input,
     return NULL;
 }
 
+logical_device_t *hid_pt_peek_logical_for_gamepad(const app_gamepad_state_t *gamepad)
+{
+    // Lookup WITHOUT the moonlight_gs_id binding side effect: predicates
+    // (hid_pt_gamepad_is_autoplug) run for every pad, and letting a mere match
+    // rebind another pad's logical device corrupts the multi-DS5 slot/rumble
+    // bindings. Binding is committed only by hid_pt_find_logical_for_gamepad.
+    if (!gamepad) {
+        return NULL;
+    }
+    for (int i = 0; i < g_devices.count; ++i) {
+        logical_device_t *item = &g_devices.items[i];
+        if (hid_pt_match_gamepad_to_logical(gamepad, item)) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
 bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad)
 {
+    (void) input;
     if (!gamepad) {
         return false;
     }
@@ -215,7 +234,17 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     // auto-plug pref on the LOGICAL device (keyed by its own stored MAC). Without
     // this a bridged DS5 leaks a parallel ViGEm/Xbox pad to the host and the game
     // flaps between Xbox and DS5. Non-CTM pads have no auto-plug logical device.
-    logical_device_t *item = hid_pt_find_logical_for_gamepad(input, gamepad);
+    //
+    // ONLY for genuinely serial-less pads (stable-id degraded to the sdl:
+    // vid:pid:guid form): with a readable serial the primary lookup above is
+    // authoritative, and running the fuzzy VID:PID+name fallback anyway would
+    // adopt another same-model pad's pref for a genuinely-new controller.
+    char sid[96];
+    hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
+    if (sid[0] && strncmp(sid, "sdl:", 4) != 0) {
+        return false;
+    }
+    logical_device_t *item = hid_pt_peek_logical_for_gamepad(gamepad);
     if (item && hid_pt_prefs_auto_plugin_for_logical(item)) {
         commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (serial-less gamepad)",
                          item->name);

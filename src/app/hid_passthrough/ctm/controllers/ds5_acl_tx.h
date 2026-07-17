@@ -46,6 +46,10 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
                                ds5_acl_log_fn log_fn, void *log_ctx);
 int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len);
 void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready);
+/* Daemon control: elastic audio-FIFO depth for this session (0..FIFO max on the
+ * daemon side; -1 clears the override). Send 10 only when the host advertised
+ * CTMB_HOSTCFG_PACE_FEEDBACK; the rate servo is what bounds the parked latency. */
+void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 
 /* Daemon inject-queue telemetry (v9 "<tmpl>.st" record): the session loop

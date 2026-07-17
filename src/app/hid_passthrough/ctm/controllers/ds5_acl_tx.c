@@ -33,6 +33,8 @@
 #define ACL_TAG_M0      0xA5
 #define ACL_TAG_INJECT  0x5A
 #define ACL_TAG_ASSERT  0x5B
+#define ACL_TAG_CTRL    0x5C   /* [A5][5C][code][value] — daemon control */
+#define ACL_CTRL_FIFO_DEPTH 0x01
 #define ACL_TAG_LEN     8
 
 struct ds5_acl_tx {
@@ -240,6 +242,23 @@ static ssize_t send_tagged(ds5_acl_tx_t *t, uint8_t kind, const uint8_t *report,
     mh.msg_iov = iov;
     mh.msg_iovlen = 2;
     return sendmsg(t->unixfd, &mh, 0);
+}
+
+void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth)
+{
+    /* Tell the daemon which elastic audio-FIFO depth this session may use.
+     * Deep (10) only when the HOST advertised the rate-servo capability —
+     * the servo is what bounds a deep FIFO's parked latency; against a
+     * fixed-pace host it just parks ~107ms of permanent audio latency.
+     * Best-effort datagram; the daemon's boot default stays shallow. */
+    if (!t || t->unixfd < 0) {
+        return;
+    }
+    uint8_t msg[4] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_FIFO_DEPTH,
+                       (depth < 0) ? 0xFF : (uint8_t)depth };
+    (void)sendto(t->unixfd, msg, sizeof msg, 0,
+                 (struct sockaddr *)&t->daddr, sizeof t->daddr);
+    acl_log(t, "ctrl: audio-FIFO depth -> %d", depth);
 }
 
 int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len)

@@ -1978,6 +1978,13 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     uint64_t fb_next_us = 0;
     uint32_t fb_last_seq = 0;
     int fb_have_seq = 0;
+    /* FIFO-depth gating: the deep (10) elastic FIFO is only safe under a
+     * rate-servo host — it is the servo that bounds the parked latency. A
+     * non-servo host (CTM, or a rolled-back Vibepollo) gets the shallow
+     * depth explicitly, so a previous session's override never lingers. */
+    if (c->acl_tx) {
+        ds5_acl_tx_set_fifo_depth(c->acl_tx, fb_enabled ? 10 : 3);
+    }
 
     int link_alive = 1;
     while (!c->stop && !c->link_down && link_alive) {
