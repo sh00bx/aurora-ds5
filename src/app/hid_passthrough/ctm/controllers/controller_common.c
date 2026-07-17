@@ -15,6 +15,12 @@
 #include "ds5_acl_tx.h"
 #include "ds5_hidfd.h"
 
+/* ui/root.c — true while the streaming overlay / soft keyboard / HID panel owns
+ * input. Declared here instead of including ui/root.h to keep the controller
+ * layer free of LVGL headers; plain bool read, safe cross-thread (worst case
+ * one report forwarded with stale gate state). */
+extern bool ui_should_block_input(void);
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -224,6 +230,8 @@ struct ctm_controller {
     volatile unsigned long st_reports_in;
     volatile unsigned long st_reports_out;
     volatile unsigned long st_coalesced;   /* input reports dropped by per-burst coalescing */
+    volatile unsigned long st_ui_neutralized; /* input reports neutralized while overlay owned input */
+    int ui_gated_logged;                   /* last logged overlay-gate state (input thread only) */
     char st_last_event[96];
 
     uint8_t battery_level;
@@ -1435,7 +1443,17 @@ static void xpad_send_report(ctm_controller_t *c, const xpad_evdev_state_t *st)
 {
     if (!c || c->xpad_in_ep == 0) return;
     uint8_t buf[20];
-    xpad_build_hid_report(st, buf);
+    /* Overlay gate (event-driven flavor): while the overlay owns input, send a
+     * neutral report per event instead of the real state. Stick jitter fires
+     * evdev events continuously, so a press held across the gate edge is
+     * released host-side within a few events. */
+    if (ui_should_block_input()) {
+        xpad_evdev_state_t neutral;
+        memset(&neutral, 0, sizeof(neutral));
+        xpad_build_hid_report(&neutral, buf);
+    } else {
+        xpad_build_hid_report(st, buf);
+    }
     if (c_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, c->xpad_in_ep, buf, sizeof(buf)) == 0) {
         c->st_reports_in++;
     }
@@ -1623,7 +1641,23 @@ static void *input_thread_main(void *arg)
             coal_len[slot] = (size_t)n;
             drained++;
         }
+        /* Overlay gate: while the streaming overlay (or soft keyboard / HID
+         * panel) owns the controller, its presses must not reach the game.
+         * Reports are neutralized in place rather than dropped so the host
+         * keeps seeing a live, untouched pad (no stuck buttons from a press
+         * held across the gate edge, battery/seq keep flowing). Evaluated once
+         * per burst; ops without a neutralizer forward unmodified (see
+         * ctm_controller.h). */
+        const bool ui_blocked = ui_should_block_input();
+        if (c->ops->neutralize_input && ui_blocked != (c->ui_gated_logged != 0)) {
+            c->ui_gated_logged = ui_blocked ? 1 : 0;
+            ctl_log(c, "input %s by overlay gate", ui_blocked ? "neutralized" : "released");
+        }
         for (int i = 0; i < coal_n && !c->stop; ++i) {
+            if (ui_blocked && c->ops->neutralize_input) {
+                c->ops->neutralize_input(c, coal_buf[i], coal_len[i]);
+                c->st_ui_neutralized++;
+            }
             if (c_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, c->primary_in_ep,
                        coal_buf[i], coal_len[i]) != 0) {
                 /* Send failure = link down, NOT stop: stop=1 here races the

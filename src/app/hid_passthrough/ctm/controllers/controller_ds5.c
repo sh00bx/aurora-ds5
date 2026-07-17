@@ -228,6 +228,31 @@ static void ds5_on_input_report(ctm_controller_t *c, const uint8_t *data, size_t
     ctm_controller_update_battery_raw(c, data[54]);
 }
 
+static void ds5_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
+{
+    /* Offsets per Linux hid-playstation dualsense_input_report (payload at
+     * buf+2 for BT 0x31): sticks 0-3, triggers 4-5, seq 6, buttons 7-10,
+     * gyro 15-20, accel 21-26, touch points at 32/36 (bit7 of the contact
+     * byte = finger up). Accel, timestamps, seq and battery stay real so the
+     * game sees a live but untouched pad. The stale BT CRC is fine: the host
+     * bridge repacks the payload into the USB 0x01 report and never validates
+     * it (ds5_reports.h bt_input_to_usb). */
+    (void) c;
+    if (!buf || len < 55 || buf[0] != 0x31) {
+        return;
+    }
+    uint8_t *p = buf + 2;
+    p[0] = p[1] = p[2] = p[3] = 0x80; /* LX LY RX RY centered */
+    p[4] = p[5] = 0;                  /* L2 R2 released */
+    p[7] = 0x08;                      /* dpad neutral, face buttons clear */
+    p[8] = 0;                         /* L1 R1 L2 R2 create options L3 R3 */
+    p[9] = 0;                         /* PS, touchpad click, mute */
+    p[10] = 0;                        /* vendor */
+    memset(&p[15], 0, 6);             /* gyro: no rotation (accel keeps gravity) */
+    p[32] |= 0x80;                    /* touch finger 1 up */
+    p[36] |= 0x80;                    /* touch finger 2 up */
+}
+
 const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .kind = "ds5",
     .needs_host_config = true,
@@ -240,4 +265,5 @@ const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .patch_output = ds5_patch_output,
     .set_settings = NULL,   /* live values read via get_settings in patch_output */
     .on_input_report = ds5_on_input_report,
+    .neutralize_input = ds5_neutralize_input,
 };

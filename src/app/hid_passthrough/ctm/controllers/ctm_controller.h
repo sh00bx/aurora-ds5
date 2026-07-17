@@ -73,6 +73,16 @@ typedef struct {
 
     /* Optional per-input-report hook (DS5 battery, etc.). NULL => none. */
     void (*on_input_report)(ctm_controller_t *c, const uint8_t *data, size_t len);
+
+    /* Neutralize the gamepad state of an input report IN PLACE (sticks
+     * centered, buttons/triggers/touch released, gyro zeroed) — used while the
+     * streaming overlay owns the controller so UI navigation stops leaking
+     * into the game. Reports keep flowing at the native rate (battery, seq and
+     * timestamps stay live), which avoids stuck-input edge cases that dropping
+     * reports would create. NULL => reports forward unmodified (types without
+     * a known input layout keep today's leaky behavior on purpose: a wrongly
+     * guessed offset or a dropped release event is worse than the leak). */
+    void (*neutralize_input)(ctm_controller_t *c, uint8_t *buf, size_t len);
 } ctm_controller_ops_t;
 
 /* Live bridging status — read-only snapshot for the UI status panel. */
