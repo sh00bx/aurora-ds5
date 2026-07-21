@@ -853,6 +853,14 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
     autoplug_reap_vanished();   /* drop stale plugged state for devices that left */
     autoplug_prune();           /* drop bookkeeping for devices that left */
 
+    /* Before any plug work (and also during plug-failure cooldown ticks):
+     * converge Moonlight exclusion for pads that are already bridged. The
+     * plug-time and arrival-time exclusions are one-shot and both have race
+     * windows against SDL's lagging BT enumeration. */
+    if (input) {
+        hid_pt_moonlight_reconcile_exclusions(input);
+    }
+
     /* Backing off after a recent plug failure: don't issue any (blocking) agent
      * round-trips this tick, but still record manually/already-plugged devices so a
      * deliberate plug-out keeps being respected. */

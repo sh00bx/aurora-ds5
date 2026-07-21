@@ -15,6 +15,9 @@
 #include <ctype.h>
 #include <string.h>
 
+static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t *gp,
+                                      logical_device_t *item);
+
 static bool mac_stable_ids_equal(const char *a, const char *b)
 {
     if (!a || !b || !a[0] || !b[0]) {
@@ -241,16 +244,59 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     // adopt another same-model pad's pref for a genuinely-new controller.
     char sid[96];
     hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
-    if (sid[0] && strncmp(sid, "sdl:", 4) != 0) {
+    logical_device_t *item = hid_pt_peek_logical_for_gamepad(gamepad);
+    if (!item || !hid_pt_prefs_auto_plugin_for_logical(item)) {
         return false;
     }
-    logical_device_t *item = hid_pt_peek_logical_for_gamepad(gamepad);
-    if (item && hid_pt_prefs_auto_plugin_for_logical(item)) {
-        commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (serial-less gamepad)",
+    if (sid[0] && strncmp(sid, "sdl:", 4) != 0) {
+        // Readable serial but the gamepad-keyed pref above missed (fresh pref
+        // store, store/serial formatting drift): trust the logical device's
+        // auto-plug pref ONLY on an exact stable-id identity — same physical
+        // pad beyond doubt. The fuzzy VID:PID+name match stays reserved for
+        // serial-less pads, so another same-model controller can never adopt
+        // this pad's pref.
+        char lid[96];
+        hid_pt_stable_id_for_logical(item, lid, sizeof(lid));
+        if (!mac_stable_ids_equal(sid, lid)) {
+            return false;
+        }
+        commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (exact id)",
                          item->name);
         return true;
     }
-    return false;
+    commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (serial-less gamepad)",
+                     item->name);
+    return true;
+}
+
+void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
+{
+    // Convergent sweep, driven by the 1 Hz auto-plug poll: any bridged pad
+    // whose Moonlight slot is not yet excluded gets excluded here, regardless
+    // of the order BT connect, SDL enumeration and the bridge claim happened
+    // in. Both point-in-time guards have unavoidable miss windows — the
+    // plug-time exclusion runs before SDL has opened a freshly connected pad
+    // (JOYDEVICEADDED lags the BT link by seconds), and the arrival-time guard
+    // depends on pref/device state that may not exist yet. Each miss used to
+    // leak a parallel ViGEm pad on the host, flapping the game Xbox<->DS5
+    // until an app restart; this sweep converges within one poll tick instead.
+    if (!input) {
+        return;
+    }
+    for (int i = 0; i < g_devices.count; ++i) {
+        logical_device_t *item = &g_devices.items[i];
+        if (!item->plugged) {
+            continue;
+        }
+        app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
+        if (!gp || gp->gs_id < 0) {
+            continue;
+        }
+        if (input->moonlightExcludedMask & (1u << (unsigned) gp->gs_id)) {
+            continue;
+        }
+        moonlight_exclude_gamepad(input, gp, item);
+    }
 }
 
 uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)

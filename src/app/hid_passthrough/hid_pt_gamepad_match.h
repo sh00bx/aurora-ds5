@@ -38,6 +38,11 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input);
 void hid_pt_moonlight_exclude(struct stream_input_t *input, logical_device_t *item);
 void hid_pt_moonlight_restore(struct stream_input_t *input, logical_device_t *item);
 
+/// Convergent exclusion sweep (1 Hz auto-plug poll): excludes the Moonlight
+/// slot of every bridged pad that slipped past the point-in-time guards, so a
+/// leaked parallel host pad heals within one tick instead of an app restart.
+void hid_pt_moonlight_reconcile_exclusions(struct stream_input_t *input);
+
 bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
                                           const app_gamepad_state_t *gamepad);
 
