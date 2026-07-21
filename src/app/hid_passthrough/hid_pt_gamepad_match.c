@@ -242,6 +242,23 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     // vid:pid:guid form): with a readable serial the primary lookup above is
     // authoritative, and running the fuzzy VID:PID+name fallback anyway would
     // adopt another same-model pad's pref for a genuinely-new controller.
+    // Matching-independent stage: a pad whose VID:PID matches an already
+    // BRIDGED logical device never belongs in the Moonlight input path,
+    // regardless of whether identity matching works right now (every
+    // same-model pad in this setup gets auto-plugged). This is what stops the
+    // announce when SDL enumerates the pad only after the bridge claimed it.
+    if (gamepad->controller) {
+        SDL_Joystick *gjoy = SDL_GameControllerGetJoystick(gamepad->controller);
+        uint16_t gvid = (uint16_t) SDL_JoystickGetVendor(gjoy);
+        uint16_t gpid = (uint16_t) SDL_JoystickGetProduct(gjoy);
+        for (int d = 0; d < g_devices.count; ++d) {
+            const logical_device_t *pl = &g_devices.items[d];
+            if (pl->plugged && vid_pid_equal_hex(pl->vid, pl->pid, gvid, gpid)) {
+                commons_log_info("HID-PT", "autoplug: pad matches bridged %s by VID:PID", pl->name);
+                return true;
+            }
+        }
+    }
     char sid[96];
     hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
     logical_device_t *item = hid_pt_peek_logical_for_gamepad(gamepad);
@@ -283,11 +300,13 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
     if (!input) {
         return;
     }
+    int plugged = 0;
     for (int i = 0; i < g_devices.count; ++i) {
         logical_device_t *item = &g_devices.items[i];
         if (!item->plugged) {
             continue;
         }
+        plugged++;
         app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
         if (!gp || gp->gs_id < 0) {
             continue;
@@ -296,6 +315,56 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
             continue;
         }
         moonlight_exclude_gamepad(input, gp, item);
+    }
+    if (plugged == 0) {
+        return;
+    }
+    // Stage 2, matching-independent: identity matching above can fail outright
+    // (unreadable SDL serial + name drift, duplicate enumeration of one
+    // physical pad — observed as an 18 s announced X360 twin that stage 1
+    // never caught). A pad MODEL that is bridged must never keep feeding
+    // Moonlight, so drop every still-announced gamepad that shares a plugged
+    // logical device's VID:PID. Every same-model pad in this setup gets
+    // auto-plugged, so this cannot orphan a legitimate Moonlight pad.
+    static unsigned diag_tick = 0;
+    diag_tick++;
+    for (short i = 0; i < app_input_get_max_gamepads(input->input); ++i) {
+        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input->input, i);
+        if (!gp || !gp->controller || gp->gs_id < 0) {
+            continue;
+        }
+        if (input->moonlightExcludedMask & (1u << (unsigned) gp->gs_id)) {
+            continue;
+        }
+        SDL_Joystick *joy = SDL_GameControllerGetJoystick(gp->controller);
+        uint16_t vid = (uint16_t) SDL_JoystickGetVendor(joy);
+        uint16_t pid = (uint16_t) SDL_JoystickGetProduct(joy);
+        bool excluded = false;
+        for (int d = 0; d < g_devices.count; ++d) {
+            logical_device_t *item = &g_devices.items[d];
+            if (!item->plugged || !vid_pid_equal_hex(item->vid, item->pid, vid, pid)) {
+                continue;
+            }
+            commons_log_warn("HID-PT", "sweep: excluding Moonlight slot %d by VID:PID of bridged %s",
+                             gp->gs_id, item->name);
+            moonlight_exclude_gamepad(input, gp, item);
+            excluded = true;
+            break;
+        }
+        // Diagnostic heartbeat (~15 s): a live, unexcluded Moonlight pad while
+        // devices are bridged means both sweep stages failed — log the raw
+        // identities so the residual mismatch is visible in the field.
+        if (!excluded && diag_tick % 15 == 0) {
+            for (int d = 0; d < g_devices.count; ++d) {
+                logical_device_t *item = &g_devices.items[d];
+                if (!item->plugged) {
+                    continue;
+                }
+                commons_log_warn("HID-PT",
+                                 "sweep: slot %d (vid=%04x pid=%04x) not excluded; bridged %s has vid='%s' pid='%s'",
+                                 gp->gs_id, vid, pid, item->name, item->vid, item->pid);
+            }
+        }
     }
 }
 
