@@ -1608,6 +1608,17 @@ static void *input_thread_main(void *arg)
     static __thread uint8_t coal_buf[CTM_COAL_MAX_IDS][MAX_REPORT];
     size_t  coal_len[CTM_COAL_MAX_IDS];
     uint8_t coal_id[CTM_COAL_MAX_IDS];
+    /* Jailed-hidraw disconnect detection: the app's static jail device node
+     * (/var/palm/jail/.../dev/hidrawN) never raises POLLHUP when the DS5 drops
+     * off BT — the underlying device vanishes but the static node stays, so a
+     * lost link degenerates into silent 250ms poll timeouts forever. A connected
+     * DS5 streams input reports continuously (~250/s even idle), so a multi-second
+     * silence means the link is down. Signal link_down so run_session tears the
+     * session down and session_main reconnects (same recovery path as the
+     * c_send-failure case below), instead of spinning on a dead fd and wedging
+     * the bridge (which also froze the whole app on a mid-session BT reconnect). */
+    const uint64_t liveness_us = 2000000ull;
+    uint64_t last_rx_us = now_us();
     while (!c->stop && !c->link_down) {
         struct pollfd pfds[2];
         pfds[0].fd = c->hid_fd; pfds[0].events = POLLIN; pfds[0].revents = 0;
@@ -1618,9 +1629,23 @@ static void *input_thread_main(void *arg)
          * wakeups/s; 250ms keeps a safety poll without the idle spin. */
         int pr = poll(pfds, 2, 250);
         if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;
+        if (pr == 0) {
+            if (now_us() - last_rx_us > liveness_us) {
+                ctl_log(c, "no input for %llums, link presumed down",
+                        (unsigned long long)((now_us() - last_rx_us) / 1000));
+                c->link_down = 1;
+                break;
+            }
+            continue;
+        }
         if (pfds[1].revents & POLLIN) break;
-        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            /* Real hangup/error on the fd (delivered outside the jailed-node case):
+             * signal link_down so run_session reconnects, rather than silently
+             * killing input for the rest of the session. */
+            c->link_down = 1;
+            break;
+        }
         if (!(pfds[0].revents & POLLIN)) continue;
         int coal_n = 0, drained = 0;
         for (;;) {
@@ -1641,6 +1666,7 @@ static void *input_thread_main(void *arg)
             coal_len[slot] = (size_t)n;
             drained++;
         }
+        if (drained > 0) last_rx_us = now_us();
         /* Overlay gate: while the streaming overlay (or soft keyboard / HID
          * panel) owns the controller, its presses must not reach the game.
          * Reports are neutralized in place rather than dropped so the host
@@ -2327,6 +2353,30 @@ static void *session_main(void *arg)
     (void)fcntl(c->wake_pipe[1], F_SETFL, fcntl(c->wake_pipe[1], F_GETFL, 0) | O_NONBLOCK);
 
     while (!c->stop) {
+        /* Re-entry after a dropped controller link (the input thread's liveness
+         * timeout, or a POLLHUP, set link_down): the hid_fd still points at the
+         * pad that fell off BT, so without this we'd re-run run_session on a dead
+         * fd forever (input never recovers until a manual re-bridge). Reopen it to
+         * re-attach to the reconnected controller. open_hid validates VID:PID (so
+         * it never grabs the wrong node) and falls back to the root broker if the
+         * static jail node went stale; -1 just means the pad isn't back yet, so
+         * retry with a 500ms backoff until it re-pairs (or the stream stops). */
+        if (c->link_down) {
+            if (c->hid_fd >= 0) { close(c->hid_fd); c->hid_fd = -1; }
+            int announced = 0;
+            while (!c->stop) {
+                int fd = open_hid(c, &caps, report_desc, &report_desc_len);
+                if (fd >= 0) {
+                    c->hid_fd = fd;
+                    ctl_log(c, "controller re-attached after link loss");
+                    break;
+                }
+                if (!announced) { ctl_log(c, "controller dropped; waiting to re-attach"); announced = 1; }
+                for (int s = 0; s < 500 && !c->stop; s += 50) usleep(50000);
+            }
+            if (c->stop) break;
+            c->link_down = 0;
+        }
         /* ENet budget >=1200ms: the vendored enet's initial RTO is 500ms, so the
          * old 400ms window could never retransmit a lost connect datagram - one
          * lost UDP packet silently pinned the whole session to TCP fallback. */
