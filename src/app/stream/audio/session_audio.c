@@ -101,10 +101,18 @@ static void aud_cleanup() {
 
 static void aud_feed(char *sampleData, int sampleLength) {
     if (decoder != NULL) {
+        // A NULL sample is the lost-packet placeholder; libopus renders concealment audio for it.
         int decode_len = opus_multistream_decode(decoder, (unsigned char *) sampleData, sampleLength,
                                                  (opus_int16 *) buffer, frame_size, 0);
+        if (decode_len <= 0) {
+            // Negative values are opus error codes, and feeding them would underflow the size_t length.
+            if (decode_len < 0) {
+                commons_log_warn("Session", "Audio decode failed: %s", opus_strerror(decode_len));
+            }
+            return;
+        }
         SS4S_PlayerAudioFeed(player, buffer, unit_size * decode_len);
-    } else {
+    } else if (sampleData != NULL && sampleLength > 0) {
         SS4S_PlayerAudioFeed(player, (unsigned char *) sampleData, sampleLength);
     }
 }
