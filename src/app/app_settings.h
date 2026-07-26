@@ -71,6 +71,11 @@ typedef struct app_settings_t {
      * arrival wall-clock. A/B toggle: NDL is believed to present ASAP ignoring PTS.
      */
     bool smooth_frame_pacing;
+    /**
+     * webOS: Phase B soft recovery for >=4K decode backlog (temporary bitrate drop
+     * via ABR instead of Flush+IDR). Default true on webOS.
+     */
+    bool soft_recovery;
     bool auto_adjust_bitrate;
     int abr_mode;
     char *conf_dir;

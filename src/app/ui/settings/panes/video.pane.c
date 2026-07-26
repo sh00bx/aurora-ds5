@@ -179,6 +179,12 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                     locstr("Pace video presentation from the host capture clock instead of packet "
                            "arrival time. Experimental A/B test; takes effect on the next stream."),
                     false);
+    pref_checkbox(view, locstr("Soft recovery (4K)"), &app_configuration->soft_recovery, false);
+    pref_desc_label(view,
+                    locstr("When decode backlog builds on 4K streams, temporarily lower bitrate so "
+                           "video/input can catch up (no Flush+IDR). Leave enabled for C5 testing; "
+                           "disable to compare."),
+                    false);
 #endif
 
     pref_header(view, locstr("Color"));
