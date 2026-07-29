@@ -112,7 +112,13 @@ static void aud_feed(char *sampleData, int sampleLength) {
             return;
         }
         SS4S_PlayerAudioFeed(player, buffer, unit_size * decode_len);
-    } else if (sampleData != NULL && sampleLength > 0) {
+    } else {
+        /*
+         * Passthrough: the sink decodes Opus itself, so the libopus concealment the NULL
+         * placeholder is meant to trigger never happens here. Forward it anyway — the sink
+         * substitutes a silent frame, which keeps the audio timeline continuous instead of
+         * dropping a frame's worth of it on every lost packet.
+         */
         SS4S_PlayerAudioFeed(player, (unsigned char *) sampleData, sampleLength);
     }
 }
