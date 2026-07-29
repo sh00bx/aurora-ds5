@@ -56,7 +56,7 @@ typedef struct app_settings_t {
     bool hevc;
     /** Periodic HEVC IDR refresh interval in seconds (0 = off, min 2 when enabled). */
     int idr_refresh_interval_sec;
-    /** Sunshine: negotiate AV1 Main8/Main10 when decoder exposes SS4S_VIDEO_AV1. */
+    /** Sunshine/Apollo: negotiate AV1 Main8/Main10 when decoder exposes SS4S_VIDEO_AV1. */
     bool av1;
     bool show_stats_on_start;
     bool show_stats_compact;

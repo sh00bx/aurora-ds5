@@ -361,7 +361,7 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         }
     } else if (INI_NAME_MATCH("hevc")) {
         config->hevc = INI_IS_TRUE(value);
-    } else if (INI_FULL_MATCH("video", "av1")) {
+    } else if (INI_FULL_MATCH("video", "av1") || INI_NAME_MATCH("av1")) {
         config->av1 = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "video_simple_sdp")) {
         /* Legacy: ignored; client always negotiates RFI + slices when applicable. */
