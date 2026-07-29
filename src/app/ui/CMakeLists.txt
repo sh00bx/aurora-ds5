@@ -13,6 +13,7 @@ target_sources(moonlight-lib PRIVATE
         launcher/coverloader.c
         streaming/streaming.view.c
         streaming/streaming.controller.c
+        streaming/controller_info.c
         streaming/soft_keyboard.c
         streaming/hints.c
         help/help.dialog.c

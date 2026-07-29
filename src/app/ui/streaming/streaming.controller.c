@@ -3,6 +3,8 @@
 #include "streaming.controller.h"
 #include "soft_keyboard.h"
 #include "hid_passthrough_panel.h"
+#include "controller_info.h"
+#include "input/input_gamepad.h"
 
 #include <SDL.h>
 #include "stream/video/session_video.h"
@@ -20,12 +22,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(TARGET_WEBOS)
-#include <fcntl.h>
-#include <unistd.h>
-#include <poll.h>
-#include "hid_passthrough/hid_passthrough_manager.h"
-#endif
 
 static void exit_streaming(lv_event_t *event);
 
@@ -69,29 +65,6 @@ static void update_buttons_layout(streaming_controller_t *controller);
 static void pin_toggle(lv_event_t *e);
 
 static void streaming_set_stats_pinned(streaming_controller_t *controller, bool pinned);
-
-/** Pretty codec label for stats (matches session_video video_format_name strings). */
-static const char *streaming_codec_display(const char *fmt) {
-    if (fmt == NULL || fmt[0] == '\0') {
-        return "-";
-    }
-    if (strcmp(fmt, "H264") == 0) {
-        return "H.264";
-    }
-    if (strcmp(fmt, "H265") == 0) {
-        return "H.265";
-    }
-    if (strcmp(fmt, "H265 10bit") == 0) {
-        return "H.265 10bit";
-    }
-    if (strcmp(fmt, "AV1 8bit") == 0) {
-        return "AV1";
-    }
-    if (strcmp(fmt, "AV1 10bit") == 0) {
-        return "AV1 10bit";
-    }
-    return fmt;
-}
 
 /** Compact codec label matching Moonlight Qt (e.g. "AV1 10-bit", "H.265"). */
 static const char *streaming_codec_compact_text(const char *fmt) {
@@ -226,146 +199,144 @@ bool streaming_stats_shown() {
     return overlay_showing || overlay_pinned;
 }
 
-#if defined(TARGET_WEBOS)
-/* Sony DualSense family — the only controllers whose battery byte lives at the
- * fixed offset decoded below. DS4/Xbox/puck use different layouts, so we skip them. */
-#define DS_VENDOR_SONY  0x054c
-#define DS_PRODUCT_DS5  0x0ce6
-#define DS_PRODUCT_EDGE 0x0df2
-
-/* The DualSense `status` byte sits at offset 52 of the common input-report struct.
- * The report is prefixed by the report id plus, over Bluetooth, a 1-byte seq tag:
- * +2 for BT report 0x31, +1 for USB report 0x01. Returns capacity 0..100 (and the
- * charging nibble), or -1 when the report id/length is not a full DualSense report. */
-static int ds5_parse_battery(const uint8_t *buf, int len, int *charging) {
-    int off;
-    if (buf[0] == 0x31) {
-        off = 2 + 52; /* Bluetooth full report */
-    } else if (buf[0] == 0x01) {
-        off = 1 + 52; /* USB full report */
-    } else {
-        return -1;
-    }
-    if (len <= off) {
-        return -1;
-    }
-    uint8_t status = buf[off];
-    int raw = status & 0x0f;        /* 0..10 capacity, or an error code (>10) */
-    int chg = (status >> 4) & 0x0f; /* 0 discharging, 1 charging, 2 full */
-    if (charging) {
-        *charging = chg;
-    }
-    if (chg == 0x02) {
-        return 100; /* fully charged */
-    }
-    if (raw > 10) {
-        return -1; /* temperature/voltage error code, not a real level */
-    }
-    int pct = raw * 10 + 5;
-    return pct > 100 ? 100 : pct;
+/* Quality colour for a total latency, matching the compact bar's thresholds. */
+static lv_color_t streaming_latency_color(float total_ms) {
+    return total_ms <= 25.0f ? lv_palette_main(LV_PALETTE_GREEN)
+         : total_ms <= 30.0f ? lv_palette_main(LV_PALETTE_YELLOW)
+         : lv_palette_main(LV_PALETTE_RED);
 }
 
-/* Read one input report off a bridged DualSense hidraw node and decode its battery.
- * The kernel fans each hidraw report out to every open fd, so this read does NOT
- * steal frames from the usbip passthrough that also holds the node open. */
-static int ds5_read_battery_node(const char *node, int *charging) {
-    int fd = open(node, O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        return -1;
+/* Fill the latency chain: the bar's segments carry the proportions, the legend the
+ * numbers. Stages the host never reports are left out of both rather than drawn as
+ * a zero, so the bar only ever claims what was actually measured. */
+static void streaming_refresh_latency(streaming_controller_t *controller, const struct VIDEO_STATS *dst) {
+    float parts[4] = {(float) dst->rtt, 0.0f, 0.0f, 0.0f};
+    bool have[4] = {true, false, false, false};
+    if (dst->submittedFrames) {
+        parts[3] = (float) dst->totalSubmitTime / (float) dst->submittedFrames;
+        have[3] = true;
+        if (vdec_stream_info.has_host_latency) {
+            parts[1] = (float) dst->totalCaptureLatency / (float) dst->submittedFrames / 10.0f;
+            have[1] = true;
+        }
+        if (vdec_stream_info.has_decoder_latency) {
+            parts[2] = dst->avgDecoderLatency;
+            have[2] = true;
+        }
     }
-    int result = -1;
-    /* DualSense streams ~250 reports/s; poll briefly for a fresh one (~100ms cap). */
-    for (int tries = 0; tries < 8 && result < 0; tries++) {
-        struct pollfd p = {fd, POLLIN, 0};
-        if (poll(&p, 1, 12) <= 0) {
+    float total = parts[0] + parts[1] + parts[2] + parts[3];
+
+    lv_label_set_text_fmt(controller->stats_items.latency_total, "%.1f ms", total);
+    lv_obj_set_style_text_color(controller->stats_items.latency_total,
+                                streaming_latency_color(total), 0);
+
+    /* A stage that rounds to 0.0 ms is dropped from bar and legend alike — on this
+     * decoder submit is always instant, and a permanent zero is just noise. */
+    for (int i = 0; i < 4; i++) {
+        if (have[i] && parts[i] < 0.05f) {
+            have[i] = false;
+        }
+    }
+
+    /* Split the bar by hand. LVGL's flex_grow divides the free space by an integer
+     * unit, so a fine-grained split collapses and the last segment absorbs the
+     * remainder — which is how "submit 0.0" ended up a fat grey block. */
+    lv_coord_t bar_width = lv_obj_get_content_width(controller->stats_items.chain_bar);
+    if (bar_width > 0) {
+        int widths[4] = {0, 0, 0, 0};
+        int used = 0, last = -1;
+        for (int i = 0; i < 4; i++) {
+            if (!have[i] || total <= 0.0f) {
+                continue;
+            }
+            widths[i] = (int) ((float) bar_width * parts[i] / total + 0.5f);
+            if (widths[i] < 2) {
+                widths[i] = 2; /* a measured stage stays visible as a hairline */
+            }
+            used += widths[i];
+            last = i;
+        }
+        /* Rounding leftovers go to the widest stage's neighbour on the right, so
+         * the segments always add up to the full track. */
+        if (last >= 0 && bar_width - used != 0) {
+            widths[last] += bar_width - used;
+            if (widths[last] < 0) {
+                widths[last] = 0;
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            lv_obj_set_width(controller->stats_items.chain[i], widths[i]);
+        }
+    }
+
+    static const char *names[4] = {"net", "host", "decode", "submit"};
+    static const uint32_t colors[4] = {
+            STREAMING_CHAIN_COLOR_NET,
+            STREAMING_CHAIN_COLOR_HOST,
+            STREAMING_CHAIN_COLOR_DECODE,
+            STREAMING_CHAIN_COLOR_SUBMIT,
+    };
+    char legend[192];
+    int len = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!have[i] || (size_t) len >= sizeof(legend)) {
             continue;
         }
-        uint8_t buf[96];
-        int n = (int) read(fd, buf, sizeof(buf));
-        if (n <= 0) {
-            continue;
-        }
-        result = ds5_parse_battery(buf, n, charging);
+        len += snprintf(legend + len, sizeof(legend) - (size_t) len, "%s#%06x %s %.1f#",
+                        len ? "  " : "", colors[i], names[i], parts[i]);
     }
-    close(fd);
-    return result;
+    lv_label_set_text(controller->stats_items.chain_legend, legend);
 }
 
-/* Summarize the battery of every bridged DualSense into out, e.g.
- * "75%  ·  40% (charging)" — one entry per controller in device-index order.
- * Returns the number of controllers whose battery was decoded (0 = none). */
-static int ds5_bridged_battery_summary(streaming_controller_t *controller, char *out, size_t outlen) {
-    if (outlen) {
-        out[0] = '\0';
-    }
-    if (!controller->global || !controller->global->session) {
-        return 0;
-    }
-    hid_passthrough_manager_t *mgr = session_get_hid_passthrough(controller->global->session);
-    if (!mgr) {
-        return 0;
-    }
-    int count = hid_passthrough_manager_device_count(mgr);
-    int found = 0;
-    size_t pos = 0;
-    for (int i = 0; i < count; i++) {
-        hid_pt_device_info_t info;
-        if (hid_passthrough_manager_get_device(mgr, i, &info) != 0) {
-            continue;
-        }
-        if (!info.plugged || info.vendor_id != DS_VENDOR_SONY) {
-            continue;
-        }
-        if (info.product_id != DS_PRODUCT_DS5 && info.product_id != DS_PRODUCT_EDGE) {
-            continue;
-        }
-        if (!info.path[0]) {
-            continue;
-        }
-        int chg = 0;
-        int pct = ds5_read_battery_node(info.path, &chg);
-        if (pct < 0) {
-            continue;
-        }
-        const char *suffix = (chg == 0x01) ? " (charging)"
-                           : (chg == 0x02 || pct >= 100) ? " (full)" : "";
-        int w = snprintf(out + pos, outlen - pos, "%s%d%%%s",
-                         found ? "  \xc2\xb7  " : "", pct, suffix);
-        if (w > 0 && (size_t) w < outlen - pos) {
-            pos += (size_t) w;
-        }
-        found++;
-    }
-    return found;
-}
-#endif
+/* One row per controller: what it is, how it reaches the host, what charge is left.
+ * Unused rows are hidden, and an empty list says so instead of leaving a gap. */
+static void streaming_refresh_controllers(streaming_controller_t *controller) {
+    controller_info_t pads[CONTROLLER_INFO_MAX];
+    int count = controller_info_collect(controller->global, pads, CONTROLLER_INFO_MAX);
 
-/* Refresh the "Controller battery" stat row. The hidraw reads are throttled to once
- * per 10s (battery changes slowly) so reopening the nodes never janks the overlay.
- * Shows every bridged DualSense, e.g. "75%  ·  40% (charging)". */
-static void streaming_refresh_battery(streaming_controller_t *controller) {
-    if (!controller->stats_items.battery) {
-        return;
-    }
-#if defined(TARGET_WEBOS)
-    static uint32_t last_ms = 0;
-    static int initialized = 0;
-    static char text[96];
-    uint32_t now = SDL_GetTicks();
-    if (!initialized || (now - last_ms) >= 10000) {
-        char summary[96];
-        if (ds5_bridged_battery_summary(controller, summary, sizeof summary) <= 0) {
-            snprintf(text, sizeof text, "no controller bridged");
+    for (int i = 0; i < CONTROLLER_INFO_MAX; i++) {
+        lv_obj_t *row = controller->stats_items.pads[i].row;
+        if (i >= count) {
+            lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        const controller_info_t *pad = &pads[i];
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(controller->stats_items.pads[i].name, pad->name);
+
+        /* Purple is what this overlay already uses for HID passthrough, on the
+         * "HID Devices" button right below. */
+        lv_obj_t *badge = controller->stats_items.pads[i].badge;
+        lv_label_set_text(badge, pad->bridged ? "BRIDGED" : "SDL");
+        lv_obj_set_style_bg_color(badge, pad->bridged ? lv_palette_main(LV_PALETTE_PURPLE)
+                                                      : lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(badge, pad->bridged ? LV_OPA_60 : LV_OPA_20, 0);
+        lv_obj_set_style_text_opa(badge, pad->bridged ? LV_OPA_COVER : LV_OPA_70, 0);
+
+        lv_obj_t *power = controller->stats_items.pads[i].power;
+        if (pad->charging) {
+            lv_label_set_text_fmt(power, "+%s", pad->power_text);
         } else {
-            snprintf(text, sizeof text, "%s", summary);
+            lv_label_set_text(power, pad->power_text);
         }
-        last_ms = now;
-        initialized = 1;
+        lv_color_t color = lv_color_white();
+        if (pad->charging) {
+            color = lv_palette_main(LV_PALETTE_GREEN);
+        } else if (pad->power != CONTROLLER_POWER_UNKNOWN && pad->power != CONTROLLER_POWER_WIRED) {
+            if (pad->percent <= 15) {
+                color = lv_palette_main(LV_PALETTE_RED);
+            } else if (pad->percent <= 30) {
+                color = lv_palette_main(LV_PALETTE_YELLOW);
+            }
+        }
+        lv_obj_set_style_text_color(power, color, 0);
     }
-    lv_label_set_text(controller->stats_items.battery, text);
-#else
-    lv_label_set_text(controller->stats_items.battery, "-");
-#endif
+
+    if (count > 0) {
+        lv_obj_add_flag(controller->stats_items.pads_empty, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(controller->stats_items.pads_empty, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 bool streaming_refresh_stats() {
@@ -449,45 +420,37 @@ bool streaming_refresh_stats() {
         return true;
     }
 
-    const char *hdr_str = app_configuration->hdr ? "HDR" : "SDR";
-    const char *codec = streaming_codec_display(vdec_stream_info.format);
+    /* Stream identity. Resolution, codec and decoder name themselves, so they run
+     * as one unlabelled line instead of three label/value rows. */
+    const char *hdr_suffix = app_configuration->hdr ? " HDR" : "";
+    const char *codec = streaming_codec_compact_text(vdec_stream_info.format);
+    const char *video_module = SS4S_ModuleInfoGetId(app->ss4s.selection.video_module);
     if (info->width > 0 && info->height > 0) {
-        lv_label_set_text_fmt(controller->stats_items.decoder, "%d\u00d7%d %s %s (%s)", info->width, info->height, hdr_str,
-                              codec, SS4S_ModuleInfoGetId(app->ss4s.selection.video_module));
+        lv_label_set_text_fmt(controller->stats_items.stream, "%d\u00d7%d  %s%s  \u00b7  %s",
+                              info->width, info->height, codec, hdr_suffix, video_module);
     } else {
-        lv_label_set_text_fmt(controller->stats_items.decoder, "%s %s (%s)", codec, hdr_str,
-                              SS4S_ModuleInfoGetId(app->ss4s.selection.video_module));
+        lv_label_set_text_fmt(controller->stats_items.stream, "%s%s  \u00b7  %s", codec, hdr_suffix,
+                              video_module);
     }
-    lv_label_set_text_fmt(controller->stats_items.audio, "%s, %s (%s)", audio_stream_info.format,
-                          audio_stream_info.channels, SS4S_ModuleInfoGetId(app->ss4s.selection.audio_module));
-    lv_label_set_text_fmt(controller->stats_items.rtt, "%d ms (var. %d ms)", dst->rtt, dst->rttVariance);
-    lv_label_set_text_fmt(controller->stats_items.net_fps, "%.2f FPS", dst->receivedFps);
-    float renderFps = streaming_render_fps(dst->decodedFps);
-    lv_label_set_text_fmt(controller->stats_items.render_fps, "%.2f FPS", renderFps);
-    lv_label_set_text_fmt(controller->stats_items.bitrate, "%u Mbps", dst->currentBitrateKbps / 1000000);
+    lv_label_set_text_fmt(controller->stats_items.audio, "%s %s  \u00b7  %s", audio_stream_info.format,
+                          audio_stream_info.channels,
+                          SS4S_ModuleInfoGetId(app->ss4s.selection.audio_module));
 
-        if (dst->submittedFrames) {
-            lv_label_set_text_fmt(controller->stats_items.drop_rate, "%.2f%%",
-                                  (float) dst->networkDroppedFrames / (float) dst->totalFrames * 100);
-            if (vdec_stream_info.has_host_latency) {
-                float avgCapLatency = (float) dst->totalCaptureLatency / (float) dst->submittedFrames / 10.0f;
-                lv_label_set_text_fmt(controller->stats_items.host_latency, "avg %.2f ms", avgCapLatency);
-            } else {
-                lv_label_set_text_fmt(controller->stats_items.host_latency, "not available");
-            }
-            if (vdec_stream_info.has_decoder_latency) {
-                float avgSubmitTime = (float) dst->totalSubmitTime / (float) dst->submittedFrames;
-                lv_label_set_text_fmt(controller->stats_items.vdec_latency, "submit %.2f ms + decode %.2f ms",
-                                      avgSubmitTime, dst->avgDecoderLatency);
-            } else {
-                lv_label_set_text_fmt(controller->stats_items.vdec_latency, "not available");
-            }
+    streaming_refresh_latency(controller, dst);
+
+    lv_label_set_text_fmt(controller->stats_items.net_fps, "%.1f FPS", dst->receivedFps);
+    float renderFps = streaming_render_fps(dst->decodedFps);
+    lv_label_set_text_fmt(controller->stats_items.render_fps, "%.1f FPS", renderFps);
+    lv_label_set_text_fmt(controller->stats_items.bitrate, "%.1f Mbps",
+                          (float) dst->currentBitrateKbps / 1000000.0f);
+    if (dst->totalFrames > 0) {
+        lv_label_set_text_fmt(controller->stats_items.drop_rate, "%.2f %%",
+                              (float) dst->networkDroppedFrames / (float) dst->totalFrames * 100);
     } else {
         lv_label_set_text(controller->stats_items.drop_rate, "-");
-        lv_label_set_text_fmt(controller->stats_items.host_latency, "-");
-        lv_label_set_text_fmt(controller->stats_items.vdec_latency, "-");
     }
-    streaming_refresh_battery(controller);
+
+    streaming_refresh_controllers(controller);
     return true;
 }
 
@@ -906,6 +869,9 @@ static void streaming_set_stats_pinned(streaming_controller_t *controller, bool 
         return;
     }
     lv_obj_t *stats = controller->stats;
+    /* Applied before the early-out below, so the look always matches the state even
+     * when nothing else has to move. */
+    streaming_stats_set_pinned_look(controller, pinned);
     bool currently_pinned = stats->parent == lv_layer_top();
     if (pinned == currently_pinned) {
         overlay_pinned = pinned;
