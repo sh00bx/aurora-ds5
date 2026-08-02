@@ -27,7 +27,12 @@ typedef struct ds5_acl_tx ds5_acl_tx_t;
  * every ID (lengths are recomputed per send). Other IDs stay on hidraw. */
 static inline int ds5_acl_is_injectable(unsigned char report_id)
 {
-    return report_id == 0x31 || report_id == 0x32 || report_id == 0x36;
+    /* 0x39 = batched audio/haptics (two Opus frames + two coil blocks per report,
+     * 547 B) — same L2CAP HID-interrupt channel, lengths recomputed per send, and
+     * the TV controller's ACL_Data_Packet_Length is 1021 (measured 2026-08-02) so
+     * the 552-byte PDU still goes out unfragmented. */
+    return report_id == 0x31 || report_id == 0x32 ||
+           report_id == 0x36 || report_id == 0x39;
 }
 
 /* ds5_acl_tx_send() return codes. */

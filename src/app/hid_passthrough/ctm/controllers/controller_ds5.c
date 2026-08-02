@@ -18,6 +18,31 @@ static bool ds5_matches(const ctm_controller_dev_t *dev)
            strcmp(dev->bus, "BT") == 0;
 }
 
+/* Sub-block geometry, shared by both patch branches.
+ *
+ * A DS5 audio/haptic sub-block header is [id][payload length]. Bit 6 of the id
+ * marks a DOUBLED payload: the batched 0x39 report carries TWO 64-byte coil
+ * blocks / TWO 200-byte Opus frames under one header while the length byte keeps
+ * naming the SINGLE block size (0x12|0xC0 = 0xD2, len 64 => 128 bytes on the
+ * wire). 0x36's own blocks never set bit 6, so every rule below is a byte-for-byte
+ * no-op on 0x36 — walking a 0x39 with the plain length would step into the middle
+ * of the second block and let arbitrary audio bytes masquerade as a 0x90/0x91
+ * header.
+ *
+ * Inferred from two independent implementations (awalol/DS5Dongle src/audio.cpp,
+ * Kodzinho/DualSense-Bluetooth-Audio), not from a vendor spec. */
+static size_t ds5_block_wire_len(uint8_t block_id, size_t payload_len)
+{
+    return (block_id & 0x40u) ? payload_len * 2u : payload_len;
+}
+
+/* Sub-block id with the doubling bit masked off, so the matchers below can be
+ * written once against the 0x9x ids and cover the 0xDx (batched) forms too. */
+static uint8_t ds5_block_base(uint8_t block_id)
+{
+    return (uint8_t)(block_id & ~0x40u);
+}
+
 /* Map an audio mode to the DS5 BT 0x36 sub-block header byte. */
 static uint8_t ds5_audio_block_for_mode(tv_bridge_audio_mode_t mode)
 {
@@ -57,7 +82,11 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     const tv_bridge_worker_settings_t *settings = &s;
 
     size_t len = len_io ? *len_io : 0;
-    if (!data || len < 12 || (data[0] != 0x36 && data[0] != 0x32)) return 0;
+    /* 0x39 is the batched audio/haptic report (two Opus frames + two coil blocks,
+     * 547 B) — same sub-block grammar as 0x36, so it patches through the same
+     * walker; only the geometry helpers above differ. */
+    if (!data || len < 12 ||
+        (data[0] != 0x36 && data[0] != 0x32 && data[0] != 0x39)) return 0;
 
     int patched = 0;
     size_t pos = 2;
@@ -75,17 +104,24 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
         while (pos + 2 <= limit) {
             uint8_t block_id = data[pos];
             size_t payload_len = data[pos + 1];
-            size_t block_len = payload_len + 2;
+            size_t block_len = ds5_block_wire_len(block_id, payload_len) + 2;
+            uint8_t block_base = ds5_block_base(block_id);
             if (block_id == 0 && payload_len == 0) break;
             if (block_len > limit - pos) break;
-            if (block_id == 0x91 && payload_len >= 6) {
-                for (size_t i = 3; i <= 7; ++i) {
+            if (block_base == 0x91 && payload_len >= 6) {
+                /* Payload is [marker][latency ...][audio packet counter]: patch
+                 * everything between the two. 0x36 carries five latency bytes
+                 * (payload_len 7 -> i 3..7, the historical hardcoded range),
+                 * 0x39 four (payload_len 6 -> i 3..6). Running the old fixed
+                 * range on 0x39 would overwrite the packet counter — which the
+                 * pad uses to sequence audio — with a latency value. */
+                for (size_t i = 3; i <= payload_len; ++i) {
                     if (data[pos + i] != auto_latency) {
                         data[pos + i] = auto_latency;
                         patched = 1;
                     }
                 }
-            } else if (block_id == 0x90 && payload_len >= 8) {
+            } else if (block_base == 0x90 && payload_len >= 8) {
                 /* AUTO leaves route/audio-control to the game, but the volume
                  * sliders must still work: games practically never set the
                  * volume-valid flags, so the firmware default (full volume)
@@ -143,11 +179,12 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     while (pos + 2 <= limit) {
         uint8_t block_id = data[pos];
         size_t payload_len = data[pos + 1];
-        size_t block_len = payload_len + 2;
+        size_t block_len = ds5_block_wire_len(block_id, payload_len) + 2;
+        uint8_t block_base = ds5_block_base(block_id);
         if (block_id == 0 && payload_len == 0) break;
         if (block_len > limit - pos) break;
 
-        if (block_id == 0x90 && payload_len >= 8) {
+        if (block_base == 0x90 && payload_len >= 8) {
             /* Only patch confirmed audio fields; preserve effect/rumble bytes. */
             if ((data[pos + 2] & 0xb0u) != 0xb0u) {
                 data[pos + 2] = (uint8_t)(data[pos + 2] | 0xb0u);
@@ -169,19 +206,26 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
                 data[pos + 9] = target_audio_flags;
                 patched = 1;
             }
-        } else if ((block_id == 0x93 || block_id == 0x94 || block_id == 0x95 || block_id == 0x96) && audio_block != 0) {
-            if (data[pos] != audio_block) {
-                data[pos] = audio_block;
+        } else if ((block_base == 0x93 || block_base == 0x94 || block_base == 0x95 || block_base == 0x96) &&
+                   audio_block != 0) {
+            /* The route IS the block id; keep the doubling bit when rewriting it,
+             * or a batched 0x39 audio block would shrink to half its length for
+             * every later walker (ours and the pad's). */
+            uint8_t routed = (uint8_t)(audio_block | (block_id & 0x40u));
+            if (data[pos] != routed) {
+                data[pos] = routed;
                 patched = 1;
             }
-        } else if (block_id == 0x91 && payload_len >= 6) {
-            for (size_t i = 3; i <= 7; ++i) {
+        } else if (block_base == 0x91 && payload_len >= 6) {
+            /* See the AUTO branch: patch payload[1 .. len-2], never the trailing
+             * audio packet counter. */
+            for (size_t i = 3; i <= payload_len; ++i) {
                 if (data[pos + i] != latency) {
                     data[pos + i] = latency;
                     patched = 1;
                 }
             }
-        } else if (block_id == 0x92 && payload_len >= 2 && settings->haptics_gain_centi != 100) {
+        } else if (block_base == 0x92 && payload_len >= 2 && settings->haptics_gain_centi != 100) {
             double gain = ds5_haptics_gain(settings->haptics_gain_centi);
             for (size_t i = 2; i < block_len; ++i) {
                 int sample = (int)(int8_t)data[pos + i];

@@ -184,6 +184,9 @@ struct ctm_controller {
     int64_t st_net_skew_sum;
     /* Diagnostic: per-report-id output histogram (what actually flows out). */
     unsigned long st_out_36, st_out_31, st_out_32, st_out_other;
+    unsigned long st_out_39;      /* batched audio/haptic report (0x39): counted
+                                   * separately so the telemetry line shows WHICH
+                                   * audio form is on air during the 0x39 A/B. */
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
     int hid_wait_ms;
     int dedup_enabled;
@@ -785,6 +788,12 @@ static int apply_output_settings(ctm_controller_t *c, uint8_t *data, size_t *len
 
 static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
 {
+    /* 0x36 only, deliberately: the batched 0x39 form carries two Opus frames and
+     * two coil blocks per report, so both the sub-block walk below (which assumes
+     * one payload per header) and the timer-driven synth cadence (~10 ms) would
+     * have to be doubled. Until that is done and measured, a 0x39 stream simply
+     * runs without concealment — which is also the cleaner baseline for the
+     * transport A/B, since it removes a synthesiser from the measurement. */
     if (!c->plc_enabled || !data || len < 12 || data[0] != 0x36) {
         return;
     }
@@ -911,6 +920,7 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
     if (!c || c->hid_fd < 0 || !data || len == 0) return -1;
     switch (data[0]) {
         case 0x36: c->st_out_36++; break;
+        case 0x39: c->st_out_39++; break;
         case 0x31: c->st_out_31++; break;
         case 0x32: c->st_out_32++; break;
         default:   c->st_out_other++; break;
@@ -2135,15 +2145,15 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 if (c->acl_tx) {
                     ds5_acl_tx_stats(c->acl_tx, &inj, &drp, &rdy);
                 }
-                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu fillskip=%lu capdrop=%lu | out36=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
+                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu fillskip=%lu capdrop=%lu | out36=%lu out39=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
                         c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_fill_skip, c->st_audio_capdrop,
-                        c->st_out_36, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
+                        c->st_out_36, c->st_out_39, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
                         rdy, inj, drp,
                         c->st_hid_ok, c->st_hid_eagain, c->st_hid_recovered, c->st_hid_dropped,
                         c->st_dedup_skipped, c->st_reports_in, c->st_coalesced);
                 c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = c->st_audio_fill = 0;
                 c->st_fill_skip = 0;
-                c->st_out_36 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
+                c->st_out_36 = c->st_out_39 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
                 c->plc_log_next_us = pnow + 60000000ull;
