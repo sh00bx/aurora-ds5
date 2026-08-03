@@ -167,6 +167,26 @@ struct ctm_controller {
                                    * anchor for the synth-covered stale window */
     unsigned long st_fill_dupdrop;/* late reals dropped: their slot was synth-bridged */
     uint32_t last_pace_log_us;    /* last logged paced-drain interval (log-on-change) */
+    /* Rumble slotting (hidraw path, audio active): 0x31/0x32 ride leftover air
+     * slots as a 1-deep latest-wins state instead of jumping past the paced
+     * audio queue into the BT stack FIFO — the one-outstanding wall serializes
+     * EVERYTHING, so an unpaced rumble burst (up to 5/s measured, clustered in
+     * combat) steals ~16ms air slots exactly when audio needs them. */
+    uint8_t rumble_slot[2][MAX_REPORT]; /* [0]=0x31 [1]=0x32 */
+    size_t rumble_slot_len[2];
+    int rumble_rr;                /* round-robin cursor between the two slots */
+    uint64_t last_rumble_write_us;
+    uint32_t rumble_min_us;       /* min gap between rumble writes while audio active */
+    uint64_t audio_last_us;       /* last 0x36/0x39 write: gates rumble slotting */
+    unsigned long st_rumble_coal; /* rumble states overwritten latest-wins */
+    unsigned long st_stale_drop;  /* queued audio dropped by the post-outage trim */
+    /* Adaptive pad latency: extra ms over the slider while the link is hot
+     * (fill bridging stalls). Slewed in the pump loop, applied per report by
+     * ds5_patch_output via ctm_controller_adapt_latency_ms(). */
+    int adapt_enabled;
+    volatile uint32_t adapt_lat_add_ms;
+    uint64_t adapt_hot_until_us;
+    uint64_t adapt_slew_next_us;
     uint64_t plc_fill_next_us;    /* when the next audio frame is due (0 = idle) */
     uint32_t plc_fill_interval_us;/* target inter-frame period (~DS5 100 Hz) */
     unsigned long st_audio_fill;  /* synthesized (transport-loss) conceal frames */
@@ -850,6 +870,23 @@ static int plc_fill_arm_real(ctm_controller_t *c, const uint8_t *data, size_t le
     return stale;
 }
 
+/* Account for a queued audio report dropped WITHOUT being written (post-outage
+ * stale trim): advance the fill's counter anchor and shrink the synth debt so
+ * plc_fill_arm_real's stale window stays aligned with what actually reached
+ * the pad — otherwise a trimmed in-window frame would leave the debt too high
+ * and the NEXT (fresh) frame would be mistaken for a bridged slot. */
+static void plc_note_dropped_audio(ctm_controller_t *c, const uint8_t *data, size_t len)
+{
+    if (!c->plc_fill_enabled || !data || len < 12) return;
+    uint8_t ctr;
+    if (data[0] == 0x39 && len == 547) ctr = data[9];
+    else if (data[0] == 0x36) ctr = data[10];
+    else return;
+    if (c->plc_repeat > 0) c->plc_repeat--;
+    c->plc_real_ctr = ctr;
+    c->st_stale_drop++;
+}
+
 /* Returns 1 if the report must be DROPPED (a late real for a slot the fill
  * already bridged — see plc_fill_arm_real), 0 to write it. */
 static int ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
@@ -1000,8 +1037,18 @@ static int plc_inject_synth(ctm_controller_t *c)
         c->plc_repeat++;
         c->st_reports_out++;
         c->st_audio_fill++;
+        /* A bridged stall = the pad buffer dipped: arm the adaptive latency
+         * window (slewed in the pump loop) for the next 10s. */
+        c->adapt_hot_until_us = now_us() + 10000000ull;
     }
     return sent;
+}
+
+/* Extra pad-buffer ms the adaptive controller wants on top of the user's
+ * latency slider right now. Read by ds5_patch_output per outbound report. */
+uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c)
+{
+    return c ? c->adapt_lat_add_ms : 0;
 }
 
 /* Patch (via the ops hook) then write one report to the device, mutex-guarded.
@@ -1010,8 +1057,8 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
 {
     if (!c || c->hid_fd < 0 || !data || len == 0) return -1;
     switch (data[0]) {
-        case 0x36: c->st_out_36++; break;
-        case 0x39: c->st_out_39++; break;
+        case 0x36: c->st_out_36++; c->audio_last_us = now_us(); break;
+        case 0x39: c->st_out_39++; c->audio_last_us = now_us(); break;
         case 0x31: c->st_out_31++; break;
         case 0x32: c->st_out_32++; break;
         default:   c->st_out_other++; break;
@@ -1025,8 +1072,10 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
     }
     if (ds5_audio_plc(c, patched, patched_len)) {
         /* Late real for a slot the fill already bridged: dropping it keeps the
-         * pad's rate-matched buffer level (the synth already fed that slot). */
-        return 0;
+         * pad's rate-matched buffer level (the synth already fed that slot).
+         * rc 2 tells drain_paced no air slot was consumed, so it flushes a
+         * stale run at loop speed instead of burning 16ms pace ticks on it. */
+        return 2;
     }
     if (c->plc_fill_enabled && patched_len >= 12 &&
         (patched[0] == 0x36 || patched[0] == 0x39)) {
@@ -1136,9 +1185,16 @@ static void drain_paced(ctm_controller_t *c, queued_report_t *q, int *head, int 
     if (*next_us == 0) *next_us = now;
     while (*count > 0 && now >= *next_us) {
         queued_report_t *r = &q[*head];
-        (void)hid_write_report(c, r->data, r->len);
+        int rc = hid_write_report(c, r->data, r->len);
         *head = (*head + 1) % PACED_QUEUE_CAP;
         (*count)--;
+        if (rc == 2) {
+            /* Dup-dropped stale frame: no air slot consumed — don't advance
+             * the pace grid, so a run of stale frames flushes immediately and
+             * the fresh audio behind it isn't delayed by phantom slots. */
+            now = now_us();
+            continue;
+        }
         if (pace_us == 0) pace_us = 10667;
         *next_us += pace_us;
         if (*next_us + pace_us < now) *next_us = now + pace_us;
@@ -2018,6 +2074,34 @@ static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
             (void)hid_write_fd_raw(c, fd, payload, h->payload_len);
         } else if (should_pace(host_cfg, h, payload, h->payload_len)) {
             queue_paced(paced_q, paced_head, paced_count, payload, h->payload_len);
+            /* Post-outage stale trim: after a long stall the burst of late
+             * audio is history the pad already glitched through — playing it
+             * all parks its length as PERMANENT extra speaker latency. Keep
+             * ~85ms (4 x 0x39) and drop the oldest, with the fill's counter
+             * anchor kept aligned (plc_note_dropped_audio). */
+            while (*paced_count > 4) {
+                queued_report_t *r = &paced_q[*paced_head];
+                plc_note_dropped_audio(c, r->data, r->len);
+                *paced_head = (*paced_head + 1) % PACED_QUEUE_CAP;
+                (*paced_count)--;
+            }
+        } else if (!c->acl_tx && payload && h->payload_len >= 8 &&
+                   h->payload_len <= MAX_REPORT &&
+                   (payload[0] == 0x31 || payload[0] == 0x32) &&
+                   now_us() - c->audio_last_us < 150000ull) {
+            /* Rumble/SetState while an audio stream is live on the hidraw
+             * path: park in the 1-deep latest-wins slot instead of writing
+             * immediately — a direct write jumps past the paced audio queue
+             * into the BT stack FIFO and steals a ~16ms one-outstanding air
+             * slot exactly when audio needs it (combat = rumble bursts = the
+             * measured dropout windows). The pump loop writes the slot into
+             * leftover air slots (see the drain block). Without live audio
+             * (menus, DS4, 0x36/0x39 idle) this branch never taken -> direct
+             * write, byte-identical to the old behavior. */
+            int s = payload[0] == 0x31 ? 0 : 1;
+            if (c->rumble_slot_len[s]) c->st_rumble_coal++;
+            memcpy(c->rumble_slot[s], payload, h->payload_len);
+            c->rumble_slot_len[s] = h->payload_len;
         } else {
             (void)hid_write_report(c, payload, h->payload_len);
         }
@@ -2199,6 +2283,53 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                     eff_pace_us, host_cfg.bt_pace_us);
         }
         drain_paced(c, paced_q, &paced_head, &paced_count, &next_paced_us, eff_pace_us);
+        /* Rumble rides leftover air slots (stored latest-wins in
+         * handle_message): one write per tick, never just before a due audio
+         * slot, and rate-capped while audio is live — the ~62/s
+         * one-outstanding budget leaves ~15 slots/s beside 46.9/s of 0x39, so
+         * a sustained rumble stream physically cannot go faster without
+         * starving audio. Latest-wins makes the cap lossless for state
+         * (newest rumble always wins); envelope steps in between coalesce. */
+        if (c->rumble_slot_len[0] || c->rumble_slot_len[1]) {
+            uint64_t rnow = now_us();
+            int audio_live = rnow - c->audio_last_us < 150000ull;
+            uint64_t min_gap = audio_live ? c->rumble_min_us : 16000ull;
+            int audio_due_soon = paced_count > 0 && next_paced_us != 0 &&
+                                 next_paced_us <= rnow + 4000;
+            if (!audio_due_soon && rnow - c->last_rumble_write_us >= min_gap) {
+                for (int k = 0; k < 2; k++) {
+                    int s = (c->rumble_rr + k) & 1;
+                    if (!c->rumble_slot_len[s]) continue;
+                    (void)hid_write_report(c, c->rumble_slot[s], c->rumble_slot_len[s]);
+                    c->rumble_slot_len[s] = 0;
+                    c->rumble_rr = s ^ 1;
+                    c->last_rumble_write_us = rnow;
+                    break;
+                }
+            }
+        }
+        /* Adaptive pad latency: slider baseline while the link is clean; when
+         * the fill has to bridge stalls (adapt_hot_until_us armed in
+         * plc_inject_synth), raise the pad's jitter buffer by up to +40ms in
+         * ~1.25s, decay ~8ms/s after 10s of quiet. Applied per outbound
+         * report by ds5_patch_output via ctm_controller_adapt_latency_ms —
+         * the same live-patch path the manual slider uses. */
+        if (c->adapt_enabled) {
+            uint64_t anow = now_us();
+            if (c->adapt_slew_next_us == 0 || anow >= c->adapt_slew_next_us) {
+                c->adapt_slew_next_us = anow + 250000ull;
+                uint32_t target = anow < c->adapt_hot_until_us ? 40u : 0u;
+                uint32_t cur = c->adapt_lat_add_ms;
+                if (cur < target) {
+                    cur = cur + 8 > target ? target : cur + 8;
+                } else if (cur > target) {
+                    cur = cur >= 2 ? cur - 2 : 0;
+                }
+                if (cur != c->adapt_lat_add_ms) {
+                    c->adapt_lat_add_ms = cur;
+                }
+            }
+        }
         if (fb_enabled && c->acl_tx) {
             uint64_t fnow = now_us();
             if (fb_next_us == 0) {
@@ -2266,15 +2397,18 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 if (c->acl_tx) {
                     ds5_acl_tx_stats(c->acl_tx, &inj, &drp, &rdy);
                 }
-                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu dupdrop=%lu fillskip=%lu capdrop=%lu | out36=%lu out39=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
+                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu dupdrop=%lu fillskip=%lu capdrop=%lu | out36=%lu out39=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu | rcoal=%lu stale=%lu adapt=%u",
                         c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_fill_dupdrop, c->st_fill_skip, c->st_audio_capdrop,
                         c->st_out_36, c->st_out_39, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
                         rdy, inj, drp,
                         c->st_hid_ok, c->st_hid_eagain, c->st_hid_recovered, c->st_hid_dropped,
-                        c->st_dedup_skipped, c->st_reports_in, c->st_coalesced);
+                        c->st_dedup_skipped, c->st_reports_in, c->st_coalesced,
+                        c->st_rumble_coal, c->st_stale_drop, (unsigned)c->adapt_lat_add_ms);
                 c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = c->st_audio_fill = 0;
                 c->st_fill_skip = 0;
                 c->st_fill_dupdrop = 0;
+                c->st_rumble_coal = 0;
+                c->st_stale_drop = 0;
                 c->st_out_36 = c->st_out_39 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
@@ -2322,6 +2456,15 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             uint64_t now = now_us();
             timeout_ms = next_paced_us <= now ? 0 : (int)((next_paced_us - now) / 1000u);
             if (timeout_ms > 50) timeout_ms = 50;
+        }
+        /* Bound the idle sleep by a pending rumble slot's earliest write time
+         * so it lands close to min_gap even without ENet wakeups to ride on. */
+        if (c->rumble_slot_len[0] || c->rumble_slot_len[1]) {
+            uint64_t rnow = now_us();
+            uint64_t due = c->last_rumble_write_us +
+                           (rnow - c->audio_last_us < 150000ull ? c->rumble_min_us : 16000ull);
+            int rto = due <= rnow ? 0 : (int)((due - rnow) / 1000u);
+            if (rto < timeout_ms) timeout_ms = rto;
         }
         /* Bound the idle sleep by the next audio-fill deadline so a run of lost
          * frames (no ENet wakeups to ride on) still gets concealed on time
@@ -2468,6 +2611,22 @@ static void *session_main(void *arg)
         c->plc_fill_interval_us = (uint32_t)fival;
         ctl_log(c, "audio PLC fill %s (%u us)",
                 c->plc_fill_enabled ? "enabled" : "disabled", c->plc_fill_interval_us);
+        /* Rumble min-interval while audio is live (see the drain block). The
+         * one-outstanding budget leaves ~15 rumble slots/s beside 0x39 audio;
+         * 48ms (~21/s) is a slight overdraw the queue absorbs in bursts,
+         * chosen so artzox trigger-kick frames (25ms cadence) coalesce ~2:1
+         * instead of 3:1. */
+        const char *rmenv = getenv("CTM_RUMBLE_MIN_US");
+        long rmv = rmenv ? atol(rmenv) : 48000;
+        if (rmv < 8000) rmv = 8000;
+        if (rmv > 200000) rmv = 200000;
+        c->rumble_min_us = (uint32_t)rmv;
+        /* Adaptive pad latency: default ON, kill switch CTM_ADAPT_LATENCY=0
+         * (then the slider value passes through untouched, as before). */
+        const char *adenv = getenv("CTM_ADAPT_LATENCY");
+        c->adapt_enabled = !adenv || strcmp(adenv, "0") != 0;
+        ctl_log(c, "rumble slotting min=%uus (audio-live), adaptive latency %s",
+                c->rumble_min_us, c->adapt_enabled ? "enabled (+40ms cap)" : "disabled");
         const char *wenv = getenv("CTM_HID_WAIT_MS");
         c->hid_wait_ms = wenv ? atoi(wenv) : 3;
         if (c->hid_wait_ms < 0) {

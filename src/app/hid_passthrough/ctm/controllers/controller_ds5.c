@@ -98,7 +98,11 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
          * user-visible setting >=1ms stays byte-identical; only the unverified
          * 0x00 is never emitted. (The old floor of 20 had been lowered to 0 for
          * low-latency testing.) */
-        uint8_t auto_latency = (uint8_t)(settings->latency_ms < 1 ? 1 : settings->latency_ms);
+        /* Slider + adaptive congestion add (0 while the link is clean),
+         * capped at the byte range. */
+        unsigned auto_lat_eff = settings->latency_ms + ctm_controller_adapt_latency_ms(c);
+        if (auto_lat_eff > 255) auto_lat_eff = 255;
+        uint8_t auto_latency = (uint8_t)(auto_lat_eff < 1 ? 1 : auto_lat_eff);
         uint8_t auto_headset = ds5_volume_raw_byte(settings->headset_volume_percent);
         uint8_t auto_speaker = ds5_volume_raw_byte(settings->speaker_volume_percent);
         while (pos + 2 <= limit) {
@@ -151,7 +155,9 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     uint8_t audio_block = ds5_audio_block_for_mode(settings->audio_mode);
     /* Same 1ms floor as the AUTO branch: 0x00 in the 0x91 latency block is
      * unverified against the DS5 firmware (possible sentinel) — review S6. */
-    uint8_t latency = (uint8_t)(settings->latency_ms < 1 ? 1 : settings->latency_ms);
+    unsigned lat_eff = settings->latency_ms + ctm_controller_adapt_latency_ms(c);
+    if (lat_eff > 255) lat_eff = 255;
+    uint8_t latency = (uint8_t)(lat_eff < 1 ? 1 : lat_eff);
     uint8_t headset_volume = ds5_volume_raw_byte(settings->headset_volume_percent);
     uint8_t speaker_volume = ds5_volume_raw_byte(settings->speaker_volume_percent);
     uint8_t target_headset_volume = 0;

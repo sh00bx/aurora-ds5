@@ -107,6 +107,10 @@ void ctm_controller_plug_out(ctm_controller_t *c);
 void ctm_controller_set_enum_payload(ctm_controller_t *c, const uint8_t *payload, int len);
 void ctm_controller_set_settings(ctm_controller_t *c, const tv_bridge_worker_settings_t *s);
 void ctm_controller_get_settings(ctm_controller_t *c, tv_bridge_worker_settings_t *out);
+/* Adaptive pad latency: extra ms the congestion controller wants on top of the
+ * latency slider right now (0 when the link is clean or the feature is off).
+ * Read by the DS5 patch_output hook per outbound report. */
+uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c);
 void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out);
 /* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
 bool ctm_controller_finished(ctm_controller_t *c);
