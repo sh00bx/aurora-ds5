@@ -18,6 +18,14 @@
  *
  * Called from two threads (SDL main loop for the gamepad state, the ctm session
  * thread for ownership), so the state is mutex-guarded and only sent on change.
+ *
+ * NONE of these calls may ever wait. The SDL main loop is the thread that pumps
+ * every keyboard event, so a send that parks there takes the keyboard down with
+ * it (1.0.58 regression: an AF_UNIX datagram send is flow controlled and blocks
+ * once the daemon's queue is full). The socket is therefore non-blocking, the
+ * syscall runs outside the state lock, and a send that cannot go through is
+ * dropped and retried on the next change. AURORA_DS5_IDLE_LB=0 disables the
+ * signal entirely.
  */
 
 /* A passthrough session has taken/released this pad (the host owns the bar). */
