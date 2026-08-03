@@ -11,10 +11,15 @@
  *
  *   passthrough session owns the pad -> daemon must not paint (the host does)
  *   held open as one of our SDL pads  -> dark red
- *   connected but unused             -> dark blue
+ *   connected but unused             -> no selection at all: a clear-selection
+ *                                       datagram (ctrl 0x03) restores the
+ *                                       daemon's boot-configured default
+ *                                       (DS5_IDLE_LIGHTBAR, including "off")
+ *                                       instead of overwriting it with a colour
  *
  * We never paint here. The daemon stays the only writer on the pad; this just
- * selects. Best-effort: with no daemon the datagram goes nowhere.
+ * selects (the two claimed states go out as a ctrl 0x02 colour overlay).
+ * Best-effort: with no daemon the datagram goes nowhere.
  *
  * Called from two threads (SDL main loop for the gamepad state, the ctm session
  * thread for ownership), so the state is mutex-guarded and only sent on change.
@@ -28,11 +33,15 @@
  * signal entirely.
  */
 
-/* A passthrough session has taken/released this pad (the host owns the bar). */
+/* A passthrough session has taken (true) / released (false) a pad. Counted,
+ * not a flag: sessions run one per pad, so each session must call this exactly
+ * once with true and once with false; the bar counts as owned while ANY
+ * session still holds a claim. */
 void ds5_idle_lb_set_owned(bool owned);
 
 /* We hold at least one DualSense open as an SDL gamepad. */
 void ds5_idle_lb_set_sdl_open(bool open);
 
-/* Shutdown: hand the bar back to the "connected, unused" colour. */
+/* Shutdown: drop every claim (the owned count resets to 0) and hand the bar
+ * back to the daemon's own default. */
 void ds5_idle_lb_release(void);

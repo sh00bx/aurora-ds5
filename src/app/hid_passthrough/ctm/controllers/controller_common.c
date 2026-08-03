@@ -501,6 +501,12 @@ static int open_hid(ctm_controller_t *c, ctmb_device_caps_t *caps,
     caps->output_report_len = 1024;
     caps->feature_report_len = 64;
     caps->flags = 1;
+    if (c->ops && strcmp(c->ops->kind, "ds5") == 0) {
+        /* This client accepts batched 0x39 DS5 audio output reports (the
+         * controller_ds5.c patch path handles the doubled sub-blocks), so tell
+         * the host it may send them. */
+        caps->flags |= CTMB_DEVCAP_DS5_AUDIO_0X39;
+    }
     snprintf(caps->path, sizeof(caps->path), "%s", path);
     snprintf(caps->serial, sizeof(caps->serial), "%s", c->dev.mac);
     snprintf(caps->manufacturer, sizeof(caps->manufacturer), "hidraw");
@@ -794,6 +800,21 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
      * have to be doubled. Until that is done and measured, a 0x39 stream simply
      * runs without concealment — which is also the cleaner baseline for the
      * transport A/B, since it removes a synthesiser from the measurement. */
+    if (data && len >= 1 && data[0] == 0x39) {
+        /* Mid-session switch to the batched form: disarm BOTH 0x36 caches.
+         * Left armed, the timer-driven synth would keep re-injecting the stale
+         * cached 0x36 into the live 0x39 stream for up to ~150 ms (plc_repeat
+         * cap), and the in-place splice cache (plc_have/plc_audio) would patch
+         * a minute-old Opus block into the first audio-less 0x36 after a
+         * switch BACK — with a freshly re-armed repeat budget. A later return
+         * to 0x36 re-arms cleanly from the first real frame. */
+        c->plc_have36 = 0;
+        c->plc_fill_next_us = 0;
+        c->plc_have = 0;
+        c->plc_audio_len = 0;
+        c->plc_repeat = 0;
+        return;
+    }
     if (!c->plc_enabled || !data || len < 12 || data[0] != 0x36) {
         return;
     }

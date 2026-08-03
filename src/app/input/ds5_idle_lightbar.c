@@ -13,14 +13,27 @@
 
 #include "logging.h"
 
-/* Control datagram understood by ds5_txd: [A5][5C][02][R][G][B]. */
-#define DS5_ACL_TAG_M0       0xA5
-#define DS5_ACL_TAG_CTRL     0x5C
-#define DS5_ACL_CTRL_IDLE_LB 0x02
+/* Control datagrams understood by ds5_txd:
+ *   [A5][5C][02][R][G][B]  -- app selection: overlay this idle colour
+ *   [A5][5C][03]           -- clear selection: back to the daemon's own
+ *                             boot-configured default (DS5_IDLE_LIGHTBAR,
+ *                             including "off") */
+#define DS5_ACL_TAG_M0        0xA5
+#define DS5_ACL_TAG_CTRL      0x5C
+#define DS5_ACL_CTRL_IDLE_LB  0x02
+#define DS5_ACL_CTRL_LB_CLEAR 0x03
 
-#define LB_UNUSED   0x000002u   /* connected to the TV, nobody using it */
-#define LB_SDL      0x020000u   /* open as one of our SDL gamepads */
-#define LB_OWNED    0x000000u   /* 0 tells the daemon not to paint at all */
+/* What the daemon's idle painter should do. UNUSED is not a colour of ours:
+ * it clears the selection so the operator's configured default shows. */
+typedef enum {
+    LB_OWNED,    /* passthrough session drives the pad (host owns the bar) */
+    LB_SDL,      /* open as one of our SDL gamepads */
+    LB_UNUSED,   /* no claim: daemon's own default */
+    LB_UNKNOWN,  /* nothing sent yet this process lifetime (lb_sent only) */
+} lb_state_t;
+
+#define LB_SDL_RGB   0x020000u   /* dark red */
+#define LB_OWNED_RGB 0x000000u   /* 0 tells the daemon not to paint at all */
 
 /* Bound on how many times one flush may re-send while another thread keeps
  * flipping the state under it. Whoever flips last runs its own flush, so the
@@ -36,25 +49,33 @@ static pthread_mutex_t lb_state_lock = PTHREAD_MUTEX_INITIALIZER;
  * each other. Taken alone, never together with lb_state_lock held. */
 static pthread_mutex_t lb_send_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static bool lb_owned = false;
+/* Counted, not boolean: every passthrough session acquires on start and
+ * releases on stop, and with two pads bridged one session's stop must not
+ * clear the other's claim. */
+static int lb_owned_count = 0;
 static bool lb_sdl_open = false;
-static uint32_t lb_sent = LB_UNUSED;   /* the daemon's own boot default */
+/* UNKNOWN, not UNUSED: a predecessor instance that crashed mid-session leaves
+ * its selection latched in the daemon (only 0x03 or a daemon restart clears
+ * it). Starting at UNKNOWN makes the first flush send one explicit clear even
+ * when the desired state is UNUSED, so this process always converges the
+ * daemon onto ITS state; the clear is idempotent daemon-side. */
+static lb_state_t lb_sent = LB_UNKNOWN;
 static int lb_fd = -1;                 /* guarded by lb_send_lock */
 static bool lb_disabled = false;       /* AURORA_DS5_IDLE_LB=0 kill switch */
 static bool lb_disabled_read = false;
 
-static uint32_t lb_want_locked(void) {
+static lb_state_t lb_want_locked(void) {
     /* Ownership wins: while a passthrough session drives the pad the host paints
      * the bar, and the daemon must stay off it entirely. Inferring this from
      * daemon-side traffic is NOT good enough -- a session that only writes
      * sporadically looks idle within a second, and the painter then fights the
      * host's colour. Hence an explicit signal. */
-    return lb_owned ? LB_OWNED : (lb_sdl_open ? LB_SDL : LB_UNUSED);
+    return (lb_owned_count > 0) ? LB_OWNED : (lb_sdl_open ? LB_SDL : LB_UNUSED);
 }
 
 /* Send one selection. Caller holds lb_send_lock and no other lock.
  * Returns true only if the datagram actually left. */
-static bool lb_send_one(uint32_t want) {
+static bool lb_send_one(lb_state_t want) {
     if (lb_fd < 0) {
         const char *sp = getenv("DS5_ACL_SOCK");
         const char *sock = (sp && sp[0]) ? sp : "/tmp/ds5_acl.sock";
@@ -89,21 +110,33 @@ static bool lb_send_one(uint32_t want) {
         }
     }
 
-    uint8_t msg[6] = { DS5_ACL_TAG_M0, DS5_ACL_TAG_CTRL, DS5_ACL_CTRL_IDLE_LB,
-                       (uint8_t) (want >> 16), (uint8_t) (want >> 8), (uint8_t) want };
+    /* UNUSED clears our selection (3-byte 0x03) instead of overwriting the
+     * daemon's configured colour; the other two states select an overlay
+     * colour (6-byte 0x02). */
+    uint8_t msg[6] = { DS5_ACL_TAG_M0, DS5_ACL_TAG_CTRL, DS5_ACL_CTRL_LB_CLEAR };
+    size_t mlen = 3;
+    if (want != LB_UNUSED) {
+        uint32_t rgb = (want == LB_OWNED) ? LB_OWNED_RGB : LB_SDL_RGB;
+        msg[2] = DS5_ACL_CTRL_IDLE_LB;
+        msg[3] = (uint8_t) (rgb >> 16);
+        msg[4] = (uint8_t) (rgb >> 8);
+        msg[5] = (uint8_t) rgb;
+        mlen = 6;
+    }
+    const char *name = (want == LB_OWNED) ? "owned" : (want == LB_SDL ? "sdl" : "clear");
     ssize_t w;
     do {
-        w = send(lb_fd, msg, sizeof msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+        w = send(lb_fd, msg, mlen, MSG_DONTWAIT | MSG_NOSIGNAL);
     } while (w < 0 && errno == EINTR);
 
-    if (w == (ssize_t) sizeof msg) {
-        commons_log_debug("Input", "DS5 idle lightbar -> %06x", want);
+    if (w == (ssize_t) mlen) {
+        commons_log_debug("Input", "DS5 idle lightbar -> %s", name);
         return true;
     }
     if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         /* Daemon queue full. The bar is cosmetic -- never wait on it. The
          * selection stays un-sent and the next state change retries. */
-        commons_log_debug("Input", "DS5 idle lightbar %06x skipped: daemon queue full", want);
+        commons_log_debug("Input", "DS5 idle lightbar %s skipped: daemon queue full", name);
         return false;
     }
     /* Peer gone/replaced (daemon restart): drop the fd so the next attempt
@@ -123,7 +156,7 @@ static void lb_flush(void) {
     pthread_mutex_lock(&lb_send_lock);
     for (int round = 0; round < LB_FLUSH_MAX_ROUNDS; round++) {
         pthread_mutex_lock(&lb_state_lock);
-        uint32_t want = lb_want_locked();
+        lb_state_t want = lb_want_locked();
         bool need = (want != lb_sent);
         pthread_mutex_unlock(&lb_state_lock);
 
@@ -156,7 +189,13 @@ static void lb_check_disabled(void) {
 void ds5_idle_lb_set_owned(bool owned) {
     lb_check_disabled();
     pthread_mutex_lock(&lb_state_lock);
-    lb_owned = owned;
+    if (owned) {
+        lb_owned_count++;
+    } else if (lb_owned_count > 0) {
+        /* Clamped at 0: an unbalanced release must not go negative and wedge
+         * a later session's claim. */
+        lb_owned_count--;
+    }
     pthread_mutex_unlock(&lb_state_lock);
     lb_flush();
 }
@@ -172,7 +211,8 @@ void ds5_idle_lb_set_sdl_open(bool open) {
 void ds5_idle_lb_release(void) {
     lb_check_disabled();
     pthread_mutex_lock(&lb_state_lock);
-    lb_owned = false;
+    /* Whole-app shutdown: drop every session's claim, not just one. */
+    lb_owned_count = 0;
     lb_sdl_open = false;
     pthread_mutex_unlock(&lb_state_lock);
     lb_flush();

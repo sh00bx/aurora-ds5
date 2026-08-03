@@ -29,6 +29,12 @@ enum ctmb_message_type {
 /* ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host). */
 #define CTMB_HOSTCFG_PACE_FEEDBACK 0x01u
 
+/* ctmb_device_caps_t.flags capability bits (TV -> host, in HELLO).
+ * Bit 0 is the pre-existing always-set "1".
+ *   DS5_AUDIO_0X39 — this client accepts batched 0x39 DS5 audio output
+ *   reports (two Opus frames + two coil blocks per report). */
+#define CTMB_DEVCAP_DS5_AUDIO_0X39 0x0002u
+
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;

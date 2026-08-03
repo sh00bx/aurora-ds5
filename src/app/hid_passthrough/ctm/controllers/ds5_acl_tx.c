@@ -50,6 +50,7 @@ struct ds5_acl_tx {
 
     pthread_t poll_thread;
     int poll_started;
+    int lb_owned_held;      /* this session holds one idle-lightbar claim */
     int wake_pipe[2];       /* stop() -> mon thread: wake the blocking poll() */
     volatile int running;
     volatile int ready;
@@ -226,7 +227,11 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
     /* This session owns the pad's lightbar from here on: the host paints it, so
      * the daemon's idle painter must stay off. It cannot infer this on its own
      * -- a session that writes only sporadically looks idle to it within a
-     * second, and it would then repaint over the host's colour. */
+     * second, and it would then repaint over the host's colour. The claim is
+     * counted per session (one acquire here, one release in stop, gated by
+     * lb_owned_held), so with two pads bridged one session's stop cannot clear
+     * the other's ownership. */
+    t->lb_owned_held = 1;
     ds5_idle_lb_set_owned(true);
     acl_log(t, "raw-ACL forwarder ON: sock=%s tag=%s (root ds5_txd does the inject)",
             sock, t->tagged ? machex : "none(legacy)");
@@ -375,7 +380,12 @@ void ds5_acl_tx_stop(ds5_acl_tx_t *t)
         return;
     }
     t->running = 0;
-    ds5_idle_lb_set_owned(false);   /* hand the bar back to the idle painter */
+    if (t->lb_owned_held) {
+        /* Release exactly the one claim this session took in start; the flag
+         * keeps a repeated stop from decrementing another session's claim. */
+        t->lb_owned_held = 0;
+        ds5_idle_lb_set_owned(false);   /* hand the bar back to the idle painter */
+    }
     if (t->wake_pipe[1] >= 0) {
         ssize_t wr = write(t->wake_pipe[1], "x", 1);
         (void)wr;
