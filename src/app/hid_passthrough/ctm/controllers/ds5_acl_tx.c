@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include "ds5_acl_tx.h"
+#include "input/ds5_idle_lightbar.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -222,6 +223,11 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
         return NULL;
     }
     t->poll_started = 1;
+    /* This session owns the pad's lightbar from here on: the host paints it, so
+     * the daemon's idle painter must stay off. It cannot infer this on its own
+     * -- a session that writes only sporadically looks idle to it within a
+     * second, and it would then repaint over the host's colour. */
+    ds5_idle_lb_set_owned(true);
     acl_log(t, "raw-ACL forwarder ON: sock=%s tag=%s (root ds5_txd does the inject)",
             sock, t->tagged ? machex : "none(legacy)");
     return t;
@@ -369,6 +375,7 @@ void ds5_acl_tx_stop(ds5_acl_tx_t *t)
         return;
     }
     t->running = 0;
+    ds5_idle_lb_set_owned(false);   /* hand the bar back to the idle painter */
     if (t->wake_pipe[1] >= 0) {
         ssize_t wr = write(t->wake_pipe[1], "x", 1);
         (void)wr;
