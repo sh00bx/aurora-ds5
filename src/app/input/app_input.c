@@ -2,6 +2,7 @@
 #include "logging.h"
 #include "app.h"
 #include "input_gamepad_mapping.h"
+#include "input_gamepad.h"
 
 #include "lvgl/lv_sdl_drv_input.h"
 
@@ -33,6 +34,10 @@ void app_input_init(app_input_t *input, app_t *app) {
 }
 
 void app_input_deinit(app_input_t *input) {
+    /* Before SDL tears the joystick subsystem down: quitting must not leave the
+     * pad on the in-use lightbar colour (SDL_QuitSubSystem closes the
+     * controllers without routing them through app_input_close_gamepad). */
+    app_input_ds5_idle_lightbar_release();
     app_input_deinit_gamepad_mapping(input);
     if (input->blank_cursor_surface->userdata != NULL) {
         SDL_FreeCursor(input->blank_cursor_surface->userdata);

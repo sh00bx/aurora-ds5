@@ -1,6 +1,11 @@
 #include "input_gamepad.h"
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <SDL_version.h>
 #include <Limelight.h>
 #include <assert.h>
@@ -15,6 +20,70 @@ static int new_gamepad_state_index(app_input_t *input, SDL_GameController *contr
 static short next_gamepad_gs_id(app_input_t *input);
 
 static bool is_same_gamepad(const app_gamepad_state_t *state, SDL_GameController *controller);
+
+/* --- DS5 idle lightbar ----------------------------------------------------
+ * ds5_txd paints the lightbar of a pad that is CONNECTED BUT UNUSED. It cannot
+ * tell that state apart from "connected and driven by our own SDL input",
+ * because SDL talks to the pad through the kernel and never through the
+ * daemon's socket -- from the daemon's side both look equally idle.
+ *
+ * So we do not paint here; we just tell the daemon which colour to use. That
+ * keeps a single writer on the pad: two independent painters would fight every
+ * keep-alive tick. While a passthrough session is feeding the daemon, the host
+ * owns the bar and the painter is silent regardless of what we selected here.
+ *
+ * Best-effort throughout: no daemon (or an older one) simply means no colour
+ * change, which is what happened before this existed. */
+#define DS5_IDLE_LB_UNUSED  0x000002u   /* connected to the TV, nobody using it */
+#define DS5_IDLE_LB_SDL     0x020000u   /* open as one of OUR SDL gamepads */
+
+#define DS5_ACL_TAG_M0      0xA5
+#define DS5_ACL_TAG_CTRL    0x5C
+#define DS5_ACL_CTRL_IDLE_LB 0x02
+
+static int ds5_sdl_open_count = 0;   /* DS5s we hold open via SDL */
+
+static bool joystick_is_ds5(SDL_Joystick *joystick) {
+#if SDL_VERSION_ATLEAST(2, 0, 6)
+    if (joystick == NULL) {
+        return false;
+    }
+    if (SDL_JoystickGetVendor(joystick) != 0x054C) {
+        return false;
+    }
+    Uint16 product = SDL_JoystickGetProduct(joystick);
+    return product == 0x0CE6 /* DualSense */ || product == 0x0DF2 /* DualSense Edge */;
+#else
+    (void) joystick;
+    return false;
+#endif
+}
+
+static void ds5_idle_lightbar_send(uint32_t rgb) {
+    const char *sp = getenv("DS5_ACL_SOCK");
+    const char *sock = (sp && sp[0]) ? sp : "/tmp/ds5_acl.sock";
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return;
+    }
+    struct sockaddr_un dst;
+    memset(&dst, 0, sizeof dst);
+    dst.sun_family = AF_UNIX;
+    snprintf(dst.sun_path, sizeof dst.sun_path, "%s", sock);
+    uint8_t msg[6] = { DS5_ACL_TAG_M0, DS5_ACL_TAG_CTRL, DS5_ACL_CTRL_IDLE_LB,
+                       (uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb };
+    ssize_t w = sendto(fd, msg, sizeof msg, 0, (struct sockaddr *) &dst, sizeof dst);
+    close(fd);
+    commons_log_debug("Input", "DS5 idle lightbar -> %06x (%s)", rgb, w == (ssize_t) sizeof msg ? "sent" : "no daemon");
+}
+
+void app_input_ds5_idle_lightbar_release(void) {
+    if (ds5_sdl_open_count <= 0) {
+        return;
+    }
+    ds5_sdl_open_count = 0;
+    ds5_idle_lightbar_send(DS5_IDLE_LB_UNUSED);
+}
 
 #ifdef TARGET_WEBOS
 static bool str_contains_ci(const char *haystack, const char *needle);
@@ -50,6 +119,9 @@ bool app_input_init_gamepad(app_input_t *input, int device_index) {
         assert(state->gs_id >= 0);
         input->activeGamepadMask |= 1 << state->gs_id;
         input->gamepads_count++;
+        if (joystick_is_ds5(joystick) && ++ds5_sdl_open_count == 1) {
+            ds5_idle_lightbar_send(DS5_IDLE_LB_SDL);
+        }
         return true;
     } else {
         commons_log_warn("Input", "Unrecognized game controller %s. GUID: %s", name, guidstr);
@@ -76,7 +148,12 @@ void app_input_close_gamepad(app_input_t *input, SDL_JoystickID sdl_id) {
         SDL_HapticClose(state->haptic);
     }
 #endif
+    /* Classify BEFORE the close: afterwards the joystick handle is gone. */
+    bool was_ds5 = joystick_is_ds5(SDL_GameControllerGetJoystick(state->controller));
     SDL_GameControllerClose(state->controller);
+    if (was_ds5 && ds5_sdl_open_count > 0 && --ds5_sdl_open_count == 0) {
+        ds5_idle_lightbar_send(DS5_IDLE_LB_UNUSED);
+    }
     commons_log_info("Input", "Controller #%d disconnected, sdl_id: %d", state->gs_id, sdl_id);
     app_input_gamepad_state_deinit(state);
 }

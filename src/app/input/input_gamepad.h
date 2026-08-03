@@ -35,3 +35,8 @@ void app_input_gamepad_state_deinit(app_gamepad_state_t *state);
 app_gamepad_state_t *app_input_gamepad_state_by_index(app_input_t *input, int index);
 
 app_gamepad_state_t *app_input_gamepad_state_by_instance_id(app_input_t *input, SDL_JoystickID instance_id);
+
+/* Hand the DS5 idle lightbar back to its "connected, unused" colour. Called on
+ * input shutdown so quitting the app does not leave the pad on the in-use
+ * colour; the per-controller open/close path does this on its own. */
+void app_input_ds5_idle_lightbar_release(void);
