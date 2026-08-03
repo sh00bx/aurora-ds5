@@ -151,13 +151,22 @@ struct ctm_controller {
      * rate-matched speaker buffer does not drain. Off = classic behaviour. */
     int plc_fill_enabled;
     int plc_have36;               /* plc_last36 holds a valid cached report */
-    uint8_t plc_seq;              /* rolling 4-bit seq for synthesized frames */
+    uint8_t plc_seq;              /* UNUSED since 08-03 (synths draw tx_audio_seq) */
     uint16_t plc_last36_len;
     /* Whole-frame cache. 260 was too small for a full 0x36 (config blocks +
      * >=100-byte audio block(s) + CRC easily exceed it), which silently kept
      * plc_have36 at 0 and made the fill a no-op; 1024 covers any BT 0x36. */
     uint8_t plc_last36[1024];     /* last real 0x36-with-audio report, verbatim */
     uint64_t plc_last_real_us;    /* arrival time of the last real audio frame */
+    uint8_t tx_audio_seq;         /* client-authoritative 4-bit BT seq for 0x36/0x39:
+                                   * real frames and fill synths draw ONE monotonic
+                                   * counter, so a fill can never overtake a late real
+                                   * frame (the 2026-07-08 fill regression class). */
+    uint8_t plc_real_ctr;         /* host audio packet counter of the newest REAL
+                                   * audio frame (0x36 byte 10 / 0x39 byte 9) — the
+                                   * anchor for the synth-covered stale window */
+    unsigned long st_fill_dupdrop;/* late reals dropped: their slot was synth-bridged */
+    uint32_t last_pace_log_us;    /* last logged paced-drain interval (log-on-change) */
     uint64_t plc_fill_next_us;    /* when the next audio frame is due (0 = idle) */
     uint32_t plc_fill_interval_us;/* target inter-frame period (~DS5 100 Hz) */
     unsigned long st_audio_fill;  /* synthesized (transport-loss) conceal frames */
@@ -792,31 +801,89 @@ static int apply_output_settings(ctm_controller_t *c, uint8_t *data, size_t *len
     return c->ops->patch_output(c, data, len_io);
 }
 
-static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
+/* Effective fill slot period: the batched 0x39 carries TWO 10.67ms frames per
+ * report, so slots come at twice the configured (0x36-scale) interval. Valid
+ * only while plc_have36 is armed (reads the cached report id). */
+static inline uint32_t plc_fill_eff_us(const ctm_controller_t *c)
 {
-    /* 0x36 only, deliberately: the batched 0x39 form carries two Opus frames and
-     * two coil blocks per report, so both the sub-block walk below (which assumes
-     * one payload per header) and the timer-driven synth cadence (~10 ms) would
-     * have to be doubled. Until that is done and measured, a 0x39 stream simply
-     * runs without concealment — which is also the cleaner baseline for the
-     * transport A/B, since it removes a synthesiser from the measurement. */
+    return (c->plc_have36 && c->plc_last36[0] == 0x39)
+        ? c->plc_fill_interval_us * 2u : c->plc_fill_interval_us;
+}
+
+/* Fill bookkeeping for a REAL audio-carrying frame about to be written; also
+ * the LATE-vs-LOST discriminator. Network stalls here are mostly jitter: the
+ * "missing" frames arrive late, AFTER the fill already bridged their slots.
+ * Writing them too would double-feed the pad's rate-matched speaker buffer
+ * (~5 stalls/min measured -> unbounded buffer creep). The host audio packet
+ * counter (0x36 byte 10 stride 1, 0x39 byte 9 stride 2) tells the cases
+ * apart: a late real for a bridged slot carries a counter inside the
+ * synth-covered window [real_ctr+step .. real_ctr+step*repeat] -> DROP it
+ * (returns 1) and shrink the debt; a fresh post-loss frame jumped past the
+ * window -> forward it and clear the debt. Either way the frame is the newest
+ * real content: it re-arms the cache and the fill clock. */
+static int plc_fill_arm_real(ctm_controller_t *c, const uint8_t *data, size_t len,
+                             uint8_t ctr, uint8_t step)
+{
+    int stale = 0;
+    if (c->plc_have36 && c->plc_repeat > 0) {
+        uint8_t d = (uint8_t)(ctr - c->plc_real_ctr);
+        if (d != 0 && d <= (uint8_t)(step * c->plc_repeat)) {
+            stale = 1;
+            c->plc_repeat--;
+            c->st_fill_dupdrop++;
+        }
+    }
+    if (!stale) c->plc_repeat = 0;
+    if (len <= sizeof(c->plc_last36)) {
+        memcpy(c->plc_last36, data, len);
+        c->plc_last36_len = (uint16_t)len;
+        c->plc_have36 = 1;
+        c->plc_real_ctr = ctr;
+        uint64_t now = now_us();
+        c->plc_last_real_us = now;
+        c->plc_fill_next_us = now + plc_fill_eff_us(c);
+    } else {
+        /* Frame bigger than the cache: fill silently degrades to off.
+         * Counted so the 60s PLC line makes that visible. */
+        c->st_fill_skip++;
+    }
+    return stale;
+}
+
+/* Returns 1 if the report must be DROPPED (a late real for a slot the fill
+ * already bridged — see plc_fill_arm_real), 0 to write it. */
+static int ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
+{
+    /* Batched 0x39: the in-place splice conceal below stays 0x36-only (a sent
+     * 0x39 always carries two host-encoded Opus blocks, so the audio-less case
+     * it patches does not exist), but the timer-driven FILL is armed here —
+     * cache the whole report for re-injection on a transport gap, at the
+     * doubled slot period (plc_fill_eff_us) and halved repeat cap. Fixed
+     * offsets instead of the sub-block walk: the 0x39 length byte deliberately
+     * names ONE block while two follow (bit 6 in the id), so the walk cannot
+     * parse it — layout is [0]=0x39 [1]=seq [2]=0x91 ... [140]=0xD3 (Opus). */
     if (data && len >= 1 && data[0] == 0x39) {
-        /* Mid-session switch to the batched form: disarm BOTH 0x36 caches.
-         * Left armed, the timer-driven synth would keep re-injecting the stale
-         * cached 0x36 into the live 0x39 stream for up to ~150 ms (plc_repeat
-         * cap), and the in-place splice cache (plc_have/plc_audio) would patch
-         * a minute-old Opus block into the first audio-less 0x36 after a
-         * switch BACK — with a freshly re-armed repeat budget. A later return
-         * to 0x36 re-arms cleanly from the first real frame. */
-        c->plc_have36 = 0;
-        c->plc_fill_next_us = 0;
+        /* Splice cache stays disarmed either way: left armed, it would patch a
+         * minute-old Opus block into the first audio-less 0x36 after a switch
+         * back to the unbatched form. A return to 0x36 re-arms cleanly. */
         c->plc_have = 0;
         c->plc_audio_len = 0;
-        c->plc_repeat = 0;
-        return;
+        if (!c->plc_enabled || !c->plc_fill_enabled) {
+            c->plc_have36 = 0;
+            c->plc_fill_next_us = 0;
+            c->plc_repeat = 0;
+            return 0;
+        }
+        if (len == 547 && data[140] == 0xD3) {
+            return plc_fill_arm_real(c, data, len, data[9], 2);
+        }
+        /* Unexpected 0x39 shape: don't cache (a malformed synth would
+         * repeat), counted so the 60s PLC line makes that visible. */
+        c->st_fill_skip++;
+        return 0;
     }
     if (!c->plc_enabled || !data || len < 12 || data[0] != 0x36) {
-        return;
+        return 0;
     }
 
     size_t limit = len - 4;
@@ -831,7 +898,7 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
             break;
         }
         if (blen > limit - pos) {
-            return;
+            return 0;
         }
         if (id >= 0x93 && id <= 0x96 && plen >= 100) {
             audio_present = 1;
@@ -845,37 +912,26 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
         blocks_end = pos;
     }
     if (audio_present) {
-        c->plc_repeat = 0;
         /* Cache the whole frame for timer-driven loss concealment and rearm the
-         * "next frame due" clock. Runs only for real arrivals (synth frames
-         * bypass this path), so the cache never feeds on itself. */
+         * "next frame due" clock (plc_fill_arm_real; runs only for real
+         * arrivals — synth frames bypass this path, so the cache never feeds
+         * on itself). Counter at byte 10, stride 1 per report. */
         if (c->plc_fill_enabled) {
-            if (len <= sizeof(c->plc_last36)) {
-                memcpy(c->plc_last36, data, len);
-                c->plc_last36_len = (uint16_t)len;
-                c->plc_have36 = 1;
-                c->plc_seq = (uint8_t)(data[1] >> 4);
-                uint64_t now = now_us();
-                c->plc_last_real_us = now;
-                c->plc_fill_next_us = now + c->plc_fill_interval_us;
-            } else {
-                /* Frame bigger than the cache: fill silently degrades to off.
-                 * Counted so the 60s PLC line makes that visible. */
-                c->st_fill_skip++;
-            }
+            return plc_fill_arm_real(c, data, len, data[10], 1);
         }
-        return;
+        c->plc_repeat = 0;
+        return 0;
     }
     c->st_audio_omit++;
     if (!c->plc_have || c->plc_repeat >= 12) {
         c->st_audio_capdrop++;
-        return;
+        return 0;
     }
 
     size_t al = c->plc_audio_len;
     if (blocks_end + al > limit) {
         c->st_audio_capdrop++;
-        return;
+        return 0;
     }
     /* Append concealed audio after the last known block, not before haptics. */
     memcpy(&data[blocks_end], c->plc_audio, al);
@@ -886,31 +942,45 @@ static void ds5_audio_plc(ctm_controller_t *c, uint8_t *data, size_t len)
     ctm_bt_sign_output(data, len);
     c->plc_repeat++;
     c->st_audio_conceal++;
+    return 0;
 }
 
-/* Re-inject the last real 0x36 audio frame to fill a transport gap (a frame the
- * air dropped), keeping the DS5's rate-matched speaker buffer topped up. Bumps
- * the 4-bit BT sequence (byte 1 high nibble) so the DS5 accepts it as fresh,
- * re-signs, and rides the same raw-ACL path as real reports. Capped by
- * plc_repeat so a sustained outage (>~12 frames) stops repeating stale audio.
+/* Re-inject the last real audio frame (0x36 or batched 0x39) to fill a
+ * transport gap, keeping the DS5's rate-matched speaker buffer topped up.
+ * Stamps the shared client BT seq + a fresh audio packet counter, re-signs,
+ * and rides the same output path as real reports. Capped by plc_repeat
+ * (~128ms of bridged outage either form) so a sustained outage stops
+ * repeating stale audio.
  * When: the pump loop, once per overdue audio slot. Returns 1 if injected. */
 static int plc_inject_synth(ctm_controller_t *c)
 {
     if (!c->plc_fill_enabled || !c->plc_have36 || c->plc_last36_len < 12) return 0;
-    if (c->plc_repeat >= 12) return 0;
+    /* Same ~128ms outage budget for both forms: 12 x 10.67ms or 6 x 21.33ms. */
+    if (c->plc_repeat >= (c->plc_last36[0] == 0x39 ? 6 : 12)) return 0;
     size_t n = c->plc_last36_len;
     uint8_t rep[sizeof(c->plc_last36)];
     if (n > sizeof(rep)) return 0;
     memcpy(rep, c->plc_last36, n);
-    /* Sequence nibble (byte 1 high): continue +1 from the LAST REAL frame's
-     * seq. The host's counter keeps advancing for frames the air dropped, so
-     * when real audio resumes its seq is (last_real + lost + 1) — always ahead
-     * of our synths (we inject at most one per lost slot, and start a slot
-     * late), so the resumed real frame never collides with a synth seq and
-     * always wins. Preserve the low nibble verbatim (it is part of the frame
-     * the host signed, not ours to zero). */
-    c->plc_seq = (uint8_t)((c->plc_seq + 1u) & 0x0fu);
-    rep[1] = (uint8_t)((c->plc_seq << 4) | (rep[1] & 0x0fu));
+    /* Sequence nibble (byte 1 high): draw from the SAME client-authoritative
+     * counter hid_write_report stamps real frames with. The old scheme
+     * (continue +1 from the last real frame's HOST seq) assumed lost frames —
+     * under jitter the "lost" frames arrive LATE, still carrying the host seq
+     * the synth already used, and the pad rejects them as stale (the 07-08
+     * fill regression: valid CRC, silent speaker). One shared monotonic
+     * counter makes that collision impossible by construction. Preserve the
+     * low nibble verbatim (part of the host-signed frame, not ours to zero). */
+    c->tx_audio_seq = (uint8_t)((c->tx_audio_seq + 1u) & 0x0fu);
+    rep[1] = (uint8_t)((c->tx_audio_seq << 4) | (rep[1] & 0x0fu));
+    /* Audio packet counter: advance past the last REAL frame by the per-report
+     * stride (0x36 byte 10 stride 1, 0x39 byte 9 stride 2) so the pad
+     * sequences the synth as fresh audio instead of a duplicate. A late real
+     * for a bridged slot then lands INSIDE this window and is dropped by
+     * plc_fill_arm_real, so the pad's buffer never double-feeds. */
+    if (rep[0] == 0x39) {
+        if (n > 9) rep[9] = (uint8_t)(c->plc_real_ctr + 2u * (uint8_t)(c->plc_repeat + 1));
+    } else {
+        if (n > 10) rep[10] = (uint8_t)(c->plc_real_ctr + (uint8_t)(c->plc_repeat + 1));
+    }
     ctm_bt_sign_output(rep, n);
 
     int sent = 0;
@@ -953,7 +1023,24 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
     if (apply_output_settings(c, patched, &patched_len)) {
         return 0;
     }
-    ds5_audio_plc(c, patched, patched_len);
+    if (ds5_audio_plc(c, patched, patched_len)) {
+        /* Late real for a slot the fill already bridged: dropping it keeps the
+         * pad's rate-matched buffer level (the synth already fed that slot). */
+        return 0;
+    }
+    if (c->plc_fill_enabled && patched_len >= 12 &&
+        (patched[0] == 0x36 || patched[0] == 0x39)) {
+        /* Client-authoritative BT seq (byte 1 high nibble): real audio frames
+         * and fill synths (plc_inject_synth) draw one monotonic 4-bit counter,
+         * so a synth can never overtake a late-arriving real frame — the 07-08
+         * fill regression class. Only while fill is enabled: with the kill
+         * switch set the host's own seq passes through untouched. Re-sign
+         * unconditionally — the settings patch only re-CRCs when it changed a
+         * byte, and the stamp above always does. */
+        c->tx_audio_seq = (uint8_t)((c->tx_audio_seq + 1u) & 0x0fu);
+        patched[1] = (uint8_t)((c->tx_audio_seq << 4) | (patched[1] & 0x0fu));
+        ctm_bt_sign_output(patched, patched_len);
+    }
     if (c->dedup_enabled && patched_len >= 8 && patched[0] == 0x31) {
         /* TTL on the dedup match: DS5_ACL_TX_SENT only means the datagram reached
          * the root daemon; the daemon can still drop the frame latest-wins on a
@@ -2092,11 +2179,24 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             int rdy_ = 0;
             ds5_acl_tx_stats(c->acl_tx, &ij_, &dp_, &rdy_);
             if (rdy_ && eff_pace_us > 8000) eff_pace_us = 8000;
-        } else if (eff_pace_us > 8000) {
-            /* hidraw path: tighten to 8 ms (~125/s) to stay above DS5's 100 Hz audio
-             * clock. The hidraw write blocks on BT slot anyway, so over-scheduling
-             * wastes nothing — the kernel serializes for us. */
-            eff_pace_us = 8000;
+        } else {
+            /* hidraw path: pace the drain at 3/4 of the host's ADVERTISED
+             * cadence. The old hard 8ms clamp assumed "the hidraw write blocks
+             * on BT slot anyway, so the kernel serializes for us" — false: the
+             * fd is O_NONBLOCK and never pushes back (0 EAGAIN over 24k writes,
+             * 08-03), so a backlog shoved in at 8ms just parks in the BT
+             * stack's invisible one-outstanding queue where the PLC-fill gate
+             * (paced_count == 0) cannot see it and would synth on top of it.
+             * 3/4 of the legacy 10667 advert is exactly the old 8000, so a
+             * pre-0x39 host is bit-identical; a batched host advertising 21334
+             * drains at 16ms ~= the one-outstanding service rate. */
+            uint32_t adv = eff_pace_us ? eff_pace_us : 10667;
+            eff_pace_us = (adv * 3u) / 4u;
+        }
+        if (eff_pace_us != c->last_pace_log_us) {
+            c->last_pace_log_us = eff_pace_us;
+            ctl_log(c, "paced drain interval %u us (host advertises %u us)",
+                    eff_pace_us, host_cfg.bt_pace_us);
         }
         drain_paced(c, paced_q, &paced_head, &paced_count, &next_paced_us, eff_pace_us);
         if (fb_enabled && c->acl_tx) {
@@ -2135,7 +2235,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             uint64_t fnow = now_us();
             if (fnow - c->plc_last_real_us < active_us) {
                 if (c->plc_fill_next_us == 0)
-                    c->plc_fill_next_us = c->plc_last_real_us + c->plc_fill_interval_us;
+                    c->plc_fill_next_us = c->plc_last_real_us + plc_fill_eff_us(c);
                 int guard = 0;
                 while (fnow >= c->plc_fill_next_us && guard++ < 4) {
                     if (!plc_inject_synth(c)) {
@@ -2144,12 +2244,12 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                          * in the past makes the poll-timeout bound below 0 and
                          * busy-spins this RT thread until the 150ms activity
                          * window expires. */
-                        c->plc_fill_next_us = fnow + c->plc_fill_interval_us;
+                        c->plc_fill_next_us = fnow + plc_fill_eff_us(c);
                         break;
                     }
-                    c->plc_fill_next_us += c->plc_fill_interval_us;
-                    if (c->plc_fill_next_us + c->plc_fill_interval_us < fnow)
-                        c->plc_fill_next_us = fnow + c->plc_fill_interval_us;
+                    c->plc_fill_next_us += plc_fill_eff_us(c);
+                    if (c->plc_fill_next_us + plc_fill_eff_us(c) < fnow)
+                        c->plc_fill_next_us = fnow + plc_fill_eff_us(c);
                     fnow = now_us();
                 }
             } else {
@@ -2166,14 +2266,15 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                 if (c->acl_tx) {
                     ds5_acl_tx_stats(c->acl_tx, &inj, &drp, &rdy);
                 }
-                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu fillskip=%lu capdrop=%lu | out36=%lu out39=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
-                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_fill_skip, c->st_audio_capdrop,
+                ctl_log(c, "PLC/60s: audio_omit=%lu conceal=%lu fill=%lu dupdrop=%lu fillskip=%lu capdrop=%lu | out36=%lu out39=%lu out31=%lu out32=%lu outX=%lu have36=%d | acl_ready=%d inj=%ld drop=%ld | hid ok=%lu eagain=%lu recov=%lu drop=%lu | dedup31=%lu | in=%lu coal=%lu",
+                        c->st_audio_omit, c->st_audio_conceal, c->st_audio_fill, c->st_fill_dupdrop, c->st_fill_skip, c->st_audio_capdrop,
                         c->st_out_36, c->st_out_39, c->st_out_31, c->st_out_32, c->st_out_other, c->plc_have36,
                         rdy, inj, drp,
                         c->st_hid_ok, c->st_hid_eagain, c->st_hid_recovered, c->st_hid_dropped,
                         c->st_dedup_skipped, c->st_reports_in, c->st_coalesced);
                 c->st_audio_omit = c->st_audio_conceal = c->st_audio_capdrop = c->st_audio_fill = 0;
                 c->st_fill_skip = 0;
+                c->st_fill_dupdrop = 0;
                 c->st_out_36 = c->st_out_39 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
                 c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
                 c->st_dedup_skipped = 0;
@@ -2343,14 +2444,25 @@ static void *session_main(void *arg)
          * interval targets the DS5's ~100 Hz audio clock (10 ms); a lost frame
          * that leaves a slot unfilled past one interval is re-injected. */
         const char *fenv = getenv("CTM_AUDIO_PLC_FILL");
-        /* DEFAULT OFF (2026-07-08, bisect regression from 82bd673f): once the
-         * 0x36 cache grew 260->1024 the timer-driven synth actually fires, and
-         * on links with frequent BT coex gaps its bumped seq nibble overtakes
-         * the real frames' seq -> the DS5 rejects the real audio as out-of-order
-         * -> valid-CRC-but-silent speaker/haptics. Opt-in only (CTM_AUDIO_PLC_FILL=1). */
-        c->plc_fill_enabled = c->plc_enabled && fenv && strcmp(fenv, "1") == 0;
+        /* DEFAULT ON again (2026-08-03). The 07-08 bisect regression (synth seq
+         * nibble overtakes LATE — not lost — real frames, the DS5 rejects the
+         * real audio as out-of-order: valid-CRC-but-silent speaker/haptics) is
+         * designed out by the client-authoritative tx_audio_seq: real frames
+         * and synths draw ONE monotonic counter, so the collision cannot occur.
+         * Daemon-free hidraw needs the fill — the measured network jitter tail
+         * (delay_max 54–67ms EVERY minute) exceeds a 60ms pad buffer, and
+         * hidraw catch-up is capped at ~1.33x realtime (vs raw-ACL's NOCP
+         * burst), so an unbridged stall is an audible dropout. Kill switch:
+         * CTM_AUDIO_PLC_FILL=0. */
+        c->plc_fill_enabled = c->plc_enabled && (!fenv || strcmp(fenv, "0") != 0);
         const char *fienv = getenv("CTM_AUDIO_PLC_FILL_US");
-        int fival = fienv ? atoi(fienv) : 10000;
+        /* Default 16000 = 1.5x the 0x36 slot period (10667; 0x39 doubles both
+         * via plc_fill_eff_us -> 32000 vs 21334). The old 10000 default sat
+         * BELOW the real cadence, so every marginally-late real frame drew a
+         * synth — a duplicate-injection storm on a jittery link. 1.5 slots
+         * means a synth fires only for a genuinely stalled slot, still early
+         * enough to bridge a 60ms pad buffer. */
+        int fival = fienv ? atoi(fienv) : 16000;
         if (fival < 5000) fival = 5000;
         if (fival > 20000) fival = 20000;
         c->plc_fill_interval_us = (uint32_t)fival;
