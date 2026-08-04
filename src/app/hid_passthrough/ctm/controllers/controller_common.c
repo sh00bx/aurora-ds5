@@ -2590,17 +2590,25 @@ static void *session_main(void *arg)
          * interval targets the DS5's ~100 Hz audio clock (10 ms); a lost frame
          * that leaves a slot unfilled past one interval is re-injected. */
         const char *fenv = getenv("CTM_AUDIO_PLC_FILL");
-        /* DEFAULT ON again (2026-08-03). The 07-08 bisect regression (synth seq
-         * nibble overtakes LATE — not lost — real frames, the DS5 rejects the
-         * real audio as out-of-order: valid-CRC-but-silent speaker/haptics) is
-         * designed out by the client-authoritative tx_audio_seq: real frames
-         * and synths draw ONE monotonic counter, so the collision cannot occur.
-         * Daemon-free hidraw needs the fill — the measured network jitter tail
-         * (delay_max 54–67ms EVERY minute) exceeds a 60ms pad buffer, and
-         * hidraw catch-up is capped at ~1.33x realtime (vs raw-ACL's NOCP
-         * burst), so an unbridged stall is an audible dropout. Kill switch:
-         * CTM_AUDIO_PLC_FILL=0. */
-        c->plc_fill_enabled = c->plc_enabled && (!fenv || strcmp(fenv, "0") != 0);
+        /* DEFAULT OFF again since 1.3.1 — the latency slider is the truth.
+         *
+         * The fill was built for the daemon-free path, where a network stall
+         * landed on top of 30–67ms of air jitter and blew past a 60ms pad
+         * buffer. With the raw-ACL transport shipping in this IPK that air hop
+         * is gone, and a stall inside the buffer's own budget needs no synthetic
+         * frame at all. Leaving it on was not free: its trigger is purely
+         * receive-side (a real 0x39 more than plc_fill_eff_us late, measured
+         * from ARRIVAL — the transport does not enter), so it kept firing at
+         * 2–5/s on ordinary network jitter, and every single fire re-armed the
+         * adaptive latency ramp below for 10s. Measured over a 14-minute Ratchet
+         * session: 1317 fills, ramp pinned at +40ms the entire time, i.e. a
+         * slider set to 60 silently ran at 100.
+         *
+         * The 07-08 seq regression it once had (synth nibble overtakes LATE real
+         * frames -> valid-CRC-but-silent pad) stays designed out by the
+         * client-authoritative tx_audio_seq, so turning it back on is safe:
+         * CTM_AUDIO_PLC_FILL=1, which is what the daemon-free fallback wants. */
+        c->plc_fill_enabled = c->plc_enabled && fenv && strcmp(fenv, "1") == 0;
         const char *fienv = getenv("CTM_AUDIO_PLC_FILL_US");
         /* Default 16000 = 1.5x the 0x36 slot period (10667; 0x39 doubles both
          * via plc_fill_eff_us -> 32000 vs 21334). The old 10000 default sat
@@ -2624,10 +2632,19 @@ static void *session_main(void *arg)
         if (rmv < 8000) rmv = 8000;
         if (rmv > 200000) rmv = 200000;
         c->rumble_min_us = (uint32_t)rmv;
-        /* Adaptive pad latency: default ON, kill switch CTM_ADAPT_LATENCY=0
-         * (then the slider value passes through untouched, as before). */
+        /* Adaptive pad latency: DEFAULT OFF since 1.3.1 — the slider value now
+         * passes through untouched and means what it says.
+         *
+         * One bridged stall armed this for 10s (see plc_inject_synth), so with
+         * fills running at a few per second it never decayed and simply added a
+         * permanent +40ms on top of whatever the user had dialled in. That was
+         * defensible while the daemon-free path had to absorb the air-jitter
+         * tail; it is not defensible now that the transport removes that tail,
+         * because it hands the latency straight back. Opt in with
+         * CTM_ADAPT_LATENCY=1 (only useful together with CTM_AUDIO_PLC_FILL=1,
+         * since nothing else arms it). */
         const char *adenv = getenv("CTM_ADAPT_LATENCY");
-        c->adapt_enabled = !adenv || strcmp(adenv, "0") != 0;
+        c->adapt_enabled = adenv && strcmp(adenv, "1") == 0;
         ctl_log(c, "rumble slotting min=%uus (audio-live), adaptive latency %s",
                 c->rumble_min_us, c->adapt_enabled ? "enabled (+40ms cap)" : "disabled");
         const char *wenv = getenv("CTM_HID_WAIT_MS");
