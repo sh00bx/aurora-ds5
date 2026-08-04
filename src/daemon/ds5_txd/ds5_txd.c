@@ -191,6 +191,15 @@
  * the app merely selects. (While an app IS feeding us the host owns the bar and
  * the painter is silent anyway, so this never competes with a live session.) */
 #define ACL_CTRL_IDLE_LB    0x02
+/* Code 0x03 = clear the app's idle-lightbar selection, [A5][5C][03] (n>=3, no
+ * payload). 0x02 used to OVERWRITE the daemon's one colour global, so a single
+ * SDL open/close cycle in the app permanently discarded the operator's
+ * DS5_IDLE_LIGHTBAR env config (including "off" — the app re-enabled a painter
+ * the operator disabled). Boot and app state are now split (see
+ * g_idle_lb_boot/_app): 0x02 keeps its exact 6-byte wire format but only sets
+ * the APP SELECTION; the client sends 0x03 for "connected, unused" so the boot
+ * default comes back instead of the app echoing a literal colour. */
+#define ACL_CTRL_IDLE_LB_CLEAR 0x03
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -240,8 +249,29 @@ static int injectable(uint8_t id){ return id==0x31 || id==0x32 || id==0x36 || id
 #define IDLE_LB_BURST        3
 #define IDLE_LB_BURST_MS     1000
 #define IDLE_LB_KEEPALIVE_MS 30000
+/* The painter's demand gate (tx_demand) only sees OUR unix-socket datagrams;
+ * kernel/hidraw writers (the app seeding pre-readiness, a non-Aurora app like
+ * Kodi setting the LED, hid-playstation itself) never stamp last_demand, and
+ * painting over them raw-injects 0x31 frames interleaved with the kernel's
+ * writes on the same L2CAP channel (the documented two-writer oscillation).
+ * session_seen DOES see them (on-air MON_ACL_TX), so additionally require this
+ * much on-air OUTPUT silence before painting. Residual limitation: a hidraw
+ * app that writes once and then never again is indistinguishable from idle
+ * without traffic and will still be repainted after the quiet window. */
+#define IDLE_LB_HIDRAW_QUIET_MS 5000
 
-static uint32_t g_idle_lb_rgb = IDLE_LB_RGB_DEFAULT;
+/* Painter colour state is SPLIT so the app can never destroy the operator's
+ * boot configuration (a single global here let one ctrl-0x02 overwrite it for
+ * the rest of the daemon's life). Boot value 0 = painter disabled, operator
+ * wins regardless of any app selection; an app selection of 0 means "paint
+ * nothing" (the app owns the idle bar) and is honored. All three are
+ * main-thread-only (env parse, ctrl handler and painter run on main). */
+static uint32_t g_idle_lb_boot    = IDLE_LB_RGB_DEFAULT; /* DS5_IDLE_LIGHTBAR */
+static uint32_t g_idle_lb_app     = 0;  /* ctrl-0x02 selection (iff _set) */
+static int      g_idle_lb_app_set = 0;  /* cleared by ctrl-0x03 / restart */
+static uint32_t idle_lb_effective(void){
+    return g_idle_lb_boot==0 ? 0 : (g_idle_lb_app_set ? g_idle_lb_app : g_idle_lb_boot);
+}
 
 static uint32_t ds5_crc32_update(uint32_t crc, const uint8_t *d, size_t n){
     for(size_t i=0;i<n;i++){
@@ -683,12 +713,20 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
  * mismatch means the slot moved, so we skip (return -2) rather than buzz the wrong
  * pad. NULL (legacy untagged -> primary link) skips the check, unchanged.
  *
+ * `from_app` separates APP-driven traffic (unix-socket datagrams, via
+ * process_report/drain_fifo) from the daemon's OWN idle-lightbar paints: only
+ * the former stamps session_seen. The painter's keep-alive period equals
+ * SESSION_IDLE_MS, so letting its paints count as session output made an idle
+ * pad's keep-alives self-refresh the session forever — page scan stayed
+ * suppressed (or flip-flopped) while a connected-but-unused pad sat there,
+ * exactly the stuck-scan regression session_seen exists to fix.
+ *
  * Returns:  1 = injected (L->outstanding++),
  *           0 = credit window full (caller may queue or drop),
  *          -1 = template invalidated (foreign handle / EBADF; *reason set, caller
  *               must publish_all() + log),
  *          -2 = no live template (L->have==0) or the routed slot was rebound. */
-static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, int maxq, const char **reason, const uint8_t *expect){
+static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, int maxq, const char **reason, const uint8_t *expect, int from_app){
     uint8_t frame[1+8+1+ACL_MAX_REPORT];
     int r=-2;
     int is_rumble=!is_audio_report(rep[0]);
@@ -696,9 +734,11 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
     int rcap = (maxq/2)>0 ? (maxq/2) : 1;
     pthread_mutex_lock(&g_lock);
     if(L->have && (!expect || memcmp(L->bound_addr,expect,6)==0)){
-        L->session_seen=now_ms();   /* the app is driving this live link: session traffic
-                                     * (stamped even when the credit window blocks us —
-                                     * congestion is not the end of a session) */
+        if(from_app)
+            L->session_seen=now_ms();   /* the app is driving this live link: session traffic
+                                         * (stamped even when the credit window blocks us —
+                                         * congestion is not the end of a session). Painter
+                                         * paints (from_app==0) are NOT a session — see above. */
         uint16_t hh=(uint16_t)((L->hdr[0]|(L->hdr[1]<<8))&0x0fff);
         if(g_htab[hh].known && memcmp(g_htab[hh].addr,L->bound_addr,6)!=0){
             L->have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
@@ -773,7 +813,7 @@ static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval,
             L->drop_total++;                        /* age-out is a real loss: keep it visible to the host servo */
             continue;                               /* stale pre-pause audio: drop */
         }
-        int r=inject_one(L,rawfd,L->fifo[idx].buf,L->fifo[idx].len,maxq,reason,expect);
+        int r=inject_one(L,rawfd,L->fifo[idx].buf,L->fifo[idx].len,maxq,reason,expect,1 /* FIFO holds app audio */);
         if(r==1){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; inj++; L->inj_total++; continue; }
         if(r==-1){ *need_inval=1; fifo_clear(L); }  /* template gone -> drop stale audio */
         else if(r==-2) fifo_clear(L);               /* no template: backlog is already stale */
@@ -1694,7 +1734,10 @@ static void *capture_thread(void *arg){
              * a host drives output to a pad, so unlike inbound input reports this does
              * mean somebody is using the controller — a hidraw-only session must keep
              * scan off exactly as it does today. Our own raw injects are not mirrored
-             * on MONITOR, so this cannot self-refresh. */
+             * on MONITOR, so THIS path cannot self-refresh — but the raw path stamps
+             * session_seen in inject_one() itself, which is why that stamp is gated
+             * on from_app: the idle-lightbar painter's keep-alives (period ==
+             * SESSION_IDLE_MS) would otherwise self-refresh the session forever. */
             L->session_seen=L->last_seen;
             int changed=(L->hdr[0]!=d[0]||L->hdr[1]!=d[1]||L->hdr[6]!=d[6]||L->hdr[7]!=d[7]);
             if(changed && g_htab[hh].known){
@@ -1787,7 +1830,7 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
          * would hand every freed credit to audio within the same wakeup — starvation
          * by ordering, on top of the type-aware window in inject_one(). Rumble itself
          * stays latest-wins on a full window: a stale rumble is wrong. */
-        r=inject_one(L,rawfd,report,n,maxq,&reason,expect);
+        r=inject_one(L,rawfd,report,n,maxq,&reason,expect,1);
         if(r==1){(*injected)++; L->inj_total++;}
         else if(r==-1)need_inval=1;
         else if(r==0)(*paced)++;         /* latest-wins drop */
@@ -1802,7 +1845,7 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
         if(need_inval){
             (*dropped)++; L->drop_total++;   /* template just died; fresh frame is moot */
         } else {
-            r=inject_one(L,rawfd,report,n,maxq,&reason,expect);
+            r=inject_one(L,rawfd,report,n,maxq,&reason,expect,1);
             if(r==1){(*injected)++; L->inj_total++;}
             else if(r==-1){ need_inval=1; fifo_clear(L); }
             else if(r==0){
@@ -1874,16 +1917,18 @@ int main(int argc,char**argv){
 
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
-    {   /* Idle lightbar colour: DS5_IDLE_LIGHTBAR=RRGGBB (hex), "0"/"off" disables. */
+    {   /* Idle lightbar BOOT colour: DS5_IDLE_LIGHTBAR=RRGGBB (hex), "0"/"off"
+         * disables the painter for good — the app's ctrl-0x02 selection can
+         * never override an operator-disabled painter (idle_lb_effective). */
         const char *e=getenv("DS5_IDLE_LIGHTBAR");
         if(e && *e){
-            if(!strcasecmp(e,"off")) g_idle_lb_rgb=0;
+            if(!strcasecmp(e,"off")) g_idle_lb_boot=0;
             else { char *end=NULL; unsigned long v=strtoul(e,&end,16);
-                   if(end && *end=='\0' && v<=0xFFFFFFul) g_idle_lb_rgb=(uint32_t)v;
-                   else fprintf(stderr,"[txd] DS5_IDLE_LIGHTBAR='%s' not RRGGBB hex -> keeping %06x\n",e,g_idle_lb_rgb); }
+                   if(end && *end=='\0' && v<=0xFFFFFFul) g_idle_lb_boot=(uint32_t)v;
+                   else fprintf(stderr,"[txd] DS5_IDLE_LIGHTBAR='%s' not RRGGBB hex -> keeping %06x\n",e,g_idle_lb_boot); }
         }
     }
-    fprintf(stderr,"[txd] forwarder up (cmdguard, %d links): unix=%s tmpl=%s hidfd=%s idle_lb=%06x\n",MAX_LINKS,sock_path,g_tmpl_path,hidfd_path,g_idle_lb_rgb);
+    fprintf(stderr,"[txd] forwarder up (cmdguard, %d links): unix=%s tmpl=%s hidfd=%s idle_lb=%06x\n",MAX_LINKS,sock_path,g_tmpl_path,hidfd_path,g_idle_lb_boot);
 
     /* Event loop: wait on forwarded reports (ufd) AND mount-table changes (minfo)
      * at once, on a 500ms tick.
@@ -1931,13 +1976,14 @@ int main(int argc,char**argv){
          * tracked independently so a 2-pad session shows which pad is starved. */
         uint16_t link_nonce[MAX_LINKS];
         {
-            struct { int have, qd; uint64_t ln, ld; uint16_t nonce; uint64_t rx; uint8_t addr[6]; } sn[MAX_LINKS];
+            struct { int have, qd; uint64_t ln, ld, ss; uint16_t nonce; uint64_t rx; uint8_t addr[6]; } sn[MAX_LINKS];
             uint64_t nowm=now_ms(), other_now;
             pthread_mutex_lock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
                 sn[i].have=g_links[i].have; sn[i].qd=g_links[i].outstanding;
                 sn[i].ln=g_links[i].last_nocp; sn[i].nonce=g_links[i].nonce;
                 sn[i].rx=g_links[i].rx_pkts; sn[i].ld=g_links[i].last_demand;
+                sn[i].ss=g_links[i].session_seen;   /* painter hidraw-quiet gate */
                 memcpy(sn[i].addr,g_links[i].bound_addr,6);
             }
             other_now=g_other_rx;
@@ -1974,25 +2020,40 @@ int main(int argc,char**argv){
                  * when injection stops, so the success signal would mute the real thing. */
                 int tx_demand = sn[i].ld && (nowm - sn[i].ld) < DEMAND_IDLE_MS;
                 /* Idle lightbar (2026-08-03). Same demand signal as the episode
-                 * gate, and for the same reason it is the right one: it says
-                 * whether an APP is driving this pad. While nothing is, the bar
-                 * belongs to the firmware — full-brightness blue, or the orange
-                 * charge indication — and we repaint it dim. The moment demand
-                 * returns the host owns the bar again and we stop touching it,
-                 * so the two writers can never fight over a live link. */
-                if(g_idle_lb_rgb && sn[i].have && !tx_demand){
+                 * gate: it says whether OUR app is driving this pad. While
+                 * nothing is, the bar belongs to the firmware — full-brightness
+                 * blue, or the orange charge indication — and we repaint it dim.
+                 * The moment demand returns the host owns the bar again and we
+                 * stop touching it. But demand alone is blind to kernel/hidraw
+                 * writers (see IDLE_LB_HIDRAW_QUIET_MS), so ALSO require on-air
+                 * output silence via session_seen — which paints no longer
+                 * self-refresh (inject_one's from_app). nowm predates the locked
+                 * snapshot, so guard the unsigned subtraction against a
+                 * session_seen the capture thread stamped in between. */
+                uint32_t lbrgb=idle_lb_effective();
+                if(lbrgb && sn[i].have && !tx_demand &&
+                   nowm>sn[i].ss && nowm-sn[i].ss>=IDLE_LB_HIDRAW_QUIET_MS){
                     if(L->lb_idle_gen!=sn[i].nonce){   /* fresh binding -> fresh burst */
                         L->lb_idle_gen=sn[i].nonce; L->lb_paints=0; L->lb_last_paint=0;
+                    }
+                    /* A hidraw writer painted AFTER our last paint (the quiet gate
+                     * just proved it stopped again): the bar shows the foreign
+                     * colour, so re-arm the burst — otherwise the repaint waits
+                     * out the remainder of the 30 s keep-alive. Mirrors the
+                     * tx_demand re-arm below for the kernel-path writer class. */
+                    if(sn[i].ss>L->lb_last_paint && L->lb_last_paint){
+                        L->lb_paints=0; L->lb_last_paint=0;
                     }
                     uint64_t iv = (L->lb_paints<IDLE_LB_BURST) ? IDLE_LB_BURST_MS : IDLE_LB_KEEPALIVE_MS;
                     if(!L->lb_last_paint || nowm-L->lb_last_paint>=iv){
                         uint8_t lbrep[DS5_BT_OUT_LEN];
                         const char *why=NULL;
-                        ds5_build_lightbar(lbrep,g_idle_lb_rgb,L->lb_seq++);
+                        ds5_build_lightbar(lbrep,lbrgb,L->lb_seq++);
                         /* inject_one takes g_lock itself and re-checks the binding
                          * against the address we snapshotted, so a rebind between
-                         * the snapshot and here cannot paint the wrong pad. */
-                        int lr=inject_one(L,g_rawfd,lbrep,DS5_BT_OUT_LEN,inject_maxq(),&why,sn[i].addr);
+                         * the snapshot and here cannot paint the wrong pad.
+                         * from_app=0: a paint must never count as session output. */
+                        int lr=inject_one(L,g_rawfd,lbrep,DS5_BT_OUT_LEN,inject_maxq(),&why,sn[i].addr,0);
                         /* Log the first paint of each idle stretch: whether this
                          * fires at all is the one thing that cannot be inferred
                          * from the outside. It needs a captured template, and the
@@ -2001,7 +2062,7 @@ int main(int argc,char**argv){
                          * written to the pad at least once. */
                         if(L->lb_paints==0)
                             fprintf(stderr,"[txd] L%d idle lightbar -> %06x (r=%d%s%s)\n",
-                                    i,g_idle_lb_rgb,lr,why?" ":"",why?why:"");
+                                    i,lbrgb,lr,why?" ":"",why?why:"");
                         L->lb_last_paint=nowm; L->lb_paints++;
                     }
                 } else if(tx_demand){
@@ -2063,22 +2124,41 @@ int main(int argc,char**argv){
                  * identity ring and is never injected; an untagged one (legacy/USB)
                  * goes to the PRIMARY link (g_links[0]) — byte-for-byte the old
                  * single-pad path. */
-                /* Control datagram: consumed here, never routed to a link. */
-                if(n>=4 && rep[0]==ACL_TAG_M0 && rep[1]==ACL_TAG_CTRL){
-                    if(rep[2]==ACL_CTRL_FIFO_DEPTH){
+                /* Control datagram: consumed here, never routed to a link.
+                 * n>=3 (not 4): the payload-less IDLE_LB_CLEAR is exactly 3 bytes. */
+                if(n>=3 && rep[0]==ACL_TAG_M0 && rep[1]==ACL_TAG_CTRL){
+                    if(rep[2]==ACL_CTRL_FIFO_DEPTH && n>=4){
                         int nv=(rep[3]==0xFF)?-1:(int)rep[3];
                         if(nv<=FIFO_MAX && nv!=g_fifo_override){
                             g_fifo_override=nv;
                             fprintf(stderr,"[txd] ctrl: audio-FIFO depth override -> %d\n",nv);
                         }
                     } else if(rep[2]==ACL_CTRL_IDLE_LB && n>=6){
+                        /* App SELECTION only — never touches g_idle_lb_boot, so the
+                         * operator's DS5_IDLE_LIGHTBAR (incl. "off") survives any
+                         * app open/close cycle. Re-arm the bursts only when the
+                         * EFFECTIVE colour moved (boot=off keeps the painter dead),
+                         * so the change lands now, not at the next 30 s keep-alive. */
                         uint32_t nv=((uint32_t)rep[3]<<16)|((uint32_t)rep[4]<<8)|rep[5];
-                        if(nv!=g_idle_lb_rgb){
-                            g_idle_lb_rgb=nv;
-                            /* Re-arm every link's burst so the new colour lands now
-                             * instead of at the next 30 s keep-alive. */
-                            for(int i=0;i<MAX_LINKS;i++){ g_links[i].lb_paints=0; g_links[i].lb_last_paint=0; }
-                            fprintf(stderr,"[txd] ctrl: idle lightbar -> %06x\n",nv);
+                        if(!g_idle_lb_app_set || nv!=g_idle_lb_app){
+                            uint32_t was=idle_lb_effective();
+                            g_idle_lb_app=nv; g_idle_lb_app_set=1;
+                            uint32_t eff=idle_lb_effective();
+                            if(eff!=was)
+                                for(int i=0;i<MAX_LINKS;i++){ g_links[i].lb_paints=0; g_links[i].lb_last_paint=0; }
+                            fprintf(stderr,"[txd] ctrl: idle lightbar app selection -> %06x (effective %06x)\n",nv,eff);
+                        }
+                    } else if(rep[2]==ACL_CTRL_IDLE_LB_CLEAR){
+                        /* Drop the app selection; the boot default paints again.
+                         * The client sends this for "connected, unused" instead of
+                         * echoing a literal colour (see the 0x03 define). */
+                        if(g_idle_lb_app_set){
+                            uint32_t was=idle_lb_effective();
+                            g_idle_lb_app_set=0;
+                            uint32_t eff=idle_lb_effective();
+                            if(eff!=was)
+                                for(int i=0;i<MAX_LINKS;i++){ g_links[i].lb_paints=0; g_links[i].lb_last_paint=0; }
+                            fprintf(stderr,"[txd] ctrl: idle lightbar app selection cleared -> boot %06x\n",eff);
                         }
                     }
                     continue;

@@ -15,15 +15,31 @@ by hand, which is exactly what bundling it removes.
 ## Provenance
 
 Upstream: <https://github.com/sh00bx/webos-ds5-raw-acl> (MIT).
-Vendored verbatim from commit **`7bbe0ba`** (`daemon/ds5_txd.c`, 2209 lines) —
-deliberately *not* upstream `main`, because `7bbe0ba` is the revision that
-produced the binary that has been running on the TV, so bundling changes only how
-the daemon gets there and not what it does.
+Vendored verbatim from commit **`d1557da`** (`daemon/ds5_txd.c`).
+
+Until 2026-08-04 this was pinned to **`7bbe0ba`** on the reasoning that it was the
+revision whose binary had been running on the TV, so bundling would change only
+how the daemon gets there and not what it does. That reasoning was sound for the
+transport, but it broke the idle lightbar: the *app* half of the 2026-08-03 deep
+review is already deployed (`312d10a3`), and it speaks the `d1557da` protocol —
+`0x02` with RGB `000000` means "the app owns the bar, do not paint", and the
+selection is taken back with the 3-byte **`0x03`** clear. `7bbe0ba` has neither:
+it keeps one `g_idle_lb_rgb`, so `000000` disables its painter permanently, and
+its ctrl branch gates on `n>=4`, so the 3-byte clear is not even recognised as a
+ctrl message. Observed live: the bar went dark on the first passthrough plug and
+never came back (`[txd] ctrl: idle lightbar -> 000000` in `/tmp/ds5_txd.log`, old
+log format). The two protocol halves have to ship in lockstep; pinning only one
+of them is what "reviewed but never run" turned into here.
+
+`d1557da` also carries the fix that the painter must neither count as session
+traffic nor paint over a live session (`IDLE_LB_HIDRAW_QUIET_MS`), which is the
+second writer the 08-03 review removed.
 
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
-    # md5 c87110415dd38bfeea92ea27444f8e6f, 78412 bytes
+    # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da)
+    # md5 c87110415dd38bfeea92ea27444f8e6f, 78412 bytes   (7bbe0ba, superseded)
 
 Two traps if you ever build it by hand:
 
