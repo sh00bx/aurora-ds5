@@ -1,0 +1,9 @@
+{
+  "id": "com.aurora.gamestream.ds5txd",
+  "description": "Aurora DS5 raw-ACL transport",
+  "services": [
+    {
+      "name": "com.aurora.gamestream.ds5txd"
+    }
+  ]
+}

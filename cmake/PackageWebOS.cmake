@@ -8,6 +8,29 @@ install(DIRECTORY deploy/webos/ DESTINATION . USE_SOURCE_PERMISSIONS PATTERN ".*
         PATTERN "appinfo.json" EXCLUDE)
 install(FILES "${CMAKE_BINARY_DIR}/appinfo.json" DESTINATION .)
 
+# The DS5 raw-ACL transport daemon travels inside the IPK (deploy/webos/services/
+# is picked up by ares-package and becomes usr/palm/services/<id>/), so a user
+# only ever installs Aurora — the daemon used to be scp'd to /var/lib/webosbrew
+# and launched from a hand-placed boot hook.
+#
+# Built by hand rather than with add_executable() on purpose: the goal is to
+# reproduce the exact binary that has been running on the TV, and the app's own
+# build type would add -g and change it. The compile runs from the source
+# directory with a bare file name because gcc stores the path it was given in
+# STT_FILE, and an absolute path would change the output. See
+# src/daemon/ds5_txd/README.md for the reference md5.
+set(DS5_TXD_DIR "${CMAKE_SOURCE_DIR}/src/daemon/ds5_txd")
+set(DS5_TXD_BIN "${CMAKE_BINARY_DIR}/ds5_txd")
+add_custom_command(OUTPUT "${DS5_TXD_BIN}"
+        COMMAND "${CMAKE_C_COMPILER}" -O2 -Wall -Wextra ds5_txd.c -o "${DS5_TXD_BIN}" -lpthread
+        WORKING_DIRECTORY "${DS5_TXD_DIR}"
+        DEPENDS "${DS5_TXD_DIR}/ds5_txd.c"
+        COMMENT "Building ds5_txd (DS5 raw-ACL transport daemon)"
+        VERBATIM)
+add_custom_target(ds5-txd ALL DEPENDS "${DS5_TXD_BIN}")
+add_dependencies(moonlight ds5-txd)
+install(PROGRAMS "${DS5_TXD_BIN}" DESTINATION services/com.aurora.gamestream.ds5txd)
+
 # Generate translations
 foreach (I18N_LOCALE ${I18N_LOCALES})
     string(REPLACE "-" "/" I18N_JSON_DIR "resources/${I18N_LOCALE}")

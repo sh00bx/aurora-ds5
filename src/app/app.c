@@ -27,6 +27,10 @@
 #include "stream/embed_wrapper.h"
 #include "profile/profile_manager.h"
 
+#if TARGET_WEBOS
+#include "platform/webos/ds5_service.h"
+#endif
+
 PCONFIGURATION app_configuration = NULL;
 
 static void quit_confirm_cb(lv_event_t *e);
@@ -93,6 +97,12 @@ int app_init(app_t *app, app_settings_loader *settings_loader, int argc, char *a
     app_ui_init(&app->ui, app);
 
     global = app;
+
+#if TARGET_WEBOS
+    /* Heal the bundled root transport's elevation (an app update always knocks it
+     * back into the jail) and start it. Fire-and-forget on a detached thread. */
+    ds5_service_bootstrap();
+#endif
 
     SS4S_PostInit(argc, argv);
     return 0;

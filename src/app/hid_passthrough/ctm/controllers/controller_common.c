@@ -2549,26 +2549,28 @@ static void *session_main(void *arg)
     uint32_t report_desc_len = 0;
 
     if (c->ops && c->ops->raw_acl_output) {
-        /* DEFAULT OFF since 1.0.60 — daemon-free operation is the product default.
+        /* DEFAULT ON again since 1.3.0 — the daemon ships in this IPK.
          *
-         * The raw-ACL injector existed to bypass the webOS one-outstanding BT-HID
-         * flow control, whose ceiling is ~62 reports/s: the 0x36 audio stream needs
-         * ~94/s and does not fit. Batched 0x39 (ds5_native_audio_batched on the host)
-         * carries two Opus frames per report and was measured at 40.8 reports/s
-         * (2026-08-02 A/B) -- 66% of that ceiling, so the stream fits through plain
-         * hidraw and the bypass is no longer load-bearing.
+         * It was turned OFF in 1.0.60 for one reason only: ds5_txd had to be
+         * hand-installed under /var/lib/webosbrew, so a stock install did not have
+         * it and the default had to work without it. Batched 0x39 made that
+         * viable (40.8 reports/s against the ~62/s one-outstanding ceiling), but
+         * it did not make it better: hidraw still carries 30-67 ms of air jitter,
+         * which is why a 60 ms pad buffer drops out on the daemon-free path and
+         * needs the adaptive-latency ramp to stay clean.
          *
-         * What this costs, deliberately accepted: the credit window no longer
-         * prioritises input over audio under contention (the webOS stack decides),
-         * and the host's pace-feedback servo gets no queue telemetry (it falls back
-         * to its static pace margin -- see the fb_enabled path below).
+         * Now that the daemon travels with the app and elevates itself
+         * (ds5_service.c), the injector is available on a stock install and gets
+         * the default back. Turning it on unconditionally is safe: the forwarder
+         * is inert until the daemon publishes a valid DS5T readiness template, and
+         * ds5_acl_tx.c watches that template live — so a TV without Homebrew
+         * Channel, or one where elevation failed, simply keeps running the
+         * daemon-free hidraw path with the 1.0.61/62 fill, pacing and rumble-
+         * slotting machinery, which stays in place untouched.
          *
-         * REQUIRES 0x39 on the host. With plain 0x36 at ~94/s this path is over the
-         * ceiling by 50% and audio will break up. Set CTM_RAW_ACL=1 to restore the
-         * injector (needs the ds5_txd root daemon) -- kept as the A/B handle, since
-         * hidraw delivery jitter below the ceiling has not been measured. */
+         * CTM_RAW_ACL=0 forces the daemon-free path (the A/B handle, now inverted). */
         const char *env = getenv("CTM_RAW_ACL");
-        if (env && strcmp(env, "1") == 0) {
+        if (!env || strcmp(env, "0") != 0) {
             /* Pass the controller's BT address so the forwarder tags each report
              * to THIS pad's inject link (multi-controller: each DS5 gets its own
              * daemon credit window / template). Empty for USB pads -> legacy
@@ -2578,7 +2580,8 @@ static void *session_main(void *arg)
                     (c->acl_tx && c->dev.mac[0]) ? " mac=" : "",
                     (c->acl_tx && c->dev.mac[0]) ? c->dev.mac : "");
         } else {
-            ctl_log(c, "raw-ACL output disabled (daemon-free hidraw path; needs 0x39 host audio)");
+            ctl_log(c, "raw-ACL output disabled by CTM_RAW_ACL=0 (daemon-free hidraw path; "
+                       "needs 0x39 host audio)");
         }
         const char *penv = getenv("CTM_AUDIO_PLC");
         c->plc_enabled = (!penv || strcmp(penv, "0") != 0);

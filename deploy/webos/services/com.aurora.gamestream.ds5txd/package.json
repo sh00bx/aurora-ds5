@@ -1,0 +1,7 @@
+{
+  "name": "com.aurora.gamestream.ds5txd",
+  "version": "1.0.0",
+  "description": "Aurora DS5 raw-ACL transport",
+  "main": "service.js",
+  "license": "GPL-3.0"
+}
