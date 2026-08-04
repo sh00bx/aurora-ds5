@@ -29,6 +29,11 @@ static void set_string(char **field, const char *value);
 
 static void set_int(int *field, const char *value);
 
+/* Set while parsing when the ini actually carried a use_ntsc_refresh key, so
+ * settings_read() can tell "explicitly off" apart from "written before the key
+ * existed" (see the migration there). */
+static bool settings_seen_ntsc_key = false;
+
 void settings_sync_refresh_rate(app_settings_t *config) {
     settings_reconcile_refresh_rate(config);
 }
@@ -192,8 +197,22 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
 }
 
 bool settings_read(app_settings_t *config) {
+    settings_seen_ntsc_key = false;
     int ret = ini_parse(config->ini_path, (ini_handler) settings_parse, config);
     if (ret == 0) {
+#if defined(TARGET_WEBOS)
+        /* Migration: use_ntsc_refresh is new (upstream v1.1.7). Before it existed we
+         * always forced the fractional NTSC rate for a standard preset fps, so an ini
+         * written by an older build carries e.g. 11988 but no use_ntsc_refresh key.
+         * Without this, reconcile() would read the missing key as "integer wanted" and
+         * silently reset 119.88 Hz to a flat 120 on first launch after the update. */
+        if (!settings_seen_ntsc_key) {
+            int ntsc = settings_ntsc_refresh_rate_x100_for_fps(config->stream.fps);
+            if (ntsc > 0 && config->client_refresh_rate_x100 == ntsc) {
+                config->use_ntsc_refresh = true;
+            }
+        }
+#endif
         settings_reconcile_refresh_rate(config);
     }
     return ret == 0;
@@ -413,6 +432,7 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         }
     } else if (INI_FULL_MATCH("video", "use_ntsc_refresh")) {
         config->use_ntsc_refresh = INI_IS_TRUE(value);
+        settings_seen_ntsc_key = true;
     } else if (INI_FULL_MATCH("video", "smooth_frame_pacing")) {
         config->smooth_frame_pacing = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "soft_recovery")) {
