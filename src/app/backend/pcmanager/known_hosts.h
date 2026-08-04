@@ -27,6 +27,8 @@ typedef struct known_host_t {
     char *mac;
     char *hostname;
     hostport_t *address;
+    int wake_method;
+    char *wake_url;
     bool selected;
     appid_list_t *favs;
     appid_list_t *hidden;

@@ -7,6 +7,7 @@
 #include "app_settings.h"
 #include "stream/input/session_input.h"
 #include "stream/session.h"
+#include "stream/adaptive_bitrate.h"
 #include "embed_wrapper.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
 #include "stream/adaptive_bitrate.h"

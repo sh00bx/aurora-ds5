@@ -10,8 +10,7 @@ This guide explains how to enable developer mode on the TV, build Aurora, and in
 2. [Manual installation](#2-manual-installation)
 3. [Build](#3-build)
 4. [Troubleshooting](#4-troubleshooting)
-5. [HID Passthrough (Experimental)](#5-hid-passthrough-experimental)
-6. [webOS Homebrew (catalog)](#6-webos-homebrew-catalog)
+5. [webOS Homebrew (catalog)](#5-webos-homebrew-catalog)
 
 ---
 
@@ -219,91 +218,8 @@ Aurora does not bundle a Tailscale client on the TV. To reach a PC over Tailscal
 
 The TV and PC do not need to be on the same physical network, but both must reach each other through your tailnet.
 
-### NDL low-latency build (optional, QNED / webOS 7+)
-
-For TVs using the **NDL** decoder (not SMP on C1/C2), you can enable reduced A/V buffering at build time:
-
-```bash
-WEBOS_NDL_LOW_LATENCY=1 ./scripts/webos/build_for_lg.sh
-```
-
-This sets video/audio PTS to zero in the NDL driver. Test on your model before daily use; some sets may show A/V drift.
-
 ---
 
-## 5. HID Passthrough (Experimental)
-
-HID Passthrough sends raw controller HID reports from the TV to **[CTM-USBIP](https://github.com/CTM-Bridge/CTM-USBIP)** on your PC, so Windows sees the manufacturer's native USB driver instead of a virtual Xbox pad from Sunshine.
-
-### PC setup
-
-1. Install **CTM-Bridge-Setup.exe** from the [CTM-USBIP releases](https://github.com/CTM-Bridge/CTM-USBIP/releases).
-2. The installer registers the `ctm-usbip` Windows service (default control port **48054**) and the usbip-win2 driver.
-3. PC and TV must be on the **same LAN** as the Moonlight stream.
-
-### TV setup
-
-1. Pair your controller to the TV via **webOS Settings** (Bluetooth), not inside Aurora.
-2. In Aurora: **Settings → Input → Enable HID Passthrough (Experimental)**.
-3. Start a stream. During streaming, open the status overlay (BACK / gamepad combo) and choose **HID Devices** (next to Virtual Mouse).
-4. In the device list, tap **Plug in** on each gamepad you want bridged to CTM-USBIP on the PC. Use **Plug out** to stop bridging without unpairing the controller from the TV.
-5. Optional: enable **Auto-Plugin** on a controller so it is bridged automatically on the next stream start (and excluded from Moonlight until you plug it out).
-
-Video, audio, keyboard, and mouse still use Moonlight; **only plugged (or auto-plugged) HID gamepads** are sent to CTM-USBIP.
-
-Controllers with HID bridging active are **excluded from Moonlight gamepad emulation** for that slot only; other controllers keep using Moonlight (mixed mode).
-
-> **DS5 controller audio:** prefer **HDMI / TV speakers** for game sound. Speaker or headphone jack via passthrough is experimental — webOS BT pacing, SBC/A2DP routing, and the PC→TV→BT chain often cause crackling or reduced quality. Keep **Audio output → Auto** in the HID panel unless you need pad audio; see [DualSense raw ACL](#dualsense-ds5--optional-raw-acl-output-webos) for optional improvements.
-
-### Supported controllers
-
-| Controller | TV bridge | Host map | Notes |
-|------------|-----------|----------|-------|
-| DualSense / DS4 | `ds5` / `ds4` | Dedicated `.map` files | BT reports translated on the host |
-| Xbox (GIP) | `xbox` | `xbox_gip_*.map` | |
-| Steam Controller Puck | `puck` | `steam_puck_identity.map` | Composite + `CTMB_MSG_ENUM` |
-| Flydigi Apex 4 | `flydigi` | `flydigi_apex4_identity.map` | Enable **Recognize as native Flydigi on PC** in the HID panel |
-| Gamesir / generic | `hid` | `hid_identity.map` | Single-interface passthrough |
-
-### DualSense (DS5) — optional raw ACL output (webOS)
-
-webOS paces Bluetooth HID output **one-outstanding** (~30–40 ms between ACL writes), which degrades DS5 controller audio/haptics (~100 Hz → ~62 Hz with jitter). Aurora integrates an **optional** raw-ACL forwarder (from [PR #18](https://github.com/GuiDev1994/aurora-tv/pull/18)) that bypasses this when a root companion daemon is running.
-
-**Without the daemon:** behavior is unchanged (normal `/dev/hidraw` writes).
-
-**With the daemon:** install and run **`ds5_txd`** from [webos-ds5-raw-acl](https://github.com/sh00bx/webos-ds5-raw-acl) on the TV (root / dev mode). The daemon injects DS5 output reports (0x31/0x32/0x36) directly as HCI ACL packets.
-
-Optional environment variables (defaults shown):
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `CTM_RAW_ACL` | on | Set `0` to disable raw-ACL forwarding |
-| `CTM_AUDIO_PLC` | on | Packet-loss concealment for missing audio blocks in 0x36 |
-| `CTM_HID_WAIT_MS` | `3` | Bounded wait on hidraw `EAGAIN` (0–20 ms) |
-| `CTM_DEDUP` | on | Skip duplicate 0x31 rumble/LED reports |
-| `CTM_RT` | on | Real-time scheduling for I/O threads |
-| `DS5_ACL_SOCK` | `/tmp/ds5_acl.sock` | Daemon inject socket |
-| `DS5_HIDFD_SOCK` | `/tmp/ds5_hidfd.sock` | hidraw fd broker socket |
-
-TV log should show `raw-ACL forward ACTIVE` when the daemon template is ready. Per-controller logs (`/tmp/ctm-*.log`) include `PLC/60s` telemetry every minute.
-
-Build the Windows agent from the vendored submodule: see **[CTM_USBIP.md](CTM_USBIP.md)**.
-
-For other devices that fail on the host, add a `.map` in [CTM-USBIP](https://github.com/CTM-Bridge/CTM-USBIP).
-
-### Developer mode / hidraw access
-
-HID capture reads `/dev/hidraw*`. On developer-mode installs this is typically available to the app. If controllers are not detected, verify nodes exist (e.g. with the standalone [ctm-bridge-webos](https://github.com/CTM-Bridge/ctm-bridge-webos) `--enumerate` tool).
-
-Optional INI keys in `moonlight.ini` under `[input]`:
-
-```ini
-hid_passthrough=true
-hid_passthrough_port=48054
-```
-
----
-
-## 6. webOS Homebrew catalog
+## 5. webOS Homebrew catalog
 
 To list **Aurora** in the [Homebrew Channel](https://webosbrew.org/) app store ([repo.webosbrew.org](https://repo.webosbrew.org/)), submit a PR to [webosbrew/apps-repo](https://github.com/webosbrew/apps-repo) using [`deploy/webosbrew/com.aurora.gamestream.yml`](../deploy/webosbrew/com.aurora.gamestream.yml) and the checklist in **[WEBOS_HOMEBREW.md](WEBOS_HOMEBREW.md)**.

@@ -29,6 +29,13 @@ void app_input_gamepad_set_motion_event_state(app_input_t *input, unsigned short
 void app_input_gamepad_set_controller_led(app_input_t *input, unsigned short controllerNumber, uint8_t r, uint8_t g,
                                           uint8_t b);
 
+void app_input_gamepad_set_adaptive_triggers(app_input_t *input, unsigned short controllerNumber, uint8_t eventFlags,
+                                             uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right);
+
+void app_input_gamepad_set_player_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledValue);
+
+void app_input_gamepad_set_mic_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledState);
+
 app_gamepad_state_t * app_input_gamepad_state_init(app_input_t *input, SDL_GameController *controller);
 void app_input_gamepad_state_deinit(app_gamepad_state_t *state);
 

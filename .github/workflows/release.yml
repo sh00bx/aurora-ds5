@@ -5,13 +5,21 @@ on:
   release:
     types: [ published ]
 
+permissions:
+  contents: write
+
 env:
   BUILD_TYPE: Release
+
+concurrency:
+  group: release-webos-${{ github.event.release.tag_name }}
+  cancel-in-progress: true
 
 jobs:
   release-webos:
     name: Release (webOS)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
       - name: Checkout Source
@@ -24,7 +32,7 @@ jobs:
         with:
           repository: "webosbrew/ares-cli-rs"
           latest: true
-          fileName: "ares-package_*.deb"
+          fileName: "ares-package_*_amd64.deb"
           out-file-path: "temp"
 
       - name: Download Manifest Generator
@@ -32,7 +40,7 @@ jobs:
         with:
           repository: "webosbrew/dev-toolbox-cli"
           latest: true
-          fileName: "webosbrew-toolbox-gen-manifest_*.deb"
+          fileName: "webosbrew-toolbox-gen-manifest_*_amd64.deb"
           out-file-path: "temp"
 
       - name: Update Packages
@@ -46,6 +54,20 @@ jobs:
         with:
           build-type: RelWithDebInfo
 
+      - name: Validate Homebrew Manifest Against Schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST_FILE=$(ls dist/*.manifest.json)
+          echo "Validating ${MANIFEST_FILE}"
+          curl -sSL -o /tmp/HomebrewPackageManifest.schema.json \
+            https://raw.githubusercontent.com/webosbrew/docs/main/schemas/HomebrewPackageManifest.schema.json
+          npx --yes ajv-cli@5 validate \
+            --spec=draft2020 \
+            -s /tmp/HomebrewPackageManifest.schema.json \
+            -d "${MANIFEST_FILE}" \
+            --strict=false
+
       - name: Create Release (webOS)
         id: create_release_webos
         uses: ncipollo/release-action@v1
@@ -57,114 +79,3 @@ jobs:
           omitBody: true
           omitPrereleaseDuringUpdate: true
           artifacts: dist/*.ipk,dist/*_dbgsym.tar.gz,dist/*.manifest.json
-
-  release-raspi:
-    name: Release (Raspberry Pi ${{ matrix.arch }})
-    runs-on: ubuntu-22.04
-
-    strategy:
-      matrix:
-        arch: [ armhf, arm64 ]
-
-    steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Update Packages
-        shell: bash
-        run: sudo apt-get -yq update
-
-      - name: Prepare Sysroot
-        id: pi-sysroot
-        uses: mariotaku/raspbian-sysroot-action@v1.3
-        with:
-          release: bookworm
-          packages: ${{github.workspace}}/scripts/raspi/sysroot-packages.list
-          arch: ${{ matrix.arch }}
-
-      - name: Install Build Tools
-        shell: bash
-        run: sudo apt-get -y -qq install crossbuild-essential-${{ matrix.arch }} cmake gettext
-
-      - name: Create Build Environment
-        run: cmake -E make_directory ${{github.workspace}}/build
-
-      - name: Configure CMake
-        shell: bash
-        working-directory: ${{github.workspace}}/build
-        run: cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DTARGET_RASPI=ON
-          -DCMAKE_TOOLCHAIN_FILE=${{steps.pi-sysroot.outputs.cmake-toolchain}}
-
-      - name: Build
-        working-directory: ${{github.workspace}}/build
-        shell: bash
-        run: cmake --build . --config $BUILD_TYPE
-
-      - name: Package
-        working-directory: ${{github.workspace}}/build
-        run: cpack
-
-      - name: Create Release (Raspberry Pi)
-        id: create_release_raspi
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.event.release.tag_name }}
-          allowUpdates: true
-          omitNameDuringUpdate: true
-          omitBody: true
-          omitPrereleaseDuringUpdate: true
-          artifacts: build/*.deb
-
-  release-steamlink:
-    name: Release (Steam Link)
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Checkout Source
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install Steam Link SDK
-        uses: ./.github/actions/steamlink-sdk
-        with:
-          path: .steamlink-sdk
-
-      - name: Install Build Tools
-        shell: bash
-        run: sudo apt-get -y -qq install cmake gettext
-
-      - name: Create Build Environment
-        run: cmake -E make_directory ${{github.workspace}}/build
-
-      - name: Configure CMake
-        shell: bash
-        working-directory: ${{github.workspace}}/build
-        run: |
-          source ${{github.workspace}}/.steamlink-sdk/setenv.sh
-          cmake $GITHUB_WORKSPACE -DCMAKE_BUILD_TYPE=$BUILD_TYPE
-        env:
-          CMAKE_TOOLCHAIN_FILE: ${{github.workspace}}/.steamlink-sdk/toolchain/steamlink-toolchain.cmake
-
-      - name: Build
-        working-directory: ${{github.workspace}}/build
-        shell: bash
-        run: |
-          source ${{github.workspace}}/.steamlink-sdk/setenv.sh
-          cmake --build . --config $BUILD_TYPE
-          cpack
-
-      - name: Create Release (Steam Link)
-        id: create_release_steamlink
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.event.release.tag_name }}
-          allowUpdates: true
-          omitNameDuringUpdate: true
-          omitBody: true
-          omitPrereleaseDuringUpdate: true
-          artifacts: dist/moonlight-tv_*_steamlink.*

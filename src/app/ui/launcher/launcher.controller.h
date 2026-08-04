@@ -29,6 +29,9 @@ typedef struct launcher_fragment_t {
     lv_obj_t *nav;
     /* Detail area below the top bar; full width, hosts the apps fragment (game rail). */
     lv_obj_t *detail;
+    lv_obj_t *profile_dropdown;
+    /** Profile combobox list open; blocks arrow-key focus changes until closed. */
+    lv_obj_t *active_dropdown;
 
     /* Server selector button shown in the top bar. Click opens the server popup
      * (full PC list with status icons, long-press for context menu). The label
@@ -75,5 +78,8 @@ void launcher_refresh_server_label(launcher_fragment_t *controller);
 
 /** After closing launcher-embedded UI, point keypad/gamepad focus back at the main bar. */
 void launcher_restore_nav_focus(launcher_fragment_t *controller);
+
+/** Wire gamepad/remote navigation for the top-bar profile combobox. */
+void launcher_attach_profile_dropdown_nav(launcher_fragment_t *controller);
 
 extern const lv_fragment_class_t launcher_controller_class;

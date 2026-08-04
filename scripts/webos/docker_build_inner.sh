@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 set -e
 
-apt-get update -qq && apt-get install -y -qq cmake gawk curl git build-essential ca-certificates wget file > /dev/null
+install_apt_packages() {
+    # Docker Desktop on Windows often resolves Ubuntu mirrors to broken IPv6; force IPv4.
+    apt-get -o Acquire::ForceIPv4=true update -qq && \
+      apt-get -o Acquire::ForceIPv4=true install -y -qq cmake gawk curl git build-essential ca-certificates wget file
+}
+
+if ! install_apt_packages > /dev/null 2>&1; then
+    echo "apt-get failed (often Docker DNS). Retrying with public nameservers..."
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    if ! install_apt_packages > /dev/null; then
+        echo "Error: could not install build packages. Check Docker Desktop network/DNS and retry."
+        exit 1
+    fi
+fi
 
 # Install ares-package (required to generate the webOS IPK)
 echo "Installing ares-package..."
@@ -48,12 +61,11 @@ if [ ! -x "${SDK_ROOT}/bin/arm-webos-linux-gnueabi-gcc" ]; then
   exit 1
 fi
 # Build outside the Windows bind mount: cmake try_compile breaks on NTFS/exFAT volumes.
-export CMAKE_BINARY_DIR=/tmp/aurora-webos-build
+export CMAKE_BINARY_DIR="${CMAKE_BINARY_DIR:-/tmp/aurora-webos-build}"
 if [ "${DOCKER_CLEAN_BUILD:-0}" = "1" ]; then
     rm -rf "${CMAKE_BINARY_DIR}"
 fi
 export CI=1
-sed 's/\r$//' ./scripts/webos/apply_ndl_low_latency.sh | bash
 sed 's/\r$//' ./scripts/webos/easy_build.sh | bash -s -- -DCMAKE_BUILD_TYPE=Release
 
 mkdir -p dist

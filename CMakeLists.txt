@@ -1,22 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-execute_process(COMMAND git describe --tags --abbrev=0 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE MOONLIGHT_VERSION ERROR_QUIET)
-if (MOONLIGHT_VERSION)
-    string(STRIP "${MOONLIGHT_VERSION}" MOONLIGHT_VERSION)
-    string(SUBSTRING "${MOONLIGHT_VERSION}" 1 -1 MOONLIGHT_VERSION)
-else ()
-    execute_process(COMMAND curl -s "https://api.github.com/repos/mariotaku/moonlight-tv/releases/latest"
-            OUTPUT_VARIABLE MOONLIGHT_LATEST_RELEASE ERROR_QUIET)
-    string(JSON MOONLIGHT_VERSION GET "${MOONLIGHT_LATEST_RELEASE}" "tag_name")
-    if (MOONLIGHT_VERSION)
-        string(REGEX REPLACE "v([0-9]+)" "\\1" MOONLIGHT_VERSION "${MOONLIGHT_VERSION}")
-    else ()
-        set(MOONLIGHT_VERSION "0.0.0")
-    endif ()
-endif ()
-set(MOONLIGHT_VERSION "1.0.62")
+set(MOONLIGHT_VERSION "1.2.0")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 

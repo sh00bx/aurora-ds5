@@ -28,6 +28,9 @@
 #define MIN_SUPPORTED_GFE_VERSION 3
 #define MAX_SUPPORTED_GFE_VERSION 7
 
+#define WAKE_METHOD_WOL 0
+#define WAKE_METHOD_HTTP 1
+
 typedef struct _SERVER_DATA {
     const char *uuid;
     const char *mac;
@@ -45,6 +48,8 @@ typedef struct _SERVER_DATA {
     int currentGame;
     int serverMajorVersion;
     const char *gsVersion;
+    int wake_method;
+    char *wake_url;
     PDISPLAY_MODE modes;
     SERVER_INFORMATION serverInfo;
 } SERVER_DATA, *PSERVER_DATA;
@@ -112,3 +117,4 @@ int gs_set_abr_mode(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_CONFI
 int gs_report_abr_feedback(GS_CLIENT hnd, const SERVER_DATA *server, const GS_ABR_FEEDBACK *feedback,
                            GS_ABR_ACTION *action);
 
+int gs_http_wake(GS_CLIENT hnd, const char *url);

@@ -3,13 +3,17 @@
 #include "launcher.controller.h"
 #include "server.context_menu.h"
 
+#include "backend/pcmanager.h"
 #include "backend/types.h"
+#include "libgamestream/client.h"
 
 #include "util/i18n.h"
 #include "lvgl/util/lv_app_utils.h"
 #include "util/nullable.h"
 #include "util/bus.h"
 #include "util/user_event.h"
+
+#include <string.h>
 
 typedef struct context_menu_t {
     lv_fragment_t base;
@@ -34,6 +38,10 @@ static void open_info(const pclist_t *node);
 static void show_hidden_apps(const pclist_t *node);
 
 static void forget_host(const pclist_t *node);
+
+static void configure_wake(const pclist_t *node);
+
+static void wake_settings_cb(lv_event_t *e);
 
 static void info_action_cb(lv_event_t *e);
 
@@ -80,9 +88,15 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_add_flag(show_hidden_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_user_data(show_hidden_btn, show_hidden_apps);
 
-    lv_obj_t *forget_btn = lv_list_add_btn(content, NULL, locstr("Forget"));
-    lv_obj_add_flag(forget_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_set_user_data(forget_btn, forget_host);
+    lv_obj_t *wake_btn = lv_list_add_btn(content, NULL, locstr("Wake settings"));
+    lv_obj_add_flag(wake_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_user_data(wake_btn, configure_wake);
+
+    if (node->state.code == SERVER_STATE_OFFLINE || node->state.code == SERVER_STATE_ERROR) {
+        lv_obj_t *forget_btn = lv_list_add_btn(content, NULL, locstr("Forget"));
+        lv_obj_add_flag(forget_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_set_user_data(forget_btn, forget_host);
+    }
 
     lv_obj_t *cancel_btn = lv_list_add_btn(content, NULL, locstr("Cancel"));
     lv_obj_add_flag(cancel_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -118,8 +132,10 @@ static void context_menu_click_cb(lv_event_t *e) {
         open_info(node);
     } else if (target_userdata == forget_host) {
         forget_host(node);
-    }else if (target_userdata == show_hidden_apps) {
+    } else if (target_userdata == show_hidden_apps) {
         show_hidden_apps(node);
+    } else if (target_userdata == configure_wake) {
+        configure_wake(node);
     }
 }
 
@@ -153,6 +169,65 @@ static void forget_host(const pclist_t *node) {
         launcher_fragment_t *launcher = launcher_instance();
         launcher_select_server(launcher, NULL);
     }
+}
+
+typedef struct wake_settings_ctx_t {
+    uuidstr_t uuid;
+    lv_obj_t *method_dropdown;
+    lv_obj_t *url_input;
+} wake_settings_ctx_t;
+
+static void wake_settings_free_cb(lv_event_t *e) {
+    wake_settings_ctx_t *ctx = lv_event_get_user_data(e);
+    SDL_free(ctx);
+}
+
+static void configure_wake(const pclist_t *node) {
+    const SERVER_DATA *server = node->server;
+    static const char *btn_txts[] = {translatable("Cancel"), translatable("Save"), ""};
+    lv_obj_t *mbox = lv_msgbox_create_i18n(NULL, server->hostname, NULL, btn_txts, false);
+    lv_obj_t *content = lv_msgbox_get_content(mbox);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(content, lv_dpx(8), 0);
+
+    wake_settings_ctx_t *ctx = SDL_calloc(1, sizeof(wake_settings_ctx_t));
+    ctx->uuid = node->id;
+    lv_obj_add_event_cb(mbox, wake_settings_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    lv_obj_add_event_cb(mbox, wake_settings_free_cb, LV_EVENT_DELETE, ctx);
+
+    lv_obj_t *method_label = lv_label_create(content);
+    lv_label_set_text_static(method_label, locstr("Wake method"));
+
+    ctx->method_dropdown = lv_dropdown_create(content);
+    lv_dropdown_set_options(ctx->method_dropdown, "WoL\nHTTP");
+    lv_dropdown_set_selected(ctx->method_dropdown, server->wake_method == WAKE_METHOD_HTTP ? 1 : 0);
+    lv_obj_set_width(ctx->method_dropdown, LV_PCT(100));
+
+    lv_obj_t *url_label = lv_label_create(content);
+    lv_label_set_text_static(url_label, locstr("HTTP wake URL"));
+
+    ctx->url_input = lv_textarea_create(content);
+    lv_textarea_set_one_line(ctx->url_input, true);
+    lv_textarea_set_placeholder_text(ctx->url_input, "http://host:port/wake");
+    lv_obj_set_width(ctx->url_input, LV_PCT(100));
+    if (server->wake_url) {
+        lv_textarea_set_text(ctx->url_input, server->wake_url);
+    }
+    lv_obj_center(mbox);
+}
+
+static void wake_settings_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    wake_settings_ctx_t *ctx = lv_event_get_user_data(e);
+    uint16_t btn_id = lv_msgbox_get_active_btn(mbox);
+    if (btn_id != 1) {
+        lv_msgbox_close_async(mbox);
+        return;
+    }
+    int wake_method = lv_dropdown_get_selected(ctx->method_dropdown) == 1 ? WAKE_METHOD_HTTP : WAKE_METHOD_WOL;
+    const char *wake_url = lv_textarea_get_text(ctx->url_input);
+    pcmanager_set_wake_settings(pcmanager, &ctx->uuid, wake_method, wake_url);
+    lv_msgbox_close_async(mbox);
 }
 
 static void info_action_cb(lv_event_t *e) {

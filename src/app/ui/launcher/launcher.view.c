@@ -11,6 +11,9 @@
 
 #include "util/font.h"
 #include "util/i18n.h"
+#include "profile/profile_manager.h"
+
+#include <string.h>
 
 #include "app.h"
 #include "lvgl/theme/lv_theme_moonlight.h"
@@ -26,6 +29,10 @@ static void launcher_shell_resized(lv_event_t *event);
 static void detail_group_add(lv_event_t *event);
 
 static lv_obj_t *create_topbar_icon_btn(launcher_fragment_t *controller, lv_obj_t *parent, const char *icon);
+
+static void launcher_profile_changed(lv_event_t *event);
+
+static void launcher_refresh_profile_dropdown(launcher_fragment_t *controller);
 
 static void launcher_layout_settings_layer(launcher_fragment_t *controller, lv_obj_t *shell) {
     if (!controller || !controller->settings_layer || !shell) {
@@ -117,6 +124,12 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_style_text_font(title_label, lv_theme_get_font_large(topbar), 0);
     lv_obj_set_style_text_color(title_label, ml_color_hex(ML_COLOR_TEXT), 0);
     lv_label_set_text_static(title_label, "AURORA");
+
+    controller->profile_dropdown = lv_dropdown_create(topbar);
+    lv_obj_set_style_max_width(controller->profile_dropdown, LV_DPX(160), 0);
+    lv_obj_add_event_cb(controller->profile_dropdown, launcher_profile_changed, LV_EVENT_VALUE_CHANGED, controller);
+    launcher_refresh_profile_dropdown(controller);
+    launcher_attach_profile_dropdown_nav(controller);
 
     /* Spacer that grows to push the action buttons to the right edge. */
     lv_obj_t *spacer = lv_obj_create(topbar);
@@ -231,4 +244,39 @@ static void detail_group_add(lv_event_t *event) {
         return;
     }
     lv_group_add_obj(fragment->detail_group, child);
+}
+
+static void launcher_refresh_profile_dropdown(launcher_fragment_t *controller) {
+    if (!controller->profile_dropdown) {
+        return;
+    }
+    char options[512] = {0};
+    int active_index = 0;
+    const char *active_id = profile_manager_active_id();
+    for (int i = 0; i < profile_manager_count(); i++) {
+        const streaming_profile_t *profile = profile_manager_get(i);
+        if (!profile) {
+            continue;
+        }
+        if (i > 0) {
+            strcat(options, "\n");
+        }
+        strcat(options, profile->name);
+        if (active_id && strcmp(profile->id, active_id) == 0) {
+            active_index = i;
+        }
+    }
+    lv_dropdown_set_options(controller->profile_dropdown, options[0] ? options : "Default");
+    lv_dropdown_set_selected(controller->profile_dropdown, active_index);
+}
+
+static void launcher_profile_changed(lv_event_t *event) {
+    launcher_fragment_t *controller = lv_event_get_user_data(event);
+    uint16_t index = lv_dropdown_get_selected(controller->profile_dropdown);
+    const streaming_profile_t *profile = profile_manager_get(index);
+    if (!profile) {
+        return;
+    }
+    profile_manager_set_active(profile->id);
+    profile_manager_apply_to_settings(app_configuration);
 }

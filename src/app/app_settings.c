@@ -1,9 +1,6 @@
 #include "app_settings.h"
 #include "config.h"
-
-#if defined(TARGET_WEBOS)
 #include "hid_passthrough/hid_pt_device_prefs.h"
-#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,17 +40,28 @@ void settings_reconcile_refresh_rate(app_settings_t *config) {
 #if defined(TARGET_WEBOS)
     int ntsc = settings_ntsc_refresh_rate_x100_for_fps(config->stream.fps);
     if (ntsc > 0) {
-        /* Preserve an explicit rate that already matches the current fps — this is
-         * either the NTSC preset value or a user-entered custom fractional rate (e.g.
-         * 119.94). Only fall back to the panel NTSC rate when the stored value is unset
-         * or stale (rounds to a different fps after an fps change). Preset selection
-         * forces NTSC via settings_apply_ntsc_preset_refresh, so load/save/session must
-         * not clobber a custom rate here. */
-        int implied = config->client_refresh_rate_x100 > 0
-                          ? (config->client_refresh_rate_x100 + 50) / 100
-                          : 0;
+        if (config->use_ntsc_refresh) {
+            /* Auto NTSC for presets; keep a user Custom FPS fractional rate if present. */
+            if (config->client_refresh_rate_x100 == 0 ||
+                config->client_refresh_rate_x100 == ntsc) {
+                config->client_refresh_rate_x100 = ntsc;
+                return;
+            }
+            int implied = (config->client_refresh_rate_x100 + 50) / 100;
+            if (implied != config->stream.fps) {
+                config->client_refresh_rate_x100 = ntsc;
+            }
+            return;
+        }
+        /* Integer presets: clear auto-NTSC; keep a distinct Custom FPS fractional rate. */
+        if (config->client_refresh_rate_x100 == 0 ||
+            config->client_refresh_rate_x100 == ntsc) {
+            config->client_refresh_rate_x100 = 0;
+            return;
+        }
+        int implied = (config->client_refresh_rate_x100 + 50) / 100;
         if (implied != config->stream.fps) {
-            config->client_refresh_rate_x100 = ntsc;
+            config->client_refresh_rate_x100 = 0;
         }
         return;
     }
@@ -92,15 +100,17 @@ int settings_ntsc_refresh_rate_x100_for_fps(int nominal_fps)
 void settings_apply_ntsc_preset_refresh(app_settings_t *config, int nominal_fps)
 {
 #if defined(TARGET_WEBOS)
-    (void) nominal_fps;
     if (!config) {
         return;
     }
-    /* Explicit preset selection (or init): force the panel NTSC rate for a standard
-     * fps — overriding any previously-entered custom rate — or clear it for a non-NTSC
-     * fps. reconcile() alone would now preserve a stale custom value, so force here. */
+    (void) nominal_fps;
     int ntsc = settings_ntsc_refresh_rate_x100_for_fps(config->stream.fps);
-    config->client_refresh_rate_x100 = ntsc > 0 ? ntsc : 0;
+    if (ntsc > 0) {
+        /* Preset selection / NTSC checkbox: force auto NTSC or integer (clears Custom). */
+        config->client_refresh_rate_x100 = config->use_ntsc_refresh ? ntsc : 0;
+        return;
+    }
+    settings_reconcile_refresh_rate(config);
 #else
     (void) config;
     (void) nominal_fps;
@@ -152,12 +162,13 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->hdr = false;
     config->force_full_color_range = false;
     config->hevc = true;
-    config->idr_refresh_interval_sec = 0;
     config->av1 = false;
+    config->idr_refresh_interval_ms = 0;
     config->show_stats_on_start = false;
     config->show_stats_compact = false;
     config->stick_deadzone = 7;
     config->client_refresh_rate_x100 = 0;
+    config->use_ntsc_refresh = false;
     config->smooth_frame_pacing = false;
     config->hid_passthrough = false;
     config->hid_passthrough_port = 48054;
@@ -236,11 +247,12 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "hdr", config->hdr);
     ini_write_bool(fp, "force_full_color_range", config->force_full_color_range);
     ini_write_bool(fp, "hevc", config->hevc);
-    ini_write_int(fp, "idr_refresh_interval_sec", config->idr_refresh_interval_sec);
     ini_write_bool(fp, "av1", config->av1);
+    ini_write_int(fp, "idr_refresh_interval_ms", config->idr_refresh_interval_ms);
     ini_write_bool(fp, "show_stats_on_start", config->show_stats_on_start);
     ini_write_bool(fp, "show_stats_compact", config->show_stats_compact);
     ini_write_int(fp, "client_refresh_rate_x100", config->client_refresh_rate_x100);
+    ini_write_bool(fp, "use_ntsc_refresh", config->use_ntsc_refresh);
     ini_write_bool(fp, "smooth_frame_pacing", config->smooth_frame_pacing);
     ini_write_bool(fp, "soft_recovery", config->soft_recovery);
 
@@ -350,14 +362,33 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         if (config->abr_mode < 0 || config->abr_mode > 2) {
             config->abr_mode = 0;
         }
+    } else if (INI_FULL_MATCH("video", "idr_refresh_interval_ms")) {
+        set_int(&config->idr_refresh_interval_ms, value);
+        if (config->idr_refresh_interval_ms < 0) {
+            config->idr_refresh_interval_ms = 0;
+        } else if (config->idr_refresh_interval_ms > 0 && config->idr_refresh_interval_ms < 500) {
+            config->idr_refresh_interval_ms = 500;
+        } else if (config->idr_refresh_interval_ms > 60000) {
+            config->idr_refresh_interval_ms = 60000;
+        } else if (config->idr_refresh_interval_ms > 0) {
+            config->idr_refresh_interval_ms = ((config->idr_refresh_interval_ms + 250) / 500) * 500;
+            if (config->idr_refresh_interval_ms < 500) {
+                config->idr_refresh_interval_ms = 500;
+            }
+        }
     } else if (INI_FULL_MATCH("video", "idr_refresh_interval_sec")) {
-        set_int(&config->idr_refresh_interval_sec, value);
-        if (config->idr_refresh_interval_sec < 0) {
-            config->idr_refresh_interval_sec = 0;
-        } else if (config->idr_refresh_interval_sec > 60) {
-            config->idr_refresh_interval_sec = 60;
-        } else if (config->idr_refresh_interval_sec == 1) {
-            config->idr_refresh_interval_sec = 2;
+        /* Legacy seconds key → milliseconds */
+        int sec = 0;
+        set_int(&sec, value);
+        if (sec < 0) {
+            config->idr_refresh_interval_ms = 0;
+        } else if (sec == 0) {
+            config->idr_refresh_interval_ms = 0;
+        } else {
+            if (sec > 60) {
+                sec = 60;
+            }
+            config->idr_refresh_interval_ms = sec * 1000;
         }
     } else if (INI_NAME_MATCH("hevc")) {
         config->hevc = INI_IS_TRUE(value);
@@ -380,10 +411,14 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         } else if (config->client_refresh_rate_x100 > 24000) {
             config->client_refresh_rate_x100 = 24000;
         }
+    } else if (INI_FULL_MATCH("video", "use_ntsc_refresh")) {
+        config->use_ntsc_refresh = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "smooth_frame_pacing")) {
         config->smooth_frame_pacing = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "soft_recovery")) {
         config->soft_recovery = INI_IS_TRUE(value);
+    } else if (INI_FULL_MATCH("video", "pause_at_decode_time")) {
+        /* Upstream-Legacy: dort entfernt, bei uns nie eingefuehrt — still ignorieren. */
     } else if (INI_FULL_MATCH("video", "force_full_color_range")) {
         config->force_full_color_range = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("surround")) {

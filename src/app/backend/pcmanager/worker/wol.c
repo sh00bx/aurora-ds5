@@ -16,9 +16,13 @@ int worker_wol(worker_context_t *context) {
         return ENOENT;
     }
     SERVER_DATA *server = node->server;
-    wol_broadcast(server->mac);
-    Uint32 timeout = SDL_GetTicks() + 15000;
     GS_CLIENT gs = app_gs_client_new(context->app);
+    if (server->wake_method == WAKE_METHOD_HTTP && server->wake_url && server->wake_url[0]) {
+        gs_http_wake(gs, server->wake_url);
+    } else {
+        wol_broadcast(server->mac);
+    }
+    Uint32 timeout = SDL_GetTicks() + 15000;
     int ret;
     while (!SDL_TICKS_PASSED(SDL_GetTicks(), timeout)) {
         PSERVER_DATA tmpserver = serverdata_new();

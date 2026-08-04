@@ -1,6 +1,7 @@
 #include "app_session.h"
 #include "app.h"
 #include "stream/session.h"
+#include "profile/profile_manager.h"
 #include "logging.h"
 
 int app_session_begin(app_t *app, const uuidstr_t *uuid, const APP_LIST *gs_app) {
@@ -13,6 +14,7 @@ int app_session_begin(app_t *app, const uuidstr_t *uuid, const APP_LIST *gs_app)
         commons_log_error("App", "Failed to find node %s", (const char *) uuid);
         return -1;
     }
+    profile_manager_apply_to_settings(app_configuration);
     app->session = session_create(app, app_configuration, node->server, gs_app);
     return 0;
 }

@@ -1,6 +1,7 @@
 #include "input_gamepad.h"
 
 #include <stdbool.h>
+#include <string.h>
 #include <SDL_version.h>
 #include <Limelight.h>
 #include <assert.h>
@@ -281,6 +282,64 @@ void app_input_gamepad_set_controller_led(app_input_t *input, unsigned short con
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     SDL_GameControllerSetLED(input->gamepads[controllerNumber].controller, r, g, b);
 #endif
+}
+
+static bool app_input_gamepad_is_ps5(SDL_GameController *controller) {
+#if SDL_VERSION_ATLEAST(2, 0, 16)
+    return SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS5;
+#else
+    (void) controller;
+    return false;
+#endif
+}
+
+static int app_input_gamepad_send_ps5_effect(app_input_t *input, unsigned short controllerNumber,
+                                             const void *data, int size) {
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    if (controllerNumber >= (unsigned short) app_input_get_max_gamepads(input)) {
+        return -1;
+    }
+    SDL_GameController *controller = input->gamepads[controllerNumber].controller;
+    if (!controller || !app_input_gamepad_is_ps5(controller)) {
+        return -1;
+    }
+    return SDL_GameControllerSendEffect(controller, data, size);
+#else
+    (void) input;
+    (void) controllerNumber;
+    (void) data;
+    (void) size;
+    return -1;
+#endif
+}
+
+void app_input_gamepad_set_adaptive_triggers(app_input_t *input, unsigned short controllerNumber, uint8_t eventFlags,
+                                             uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {
+    uint8_t report[24] = {0x02, 0x04};
+    int offset = 2;
+    if (eventFlags & DS_EFFECT_LEFT_TRIGGER) {
+        report[offset++] = typeLeft;
+        memcpy(&report[offset], left, DS_EFFECT_PAYLOAD_SIZE);
+        offset += DS_EFFECT_PAYLOAD_SIZE;
+    }
+    if (eventFlags & DS_EFFECT_RIGHT_TRIGGER) {
+        report[offset++] = typeRight;
+        memcpy(&report[offset], right, DS_EFFECT_PAYLOAD_SIZE);
+        offset += DS_EFFECT_PAYLOAD_SIZE;
+    }
+    if (offset > 2) {
+        app_input_gamepad_send_ps5_effect(input, controllerNumber, report, offset);
+    }
+}
+
+void app_input_gamepad_set_player_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledValue) {
+    uint8_t report[2] = {0x05, ledValue};
+    app_input_gamepad_send_ps5_effect(input, controllerNumber, report, sizeof(report));
+}
+
+void app_input_gamepad_set_mic_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledState) {
+    uint8_t report[2] = {0x06, ledState};
+    app_input_gamepad_send_ps5_effect(input, controllerNumber, report, sizeof(report));
 }
 
 int new_gamepad_state_index(app_input_t *input, SDL_GameController *controller) {

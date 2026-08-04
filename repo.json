@@ -1,0 +1,12 @@
+{
+  "packages": [
+    {
+      "id": "com.aurora.gamestream",
+      "title": "Aurora",
+      "shortDescription": "<p>GameStream client for LG webOS. Stream at up to 4K 120Hz HDR.</p>",
+      "fullDescriptionUrl": "https://raw.githubusercontent.com/GuiDev1994/aurora-tv/main/description.html",
+      "iconUri": "https://raw.githubusercontent.com/GuiDev1994/aurora-tv/main/deploy/webos/icon_large.png",
+      "manifestUrl": "https://github.com/GuiDev1994/aurora-tv/releases/latest/download/com.aurora.gamestream.manifest.json"
+    }
+  ]
+}

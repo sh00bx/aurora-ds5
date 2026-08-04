@@ -31,6 +31,8 @@ PSERVER_DATA serverdata_clone(const SERVER_DATA *src) {
     server->currentGame = src->currentGame;
     server->serverMajorVersion = src->serverMajorVersion;
     server->gsVersion = strdup_nullable(src->gsVersion);
+    server->wake_method = src->wake_method;
+    server->wake_url = strdup_nullable(src->wake_url);
     server->modes = display_mode_clone(src->modes);
     server->serverInfo.address = strdup_nullable(src->serverInfo.address);
     server->serverInfo.rtspSessionUrl = strdup_nullable(src->serverInfo.rtspSessionUrl);
@@ -51,6 +53,7 @@ void serverdata_free(PSERVER_DATA data) {
     free_nullable((void *) data->hostname);
     free_nullable((void *) data->gpuType);
     free_nullable((void *) data->gsVersion);
+    free_nullable(data->wake_url);
     free_nullable((void *) data->serverInfo.serverInfoAppVersion);
     free_nullable((void *) data->serverInfo.serverInfoGfeVersion);
     free_nullable((void *) data->serverInfo.address);

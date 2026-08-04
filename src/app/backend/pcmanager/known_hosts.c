@@ -9,6 +9,7 @@
 #include "util/ini_ext.h"
 #include "util/path.h"
 #include "app_settings.h"
+#include "libgamestream/client.h"
 
 #define LINKEDLIST_IMPL
 #define LINKEDLIST_MODIFIER static
@@ -48,6 +49,8 @@ void pcmanager_load_known_hosts(pcmanager_t *manager) {
         server->uuid = uuidstr_tostr(&cur->uuid);
         server->mac = mac;
         server->hostname = hostname;
+        server->wake_method = cur->wake_method;
+        server->wake_url = cur->wake_url ? SDL_strdup(cur->wake_url) : NULL;
         server->serverInfo.address = strdup(hostport_get_hostname(address));
         server->extPort = hostport_get_port(address);
 
@@ -94,6 +97,11 @@ void pcmanager_save_known_hosts(pcmanager_t *manager) {
         ini_write_string(fp, "address", address_buf);
         hostport_free(address);
 
+        if (server->wake_method == WAKE_METHOD_HTTP && server->wake_url && server->wake_url[0]) {
+            ini_write_string(fp, "wake_method", "http");
+            ini_write_string(fp, "wake_url", server->wake_url);
+        }
+
         if (!selected_set && cur->selected) {
             ini_write_bool(fp, "selected", true);
             selected_set = true;
@@ -128,6 +136,10 @@ static int known_hosts_handle(known_host_t **list, const char *section, const ch
         host->hostname = SDL_strdup(value);
     } else if (INI_NAME_MATCH("address")) {
         host->address = hostport_parse(value);
+    } else if (INI_NAME_MATCH("wake_method")) {
+        host->wake_method = value && strcmp(value, "http") == 0 ? WAKE_METHOD_HTTP : WAKE_METHOD_WOL;
+    } else if (INI_NAME_MATCH("wake_url")) {
+        host->wake_url = SDL_strdup(value);
     } else if (INI_NAME_MATCH("selected")) {
         host->selected = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("favorite")) {
@@ -150,6 +162,7 @@ void known_hosts_node_free(known_host_t *node) {
     if (node->address) {
         free(node->address);
     }
+    free(node->wake_url);
     if (node->favs) {
         appid_list_free(node->favs, (appid_list_nodefree_fn) free);
     }

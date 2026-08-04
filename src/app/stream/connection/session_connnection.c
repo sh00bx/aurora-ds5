@@ -75,6 +75,8 @@ static void connection_rumble(unsigned short controllerNumber, unsigned short lo
         return;
     }
 #if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
     if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
         return;
     }
@@ -88,6 +90,8 @@ static void connection_rumble_triggers(unsigned short controllerNumber, unsigned
         return;
     }
 #if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
     if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
         return;
     }
@@ -100,6 +104,8 @@ static void connection_set_motion_event_state(uint16_t controllerNumber, uint8_t
         return;
     }
 #if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
     if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
         return;
     }
@@ -112,11 +118,57 @@ static void connection_set_controller_led(uint16_t controllerNumber, uint8_t r, 
         return;
     }
 #if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
     if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
         return;
     }
 #endif
     app_input_gamepad_set_controller_led(&current_session->app->input, controllerNumber, r, g, b);
+}
+
+static void connection_set_adaptive_triggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft,
+                                             uint8_t typeRight, uint8_t *left, uint8_t *right) {
+    if (!current_session) {
+        return;
+    }
+#if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
+    if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
+        return;
+    }
+#endif
+    app_input_gamepad_set_adaptive_triggers(&current_session->app->input, controllerNumber, eventFlags, typeLeft,
+                                            typeRight, left, right);
+}
+
+static void connection_set_player_led(uint16_t controllerNumber, uint8_t ledValue) {
+    if (!current_session) {
+        return;
+    }
+#if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
+    if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
+        return;
+    }
+#endif
+    app_input_gamepad_set_player_led(&current_session->app->input, controllerNumber, ledValue);
+}
+
+static void connection_set_mic_led(uint16_t controllerNumber, uint8_t ledState) {
+    if (!current_session) {
+        return;
+    }
+#if defined(TARGET_WEBOS)
+    /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
+     * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
+    if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
+        return;
+    }
+#endif
+    app_input_gamepad_set_mic_led(&current_session->app->input, controllerNumber, ledState);
 }
 
 static void connection_set_hdr(bool hdrEnabled) {
@@ -138,6 +190,9 @@ CONNECTION_LISTENER_CALLBACKS connection_callbacks = {
         .rumbleTriggers = connection_rumble_triggers,
         .setMotionEventState = connection_set_motion_event_state,
         .setControllerLED = connection_set_controller_led,
+        .setAdaptiveTriggers = connection_set_adaptive_triggers,
+        .setPlayerLed = connection_set_player_led,
+        .setMicLed = connection_set_mic_led,
         .connectionStatusUpdate = connection_status_update,
         .setHdrMode = connection_set_hdr
 };

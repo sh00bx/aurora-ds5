@@ -5,12 +5,14 @@
 #include "pref_fps.h"
 #include "pref_res.h"
 #include "ui/settings/settings.controller.h"
+#include "profile/profile_manager.h"
 
 #include "util/i18n.h"
 #include "logging.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     lv_fragment_t base;
@@ -20,6 +22,7 @@ typedef struct {
     lv_obj_t *bitrate_label;
     lv_obj_t *bitrate_slider;
     lv_obj_t *bitrate_warning;
+    lv_obj_t *profile_dropdown;
     lv_obj_t *abr_checkbox;
     lv_obj_t *abr_mode_dropdown;
 
@@ -47,7 +50,25 @@ static void pref_mark_restart_cb(lv_event_t *e);
 
 static void update_bitrate_hint(basic_pane_t *pane);
 
+static void on_profile_changed(lv_event_t *e);
+
+static void on_save_profile_clicked(lv_event_t *e);
+
+static void on_abr_changed(lv_event_t *e);
+
 static void on_abr_mode_changed(lv_event_t *e);
+
+static void on_ntsc_refresh_changed(lv_event_t *e);
+
+static void refresh_profile_dropdown(basic_pane_t *pane);
+
+static void on_new_profile_clicked(lv_event_t *e);
+
+static void on_rename_profile_clicked(lv_event_t *e);
+
+static void on_delete_profile_clicked(lv_event_t *e);
+
+static void basic_pane_add_profile_section(basic_pane_t *pane, lv_obj_t *view);
 
 const lv_fragment_class_t settings_pane_basic_cls = {
     .constructor_cb = pane_ctor,
@@ -79,7 +100,9 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *view = pref_pane_container(container);
     lv_obj_set_layout(view, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(view, LV_FLEX_FLOW_ROW_WRAP);
+
     pane->abr_checkbox = pref_checkbox(view, locstr("Adaptive bitrate"), &app_configuration->auto_adjust_bitrate, false);
+    lv_obj_add_event_cb(pane->abr_checkbox, on_abr_changed, LV_EVENT_VALUE_CHANGED, self);
 
     pref_title_label(view, locstr("ABR mode"));
     pane->abr_mode_dropdown = lv_dropdown_create(view);
@@ -124,6 +147,17 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                                &app_configuration->client_refresh_rate_x100);
     lv_obj_set_flex_grow(fps_dropdown, 1);
     lv_obj_add_event_cb(fps_dropdown, on_res_fps_updated, LV_EVENT_VALUE_CHANGED, self);
+
+    lv_obj_t *ntsc_checkbox = pref_checkbox(view, locstr("Use NTSC refresh (59.94 / 119.88 Hz)"),
+                                            &app_configuration->use_ntsc_refresh, false);
+    lv_obj_add_event_cb(ntsc_checkbox, on_ntsc_refresh_changed, LV_EVENT_VALUE_CHANGED, self);
+    pref_desc_label(view,
+                    locstr("When enabled, 60/120 FPS presets use fractional NTSC pacing (59.94/119.88). "
+                           "When disabled, presets use integer 60/120 like Moonlight mobile. "
+                           "At 4K the host virtual-display mode stays integer (120) to avoid a black "
+                           "screen on some webOS TVs; NTSC is still sent as clientRefreshRateX100 for "
+                           "encode pacing. Custom FPS still allows any fractional rate."),
+                    false);
 
     pref_desc_label(view,
                     locstr("Tip: choose Custom FPS to enter a fractional refresh rate (e.g. 119.94 for VRR game "
@@ -183,6 +217,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     update_bitrate_label(pane);
     update_bitrate_hint(pane);
 
+    basic_pane_add_profile_section(pane, view);
+
     return view;
 }
 
@@ -213,6 +249,12 @@ static void on_res_fps_updated(lv_event_t *e) {
     update_bitrate_hint(pane);
 }
 
+static void on_ntsc_refresh_changed(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    pane->parent->needs_stream_reconnect = true;
+    settings_apply_ntsc_preset_refresh(app_configuration, app_configuration->stream.fps);
+}
+
 static void on_fullscreen_updated(lv_event_t *e) {
     basic_pane_t *pane = lv_event_get_user_data(e);
     app_set_fullscreen(pane->parent->app, app_configuration->fullscreen);
@@ -224,8 +266,14 @@ static void update_bitrate_label(basic_pane_t *pane) {
 
 static void update_bitrate_hint(basic_pane_t *pane) {
     app_t *app = pane->parent->app;
-    if (app->ss4s.video_cap.suggestedBitrate > 0 &&
-        app_configuration->stream.bitrate > app->ss4s.video_cap.suggestedBitrate) {
+    const int bitrate = app_configuration->stream.bitrate;
+    if (bitrate > 250000) {
+        lv_obj_clear_flag(pane->bitrate_warning, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text_static(pane->bitrate_warning,
+                                 locstr("Above 250 Mbps usually brings no quality gain and can cause "
+                                        "packet loss as the connection becomes less stable."));
+    } else if (app->ss4s.video_cap.suggestedBitrate > 0 &&
+               bitrate > app->ss4s.video_cap.suggestedBitrate) {
         lv_obj_clear_flag(pane->bitrate_warning, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text_static(pane->bitrate_warning, locstr("Higher bitrate may cause performance issue, "
                                                                "try with caution."));
@@ -264,10 +312,128 @@ static void pref_mark_restart_cb(lv_event_t *e) {
     parent->needs_locale_reapply |= strcasecmp(i18n_locale(), app_configuration->language) != 0;
 }
 
+static void refresh_profile_dropdown(basic_pane_t *pane) {
+    char options[512] = {0};
+    int active_index = 0;
+    const char *active_id = profile_manager_active_id();
+    for (int i = 0; i < profile_manager_count(); i++) {
+        const streaming_profile_t *profile = profile_manager_get(i);
+        if (!profile) {
+            continue;
+        }
+        if (i > 0) {
+            strcat(options, "\n");
+        }
+        strcat(options, profile->name);
+        if (active_id && strcmp(profile->id, active_id) == 0) {
+            active_index = i;
+        }
+    }
+    lv_dropdown_set_options(pane->profile_dropdown, options[0] ? options : "Default");
+    lv_dropdown_set_selected(pane->profile_dropdown, active_index);
+}
+
+static void basic_pane_add_profile_section(basic_pane_t *pane, lv_obj_t *view) {
+    pref_header(view, locstr("Streaming profile"));
+
+    pane->profile_dropdown = lv_dropdown_create(view);
+    lv_obj_set_width(pane->profile_dropdown, LV_PCT(100));
+    refresh_profile_dropdown(pane);
+    lv_obj_add_event_cb(pane->profile_dropdown, on_profile_changed, LV_EVENT_VALUE_CHANGED, pane);
+
+    lv_obj_t *profile_actions = lv_obj_create(view);
+    lv_obj_remove_style_all(profile_actions);
+    lv_obj_set_width(profile_actions, LV_PCT(100));
+    lv_obj_set_flex_flow(profile_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(profile_actions, lv_dpx(8), 0);
+
+    lv_obj_t *save_profile_btn = lv_btn_create(profile_actions);
+    lv_obj_t *save_profile_label = lv_label_create(save_profile_btn);
+    lv_label_set_text(save_profile_label, locstr("Save to profile"));
+    lv_obj_add_event_cb(save_profile_btn, on_save_profile_clicked, LV_EVENT_CLICKED, pane);
+
+    lv_obj_t *new_profile_btn = lv_btn_create(profile_actions);
+    lv_obj_t *new_profile_label = lv_label_create(new_profile_btn);
+    lv_label_set_text(new_profile_label, locstr("New"));
+    lv_obj_add_event_cb(new_profile_btn, on_new_profile_clicked, LV_EVENT_CLICKED, pane);
+
+    lv_obj_t *rename_profile_btn = lv_btn_create(profile_actions);
+    lv_obj_t *rename_profile_label = lv_label_create(rename_profile_btn);
+    lv_label_set_text(rename_profile_label, locstr("Rename"));
+    lv_obj_add_event_cb(rename_profile_btn, on_rename_profile_clicked, LV_EVENT_CLICKED, pane);
+
+    lv_obj_t *delete_profile_btn = lv_btn_create(profile_actions);
+    lv_obj_t *delete_profile_label = lv_label_create(delete_profile_btn);
+    lv_label_set_text(delete_profile_label, locstr("Delete"));
+    lv_obj_add_event_cb(delete_profile_btn, on_delete_profile_clicked, LV_EVENT_CLICKED, pane);
+}
+
+static void on_profile_changed(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    uint16_t index = lv_dropdown_get_selected(pane->profile_dropdown);
+    const streaming_profile_t *profile = profile_manager_get(index);
+    if (!profile) {
+        return;
+    }
+    profile_manager_set_active(profile->id);
+    profile_manager_apply_to_settings(app_configuration);
+    lv_event_send(pane->bitrate_slider, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+static void on_save_profile_clicked(lv_event_t *e) {
+  basic_pane_t *pane = lv_event_get_user_data(e);
+  const streaming_profile_t *active = profile_manager_get_active();
+  if (active) {
+    profile_manager_save_from_settings(app_configuration, active->id);
+  }
+  (void) pane;
+}
+
+static void on_abr_changed(lv_event_t *e) {
+    (void) e;
+}
+
 static void on_abr_mode_changed(lv_event_t *e) {
     basic_pane_t *pane = lv_event_get_user_data(e);
     app_configuration->abr_mode = (int) lv_dropdown_get_selected(pane->abr_mode_dropdown);
     if (app_configuration->abr_mode < 0 || app_configuration->abr_mode > 2) {
         app_configuration->abr_mode = 0;
+    }
+}
+
+static void on_new_profile_clicked(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    char name_buf[64];
+    snprintf(name_buf, sizeof(name_buf), "Profile %d", profile_manager_count() + 1);
+    char new_id[37];
+    if (profile_manager_create(name_buf, app_configuration, new_id, sizeof(new_id))) {
+        profile_manager_set_active(new_id);
+        refresh_profile_dropdown(pane);
+    }
+}
+
+static void on_rename_profile_clicked(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    const streaming_profile_t *active = profile_manager_get_active();
+    if (!active) {
+        return;
+    }
+    char new_name[64];
+    snprintf(new_name, sizeof(new_name), "%s (2)", active->name);
+    if (profile_manager_rename(active->id, new_name)) {
+        refresh_profile_dropdown(pane);
+    }
+}
+
+static void on_delete_profile_clicked(lv_event_t *e) {
+    basic_pane_t *pane = lv_event_get_user_data(e);
+    const streaming_profile_t *active = profile_manager_get_active();
+    if (!active || profile_manager_count() <= 1) {
+        return;
+    }
+    if (profile_manager_delete(active->id)) {
+        profile_manager_apply_to_settings(app_configuration);
+        refresh_profile_dropdown(pane);
+        lv_event_send(pane->bitrate_slider, LV_EVENT_VALUE_CHANGED, NULL);
     }
 }

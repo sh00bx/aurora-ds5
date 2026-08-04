@@ -6,6 +6,7 @@
 #include "app.h"
 #include "backend/pcmanager/worker/worker.h"
 #include "logging.h"
+#include "util/nullable.h"
 
 pcmanager_t *pcmanager_new(app_t *app, executor_t *executor) {
     pcmanager_t *manager = SDL_calloc(1, sizeof(pcmanager_t));
@@ -102,6 +103,22 @@ bool pcmanager_forget(pcmanager_t *manager, const uuidstr_t *uuid) {
         return false;
     }
     pclist_remove(manager, uuid);
+    return true;
+}
+
+bool pcmanager_set_wake_settings(pcmanager_t *manager, const uuidstr_t *uuid, int wake_method, const char *wake_url) {
+    pcmanager_lock(manager);
+    pclist_t *node = pclist_find_by_uuid(manager, uuid);
+    if (!node || !node->server) {
+        pcmanager_unlock(manager);
+        return false;
+    }
+    SERVER_DATA *server = node->server;
+    server->wake_method = wake_method;
+    free_nullable(server->wake_url);
+    server->wake_url = wake_url && wake_url[0] ? strdup_nullable(wake_url) : NULL;
+    pcmanager_unlock(manager);
+    pcmanager_save_known_hosts(manager);
     return true;
 }
 

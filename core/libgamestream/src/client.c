@@ -488,8 +488,14 @@ static void append_launch_mode_param(char *url, size_t url_len, int width, int h
                                      int client_refresh_x100, bool is_gfe) {
     /* Apollo and several Sunshine forks parse the third mode component with atof() and
      * store refresh rate in millihertz (119.88 -> 119880). Sending an integer (120) makes
-     * them run at exactly 120 Hz even when clientRefreshRateX100 carries 11988. */
-    if (!is_gfe && client_refresh_x100 > 0 && (client_refresh_x100 % 100) != 0) {
+     * them run at exactly 120 Hz even when clientRefreshRateX100 carries 11988.
+     *
+     * At native 4K, a fractional mode string (e.g. 3840x2160x119.88) produces a black video
+     * plane on some LG webOS sets (C5). Keep mode integer at 4K; clientRefreshRateX100 is
+     * still sent separately for encode pacing when NTSC is enabled. */
+    const bool fractional = !is_gfe && client_refresh_x100 > 0 && (client_refresh_x100 % 100) != 0;
+    const bool uhd_4k = width >= 3840 && height >= 2160;
+    if (fractional && !uhd_4k) {
         append_param(url, url_len, "mode", "%dx%dx%d.%02d", width, height,
                      client_refresh_x100 / 100, client_refresh_x100 % 100);
     } else {
@@ -1071,6 +1077,9 @@ static uint16_t server_port(const SERVER_DATA *server, bool secure) {
     return secure ? server->httpsPort : server->extPort;
 }
 
+#define WAKE_METHOD_WOL 0
+#define WAKE_METHOD_HTTP 1
+
 static bool json_bool_field(const char *json, const char *field) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "\"%s\":true", field);
@@ -1165,6 +1174,20 @@ int gs_report_abr_feedback(GS_CLIENT hnd, const SERVER_DATA *server, const GS_AB
             action->new_bitrate = new_bitrate;
         }
     }
+    http_data_free(data);
+    return ret;
+}
+
+int gs_http_wake(GS_CLIENT hnd, const char *url) {
+    if (!hnd || !url || !url[0]) {
+        return GS_INVALID;
+    }
+    HTTP_DATA *data = http_data_alloc();
+    if (!data) {
+        return GS_OUT_OF_MEMORY;
+    }
+    http_set_timeout(hnd->http, 10);
+    int ret = http_request(hnd->http, (char *) url, data);
     http_data_free(data);
     return ret;
 }

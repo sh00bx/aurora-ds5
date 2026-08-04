@@ -2,6 +2,7 @@ target_sources(moonlight-lib PRIVATE app.c app_launch.c app_error.c app_session.
 target_include_directories(moonlight-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(input)
+add_subdirectory(profile)
 add_subdirectory(stream)
 if (TARGET_WEBOS)
     add_subdirectory(hid_passthrough)

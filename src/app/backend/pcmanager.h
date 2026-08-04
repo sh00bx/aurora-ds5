@@ -62,6 +62,8 @@ bool pcmanager_select(pcmanager_t *manager, const uuidstr_t *uuid);
 
 bool pcmanager_forget(pcmanager_t *manager, const uuidstr_t *uuid);
 
+bool pcmanager_set_wake_settings(pcmanager_t *manager, const uuidstr_t *uuid, int wake_method, const char *wake_url);
+
 void pcmanager_register_listener(pcmanager_t *manager, const pcmanager_listener_t *listener, void *userdata);
 
 void pcmanager_unregister_listener(pcmanager_t *manager, const pcmanager_listener_t *listener);

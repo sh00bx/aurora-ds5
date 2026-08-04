@@ -54,10 +54,10 @@ typedef struct app_settings_t {
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
     bool hevc;
-    /** Periodic HEVC IDR refresh interval in seconds (0 = off, min 2 when enabled). */
-    int idr_refresh_interval_sec;
     /** Sunshine/Apollo: negotiate AV1 Main8/Main10 when decoder exposes SS4S_VIDEO_AV1. */
     bool av1;
+    /** Periodic HEVC IDR refresh interval in ms (0 = off, min 500 when enabled, step 500). */
+    int idr_refresh_interval_ms;
     bool show_stats_on_start;
     bool show_stats_compact;
     int stick_deadzone;
@@ -76,6 +76,11 @@ typedef struct app_settings_t {
      * via ABR instead of Flush+IDR). Default true on webOS.
      */
     bool soft_recovery;
+    /**
+     * When true on webOS, map preset 30/60/120/240 fps to NTSC fractional rates
+     * (e.g. 120 → 11988). When false, presets use integer fps (client_refresh_rate_x100 = 0).
+     */
+    bool use_ntsc_refresh;
     bool auto_adjust_bitrate;
     int abr_mode;
     char *conf_dir;
@@ -102,9 +107,9 @@ extern const size_t audio_config_len;
 #define RES_720P RES_MERGE(1280, 720)
 #define RES_1080P RES_MERGE(1920, 1080)
 #define RES_1440P RES_MERGE(2560, 1440)
-/** ~90% of 4K (3584×2016); stable on recent LG TVs without full-4K input delay */
-#define RES_3_6K RES_MERGE(3584, 2016)
 #define RES_1800P RES_MERGE(3200, 1800)
+/** ~90% of 4K (3584×2016); practical limit on LG C5 without cumulative 4K delay */
+#define RES_3_6K RES_MERGE(3584, 2016)
 #define RES_4K RES_MERGE(3840, 2160)
 
 /** Fixed decode-unit reassembly buffer (megabytes). 4K IDR frames at high
@@ -121,13 +126,13 @@ bool settings_save(app_settings_t *config);
 /** Keep stream.fps aligned with client_refresh_rate_x100 when a fractional rate is set. */
 void settings_sync_refresh_rate(app_settings_t *config);
 
-/** webOS: apply NTSC x100 only for 30/60/120/240; drop stale x100 for 144/90/etc. */
+/** webOS: apply NTSC x100 only when use_ntsc_refresh for 30/60/120/240; else clear for presets. */
 void settings_reconcile_refresh_rate(app_settings_t *config);
 
 /** NTSC refresh rate (Hz × 100) for a nominal FPS preset, or 0 if not mapped (e.g. 144). */
 int settings_ntsc_refresh_rate_x100_for_fps(int nominal_fps);
 
-/** On webOS, set client_refresh_rate_x100 from a preset FPS (60→5994, 120→11988, …). */
+/** On webOS, set or clear client_refresh_rate_x100 for a preset FPS based on use_ntsc_refresh. */
 void settings_apply_ntsc_preset_refresh(app_settings_t *config, int nominal_fps);
 
 void settings_clear(app_settings_t *config);

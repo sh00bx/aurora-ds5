@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "stream/session.h"
@@ -24,10 +25,9 @@
 #include <SDL.h>
 #include <assert.h>
 
-// Starting capacity for the decode-unit reassembly buffer. Grows on
-// demand to accommodate larger frames (e.g. 4K IDR frames at high
-// bitrate routinely exceed 2 MB), capped to keep a malformed stream
-// from exhausting memory.
+/* Starting capacity for the decode-unit reassembly buffer. Grows on
+ * demand to accommodate larger frames (e.g. 4K IDR frames at high
+ * bitrate), capped to keep a malformed stream from exhausting memory. */
 #define DECODER_BUFFER_MAX_SIZE (32 * 1024 * 1024)
 
 /** Slices hint for pipeline decode while later slices still arrive (high bitrate / 120 Hz).
@@ -60,11 +60,8 @@ static unsigned char *buffer = NULL;
 static size_t buffer_size = 0;
 static size_t buffer_initial_size = 0;
 static int lastFrameNumber;
-// Set when SS4S_PlayerVideoFeed returns NOT_READY (decoder is in an
-// exclusive op like HDR toggle or resolution change). Consumed on the
-// next successful Feed: we ask Limelight for one IDR so the decoder
-// can resync from a known-good keyframe instead of decoding the next
-// P-frame against a discontinuity.
+/* Set when SS4S_PlayerVideoFeed returns NOT_READY. Consumed on the next
+ * successful Feed: ask Limelight for one IDR so the decoder can resync. */
 static bool need_idr_on_resume = false;
 // Escalating recovery for SS4S_VIDEO_FEED_ERROR: a single transient NDL
 // error drops the frame and requests an IDR; only N consecutive failures
@@ -171,9 +168,11 @@ static void soft_recovery_tick(const struct VIDEO_STATS *dst) {
 
 static int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, void *context, int drFlags);
 
-static void vdec_delegate_cleanup();
+static void vdec_delegate_cleanup(void);
 
 static int vdec_delegate_submit(PDECODE_UNIT decodeUnit);
+
+static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit);
 
 static void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now);
 
@@ -292,8 +291,16 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     memset(&info, 0, sizeof(info));
     info.width = width;
     info.height = height;
-    info.frameRateNumerator = vdec_stream_target_fps;
-    info.frameRateDenominator = 1;
+    /* Prefer host fractional refresh (e.g. 11988/100) for Starfish maxFrameRate / smooth
+     * pacing so the decoder grid matches NTSC clientRefreshRateX100 when set. */
+    if (session != NULL && session->config.stream.clientRefreshRateX100 > 0 &&
+        (session->config.stream.clientRefreshRateX100 % 100) != 0) {
+        info.frameRateNumerator = session->config.stream.clientRefreshRateX100;
+        info.frameRateDenominator = 100;
+    } else {
+        info.frameRateNumerator = vdec_stream_target_fps;
+        info.frameRateDenominator = 1;
+    }
     switch (videoFormat) {
         case VIDEO_FORMAT_H264:
             info.codec = SS4S_VIDEO_H264;
@@ -308,6 +315,8 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
             break;
         default: {
             commons_log_error("Session", "Unsupported codec %s", vdec_stream_info.format);
+            free(buffer);
+            buffer = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_UNSUPPORTED;
         }
     }
@@ -322,13 +331,17 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
             return 0;
         }
         case SS4S_VIDEO_OPEN_UNSUPPORTED_CODEC:
+            free(buffer);
+            buffer = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_UNSUPPORTED;
         default:
+            free(buffer);
+            buffer = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
 }
 
-void vdec_delegate_cleanup() {
+void vdec_delegate_cleanup(void) {
     assert(player != NULL);
     /* P15: keep the reassembly buffer allocated across streams so the malloc
      * stays off the connection-setup hot path; it is reused by the next
@@ -338,6 +351,77 @@ void vdec_delegate_cleanup() {
 #endif
     SS4S_PlayerVideoClose(player);
     session = NULL;
+}
+
+static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit) {
+    if (result == SS4S_VIDEO_FEED_OK) {
+        feed_error_count = 0;
+        not_ready_first_ms = 0;
+        if (decodeUnit->frameType == FRAME_TYPE_IDR) {
+            frames_since_idr = 0;
+        } else {
+            frames_since_idr++;
+        }
+        const int idr_ms = app_configuration ? app_configuration->idr_refresh_interval_ms : 0;
+        const bool hevc_stream = vdec_stream_format == VIDEO_FORMAT_H265 ||
+                                 vdec_stream_format == VIDEO_FORMAT_H265_MAIN10;
+        if (hevc_stream && idr_ms >= 500 && vdec_stream_target_fps > 0) {
+            const int frames_threshold = (vdec_stream_target_fps * idr_ms + 500) / 1000;
+            if (frames_threshold > 0 && frames_since_idr >= frames_threshold) {
+                LiRequestIdrFrame();
+                frames_since_idr = 0;
+            }
+        }
+        if (vdec_stream_info.width == 0 || vdec_stream_info.height == 0) {
+            stream_info_parse_size(decodeUnit, &vdec_stream_info);
+        }
+        // mcc moved DECODE_UNIT timestamps from ms to us (upstream e356b2c/a3ebaaf, pulled
+        // in by the nanors rebase); convert back to the ms unit the uint32_t accumulator and
+        // the stats UI (streaming.controller "submitMs") expect.
+        vdec_temp_stats.totalSubmitTime += (uint32_t) ((LiGetMicroseconds() - decodeUnit->enqueueTimeUs) / 1000);
+        vdec_temp_stats.submittedFrames++;
+        if (need_idr_on_resume) {
+            need_idr_on_resume = false;
+            return DR_NEED_IDR;
+        }
+        return DR_OK;
+    } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
+        return DR_NEED_IDR;
+    } else if (result == SS4S_VIDEO_FEED_NOT_READY) {
+        /* A transient NOT_READY (HDR toggle / resolution change) is expected. Only a
+         * decoder that stays NOT_READY well past any legitimate exclusive operation
+         * gets torn down — otherwise the stream would silently freeze forever. */
+        need_idr_on_resume = true;
+        unsigned long now = SDL_GetTicks();
+        if (not_ready_first_ms == 0) {
+            not_ready_first_ms = now;
+        } else if (now - not_ready_first_ms > VDEC_NOT_READY_WEDGE_MS) {
+            commons_log_error("Session", "Video decoder wedged in NOT_READY for %lu ms; interrupting",
+                              now - not_ready_first_ms);
+            not_ready_first_ms = 0;
+            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+        }
+        return DR_OK;
+    } else {
+        /* Escalating recovery: upstream interrupts on the first feed error, but a single
+         * transient NDL error is survivable — drop the frame and ask for an IDR. Only
+         * VDEC_FEED_ERROR_LIMIT failures inside the window tear the session down (a truly
+         * wedged decoder fails every Feed, so that still fires within a few frames). */
+        unsigned long now = SDL_GetTicks();
+        if (feed_error_count == 0 || now - feed_error_first_ms > VDEC_FEED_ERROR_WINDOW_MS) {
+            feed_error_count = 0;
+            feed_error_first_ms = now;
+        }
+        feed_error_count++;
+        if (feed_error_count >= VDEC_FEED_ERROR_LIMIT) {
+            commons_log_error("Session", "Video feed error %d (%d consecutive)", result, feed_error_count);
+            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+            return DR_OK;
+        }
+        commons_log_warn("Session", "Video feed error %d; dropping frame, requesting IDR (%d/%d)",
+                         result, feed_error_count, VDEC_FEED_ERROR_LIMIT);
+        return DR_NEED_IDR;
+    }
 }
 
 int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
@@ -369,7 +453,6 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         vdec_temp_stats.measurementStartTimestamp = ticksms;
         lastFrameNumber = decodeUnit->frameNumber;
     } else {
-        // Any frame number greater than m_LastFrameNumber + 1 represents a dropped frame
         vdec_temp_stats.networkDroppedFrames += decodeUnit->frameNumber - (lastFrameNumber + 1);
         vdec_temp_stats.totalFrames += decodeUnit->frameNumber - (lastFrameNumber + 1);
         lastFrameNumber = decodeUnit->frameNumber;
@@ -377,8 +460,6 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     unsigned stats_window_ms = streaming_stats_shown() ? 1000u : 2000u;
     if (ticksms - vdec_temp_stats.measurementStartTimestamp > stats_window_ms) {
         vdec_stat_submit(&vdec_temp_stats, ticksms);
-
-        // Move this window into the last window slot and clear it for next window
         memset(&vdec_temp_stats, 0, sizeof(vdec_temp_stats));
         vdec_temp_stats.measurementStartTimestamp = ticksms;
     }
@@ -418,62 +499,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
      * arrival wall-clock. Only takes effect when smooth pacing env is ON. */
     const int64_t pts_us = decodeUnit->presentationTimeUs > 0 ? (int64_t) decodeUnit->presentationTimeUs : -1;
     SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(player, buffer, length, flags, pts_us);
-    if (result == SS4S_VIDEO_FEED_OK) {
-        feed_error_count = 0;
-        not_ready_first_ms = 0;
-        if (decodeUnit->frameType == FRAME_TYPE_IDR) {
-            frames_since_idr = 0;
-        } else {
-            frames_since_idr++;
-        }
-        const int idr_interval = app_configuration ? app_configuration->idr_refresh_interval_sec : 0;
-        const bool hevc_stream = vdec_stream_format == VIDEO_FORMAT_H265 ||
-                                 vdec_stream_format == VIDEO_FORMAT_H265_MAIN10;
-        if (hevc_stream && idr_interval >= 2 && vdec_stream_target_fps > 0 &&
-            frames_since_idr >= vdec_stream_target_fps * idr_interval) {
-            LiRequestIdrFrame();
-            frames_since_idr = 0;
-        }
-        if (vdec_stream_info.width == 0 || vdec_stream_info.height == 0) {
-            stream_info_parse_size(decodeUnit, &vdec_stream_info);
-        }
-        vdec_temp_stats.totalSubmitTime += (uint32_t) ((LiGetMicroseconds() - decodeUnit->enqueueTimeUs) / 1000);
-        vdec_temp_stats.submittedFrames++;
-        if (need_idr_on_resume) {
-            need_idr_on_resume = false;
-            return DR_NEED_IDR;
-        }
-        return DR_OK;
-    } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
-        return DR_NEED_IDR;
-    } else if (result == SS4S_VIDEO_FEED_NOT_READY) {
-        need_idr_on_resume = true;
-        unsigned long now = SDL_GetTicks();
-        if (not_ready_first_ms == 0) {
-            not_ready_first_ms = now;
-        } else if (now - not_ready_first_ms > VDEC_NOT_READY_WEDGE_MS) {
-            commons_log_error("Session", "Video decoder wedged in NOT_READY for %lu ms; interrupting",
-                              now - not_ready_first_ms);
-            not_ready_first_ms = 0;
-            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
-        }
-        return DR_OK;
-    } else {
-        unsigned long now = SDL_GetTicks();
-        if (feed_error_count == 0 || now - feed_error_first_ms > VDEC_FEED_ERROR_WINDOW_MS) {
-            feed_error_count = 0;
-            feed_error_first_ms = now;
-        }
-        feed_error_count++;
-        if (feed_error_count >= VDEC_FEED_ERROR_LIMIT) {
-            commons_log_error("Session", "Video feed error %d (%d consecutive)", result, feed_error_count);
-            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
-            return DR_OK;
-        }
-        commons_log_warn("Session", "Video feed error %d; dropping frame, requesting IDR (%d/%d)",
-                         result, feed_error_count, VDEC_FEED_ERROR_LIMIT);
-        return DR_NEED_IDR;
-    }
+    return vdec_finish_feed(result, decodeUnit);
 }
 
 static inline void vdec_stats_write_begin(void) {
@@ -528,11 +554,18 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     } else {
         dst->avgDecoderLatency = 0;
     }
+    /* Upstream samples the render-queue depth here via SS4S_PlayerGetVideoRenderQueueLength.
+     * That entry point is Starfish/SMP-only and does not exist in our ss4s fork at all — we
+     * decode through NDL, where the queue depth is never exposed. Sampling it would mean
+     * carrying a submodule bump for a value that is structurally always absent, so the flag
+     * simply stays false and soft recovery relies on decoder latency + the fps gap instead. */
+    vdec_stream_info.has_render_queue = false;
     vdec_stats_write_end();
 
 #if defined(TARGET_WEBOS)
     soft_recovery_tick(dst);
 #endif
+
 
     if (show_stats) {
         app_bus_post(session->app, (bus_actionfunc) streaming_refresh_stats, NULL);

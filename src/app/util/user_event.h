@@ -16,8 +16,11 @@
 #define USER_CLOSE_SOFT_KEYBOARD 532
 #define USER_OPEN_SOFT_KEYBOARD 533
 #define USER_TOGGLE_STATS_PIN 534
-#define USER_CLOSE_HID_PANEL 535
+#define USER_TOGGLE_VMOUSE 535
 #define USER_APP_FOREGROUND 536
+/* 537 statt 535: upstream hat 535 fuer USER_TOGGLE_VMOUSE belegt. Der Code
+ * referenziert nur das Symbol, die Zahl ist frei waehlbar. */
+#define USER_CLOSE_HID_PANEL 537
 
 
 extern unsigned int app_userevent_remotebutton;

@@ -88,7 +88,6 @@ fi
 echo ""
 echo "Running build..."
 export TOOLCHAIN_FILE
-sed 's/\r$//' "${SCRIPT_DIR}/apply_ndl_low_latency.sh" | bash
 ./scripts/webos/easy_build.sh -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
 
 echo ""

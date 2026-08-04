@@ -1,0 +1,35 @@
+<p>Aurora is a fork of <a href="https://github.com/mariotaku/moonlight-tv">Moonlight TV</a> for LG webOS, tuned for high-bitrate 4K/120Hz HDR streaming from a Sunshine or NVIDIA GameStream host, with an AMOLED-friendly dark theme and a UI built for TV remotes and gamepads.</p>
+
+<h2>Highlights</h2>
+<ul>
+  <li><i>AMOLED layout</i> &mdash; pure black background, dark surfaces, violet accent across the launcher, game grid, and settings.</li>
+  <li><i>3.6K resolution</i> (3584&times;2016) &mdash; ~90% of 4K pixel area with less decoder load and lower input lag than native 4K on recent LG panels.</li>
+  <li><i>HDR10 (PQ)</i> over HEVC Main10 when the host supports it.</li>
+  <li>NTSC-correct refresh rates (59.94/119.88 Hz for 60/120 FPS) for smoother sync on LG panels.</li>
+  <li>Periodic decoder refresh for HEVC, avoiding long-session artifact drift.</li>
+</ul>
+
+<h2>Recommended settings (LG OLED)</h2>
+<table border="1">
+  <tr><th>Setting</th><th>Suggestion</th></tr>
+  <tr><td>Resolution</td><td>3.6K (3584&times;2016)</td></tr>
+  <tr><td>FPS</td><td>60 or 120, depending on game and network</td></tr>
+  <tr><td>Codec</td><td>HEVC (H.265)</td></tr>
+  <tr><td>Bitrate</td><td>~250&ndash;270 Mbps on stable 5 GHz Wi-Fi &mdash; going higher rarely improves real throughput</td></tr>
+</table>
+
+<h2>Controllers</h2>
+<p>Gamepads use standard Moonlight/SDL input. PlayStation DualSense controllers get adaptive triggers, player LED, mic LED, and rumble feedback from the host when Sunshine supports it.</p>
+<ul>
+  <li>Configurable analog stick deadzone and ABXY swap for Nintendo-style layouts.</li>
+  <li>Virtual mouse mode: LB + RS during streaming (enable in Settings &rarr; Input).</li>
+  <li>Full soft keyboard: RB + RS or remote blue button during streaming.</li>
+</ul>
+
+<h2>Built for TV remotes and gamepads</h2>
+<ul>
+  <li>On-screen streaming overlay with live latency/bitrate stats, opened with the remote's red button or a gamepad combo.</li>
+  <li>Full soft keyboard (Windows/Xbox OSK style) with sticky modifiers, openable directly from the gamepad.</li>
+  <li>Virtual mouse mode for desktop apps and launchers &mdash; right stick moves the cursor, left stick scrolls.</li>
+  <li>Auto-resume of a running app when Aurora returns to the foreground.</li>
+</ul>

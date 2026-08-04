@@ -12,20 +12,26 @@
 #include "stream/adaptive_bitrate.h"
 #include "app_session.h"
 #include "backend/pcmanager/worker/worker.h"
-
+#include "app_settings.h"
 #if defined(TARGET_WEBOS)
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #endif
 
-#include "app_settings.h"
-
 #include <stdlib.h>
 #include <stdio.h>
+
+#if TARGET_WEBOS
+#include <SDL.h>
+#endif
 
 /* Host-PTS smooth pacing (ss4s FeedWithPTS): the env must ALWAYS be set
  * explicitly — ss4s defaults to ON when the variable is absent, our default
  * is OFF (A/B baseline; NDL is believed to present ASAP ignoring PTS). Read
- * by the ss4s module in VideoOpen, so it takes effect per stream start. */
+ * by the ss4s module in VideoOpen, so it takes effect per stream start.
+ *
+ * Upstream v1.1.7 hardcodes pacing to always-on and dropped the setting. We keep
+ * the toggle (it is our A/B handle for the FeedWithPTS question) but adopt their
+ * panel-refresh anchoring for the PTS grid. */
 static void session_apply_smooth_pacing_env(const session_t *session) {
 #if TARGET_WEBOS
     const app_settings_t *cfg = app_configuration;
@@ -34,15 +40,46 @@ static void session_apply_smooth_pacing_env(const session_t *session) {
     /* Shared names for SMP + NDL; NDL_* aliases for older module builds. */
     setenv("SS4S_SMOOTH_PACING", smooth_val, 1);
     setenv("SS4S_NDL_SMOOTH_PACING", smooth_val, 1);
+    /* Historical Starfish default; not exposed in settings. */
+    setenv("SS4S_PAUSE_AT_DECODE_TIME", "1", 1);
+    /* Tight drift: 0.5 frame (SS4S reads as percent of interval via maxDrift factor). */
+    setenv("SS4S_SMOOTH_PACING_MAX_DRIFT_FRAMES", "0.5", 1);
 
-    int x100 = session->config.stream.clientRefreshRateX100;
+    /* Prefer measured panel refresh for the PTS grid so display cadence matches the OLED,
+     * not only the host's clientRefreshRateX100 / stream fps (common microstutter source). */
+    int stream_x100 = session->config.stream.clientRefreshRateX100;
+    if (stream_x100 <= 0 && session->config.stream.fps > 0) {
+        stream_x100 = session->config.stream.fps * 100;
+    }
+
+    int x100 = stream_x100;
+    int panel_hz = 0;
+    const char *source = "stream";
+    if (SDL_webOSGetRefreshRate(&panel_hz) && panel_hz >= 20 && panel_hz <= 240) {
+        int panel_x100 = panel_hz * 100;
+        if (stream_x100 <= 0) {
+            x100 = panel_x100;
+            source = "panel";
+        } else {
+            int stream_hz = (stream_x100 + 50) / 100;
+            /* Same ballpark (±2 Hz): anchor PTS to the panel. Far apart: keep stream. */
+            if (abs(stream_hz - panel_hz) <= 2) {
+                x100 = panel_x100;
+                source = "panel";
+            }
+        }
+    }
+
     if (x100 > 0) {
-        /* interval_us = 1e6 * 100 / x100  (e.g. 11988 → ~8341 µs) */
+        /* interval_us = 1e6 * 100 / x100  (e.g. 12000 → 8333 µs) */
         long interval_us = (100000000L + (x100 / 2)) / x100;
         char buf[32];
         snprintf(buf, sizeof(buf), "%ld", interval_us);
         setenv("SS4S_SMOOTH_PACING_INTERVAL_US", buf, 1);
         setenv("SS4S_NDL_PACING_INTERVAL_US", buf, 1);
+        commons_log_info("Session",
+                         "Smooth pacing %s, interval %ld µs from %s (x100=%d, stream_x100=%d, panel=%d Hz)",
+                         smooth_val, interval_us, source, x100, stream_x100, panel_hz);
     } else {
         unsetenv("SS4S_SMOOTH_PACING_INTERVAL_US");
         unsetenv("SS4S_NDL_PACING_INTERVAL_US");
@@ -104,8 +141,9 @@ int session_worker(session_t *session) {
     const char *surround_params = NULL;
 #if TARGET_WEBOS
     if (session->config.stream.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
-        // 6 channels, 4 streams, 2 coupled streams, FL, FR, SL, SR, FC, LFE
-        surround_params = "642014523";
+        // Send standard channel order so all hosts use the same layout.
+        // This is then remapped to the WebOS order in opus_fix.c from SS4S.
+        surround_params = "642012345";
     }
 #endif
     short gamepad_mask = app_input_gamepads_mask(&app->input);

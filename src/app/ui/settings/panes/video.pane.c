@@ -22,6 +22,7 @@ typedef struct video_pane_t {
     lv_obj_t *idr_refresh_slider;
     lv_obj_t *idr_refresh_hint;
     int idr_refresh_slider_value;
+    bool idr_refresh_on;
 
     pref_dropdown_string_entry_t *vdec_entries;
     int vdec_entries_len;
@@ -47,7 +48,7 @@ static void idr_refresh_state_update(video_pane_t *controller);
 
 static void idr_refresh_checkbox_cb(lv_event_t *e);
 
-static void idr_refresh_checkbox_toggle_cb(lv_event_t *e);
+static void idr_checkbox_activate(lv_event_t *e);
 
 static void idr_refresh_hevc_cb(lv_event_t *e);
 
@@ -149,26 +150,25 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 
     lv_obj_t *idr_checkbox = lv_checkbox_create(view);
     lv_checkbox_set_text(idr_checkbox, locstr("Periodic decoder refresh (HEVC)"));
-    /* Clear CHECKABLE so D-pad arrow navigation does not flip the box via LVGL's
-     * default key handler (which would silently toggle IDR refresh just by scrolling
-     * past this row); toggling is driven explicitly from CLICKED below. */
-    pref_checkbox_prepare_for_dpad(idr_checkbox);
-    if (app_configuration->idr_refresh_interval_sec >= 2) {
+    if (app_configuration->idr_refresh_interval_ms >= 500) {
         lv_obj_add_state(idr_checkbox, LV_STATE_CHECKED);
     }
     controller->idr_refresh_checkbox = idr_checkbox;
-    controller->idr_refresh_slider_value = app_configuration->idr_refresh_interval_sec >= 2
-            ? app_configuration->idr_refresh_interval_sec
-            : 10;
-    lv_obj_t *idr_slider = pref_slider(view, &controller->idr_refresh_slider_value, 2, 60, 1);
+    controller->idr_refresh_slider_value = app_configuration->idr_refresh_interval_ms >= 500
+            ? app_configuration->idr_refresh_interval_ms
+            : 10000;
+    pref_checkbox_prepare_for_dpad(idr_checkbox);
+    lv_obj_t *idr_slider = pref_slider(view, &controller->idr_refresh_slider_value, 500, 60000, 500);
     controller->idr_refresh_slider = idr_slider;
     lv_obj_t *idr_hint = pref_desc_label(view,
         locstr("Request a keyframe every N seconds during HEVC streams to reduce long-session artifact drift. "
-               "Off by default; use 10–30 s if you see blockiness or color smearing."),
+               "Off by default; use 10–30 s if you see blockiness or color smearing. Minimum 0.5 s."),
         false);
     controller->idr_refresh_hint = idr_hint;
-    lv_obj_add_event_cb(idr_checkbox, idr_refresh_checkbox_toggle_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(idr_checkbox, idr_refresh_checkbox_cb, LV_EVENT_VALUE_CHANGED, controller);
+    /* LVGL already synthesizes a CLICKED event for a focused object on ENTER
+     * key release (see indev_keypad_proc in lv_indev.c), so also listening on
+     * LV_EVENT_KEY here double-fires the toggle for one remote OK press. */
+    lv_obj_add_event_cb(idr_checkbox, idr_checkbox_activate, LV_EVENT_CLICKED, controller);
     lv_obj_add_event_cb(idr_slider, idr_refresh_slider_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hevc_checkbox, idr_refresh_hevc_cb, LV_EVENT_VALUE_CHANGED, controller);
     idr_refresh_state_update(controller);
@@ -244,7 +244,8 @@ static void idr_refresh_state_update(video_pane_t *controller) {
     app_t *app = controller->parent->app;
     const bool hevc_capable = (app->ss4s.video_cap.codecs & SS4S_VIDEO_H265) != 0;
     const bool hevc_on = app_configuration->hevc && hevc_capable;
-    const bool refresh_on = app_configuration->idr_refresh_interval_sec >= 2;
+    const bool refresh_on = app_configuration->idr_refresh_interval_ms >= 500;
+    controller->idr_refresh_on = refresh_on;
     if (refresh_on) {
         lv_obj_add_state(controller->idr_refresh_checkbox, LV_STATE_CHECKED);
     } else {
@@ -260,32 +261,21 @@ static void idr_refresh_state_update(video_pane_t *controller) {
         if (refresh_on) {
             lv_obj_clear_state(controller->idr_refresh_slider, LV_STATE_DISABLED);
             lv_label_set_text_fmt(controller->idr_refresh_hint,
-                                  locstr("Request a keyframe every %d seconds during HEVC streams."),
-                                  app_configuration->idr_refresh_interval_sec);
+                                  locstr("Request a keyframe every %.1f seconds during HEVC streams."),
+                                  app_configuration->idr_refresh_interval_ms / 1000.0);
         } else {
             lv_obj_add_state(controller->idr_refresh_slider, LV_STATE_DISABLED);
             lv_label_set_text(controller->idr_refresh_hint,
                               locstr("Request a keyframe every N seconds during HEVC streams to reduce "
-                                     "long-session artifact drift. Off by default."));
+                                     "long-session artifact drift. Off by default (0.5–60 s when enabled)."));
         }
     }
 }
 
-static void idr_refresh_checkbox_cb(lv_event_t *e) {
-    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
-    lv_obj_t *cb = lv_event_get_target(e);
-    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
-        if (controller->idr_refresh_slider_value < 2) {
-            controller->idr_refresh_slider_value = 10;
-        }
-        app_configuration->idr_refresh_interval_sec = controller->idr_refresh_slider_value;
-    } else {
-        app_configuration->idr_refresh_interval_sec = 0;
+static void idr_checkbox_activate(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
     }
-    idr_refresh_state_update(controller);
-}
-
-static void idr_refresh_checkbox_toggle_cb(lv_event_t *e) {
     lv_obj_t *cb = lv_event_get_current_target(e);
     if (lv_obj_has_state(cb, LV_STATE_DISABLED)) {
         return;
@@ -295,13 +285,27 @@ static void idr_refresh_checkbox_toggle_cb(lv_event_t *e) {
     } else {
         lv_obj_add_state(cb, LV_STATE_CHECKED);
     }
-    lv_event_send(cb, LV_EVENT_VALUE_CHANGED, NULL);
+    idr_refresh_checkbox_cb(e);
+}
+
+static void idr_refresh_checkbox_cb(lv_event_t *e) {
+    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
+    lv_obj_t *cb = lv_event_get_target(e);
+    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
+        if (controller->idr_refresh_slider_value < 500) {
+            controller->idr_refresh_slider_value = 10000;
+        }
+        app_configuration->idr_refresh_interval_ms = controller->idr_refresh_slider_value;
+    } else {
+        app_configuration->idr_refresh_interval_ms = 0;
+    }
+    idr_refresh_state_update(controller);
 }
 
 static void idr_refresh_slider_cb(lv_event_t *e) {
     video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
-    if (app_configuration->idr_refresh_interval_sec >= 2) {
-        app_configuration->idr_refresh_interval_sec = controller->idr_refresh_slider_value;
+    if (app_configuration->idr_refresh_interval_ms >= 500) {
+        app_configuration->idr_refresh_interval_ms = controller->idr_refresh_slider_value;
     }
     idr_refresh_state_update(controller);
 }

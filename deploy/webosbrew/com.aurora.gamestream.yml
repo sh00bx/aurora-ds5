@@ -2,22 +2,22 @@
 # then open a Pull Request. See docs/WEBOS_HOMEBREW.md
 
 title: Aurora
-iconUri: https://raw.githubusercontent.com/GuiDev1994/moonlight-tv/main/deploy/webos/icon_large.png
-detailIconUri: https://raw.githubusercontent.com/GuiDev1994/moonlight-tv/main/deploy/webos/icon_large.png
-manifestUrl: https://github.com/GuiDev1994/moonlight-tv/releases/latest/download/com.aurora.gamestream.manifest.json
+iconUri: https://raw.githubusercontent.com/GuiDev1994/aurora-tv/main/deploy/webos/icon_large.png
+detailIconUri: https://raw.githubusercontent.com/GuiDev1994/aurora-tv/main/deploy/webos/icon_large.png
+manifestUrl: https://github.com/GuiDev1994/aurora-tv/releases/latest/download/com.aurora.gamestream.manifest.json
 category: game
 pool: main
 description: |
   **Aurora** is a fork of [Moonlight TV](https://github.com/mariotaku/moonlight-tv) for LG webOS (C1–C5 and similar),
   focused on **4K 120fps HDR** streaming with Sunshine / GameStream hosts.
 
-  ![GitHub Release](https://img.shields.io/github/v/release/GuiDev1994/moonlight-tv)
-  ![GitHub Downloads](https://img.shields.io/github/downloads/GuiDev1994/moonlight-tv/total)
+  ![GitHub Release](https://img.shields.io/github/v/release/GuiDev1994/aurora-tv)
+  ![GitHub Downloads](https://img.shields.io/github/downloads/GuiDev1994/aurora-tv/total)
 
   ## Notes
 
   * App ID: `com.aurora.gamestream` (separate from store / Homebrew **Moonlight** `com.limelight.webos`).
-  * Releases: [github.com/GuiDev1994/moonlight-tv/releases](https://github.com/GuiDev1994/moonlight-tv/releases)
+  * Releases: [github.com/GuiDev1994/aurora-tv/releases](https://github.com/GuiDev1994/aurora-tv/releases)
 
   ## Highlights
 
