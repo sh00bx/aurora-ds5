@@ -16,8 +16,23 @@ typedef struct launcher_fragment_args_t {
     const app_launch_params_t *params;
 } launcher_fragment_args_t;
 
+/** Vertical focus zones of the home screen, ordered top to bottom. */
+typedef enum launcher_zone_t {
+    LAUNCHER_ZONE_TOPBAR = 0,
+    LAUNCHER_ZONE_FILTER = 1,
+    LAUNCHER_ZONE_GRID = 2,
+} launcher_zone_t;
+
 /** Height of the home top bar (dp); settings overlay sits below this band. */
 #define LAUNCHER_TOPBAR_DPX 60
+
+/** Height of the platform filter row (dp); only occupied while the row is shown. */
+#define LAUNCHER_FILTERBAR_DPX 34
+
+/** Platform segments the filter bar can show, excluding the leading "All". */
+#define LAUNCHER_MAX_PLATFORMS 8
+/** Longest platform name/label handled by the filter bar, in bytes. */
+#define LAUNCHER_PLATFORM_LABEL_MAX 40
 
 typedef struct launcher_fragment_t {
     lv_fragment_t base;
@@ -29,6 +44,10 @@ typedef struct launcher_fragment_t {
     lv_obj_t *nav;
     /* Detail area below the top bar; full width, hosts the apps fragment (game rail). */
     lv_obj_t *detail;
+    /* Wrapper that grows to fill whatever the bars leave over. */
+    lv_obj_t *detail_stack;
+    /* Platform filter band between the top bar and the grid. */
+    lv_obj_t *filter_row;
     lv_obj_t *profile_dropdown;
     /** Profile combobox list open; blocks arrow-key focus changes until closed. */
     lv_obj_t *active_dropdown;
@@ -41,8 +60,29 @@ typedef struct launcher_fragment_t {
 
     lv_obj_t *add_btn, *pref_btn, *help_btn, *quit_btn;
 
-    /* Focus groups: nav_group for top-bar buttons, detail_group for game rail items. */
-    lv_group_t *nav_group, *detail_group;
+    /* Segmented platform filter ("All" + one segment per platform the host
+     * reports). Hidden while the host offers nothing to group by. */
+    lv_obj_t *platform_bar;
+    /* Backing storage for the button-matrix map: lv_btnmatrix keeps the pointer
+     * we hand it, so the strings have to outlive the call. Slot 0 is "All",
+     * the last entry is the "" terminator. Labels are the shortened names shown
+     * on screen; values are the platform names as the host reports them, which
+     * is what the filter actually matches on. */
+    char platform_labels[LAUNCHER_MAX_PLATFORMS + 1][LAUNCHER_PLATFORM_LABEL_MAX];
+    char platform_values[LAUNCHER_MAX_PLATFORMS + 1][LAUNCHER_PLATFORM_LABEL_MAX];
+    const char *platform_map[LAUNCHER_MAX_PLATFORMS + 2];
+    /* Segment count including "All"; 0 while the bar is hidden. */
+    int platform_segments;
+    /* Selected segment; 0 = "All". */
+    int platform_selected;
+
+    /* Focus groups, one per vertical zone: top bar, platform filter, game rail. */
+    lv_group_t *nav_group, *filter_group, *detail_group;
+
+    /* Which zone currently owns keypad/gamepad input; see launcher_zone_t. */
+    int focus_zone;
+    /* Guards against re-entering the zone switch from the FOCUSED event it emits. */
+    bool focus_switching;
 
     /* Style applied to top-bar action buttons (icon-only). */
     lv_style_t topbar_btn_style;
@@ -79,7 +119,28 @@ void launcher_refresh_server_label(launcher_fragment_t *controller);
 /** After closing launcher-embedded UI, point keypad/gamepad focus back at the main bar. */
 void launcher_restore_nav_focus(launcher_fragment_t *controller);
 
+/** Leave the game grid upwards: onto the platform filter, or the top bar if there is none. */
+void launcher_focus_above_grid(launcher_fragment_t *controller);
+
 /** Wire gamepad/remote navigation for the top-bar profile combobox. */
 void launcher_attach_profile_dropdown_nav(launcher_fragment_t *controller);
+
+/** Wire gamepad/remote navigation for the top-bar platform filter. */
+void launcher_attach_platform_bar_nav(launcher_fragment_t *controller);
+
+/**
+ * CHILD_CREATED handler for the top bar: puts focusable children into nav_group
+ * and gives each one the shared arrow-key handler.
+ */
+void launcher_nav_child_added(lv_event_t *event);
+
+/**
+ * Rebuild the platform filter segments from the app list.
+ * @param names    platform names, or NULL when there is nothing to group by
+ * @param count    number of entries in @p names
+ * @param selected currently applied platform name, or NULL for "All"
+ */
+void launcher_set_platform_segments(launcher_fragment_t *controller, const char *const *names, int count,
+                                    const char *selected);
 
 extern const lv_fragment_class_t launcher_controller_class;

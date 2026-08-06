@@ -44,6 +44,19 @@ typedef struct {
     int col_count;
     lv_coord_t col_width, col_height;
     int focus_backup;
+
+    /* Distinct platform names present in apploader_apps, in display order.
+     * Strings are owned here (strdup'd) and rebuilt on every list load. */
+    char **platforms;
+    int platform_count;
+    /* Currently applied filter. NULL means "show everything". Owned here; kept
+     * by name (not index) so it survives a reload that adds/removes platforms. */
+    char *platform_filter;
+
+    /* Grid position -> index into apploader_apps->items. Rebuilt whenever the
+     * list or the filter changes; the grid only ever sees visible_count items. */
+    int *visible_map;
+    int visible_count;
 } apps_fragment_t;
 
 typedef struct {
@@ -64,3 +77,12 @@ extern const lv_fragment_class_t apps_controller_class;
 
 /** Move focus into the game grid. */
 void apps_focus_rail(apps_fragment_t *controller);
+
+/** Recompute tile geometry after the space available to the grid changed. */
+void apps_relayout(apps_fragment_t *controller);
+
+/**
+ * Restrict the grid to a single platform.
+ * @param platform platform name to show, or NULL to show every app.
+ */
+void apps_set_platform_filter(apps_fragment_t *controller, const char *platform);

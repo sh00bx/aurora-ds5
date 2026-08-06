@@ -171,10 +171,12 @@ void start_applist_element(void *userData, const char *name, const char **atts) 
 
         app->id = 0;
         app->name = NULL;
+        app->platform = NULL;
         app->hdr = 0;
         app->next = (PAPP_LIST) search->data;
         search->data = app;
-    } else if (strcmp("ID", name) == 0 || strcmp("AppTitle", name) == 0 || strcmp("IsHdrSupported", name) == 0) {
+    } else if (strcmp("ID", name) == 0 || strcmp("AppTitle", name) == 0 || strcmp("IsHdrSupported", name) == 0 ||
+               strcmp("Platform", name) == 0) {
         search->memory = malloc(1);
         search->size = 0;
         search->start = 1;
@@ -195,6 +197,17 @@ void end_applist_element(void *userData, const char *name) {
             search->memory = NULL;
         } else if (strcmp("AppTitle", name) == 0) {
             list->name = search->memory;
+            /* Ownership moved into the list -- drop our reference, otherwise
+             * xml_applist()'s trailing `free(query.memory)` frees a string the
+             * list still points at. That used to be harmless only because the
+             * host happens to send <ID> (which clears memory) after <AppTitle>;
+             * any element order change would have turned it into a
+             * use-after-free. */
+            search->memory = NULL;
+        } else if (strcmp("Platform", name) == 0) {
+            /* Optional; only hosts that know about Playnite platforms send it. */
+            list->platform = search->memory;
+            search->memory = NULL;
         } else if (strcmp("IsHdrSupported", name) == 0) {
             list->hdr = (int) strtol(search->memory, NULL, 10);
             free(search->memory);

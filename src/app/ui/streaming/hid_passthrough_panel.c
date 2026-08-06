@@ -254,6 +254,40 @@ static bool panel_is_option_control(const hid_pt_panel_t *panel, lv_obj_t *targe
            target == panel->reset_settings_btn;
 }
 
+/**
+ * Bring the focused control into view.
+ *
+ * The settings column is taller than the sheet for a DualSense (battery,
+ * latency, audio route + warning, two volume sliders, haptics, reset), so the
+ * last entries -- "Reset to defaults" in particular -- sit below the fold. The
+ * pane scrolls, but nothing was asking it to: LVGL only auto-scrolls to a
+ * focused object that carries LV_OBJ_FLAG_SCROLL_ON_FOCUS, which these controls
+ * don't, so arrowing down onto the button moved focus somewhere invisible.
+ * Recursive, because both the right pane and the settings box can be the one
+ * that has to move.
+ */
+static void panel_scroll_into_view_cb(lv_event_t *event)
+{
+    lv_obj_t *target = lv_event_get_target(event);
+    if (target == NULL) {
+        return;
+    }
+    lv_obj_scroll_to_view_recursive(target, LV_ANIM_ON);
+}
+
+/** Add to the focus group and keep exactly one scroll-into-view handler on it. */
+static void panel_group_add(hid_pt_panel_t *panel, lv_obj_t *obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+    lv_group_add_obj(panel->group, obj);
+    /* This runs again on every refresh; drop any previous registration first so
+     * the callbacks don't pile up on the same object. */
+    lv_obj_remove_event_cb(obj, panel_scroll_into_view_cb);
+    lv_obj_add_event_cb(obj, panel_scroll_into_view_cb, LV_EVENT_FOCUSED, panel);
+}
+
 static void panel_setup_focus_order(hid_pt_panel_t *panel)
 {
     if (!panel || !panel->group) {
@@ -262,39 +296,20 @@ static void panel_setup_focus_order(hid_pt_panel_t *panel)
     lv_group_remove_all_objs(panel->group);
     for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
         if (panel->plug_buttons[i]) {
+            /* Plug buttons scroll the device list themselves in plug_focus_cb. */
             lv_group_add_obj(panel->group, panel->plug_buttons[i]);
         }
     }
-    if (panel->composite_cb) {
-        lv_group_add_obj(panel->group, panel->composite_cb);
-    }
-    if (panel->auto_plugin_cb) {
-        lv_group_add_obj(panel->group, panel->auto_plugin_cb);
-    }
-    if (panel->latency_slider) {
-        lv_group_add_obj(panel->group, panel->latency_slider);
-    }
-    if (panel->audio_dropdown) {
-        lv_group_add_obj(panel->group, panel->audio_dropdown);
-    }
-    if (panel->speaker_slider) {
-        lv_group_add_obj(panel->group, panel->speaker_slider);
-    }
-    if (panel->headset_slider) {
-        lv_group_add_obj(panel->group, panel->headset_slider);
-    }
-    if (panel->haptics_slider) {
-        lv_group_add_obj(panel->group, panel->haptics_slider);
-    }
-    if (panel->reset_settings_btn) {
-        lv_group_add_obj(panel->group, panel->reset_settings_btn);
-    }
-    if (panel->refresh_btn) {
-        lv_group_add_obj(panel->group, panel->refresh_btn);
-    }
-    if (panel->close_btn) {
-        lv_group_add_obj(panel->group, panel->close_btn);
-    }
+    panel_group_add(panel, panel->composite_cb);
+    panel_group_add(panel, panel->auto_plugin_cb);
+    panel_group_add(panel, panel->latency_slider);
+    panel_group_add(panel, panel->audio_dropdown);
+    panel_group_add(panel, panel->speaker_slider);
+    panel_group_add(panel, panel->headset_slider);
+    panel_group_add(panel, panel->haptics_slider);
+    panel_group_add(panel, panel->reset_settings_btn);
+    panel_group_add(panel, panel->refresh_btn);
+    panel_group_add(panel, panel->close_btn);
 }
 
 static void plug_focus_cb(lv_event_t *event)
@@ -1105,11 +1120,14 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
 
     lv_obj_t *sheet = lv_obj_create(cont);
     panel->sheet = sheet;
-    lv_obj_set_size(sheet, LV_DPX(760), LV_PCT(85));
+    /* A DualSense fills the settings column (battery, latency, audio route,
+     * speaker, headset, haptics, reset); a couple more percent of height keeps
+     * that off the scrollbar in the common case. */
+    lv_obj_set_size(sheet, LV_DPX(760), LV_PCT(90));
     lv_obj_set_style_min_height(sheet, LV_DPX(400), 0);
     lv_obj_center(sheet);
     lv_obj_set_style_max_width(sheet, LV_PCT(92), 0);
-    lv_obj_set_style_max_height(sheet, LV_PCT(88), 0);
+    lv_obj_set_style_max_height(sheet, LV_PCT(92), 0);
     lv_obj_set_style_bg_color(sheet, lv_color_hex(0x121a20), 0);
     lv_obj_set_style_bg_opa(sheet, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(sheet, LV_DPX(12), 0);
@@ -1225,6 +1243,10 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_set_flex_flow(right_pane, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(right_pane, LV_DPX(12), 0);
     lv_obj_add_flag(right_pane, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(right_pane, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(right_pane, lv_color_hex(0x64748b), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(right_pane, LV_OPA_60, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(right_pane, LV_DPX(4), LV_PART_SCROLLBAR);
 
     panel->composite_row = lv_obj_create(right_pane);
     lv_obj_remove_style_all(panel->composite_row);
@@ -1273,6 +1295,15 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_set_flex_align(panel->customize_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_add_flag(panel->customize_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(panel->customize_panel, LV_OBJ_FLAG_HIDDEN);
+    /* lv_obj_remove_style_all() above took the scrollbar with it, so a pane that
+     * had more below the fold gave no hint of it. Put a slim one back. */
+    lv_obj_set_scrollbar_mode(panel->customize_panel, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(panel->customize_panel, lv_color_hex(0x64748b), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(panel->customize_panel, LV_OPA_60, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(panel->customize_panel, LV_DPX(4), LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(panel->customize_panel, LV_DPX(2), LV_PART_SCROLLBAR);
+    /* Room under the last control so it doesn't sit flush against the border. */
+    lv_obj_set_style_pad_bottom(panel->customize_panel, LV_DPX(16), 0);
 
     panel->customize_title = lv_label_create(panel->customize_panel);
     lv_label_set_text(panel->customize_title, locstr("Controller settings"));

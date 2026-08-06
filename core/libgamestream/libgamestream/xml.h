@@ -23,6 +23,11 @@
 
 typedef struct APP_LIST {
     char *name;
+    /* Platform this app belongs to, as reported by the host in the optional
+     * <Platform> element (Apollo/Vibepollo forwards Playnite's platform here).
+     * NULL when the host doesn't send one -- the launcher then treats the app
+     * as ungrouped. Owned by the list, freed with it. */
+    char *platform;
     int id;
     int hdr;
     struct APP_LIST *next;

@@ -41,8 +41,6 @@ static void on_pc_removed(const uuidstr_t *uuid, void *userdata);
 
 static void cb_topbar_focused(lv_event_t *event);
 
-static void cb_topbar_key(lv_event_t *event);
-
 static void cb_detail_focused(lv_event_t *event);
 
 static void cb_detail_cancel(lv_event_t *event);
@@ -50,10 +48,6 @@ static void cb_detail_cancel(lv_event_t *event);
 static void cb_detail_key(lv_event_t *event);
 
 static void launcher_profile_dropdown_clicked(lv_event_t *event);
-
-static void launcher_profile_dropdown_key_preprocess(lv_event_t *event);
-
-static void launcher_profile_dropdown_key(lv_event_t *event);
 
 static void launcher_profile_dropdown_esc_preprocess(lv_event_t *event);
 
@@ -73,9 +67,23 @@ static void launcher_try_auto_resume(launcher_fragment_t *controller, const uuid
 
 static void launcher_handle_app_foreground(launcher_fragment_t *controller);
 
-/* Switch the active focus group between top-bar and detail (game rail).
- * Replaces the old "set_detail_opened" semantics now that both areas are visible
- * simultaneously - we just route input to whichever group the user is in. */
+/* Vertical focus routing. The home screen is three stacked zones (top bar,
+ * platform filter, game grid) and every arrow-key transition between them goes
+ * through launcher_focus_zone() / launcher_move_zone(). Routing it explicitly --
+ * instead of relying on which object a group happened to have focused and on
+ * events bubbling up to a container handler -- is what keeps "down from the top
+ * bar" working no matter what widget the cursor is sitting on. */
+static bool launcher_zone_available(launcher_fragment_t *controller, launcher_zone_t zone);
+
+static void launcher_focus_zone(launcher_fragment_t *controller, launcher_zone_t zone);
+
+/** Step one zone in @p dir (-1 up, +1 down), skipping zones that aren't there. */
+static void launcher_move_zone(launcher_fragment_t *controller, launcher_zone_t from, int dir);
+
+static apps_fragment_t *launcher_apps_fragment(launcher_fragment_t *controller);
+
+static void launcher_layout_changed(launcher_fragment_t *controller);
+
 static void focus_topbar(launcher_fragment_t *controller);
 
 static void focus_detail(launcher_fragment_t *controller);
@@ -85,6 +93,16 @@ static void launcher_async_try_focus_detail(void *userdata);
 static void launcher_clear_nav_key_focus(launcher_fragment_t *c);
 
 static void launcher_clear_detail_key_focus(launcher_fragment_t *c);
+
+static void launcher_topbar_key_preprocess(lv_event_t *event);
+
+static void launcher_platform_bar_key_preprocess(lv_event_t *event);
+
+static void launcher_platform_bar_key(lv_event_t *event);
+
+static void launcher_platform_bar_clicked(lv_event_t *event);
+
+static void launcher_apply_platform_selection(launcher_fragment_t *controller, int segment);
 
 static void show_decoder_error();
 
@@ -142,6 +160,13 @@ void launcher_restore_nav_focus(launcher_fragment_t *controller) {
     focus_topbar(controller);
 }
 
+void launcher_focus_above_grid(launcher_fragment_t *controller) {
+    if (!controller) {
+        return;
+    }
+    launcher_move_zone(controller, LAUNCHER_ZONE_GRID, -1);
+}
+
 void launcher_refresh_server_label(launcher_fragment_t *controller) {
     if (!controller || !controller->server_label) { return; }
     const pclist_t *selected = NULL;
@@ -167,6 +192,10 @@ static void launcher_controller(lv_fragment_t *self, void *args) {
     fragment->launch_params = fargs->params;
     fragment->settings_fragment = NULL;
     fragment->active_dropdown = NULL;
+    fragment->focus_zone = LAUNCHER_ZONE_TOPBAR;
+    fragment->focus_switching = false;
+    fragment->platform_segments = 0;
+    fragment->platform_selected = 0;
 }
 
 static void controller_dtor(lv_fragment_t *self) {
@@ -179,11 +208,11 @@ static void launcher_view_init(lv_fragment_t *self, lv_obj_t *view) {
     launcher_fragment_t *fragment = (launcher_fragment_t *) self;
     pcmanager_register_listener(pcmanager, &pcmanager_callbacks, fragment);
 
-    /* Top-bar input wiring: focus enters → switch to nav_group; KEY handled for
-     * LEFT/RIGHT (move between buttons) and DOWN (descend into the game grid below the bar);
-     * CANCEL on the bar surfaces the standard quit confirmation. */
+    /* Top-bar input wiring: focus enters → switch to nav_group; CANCEL on the bar
+     * surfaces the standard quit confirmation. Arrow keys are handled per widget
+     * by launcher_topbar_key_preprocess(), attached in launcher_nav_child_added()
+     * as each button joins the group. */
     lv_obj_add_event_cb(fragment->nav, cb_topbar_focused, LV_EVENT_FOCUSED, fragment);
-    lv_obj_add_event_cb(fragment->nav, cb_topbar_key, LV_EVENT_KEY, fragment);
     lv_obj_add_event_cb(fragment->nav, app_quit_confirm, LV_EVENT_CANCEL, fragment);
 
     lv_obj_add_event_cb(fragment->detail, cb_detail_focused, LV_EVENT_FOCUSED, fragment);
@@ -242,6 +271,7 @@ static void launcher_view_destroy(lv_fragment_t *self, lv_obj_t *view) {
     controller->launch_params = NULL;
 
     lv_group_del(controller->nav_group);
+    lv_group_del(controller->filter_group);
     lv_group_del(controller->detail_group);
 
     pcmanager_unregister_listener(pcmanager, &pcmanager_callbacks);
@@ -379,7 +409,9 @@ static void cb_detail_cancel(lv_event_t *event) {
 static void cb_detail_key(lv_event_t *event) {
     launcher_fragment_t *fragment = lv_event_get_user_data(event);
     if (lv_event_get_key(event) == LV_KEY_UP) {
-        focus_topbar(fragment);
+        /* Leaving the grid upwards lands on the filter row when it exists, and
+         * only skips through to the top bar when it doesn't. */
+        launcher_move_zone(fragment, LAUNCHER_ZONE_GRID, -1);
     }
 }
 
@@ -422,66 +454,12 @@ static void launcher_profile_dropdown_esc_preprocess(lv_event_t *event) {
     }
 }
 
-static void launcher_profile_dropdown_key_preprocess(lv_event_t *event) {
-    if (lv_event_get_code(event) != LV_EVENT_KEY) {
-        return;
-    }
-    launcher_fragment_t *fragment = lv_event_get_user_data(event);
-    lv_obj_t *target = lv_event_get_target(event);
-    if (target != fragment->profile_dropdown || fragment->active_dropdown) {
-        return;
-    }
-    switch (lv_event_get_key(event)) {
-        case LV_KEY_UP:
-            lv_event_stop_processing(event);
-            return;
-        case LV_KEY_DOWN: {
-            focus_detail(fragment);
-            lv_event_stop_processing(event);
-            return;
-        }
-        case LV_KEY_LEFT:
-            lv_group_focus_prev(fragment->nav_group);
-            lv_event_stop_processing(event);
-            return;
-        case LV_KEY_RIGHT:
-            lv_group_focus_next(fragment->nav_group);
-            lv_event_stop_processing(event);
-            return;
-        default:
-            return;
-    }
-}
-
-static void launcher_profile_dropdown_key(lv_event_t *event) {
-    if (lv_event_get_code(event) != LV_EVENT_KEY) {
-        return;
-    }
-    launcher_fragment_t *fragment = lv_event_get_user_data(event);
-    if (!fragment->active_dropdown) {
-        return;
-    }
-    switch (lv_event_get_key(event)) {
-        case LV_KEY_UP:
-        case LV_KEY_DOWN:
-        case LV_KEY_LEFT:
-        case LV_KEY_RIGHT:
-            lv_event_stop_bubbling(event);
-            return;
-        default:
-            return;
-    }
-}
-
 void launcher_attach_profile_dropdown_nav(launcher_fragment_t *fragment) {
     lv_obj_t *dropdown = fragment->profile_dropdown;
     if (dropdown == NULL) {
         return;
     }
     lv_obj_add_event_cb(dropdown, launcher_profile_dropdown_clicked, LV_EVENT_CLICKED, fragment);
-    lv_obj_add_event_cb(dropdown, launcher_profile_dropdown_key_preprocess,
-                        LV_EVENT_KEY | LV_EVENT_PREPROCESS, fragment);
-    lv_obj_add_event_cb(dropdown, launcher_profile_dropdown_key, LV_EVENT_KEY, fragment);
     lv_obj_add_event_cb(dropdown, launcher_profile_dropdown_esc_preprocess,
                         LV_EVENT_KEY | LV_EVENT_PREPROCESS, fragment);
 }
@@ -492,33 +470,234 @@ static void cb_topbar_focused(lv_event_t *event) {
     focus_topbar(controller);
 }
 
-static void cb_topbar_key(lv_event_t *event) {
+/**
+ * Arrow keys for every focusable top-bar widget.
+ *
+ * Registered directly on each widget as a PREPROCESS handler rather than once on
+ * the container, because a preprocess callback on the parent still only runs
+ * after the child has had the event -- a widget that consumes arrows (the
+ * profile combobox opens its list on DOWN, for one) would win, and the cursor
+ * would sit in the bar with no way down into the games. Attaching per widget
+ * means we are unconditionally first.
+ */
+static void launcher_topbar_key_preprocess(lv_event_t *event) {
     launcher_fragment_t *fragment = lv_event_get_user_data(event);
-    if (fragment->active_dropdown) {
-        return;
+    /* Self-heal a stale "combobox is open" latch. If that flag ever survives the
+     * list closing, every arrow key in the bar is forwarded to a dropdown that
+     * isn't showing, which looks exactly like the bar having swallowed the
+     * cursor. */
+    if (fragment->active_dropdown != NULL && !lv_dropdown_is_open(fragment->active_dropdown)) {
+        fragment->active_dropdown = NULL;
+    }
+    if (fragment->active_dropdown != NULL) {
+        return; /* an open combobox owns the arrows until it closes */
     }
     switch (lv_event_get_key(event)) {
-        case LV_KEY_LEFT: {
+        case LV_KEY_LEFT:
             lv_group_focus_prev(fragment->nav_group);
+            lv_event_stop_processing(event);
             break;
-        }
-        case LV_KEY_RIGHT: {
+        case LV_KEY_RIGHT:
             lv_group_focus_next(fragment->nav_group);
+            lv_event_stop_processing(event);
             break;
-        }
-        case LV_KEY_UP: {
-            lv_fragment_t *detail_fragment = lv_fragment_manager_find_by_container(fragment->base.child_manager,
-                                                                                   fragment->detail);
-            if (detail_fragment) {
-                focus_detail(fragment);
+        case LV_KEY_DOWN:
+            launcher_move_zone(fragment, LAUNCHER_ZONE_TOPBAR, +1);
+            lv_event_stop_processing(event);
+            break;
+        case LV_KEY_UP:
+            /* Nothing above the bar; swallow it so widgets don't scroll or open. */
+            lv_event_stop_processing(event);
+            break;
+        default:
+            break;
+    }
+}
+
+/** Adds top-bar children to the nav group and gives them the arrow-key handler. */
+void launcher_nav_child_added(lv_event_t *event) {
+    lv_obj_t *child = lv_event_get_param(event);
+    launcher_fragment_t *fragment = lv_event_get_user_data(event);
+    if (child == NULL || !lv_obj_is_group_def(child)) {
+        return;
+    }
+    if (lv_obj_get_group(child)) {
+        lv_group_remove_obj(child);
+    }
+    lv_group_add_obj(fragment->nav_group, child);
+    lv_obj_add_event_cb(child, launcher_topbar_key_preprocess, LV_EVENT_KEY | LV_EVENT_PREPROCESS, fragment);
+}
+
+static void launcher_platform_bar_key_preprocess(lv_event_t *event) {
+    launcher_fragment_t *fragment = lv_event_get_user_data(event);
+    switch (lv_event_get_key(event)) {
+        case LV_KEY_UP:
+            launcher_move_zone(fragment, LAUNCHER_ZONE_FILTER, -1);
+            lv_event_stop_processing(event);
+            break;
+        case LV_KEY_DOWN:
+            launcher_move_zone(fragment, LAUNCHER_ZONE_FILTER, +1);
+            lv_event_stop_processing(event);
+            break;
+        default:
+            /* LEFT/RIGHT belong to the button matrix: it moves the cursor
+             * between segments (and wraps), which is what a segmented control
+             * should do. launcher_platform_bar_key() applies the result. */
+            break;
+    }
+}
+
+/**
+ * Applies the segment the cursor landed on. lv_btnmatrix only emits
+ * VALUE_CHANGED when a button is actually pressed, so on a remote the filter
+ * would need a separate confirm press per platform; running after the matrix has
+ * moved its cursor makes left/right switch platforms directly.
+ */
+static void launcher_platform_bar_key(lv_event_t *event) {
+    launcher_fragment_t *fragment = lv_event_get_user_data(event);
+    uint32_t key = lv_event_get_key(event);
+    if (key != LV_KEY_LEFT && key != LV_KEY_RIGHT) {
+        return;
+    }
+    uint16_t selected = lv_btnmatrix_get_selected_btn(fragment->platform_bar);
+    if (selected == LV_BTNMATRIX_BTN_NONE) {
+        return;
+    }
+    launcher_apply_platform_selection(fragment, (int) selected);
+}
+
+static void launcher_platform_bar_clicked(lv_event_t *event) {
+    launcher_fragment_t *fragment = lv_event_get_user_data(event);
+    uint16_t selected = lv_btnmatrix_get_selected_btn(fragment->platform_bar);
+    if (selected == LV_BTNMATRIX_BTN_NONE) {
+        return;
+    }
+    launcher_apply_platform_selection(fragment, (int) selected);
+}
+
+void launcher_attach_platform_bar_nav(launcher_fragment_t *controller) {
+    lv_obj_t *bar = controller->platform_bar;
+    if (bar == NULL) {
+        return;
+    }
+    lv_obj_add_event_cb(bar, launcher_platform_bar_key_preprocess, LV_EVENT_KEY | LV_EVENT_PREPROCESS, controller);
+    lv_obj_add_event_cb(bar, launcher_platform_bar_key, LV_EVENT_KEY, controller);
+    lv_obj_add_event_cb(bar, launcher_platform_bar_clicked, LV_EVENT_VALUE_CHANGED, controller);
+}
+
+static void launcher_apply_platform_selection(launcher_fragment_t *controller, int segment) {
+    if (segment < 0 || segment >= controller->platform_segments) {
+        return;
+    }
+    controller->platform_selected = segment;
+    lv_btnmatrix_set_btn_ctrl(controller->platform_bar, (uint16_t) segment, LV_BTNMATRIX_CTRL_CHECKED);
+    apps_fragment_t *apps = launcher_apps_fragment(controller);
+    if (apps == NULL) {
+        return;
+    }
+    /* Segment 0 is "All"; the rest map 1:1 onto the platform names. Filter on the
+     * value, not the shortened label that is drawn on the segment. */
+    apps_set_platform_filter(apps, segment == 0 ? NULL : controller->platform_values[segment]);
+}
+
+/**
+ * Shorten a platform name for display.
+ *
+ * Playnite names platforms in full ("PC (Windows)", "Nintendo Switch",
+ * "Nintendo Wii U"). Spelled out on a segment barely 140px wide they get
+ * ellipsised into uselessness, and the vendor prefix carries no information when
+ * every segment repeats it. The filter still matches on the full name.
+ */
+static void launcher_platform_display_name(const char *name, char *out, size_t out_size) {
+    static const char *const vendor_prefixes[] = {"Nintendo ", "Sony ", "Microsoft ", "Sega ", "Atari ",
+                                                  "Commodore ", "NEC ", "SNK ", "Bandai ", "Sinclair "};
+    const char *shortened = name;
+    if (strncmp(name, "PC (", 4) == 0) {
+        /* "PC (Windows)" / "PC (DOS)" / "PC (Linux)" all read as "PC" on a TV. */
+        shortened = "PC";
+    } else {
+        for (size_t i = 0; i < sizeof(vendor_prefixes) / sizeof(vendor_prefixes[0]); i++) {
+            size_t len = strlen(vendor_prefixes[i]);
+            if (strncmp(name, vendor_prefixes[i], len) == 0 && name[len] != '\0') {
+                shortened = name + len;
+                break;
             }
-            break;
-        }
-        case LV_KEY_DOWN: {
-            focus_detail(fragment);
-            break;
         }
     }
+    strncpy(out, shortened, out_size - 1);
+    out[out_size - 1] = '\0';
+}
+
+void launcher_set_platform_segments(launcher_fragment_t *controller, const char *const *names, int count,
+                                    const char *selected) {
+    if (controller == NULL || controller->platform_bar == NULL) {
+        return;
+    }
+    if (count > LAUNCHER_MAX_PLATFORMS) {
+        count = LAUNCHER_MAX_PLATFORMS;
+    }
+    if (count < 0) {
+        count = 0;
+    }
+    /* One platform means every app is in it -- a bar reading "All | PC" only
+     * takes space and a keypress away from the grid. */
+    bool show = count > 1;
+
+    int segments = 0;
+    if (show) {
+        strncpy(controller->platform_labels[0], locstr("All"), LAUNCHER_PLATFORM_LABEL_MAX - 1);
+        controller->platform_labels[0][LAUNCHER_PLATFORM_LABEL_MAX - 1] = '\0';
+        controller->platform_values[0][0] = '\0';
+        controller->platform_map[0] = controller->platform_labels[0];
+        segments = 1;
+        for (int i = 0; i < count; i++) {
+            strncpy(controller->platform_values[segments], names[i], LAUNCHER_PLATFORM_LABEL_MAX - 1);
+            controller->platform_values[segments][LAUNCHER_PLATFORM_LABEL_MAX - 1] = '\0';
+            launcher_platform_display_name(controller->platform_values[segments],
+                                           controller->platform_labels[segments], LAUNCHER_PLATFORM_LABEL_MAX);
+            controller->platform_map[segments] = controller->platform_labels[segments];
+            segments++;
+        }
+    }
+    controller->platform_map[segments] = ""; /* map terminator */
+    controller->platform_segments = segments;
+
+    lv_btnmatrix_set_map(controller->platform_bar, controller->platform_map);
+    if (segments > 0) {
+        lv_btnmatrix_set_btn_ctrl_all(controller->platform_bar,
+                                      LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT |
+                                      LV_BTNMATRIX_CTRL_CHECKABLE);
+        /* Equal-width segments: one shared width per button keeps the control
+         * reading as a segmented control rather than ragged chips. */
+        lv_obj_set_width(controller->platform_bar, LV_DPX(72) * segments);
+    }
+
+    int selected_segment = 0;
+    if (selected != NULL) {
+        for (int i = 1; i < segments; i++) {
+            if (strcmp(controller->platform_values[i], selected) == 0) {
+                selected_segment = i;
+                break;
+            }
+        }
+    }
+    controller->platform_selected = selected_segment;
+    if (segments > 0) {
+        lv_btnmatrix_set_btn_ctrl(controller->platform_bar, (uint16_t) selected_segment, LV_BTNMATRIX_CTRL_CHECKED);
+    }
+
+    if (show) {
+        lv_obj_clear_flag(controller->filter_row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(controller->filter_row, LV_OBJ_FLAG_HIDDEN);
+        /* Never strand the cursor on a row that just disappeared. */
+        if (controller->focus_zone == LAUNCHER_ZONE_FILTER) {
+            launcher_move_zone(controller, LAUNCHER_ZONE_FILTER, +1);
+        }
+    }
+    /* The row is inside the shell's flex column, so showing/hiding it changes
+     * how much height is left for the grid. */
+    launcher_layout_changed(controller);
 }
 
 static void launcher_clear_nav_key_focus(launcher_fragment_t *c) {
@@ -538,57 +717,141 @@ static void launcher_clear_detail_key_focus(launcher_fragment_t *c) {
     }
 }
 
-static void focus_topbar(launcher_fragment_t *controller) {
-    launcher_clear_detail_key_focus(controller);
-    bool key = app_ui_get_input_mode(&controller->global->ui.input) & UI_INPUT_MODE_BUTTON_FLAG;
-    app_input_set_group(&controller->global->ui.input, controller->nav_group);
-    if (key) {
-        lv_obj_t *cur = lv_group_get_focused(controller->nav_group);
-        if (!cur) {
-            lv_group_focus_obj(controller->server_btn);
-            cur = controller->server_btn;
+/**
+ * Re-run the layout after a band appeared or disappeared. The filter row shares
+ * the shell's flex column with the grid, so toggling it changes the height the
+ * grid gets -- and the grid derives its tile size from that height.
+ */
+static void launcher_layout_changed(launcher_fragment_t *controller) {
+    if (controller == NULL || controller->detail_stack == NULL) {
+        return;
+    }
+    lv_obj_update_layout(controller->base.obj);
+    apps_relayout(launcher_apps_fragment(controller));
+}
+
+static apps_fragment_t *launcher_apps_fragment(launcher_fragment_t *controller) {
+    if (controller == NULL || controller->detail == NULL) {
+        return NULL;
+    }
+    return (apps_fragment_t *) lv_fragment_manager_find_by_container(controller->base.child_manager,
+                                                                     controller->detail);
+}
+
+static bool launcher_zone_available(launcher_fragment_t *controller, launcher_zone_t zone) {
+    switch (zone) {
+        case LAUNCHER_ZONE_TOPBAR:
+            return lv_group_get_obj_count(controller->nav_group) > 0;
+        case LAUNCHER_ZONE_FILTER:
+            /* A single segment would just be "All" -- nothing to choose, so the
+             * row is not shown and must not swallow a keypress either. */
+            return controller->platform_bar != NULL && controller->platform_segments > 1 &&
+                   !lv_obj_has_flag(controller->filter_row, LV_OBJ_FLAG_HIDDEN);
+        case LAUNCHER_ZONE_GRID: {
+            apps_fragment_t *apps = launcher_apps_fragment(controller);
+            if (apps == NULL || apps->applist == NULL) {
+                /* No app list, but the error panel's buttons live in the same
+                 * group and still need to be reachable. */
+                return lv_group_get_obj_count(controller->detail_group) > 0;
+            }
+            return !lv_obj_has_flag(apps->applist, LV_OBJ_FLAG_HIDDEN) ||
+                   lv_group_get_obj_count(controller->detail_group) > 0;
         }
-        if (cur) {
-            lv_obj_add_state(cur, LV_STATE_FOCUS_KEY);
+        default:
+            return false;
+    }
+}
+
+static lv_group_t *launcher_zone_group(launcher_fragment_t *controller, launcher_zone_t zone) {
+    switch (zone) {
+        case LAUNCHER_ZONE_TOPBAR:
+            return controller->nav_group;
+        case LAUNCHER_ZONE_FILTER:
+            return controller->filter_group;
+        default:
+            return controller->detail_group;
+    }
+}
+
+/** Drop the key-focus ring everywhere, so only the zone we are entering shows one. */
+static void launcher_clear_all_key_focus(launcher_fragment_t *controller) {
+    launcher_clear_nav_key_focus(controller);
+    launcher_clear_detail_key_focus(controller);
+    if (controller->platform_bar != NULL) {
+        lv_obj_clear_state(controller->platform_bar, LV_STATE_FOCUS_KEY);
+    }
+}
+
+static void launcher_focus_zone(launcher_fragment_t *controller, launcher_zone_t zone) {
+    if (controller == NULL || !controller->pane_initialized) {
+        return;
+    }
+    if (!launcher_zone_available(controller, zone)) {
+        return;
+    }
+    /* lv_group_focus_obj() below emits LV_EVENT_FOCUSED, which bubbles up to the
+     * detail container and lands right back here via cb_detail_focused(). The
+     * recursion is harmless but does the whole switch twice; stop it at the door. */
+    if (controller->focus_switching) {
+        return;
+    }
+    controller->focus_switching = true;
+    controller->focus_zone = zone;
+    launcher_clear_all_key_focus(controller);
+
+    lv_group_t *group = launcher_zone_group(controller, zone);
+    app_input_set_group(&controller->global->ui.input, group);
+    bool key = app_ui_get_input_mode(&controller->global->ui.input) & UI_INPUT_MODE_BUTTON_FLAG;
+
+    if (zone == LAUNCHER_ZONE_GRID) {
+        apps_fragment_t *apps = launcher_apps_fragment(controller);
+        if (apps != NULL && apps->applist != NULL && !lv_obj_has_flag(apps->applist, LV_OBJ_FLAG_HIDDEN)) {
+            /* Point the group at the grid explicitly instead of inheriting
+             * whatever it last had focused -- after an error or a load spinner
+             * that is the actions matrix or the spinner, and the grid would
+             * silently never get the keys. */
+            if (lv_group_get_focused(group) != apps->applist) {
+                lv_group_focus_obj(apps->applist);
+            }
+            if (key) {
+                apps_focus_rail(apps);
+            }
+            controller->focus_switching = false;
+            return;
+        }
+    }
+
+    lv_obj_t *cur = lv_group_get_focused(group);
+    if (cur == NULL) {
+        lv_group_focus_next(group);
+        cur = lv_group_get_focused(group);
+    }
+    if (key && cur != NULL) {
+        lv_obj_add_state(cur, LV_STATE_FOCUS_KEY);
+    }
+    controller->focus_switching = false;
+}
+
+static void launcher_move_zone(launcher_fragment_t *controller, launcher_zone_t from, int dir) {
+    int zone = (int) from;
+    for (;;) {
+        zone += dir;
+        if (zone < LAUNCHER_ZONE_TOPBAR || zone > LAUNCHER_ZONE_GRID) {
+            return; /* nothing above the bar / below the grid */
+        }
+        if (launcher_zone_available(controller, (launcher_zone_t) zone)) {
+            launcher_focus_zone(controller, (launcher_zone_t) zone);
+            return;
         }
     }
 }
 
+static void focus_topbar(launcher_fragment_t *controller) {
+    launcher_focus_zone(controller, LAUNCHER_ZONE_TOPBAR);
+}
+
 static void focus_detail(launcher_fragment_t *controller) {
-    launcher_clear_nav_key_focus(controller);
-    bool key = app_ui_get_input_mode(&controller->global->ui.input) & UI_INPUT_MODE_BUTTON_FLAG;
-    app_input_set_group(&controller->global->ui.input, controller->detail_group);
-    if (key) {
-        lv_obj_t *cur = lv_group_get_focused(controller->detail_group);
-        if (!cur) {
-            lv_group_focus_next(controller->detail_group);
-            cur = lv_group_get_focused(controller->detail_group);
-        }
-        if (cur) {
-            if (lv_obj_check_type(cur, &lv_gridview_class)) {
-                int index = lv_gridview_get_focused_index(cur);
-                if (index < 0) {
-                    index = 0;
-                }
-                lv_gridview_focus(cur, index);
-                /* lv_gridview_focus() sends its FOCUSED event via
-                 * lv_indev_get_act(), which is NULL here (this is a
-                 * programmatic focus-route, not a real keypress) -- LVGL's
-                 * own event handler only applies LV_STATE_FOCUS_KEY for a
-                 * genuine keypad/encoder indev, so the tile ends up
-                 * "focused" internally (grid->focused_index is correct) but
-                 * visually shows no selection outline at all. Force the
-                 * state directly, same as the non-gridview branch below
-                 * already does. */
-                lv_obj_t *focused_item = lv_gridview_get_item_view(cur, index);
-                if (focused_item) {
-                    lv_obj_add_state(focused_item, LV_STATE_FOCUS_KEY);
-                }
-            } else {
-                lv_obj_add_state(cur, LV_STATE_FOCUS_KEY);
-            }
-        }
-    }
+    launcher_focus_zone(controller, LAUNCHER_ZONE_GRID);
 }
 
 static void launcher_async_try_focus_detail(void *userdata) {

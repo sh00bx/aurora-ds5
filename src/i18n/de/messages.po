@@ -566,3 +566,11 @@ msgstr "Spiel beenden"
 msgid "Performance"
 msgstr ""
 
+
+#: src/app/ui/launcher/launcher.controller.c
+msgid "All"
+msgstr "Alle"
+
+#: src/app/ui/launcher/apps.controller.c
+msgid "Other"
+msgstr "Sonstige"

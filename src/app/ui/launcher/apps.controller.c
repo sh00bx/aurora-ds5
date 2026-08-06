@@ -27,8 +27,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define APPS_GRID_COLS 5
-#define APPS_GRID_ROWS 3
+#define APPS_GRID_COLS 7
+/* Cover art is authored 600x800 (3:4, width:height). The grid sizes tiles from
+ * the available *width* and derives the height from this ratio, so a tile fills
+ * its column track exactly -- see update_grid_config(). */
+#define APPS_COVER_ASPECT_W 600
+#define APPS_COVER_ASPECT_H 800
 
 typedef void (*action_cb_t)(apps_fragment_t *controller, lv_obj_t *buttons, uint16_t index);
 
@@ -121,8 +125,9 @@ static void set_actions(apps_fragment_t *controller, const char **labels, const 
  * @param num_changes number of changes. It will be assigned to -1 if the whole dataset has been changed.
  * @return Allocated array of changes. It should be freed by caller.
  */
-static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t *old_list,
-                                                          const apploader_list_t *new_list, int *num_changes);
+static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t *old_list, const int *old_map,
+                                                          int old_count, const apploader_list_t *new_list,
+                                                          const int *new_map, int new_count, int *num_changes);
 
 static void applist_key_up_to_topbar(lv_event_t *event);
 
@@ -132,9 +137,26 @@ static void show_ok(apps_fragment_t *fragment);
 
 static void show_error(apps_fragment_t *fragment, const char *title, const char *hint, const char *detail);
 
-static int apps_raw_visible_count(apps_fragment_t *controller, apploader_list_t *list);
+static bool apps_item_passes_filter(apps_fragment_t *controller, const apploader_item_t *item);
+
+static const char *apps_item_platform(const apploader_item_t *item);
+
+static void apps_rebuild_platforms(apps_fragment_t *controller, const apploader_list_t *list);
+
+static void apps_free_platforms(apps_fragment_t *controller);
+
+static int *apps_build_visible_map(apps_fragment_t *controller, const apploader_list_t *list, int *out_count);
+
+static void apps_apply_visible_map(apps_fragment_t *controller, int *map, int count);
+
+static void apps_publish_platforms(apps_fragment_t *controller);
 
 static apps_fragment_t *current_instance = NULL;
+
+/** Bucket for apps the host reports without a platform (Desktop, Playnite itself, ...). */
+static const char *apps_platform_other() {
+    return locstr("Other");
+}
 
 const static lv_gridview_adapter_t apps_adapter = {
         .item_count = adapter_item_count,
@@ -176,6 +198,12 @@ static void apps_controller_ctor(lv_fragment_t *self, void *args) {
     controller->def_app = arg->def_app;
     controller->apploader = apploader_create(arg->global, &controller->uuid, &controller->apploader_cb, controller);
 
+    controller->platforms = NULL;
+    controller->platform_count = 0;
+    controller->platform_filter = NULL;
+    controller->visible_map = NULL;
+    controller->visible_count = 0;
+
     appitem_style_init(&controller->appitem_style);
 }
 
@@ -186,6 +214,12 @@ static void apps_controller_dtor(lv_fragment_t *self) {
     if (fragment->apploader_apps != NULL) {
         apploader_list_free(fragment->apploader_apps);
     }
+    apps_free_platforms(fragment);
+    free(fragment->platform_filter);
+    fragment->platform_filter = NULL;
+    free(fragment->visible_map);
+    fragment->visible_map = NULL;
+    fragment->visible_count = 0;
 }
 
 static lv_obj_t *apps_view(lv_fragment_t *self, lv_obj_t *container) {
@@ -318,28 +352,29 @@ static void update_grid_config(apps_fragment_t *controller) {
     lv_coord_t gap_col = lv_obj_get_style_pad_column(applist, 0);
     lv_coord_t gap_row = lv_obj_get_style_pad_row(applist, 0);
 
-    /* Row height stays exactly what it was before (fit APPS_GRID_ROWS into the
-     * visible height) so the grid keeps the same overall tile height/scroll
-     * behavior as the pre-fix build. */
-    lv_coord_t row_height = (view_h - pad_t - pad_b - gap_row * (APPS_GRID_ROWS - 1)) / APPS_GRID_ROWS;
-    if (row_height < LV_DPX(40)) {
-        row_height = LV_MAX(LV_DPX(40), view_h / APPS_GRID_ROWS);
-    }
-
-    /* Cover art assets are 600x800 (3:4, width:height). Derive the item *width*
-     * from the row height instead of stretching the height to fill a square
-     * column, so tiles match the source aspect without changing row height.
-     * Columns are laid out as equal fr tracks by lv_gridview (see update_col_dsc
-     * in lv_gridview.c) with LV_GRID_ALIGN_CENTER, so a narrower item is simply
-     * centered within its track -- this is what gives the covers extra
-     * horizontal breathing room, no explicit gap tweak needed. */
-    lv_coord_t col_width = row_height * 600 / 800;
-    lv_coord_t max_col_width = (view_w - pad_l - pad_r - gap_col * (col_count - 1)) / col_count;
-    if (col_width > max_col_width) {
-        col_width = max_col_width;
-    }
+    /* Size the tile from the available *width*, then derive its height from the
+     * cover aspect. lv_gridview lays columns out as equal fr tracks (see
+     * update_col_dsc in lv_gridview.c) and centers the item inside its track, so
+     * a tile narrower than its track leaves dead space on both sides. Deriving
+     * the width from the row height instead -- as this did before -- produced
+     * 211px covers floating in 346px tracks at 1080p: 135px of gap per column,
+     * which is what made the grid look sparse and unfinished. Making the tile
+     * exactly as wide as its track means the covers butt up against the column
+     * gap and nothing else. */
+    lv_coord_t col_width = (view_w - pad_l - pad_r - gap_col * (col_count - 1)) / col_count;
     if (col_width < LV_DPX(40)) {
-        col_width = LV_DPX(40);
+        col_width = LV_MAX(LV_DPX(40), view_w / col_count);
+    }
+    lv_coord_t row_height = col_width * APPS_COVER_ASPECT_H / APPS_COVER_ASPECT_W;
+    /* Never let a single row exceed the viewport: on an unexpectedly short/wide
+     * surface the aspect-derived height could push the first row out of view,
+     * leaving nothing focusable on screen. */
+    lv_coord_t max_row_height = view_h - pad_t - pad_b;
+    if (max_row_height > LV_DPX(40) && row_height > max_row_height) {
+        row_height = max_row_height;
+    }
+    if (row_height < LV_DPX(40)) {
+        row_height = LV_DPX(40);
     }
     controller->col_count = col_count;
     controller->col_width = col_width;
@@ -356,6 +391,11 @@ static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     current_instance = NULL;
     apps_fragment_t *controller = (apps_fragment_t *) self;
     controller->show_hidden_apps = false;
+    /* The bar outlives this fragment (it belongs to the top bar), so retract the
+     * segments -- otherwise switching hosts leaves the previous host's platforms
+     * on screen, clickable, pointing at a fragment that no longer exists. */
+    apps_free_platforms(controller);
+    apps_publish_platforms(controller);
     pcmanager_unregister_listener(pcmanager, &pc_listeners);
     coverloader_unref(controller->coverloader);
 }
@@ -572,8 +612,17 @@ static void appload_loaded(apploader_list_t *apps, void *userdata) {
     if (!fragment->base.managed->obj_created || fragment->base.managed->destroying_obj) {
         return;
     }
+    /* Refresh the platform segments first: that may retire a filter whose
+     * platform vanished, which in turn decides what the new mapping contains. */
+    apps_rebuild_platforms(fragment, apps);
+    int new_visible_count = 0;
+    int *new_visible_map = apps_build_visible_map(fragment, apps, &new_visible_count);
+
     int num_changes = -1;
-    lv_gridview_data_change_t *changes = apps_list_detect_change(fragment->apploader_apps, apps, &num_changes);
+    lv_gridview_data_change_t *changes = apps_list_detect_change(fragment->apploader_apps,
+                                                                fragment->visible_map, fragment->visible_count,
+                                                                apps, new_visible_map, new_visible_count,
+                                                                &num_changes);
 
     /* Every poll that isn't a byte-for-byte identical list (e.g. the backend
      * returning apps in a new order) forces a full grid rebuild via
@@ -586,9 +635,10 @@ static void appload_loaded(apploader_list_t *apps, void *userdata) {
      * What still breaks is fragment->focus_backup, which is only updated when
      * focus *leaves* the grid (applist_focus_leave). If the grid doesn't
      * currently own focus (e.g. the user is on the top bar), that backup is a
-     * raw index into the *old* list, which apps_list_detect_change() may have
-     * just reordered -- so re-resolve it by app id before it's used to
-     * restore focus later (show_ok / applist_focus_enter / apps_focus_rail).
+     * grid position in the *old* mapping, which a reorder (or a platform
+     * appearing/disappearing) may have just invalidated -- so re-resolve it by
+     * app id before it's used to restore focus later (show_ok /
+     * applist_focus_enter / apps_focus_rail).
      * We deliberately do NOT call lv_gridview_focus() here: doing so while
      * the grid already owns focus would fight the preservation above using
      * this same possibly-stale backup value, which is what caused focus to
@@ -596,34 +646,42 @@ static void appload_loaded(apploader_list_t *apps, void *userdata) {
     if (num_changes != 0) {
         int live_focus = lv_gridview_get_focused_index(fragment->applist);
         if (live_focus < 0) {
-            int prev_index = fragment->focus_backup;
+            int prev_position = fragment->focus_backup;
             int focused_app_id = -1;
-            if (fragment->apploader_apps != NULL && prev_index >= 0
-                    && (size_t) prev_index < fragment->apploader_apps->count) {
-                focused_app_id = fragment->apploader_apps->items[prev_index].base.id;
-            }
-            int new_index = 0;
-            if (focused_app_id >= 0) {
-                const apploader_item_t *found = apploader_list_item_by_id(apps, focused_app_id);
-                if (found != NULL) {
-                    new_index = (int) (found - apps->items);
+            if (fragment->apploader_apps != NULL && fragment->visible_map != NULL
+                && prev_position >= 0 && prev_position < fragment->visible_count) {
+                int raw = fragment->visible_map[prev_position];
+                if (raw >= 0 && (size_t) raw < fragment->apploader_apps->count) {
+                    focused_app_id = fragment->apploader_apps->items[raw].base.id;
                 }
             }
-            fragment->focus_backup = new_index;
+            int new_position = 0;
+            if (focused_app_id >= 0 && new_visible_map != NULL) {
+                for (int i = 0; i < new_visible_count; i++) {
+                    if (apps->items[new_visible_map[i]].base.id == focused_app_id) {
+                        new_position = i;
+                        break;
+                    }
+                }
+            }
+            fragment->focus_backup = new_position;
         }
     }
 
     /* Rebind the gridview to the NEW list before releasing the old one: the grid keeps
      * using grid->data until set_data_advanced() has swapped it, so freeing the previous
-     * list up front would hand it a dangling pointer. */
+     * list up front would hand it a dangling pointer. The mapping has to be swapped in
+     * lockstep with the list -- the adapter reads both. */
     apploader_list_t *old_apps = fragment->apploader_apps;
     fragment->apploader_apps = apps;
+    apps_apply_visible_map(fragment, new_visible_map, new_visible_count);
 
     lv_gridview_set_data_advanced(fragment->applist, apps, changes, num_changes);
     if (changes != NULL) {
         free(changes);
     }
     apploader_list_free(old_apps);
+    apps_publish_platforms(fragment);
     update_view_state(fragment);
 
     if (fragment->def_app > 0 && !fragment->def_app_launched) {
@@ -650,6 +708,19 @@ static void appload_errored(int code, const char *error, void *userdata) {
 
 static void appitem_bind(apps_fragment_t *controller, lv_obj_t *item, apploader_item_t *app) {
     appitem_viewholder_t *holder = lv_obj_get_user_data(item);
+
+    /* Tiles are sized in appitem_view() at creation time, but lv_gridview keeps
+     * recycling those same objects, so a tile created under one geometry keeps
+     * that size forever. That only became visible once the grid could be
+     * resized while populated (showing/hiding the platform filter row changes
+     * the height available to it), which left old and new tiles side by side at
+     * different sizes in the same row. Re-assert the size on every bind: it is a
+     * no-op when nothing changed. */
+    if (lv_obj_get_width(item) != controller->col_width || lv_obj_get_height(item) != controller->col_height) {
+        lv_obj_set_size(item, controller->col_width, controller->col_height);
+        /* The cached cover was decoded for the old tile size. */
+        holder->app_id = 0;
+    }
 
     /* lv_gridview's fill_rows() rebinds every visible tile on every single
      * lv_gridview_set_data_advanced() call, including when the view wasn't
@@ -738,7 +809,10 @@ static void launcher_quit_game(apps_fragment_t *controller) {
 static int adapter_item_count(lv_obj_t *grid, void *data) {
     if (data == NULL) { return 0; }
     apps_fragment_t *controller = lv_obj_get_user_data(grid);
-    return apps_raw_visible_count(controller, data);
+    /* visible_map is built against apploader_apps; if the grid is still holding
+     * an older list the mapping doesn't describe it and must not be used. */
+    if (data != controller->apploader_apps) { return 0; }
+    return controller->visible_count;
 }
 
 static lv_obj_t *adapter_create_view(lv_obj_t *parent) {
@@ -749,10 +823,17 @@ static lv_obj_t *adapter_create_view(lv_obj_t *parent) {
 static void adapter_bind_view(lv_obj_t *grid, lv_obj_t *item_view, void *data, int position) {
     apps_fragment_t *controller = lv_obj_get_user_data(grid);
     apploader_list_t *list = data;
-    if (list == NULL || position < 0 || position >= apps_raw_visible_count(controller, list)) {
+    if (list == NULL || list != controller->apploader_apps || controller->visible_map == NULL) {
         return;
     }
-    appitem_bind(controller, item_view, &list->items[position]);
+    if (position < 0 || position >= controller->visible_count) {
+        return;
+    }
+    int index = controller->visible_map[position];
+    if (index < 0 || (size_t) index >= list->count) {
+        return;
+    }
+    appitem_bind(controller, item_view, &list->items[index]);
 }
 
 
@@ -938,8 +1019,14 @@ static void set_actions(apps_fragment_t *controller, const char **labels, const 
 }
 
 
-static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t *old_list,
-                                                          const apploader_list_t *new_list, int *num_changes) {
+/**
+ * Decide whether the grid can keep its current views. Compares the *visible*
+ * sequences (post-filter), because that -- not the raw list -- is what the grid
+ * actually renders.
+ */
+static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t *old_list, const int *old_map,
+                                                          int old_count, const apploader_list_t *new_list,
+                                                          const int *new_map, int new_count, int *num_changes) {
     if (old_list == NULL && new_list == NULL) {
         *num_changes = 0;
         /* Must be non-NULL: lv_gridview_set_data_advanced() treats a NULL
@@ -952,12 +1039,22 @@ static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t
     } else if ((old_list != NULL) != (new_list != NULL)) {
         *num_changes = -1;
         return NULL;
-    } else if (old_list->count != new_list->count) {
+    } else if (old_count != new_count) {
         *num_changes = -1;
         return NULL;
     }
-    for (int i = 0; i < old_list->count; i++) {
-        if (old_list->items[i].base.id != new_list->items[i].base.id) {
+    for (int i = 0; i < old_count; i++) {
+        if (old_map == NULL || new_map == NULL) {
+            *num_changes = -1;
+            return NULL;
+        }
+        int old_index = old_map[i], new_index = new_map[i];
+        if (old_index < 0 || (size_t) old_index >= old_list->count ||
+            new_index < 0 || (size_t) new_index >= new_list->count) {
+            *num_changes = -1;
+            return NULL;
+        }
+        if (old_list->items[old_index].base.id != new_list->items[new_index].base.id) {
             *num_changes = -1;
             return NULL;
         }
@@ -971,17 +1068,201 @@ static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t
     return calloc(1, sizeof(lv_gridview_data_change_t));
 }
 
-static int apps_raw_visible_count(apps_fragment_t *controller, apploader_list_t *list) {
-    int count = LV_MIN(list->count, 255 * controller->col_count);
-    if (!controller->show_hidden_apps) {
-        for (int i = 0; i < count; i++) {
-            if (list->items[i].hidden) {
-                count = i;
+/** Platform an item belongs to; never NULL, so grouping has no special cases. */
+static const char *apps_item_platform(const apploader_item_t *item) {
+    const char *platform = item->base.platform;
+    if (platform == NULL || platform[0] == '\0') {
+        return apps_platform_other();
+    }
+    return platform;
+}
+
+static bool apps_item_passes_filter(apps_fragment_t *controller, const apploader_item_t *item) {
+    if (item->hidden && !controller->show_hidden_apps) {
+        return false;
+    }
+    if (controller->platform_filter == NULL) {
+        return true;
+    }
+    return strcmp(apps_item_platform(item), controller->platform_filter) == 0;
+}
+
+static void apps_free_platforms(apps_fragment_t *controller) {
+    for (int i = 0; i < controller->platform_count; i++) {
+        free(controller->platforms[i]);
+    }
+    free(controller->platforms);
+    controller->platforms = NULL;
+    controller->platform_count = 0;
+}
+
+/**
+ * Collect the distinct platforms present in @p list, preserving first-seen order
+ * (the list is already name-sorted, so this is stable across polls). Hidden apps
+ * only contribute a platform when hidden apps are being shown, otherwise the bar
+ * would offer a segment that filters down to nothing.
+ */
+static void apps_rebuild_platforms(apps_fragment_t *controller, const apploader_list_t *list) {
+    apps_free_platforms(controller);
+    if (list == NULL || list->count == 0) {
+        return;
+    }
+    char **names = calloc(list->count, sizeof(char *));
+    if (names == NULL) {
+        return;
+    }
+    int count = 0;
+    for (size_t i = 0; i < list->count; i++) {
+        const apploader_item_t *item = &list->items[i];
+        if (item->hidden && !controller->show_hidden_apps) {
+            continue;
+        }
+        const char *platform = apps_item_platform(item);
+        bool seen = false;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(names[j], platform) == 0) {
+                seen = true;
                 break;
             }
         }
+        if (!seen) {
+            names[count] = strdup(platform);
+            if (names[count] == NULL) {
+                break;
+            }
+            count++;
+        }
     }
-    return count;
+    /* Keep the catch-all bucket last. It is first-seen in a name-sorted list
+     * more often than not (Desktop, Playnite, ...), and a bar reading
+     * "All | Other | PC | Switch" puts the least interesting segment where the
+     * eye lands first. */
+    const char *other = apps_platform_other();
+    for (int i = 0; i < count - 1; i++) {
+        if (strcmp(names[i], other) == 0) {
+            char *tmp = names[i];
+            memmove(&names[i], &names[i + 1], (size_t) (count - 1 - i) * sizeof(char *));
+            names[count - 1] = tmp;
+            break;
+        }
+    }
+    controller->platforms = names;
+    controller->platform_count = count;
+
+    /* A filter naming a platform that no longer exists would leave an empty grid
+     * with no way back, so drop it. */
+    if (controller->platform_filter != NULL) {
+        bool still_there = false;
+        for (int i = 0; i < count; i++) {
+            if (strcmp(names[i], controller->platform_filter) == 0) {
+                still_there = true;
+                break;
+            }
+        }
+        if (!still_there) {
+            free(controller->platform_filter);
+            controller->platform_filter = NULL;
+        }
+    }
+}
+
+/**
+ * Build the grid position -> item index mapping for the active filter.
+ * Returns a newly allocated array (caller owns it) and writes its length to
+ * @p out_count. Returns NULL for an empty result, which is a valid mapping.
+ */
+static int *apps_build_visible_map(apps_fragment_t *controller, const apploader_list_t *list, int *out_count) {
+    *out_count = 0;
+    if (list == NULL || list->count == 0) {
+        return NULL;
+    }
+    int *map = calloc(list->count, sizeof(int));
+    if (map == NULL) {
+        return NULL;
+    }
+    int count = 0;
+    /* lv_gridview addresses rows with a uint8_t, so it can't show more than
+     * 255 rows worth of items -- same cap the pre-filter code applied. */
+    const int cap = 255 * LV_MAX(1, controller->col_count);
+    for (size_t i = 0; i < list->count && count < cap; i++) {
+        if (!apps_item_passes_filter(controller, &list->items[i])) {
+            continue;
+        }
+        map[count++] = (int) i;
+    }
+    *out_count = count;
+    return map;
+}
+
+static void apps_apply_visible_map(apps_fragment_t *controller, int *map, int count) {
+    free(controller->visible_map);
+    controller->visible_map = map;
+    controller->visible_count = count;
+}
+
+/** Hand the segment labels to the top bar so it can render the filter control. */
+static void apps_publish_platforms(apps_fragment_t *controller) {
+    launcher_fragment_t *launcher = (launcher_fragment_t *) lv_fragment_get_parent(&controller->base);
+    if (launcher == NULL) {
+        return;
+    }
+    launcher_set_platform_segments(launcher, (const char *const *) controller->platforms,
+                                   controller->platform_count, controller->platform_filter);
+}
+
+void apps_set_platform_filter(apps_fragment_t *controller, const char *platform) {
+    if (controller == NULL) {
+        return;
+    }
+    const char *current = controller->platform_filter;
+    if ((current == NULL && platform == NULL) ||
+        (current != NULL && platform != NULL && strcmp(current, platform) == 0)) {
+        return;
+    }
+    free(controller->platform_filter);
+    controller->platform_filter = platform != NULL ? strdup(platform) : NULL;
+
+    int count = 0;
+    int *map = apps_build_visible_map(controller, controller->apploader_apps, &count);
+    apps_apply_visible_map(controller, map, count);
+
+    /* Switching platforms changes which item sits at every grid position, so the
+     * old focus index is meaningless -- start at the top of the new selection. */
+    controller->focus_backup = 0;
+    if (controller->applist != NULL) {
+        lv_gridview_set_data_advanced(controller->applist, controller->apploader_apps, NULL, -1);
+        lv_obj_scroll_to_y(controller->applist, 0, LV_ANIM_OFF);
+        if (lv_gridview_get_focused_index(controller->applist) >= 0 || count > 0) {
+            gridview_focus_with_key_state(controller->applist, count > 0 ? 0 : -1);
+        }
+    }
+}
+
+void apps_relayout(apps_fragment_t *controller) {
+    if (controller == NULL || controller->applist == NULL) {
+        return;
+    }
+    /* Reached indirectly from on_destroy_view() (retracting the platform bar
+     * re-runs the layout), where the grid is already on its way out. */
+    if (!controller->base.managed->obj_created || controller->base.managed->destroying_obj) {
+        return;
+    }
+    lv_coord_t prev_w = controller->col_width, prev_h = controller->col_height;
+    int prev_cols = controller->col_count;
+    update_grid_config(controller);
+    if (prev_w == controller->col_width && prev_h == controller->col_height && prev_cols == controller->col_count) {
+        return;
+    }
+    /* A rebind alone re-runs bind_view on the views that already exist; it does
+     * not rebuild the row layout. lv_gridview_set_config() only reflows
+     * everything when the *column count* changed, so a pure row-height change
+     * (which is what showing the filter row causes) would leave the grid
+     * half-laid-out. Force the full reset instead. */
+    lv_gridview_set_data_advanced(controller->applist, controller->apploader_apps, NULL, -1);
+    int focused = lv_gridview_get_focused_index(controller->applist);
+    if (focused >= 0 && focused < controller->visible_count) {
+        gridview_focus_with_key_state(controller->applist, focused);
+    }
 }
 
 void apps_focus_rail(apps_fragment_t *controller) {
@@ -992,7 +1273,19 @@ void apps_focus_rail(apps_fragment_t *controller) {
         return;
     }
     lv_group_focus_obj(controller->applist);
-    int idx = controller->focus_backup >= 0 ? controller->focus_backup : 0;
+    if (controller->visible_count <= 0) {
+        return;
+    }
+    /* Prefer where the grid already is; only fall back to the backup taken when
+     * focus last left it. Either can point past the end after a filter change or
+     * a shrinking app list, so clamp before using it. */
+    int idx = lv_gridview_get_focused_index(controller->applist);
+    if (idx < 0) {
+        idx = controller->focus_backup;
+    }
+    if (idx < 0 || idx >= controller->visible_count) {
+        idx = 0;
+    }
     gridview_focus_with_key_state(controller->applist, idx);
 }
 
@@ -1006,6 +1299,6 @@ static void applist_key_up_to_topbar(lv_event_t *event) {
         return;
     }
     launcher_fragment_t *launcher = (launcher_fragment_t *) lv_fragment_get_parent(&controller->base);
-    launcher_restore_nav_focus(launcher);
+    launcher_focus_above_grid(launcher);
     lv_event_stop_processing(event);
 }

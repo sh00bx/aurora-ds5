@@ -83,8 +83,11 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_style_pad_all(shell, 0, 0);
     lv_obj_set_style_pad_gap(shell, 0, 0);
 
-    /* Two focus groups: nav_group for top-bar buttons, detail_group for game grid items. */
+    /* Three focus zones, one group each: the top bar, the platform filter row
+     * and the game grid. Arrow-key travel between them is routed explicitly in
+     * launcher.controller.c rather than left to LVGL's flat group order. */
     controller->nav_group = lv_group_create();
+    controller->filter_group = lv_group_create();
     controller->detail_group = lv_group_create();
 
     /* Shared style for the round icon-only top-bar action buttons. */
@@ -111,7 +114,7 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_style_pad_ver(topbar, LV_DPX(8), 0);
     lv_obj_set_style_pad_gap(topbar, LV_DPX(10), 0);
     lv_obj_clear_flag(topbar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(topbar, cb_child_group_add, LV_EVENT_CHILD_CREATED, controller->nav_group);
+    lv_obj_add_event_cb(topbar, launcher_nav_child_added, LV_EVENT_CHILD_CREATED, controller);
 
     /* App icon (same asset as OS launcher icons). */
     lv_obj_t *title_logo = lv_img_create(topbar);
@@ -175,6 +178,61 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_t *pref_btn = create_topbar_icon_btn(controller, topbar, MAT_SYMBOL_SETTINGS);
     lv_obj_t *quit_btn = create_topbar_icon_btn(controller, topbar, MAT_SYMBOL_CLOSE);
 
+    /* ---------------- Platform filter row ---------------- */
+    /* Its own band between the bar and the grid: the top bar is already full
+     * (logo, wordmark, profile, host, four actions) and squeezing segments in
+     * there would overflow it at 1080p. A row of its own also makes the vertical
+     * order read the way it behaves -- bar, filter, grid -- which is exactly how
+     * arrow-key navigation walks it. Hidden until the host reports something to
+     * group by, and then it costs no height at all. */
+    lv_obj_t *filter_row = controller->filter_row = lv_obj_create(shell);
+    lv_obj_remove_style_all(filter_row);
+    lv_obj_set_width(filter_row, LV_PCT(100));
+    lv_obj_set_height(filter_row, LV_DPX(LAUNCHER_FILTERBAR_DPX));
+    lv_obj_add_flag(filter_row, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(filter_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(filter_row, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(filter_row, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(filter_row, LV_DPX(24), 0);
+    lv_obj_set_style_pad_ver(filter_row, LV_DPX(4), 0);
+    lv_obj_set_layout(filter_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(filter_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(filter_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* One button matrix rather than N chips: it stays a single focus stop, so
+     * left/right picks a platform and only the row's edges hand focus onward. */
+    lv_obj_t *platform_bar = controller->platform_bar = lv_btnmatrix_create(filter_row);
+    controller->platform_map[0] = "";
+    controller->platform_segments = 0;
+    controller->platform_selected = 0;
+    lv_btnmatrix_set_map(platform_bar, controller->platform_map);
+    lv_btnmatrix_set_one_checked(platform_bar, true);
+    lv_obj_set_height(platform_bar, LV_PCT(100));
+    lv_obj_set_width(platform_bar, LV_DPX(80));
+    lv_obj_set_style_bg_opa(platform_bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(platform_bar, 0, 0);
+    lv_obj_set_style_outline_width(platform_bar, 0, 0);
+    lv_obj_set_style_outline_width(platform_bar, 0, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_pad_all(platform_bar, 0, 0);
+    lv_obj_set_style_pad_gap(platform_bar, LV_DPX(8), 0);
+    lv_obj_set_style_text_font(platform_bar, lv_theme_get_font_small(filter_row), LV_PART_ITEMS);
+    lv_obj_set_style_radius(platform_bar, LV_DPX(14), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(platform_bar, ml_color_hex(ML_COLOR_SURFACE_ALT), LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(platform_bar, LV_OPA_40, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(platform_bar, ml_color_hex(ML_COLOR_TEXT), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(platform_bar, 0, LV_PART_ITEMS);
+    /* Two different things have to be readable at the same time: which platform
+     * is applied (checked) and where the cursor sits (key focus). Fill marks the
+     * former, an outline the latter, so they never have to compete. */
+    lv_obj_set_style_bg_color(platform_bar, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(platform_bar, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_color(platform_bar, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_width(platform_bar, LV_DPX(3), LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_opa(platform_bar, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
+    lv_btnmatrix_set_btn_ctrl_all(platform_bar, LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT);
+    lv_group_add_obj(controller->filter_group, platform_bar);
+    launcher_attach_platform_bar_nav(controller);
+
     /* ---------------- Game grid (fills remaining space below top bar) ---------------- */
     lv_obj_t *detail_stack = lv_obj_create(shell);
     lv_obj_remove_style_all(detail_stack);
@@ -202,6 +260,7 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
 
     controller->nav = topbar;
     controller->detail = detail;
+    controller->detail_stack = detail_stack;
     controller->settings_layer = settings_layer;
     controller->server_btn = server_btn;
     controller->server_label = server_label;
