@@ -1,6 +1,7 @@
 name: Build (webOS)
 
 on:
+  workflow_dispatch:
   push:
     # Don't run for tags
     tags-ignore:
