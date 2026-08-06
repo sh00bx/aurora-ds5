@@ -28,6 +28,10 @@ typedef struct APP_LIST {
      * NULL when the host doesn't send one -- the launcher then treats the app
      * as ungrouped. Owned by the list, freed with it. */
     char *platform;
+    /* Library the app came from, as reported in the optional <Library> element
+     * ("Steam", "GOG", ...). NULL for apps that belong to no store library.
+     * Owned by the list, freed with it. */
+    char *library;
     int id;
     int hdr;
     struct APP_LIST *next;

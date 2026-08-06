@@ -211,6 +211,7 @@ void apploader_list_free(apploader_list_t *list) {
     for (int i = 0; i < list->count; i++) {
         free(list->items[i].base.name);
         free(list->items[i].base.platform);
+        free(list->items[i].base.library);
     }
     free(list);
 }

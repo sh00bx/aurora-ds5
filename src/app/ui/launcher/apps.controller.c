@@ -1068,8 +1068,19 @@ static lv_gridview_data_change_t *apps_list_detect_change(const apploader_list_t
     return calloc(1, sizeof(lv_gridview_data_change_t));
 }
 
-/** Platform an item belongs to; never NULL, so grouping has no special cases. */
+/**
+ * Group an item belongs to; never NULL, so grouping has no special cases.
+ *
+ * The store library wins over the platform when the host reports one: every
+ * Steam title is also "PC (Windows)", so grouping purely by platform buries the
+ * store libraries in one big PC bucket. This matches how Playnite itself can
+ * group a library by source.
+ */
 static const char *apps_item_platform(const apploader_item_t *item) {
+    const char *library = item->base.library;
+    if (library != NULL && library[0] != '\0') {
+        return library;
+    }
     const char *platform = item->base.platform;
     if (platform == NULL || platform[0] == '\0') {
         return apps_platform_other();

@@ -172,11 +172,12 @@ void start_applist_element(void *userData, const char *name, const char **atts) 
         app->id = 0;
         app->name = NULL;
         app->platform = NULL;
+        app->library = NULL;
         app->hdr = 0;
         app->next = (PAPP_LIST) search->data;
         search->data = app;
     } else if (strcmp("ID", name) == 0 || strcmp("AppTitle", name) == 0 || strcmp("IsHdrSupported", name) == 0 ||
-               strcmp("Platform", name) == 0) {
+               strcmp("Platform", name) == 0 || strcmp("Library", name) == 0) {
         search->memory = malloc(1);
         search->size = 0;
         search->start = 1;
@@ -207,6 +208,10 @@ void end_applist_element(void *userData, const char *name) {
         } else if (strcmp("Platform", name) == 0) {
             /* Optional; only hosts that know about Playnite platforms send it. */
             list->platform = search->memory;
+            search->memory = NULL;
+        } else if (strcmp("Library", name) == 0) {
+            /* Optional; empty for apps outside a store library. */
+            list->library = search->memory;
             search->memory = NULL;
         } else if (strcmp("IsHdrSupported", name) == 0) {
             list->hdr = (int) strtol(search->memory, NULL, 10);
