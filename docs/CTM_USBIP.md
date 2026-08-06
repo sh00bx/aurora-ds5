@@ -1,6 +1,14 @@
 # CTM-USBIP (Windows Host)
 
-CTM-USBIP is vendored as a git submodule at [`CTM-USBIP/`](../CTM-USBIP/). It receives HID reports from Aurora on the TV and presents a virtual USB gamepad on Windows via [usbip-win2](https://github.com/vadimgrn/usbip-win2).
+CTM-USBIP is the **host-side** agent: it receives HID reports from Aurora DS5 on the TV and presents a virtual USB gamepad on Windows via [usbip-win2](https://github.com/vadimgrn/usbip-win2). It is not part of the TV package and is not built by this repository.
+
+It used to be a submodule here, pinned to a commit that exists on no remote — which broke every recursive clone, including CI. Check it out separately instead:
+
+```powershell
+git clone https://github.com/CTM-Bridge/CTM-USBIP.git
+```
+
+The paths below assume that checkout; `scripts\windows\build_ctm_usbip.ps1` looks for it next to this repository or takes `-CtmRoot <path>`.
 
 ## Prerequisites
 
