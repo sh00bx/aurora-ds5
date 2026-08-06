@@ -1,8 +1,19 @@
-Aurora (Moonlight TV for LG webOS)
-Copyright (C) 2024-2026 GuiDev1994 and contributors
+Aurora DS5
+Copyright (C) 2026 sh00bx and contributors
+
+Based on Aurora (C) 2024-2026 GuiDev1994 and contributors.
+https://github.com/GuiDev1994/aurora-tv
 
 Based on moonlight-tv (C) mariotaku and contributors.
 https://github.com/mariotaku/moonlight-tv
+
+The controller passthrough sources under src/app/hid_passthrough/ctm/ are
+derived from CTM-Bridge/CTM-USBIP (GPL-3.0), with modifications:
+https://github.com/CTM-Bridge/CTM-USBIP
+
+The DS5 raw-ACL transport daemon vendored at src/daemon/ds5_txd/ is
+(C) 2026 sh00bx under the MIT license; see the LICENSE file in that directory.
+https://github.com/sh00bx/webos-ds5-raw-acl
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
