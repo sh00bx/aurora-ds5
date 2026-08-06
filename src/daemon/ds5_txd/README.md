@@ -15,7 +15,10 @@ by hand, which is exactly what bundling it removes.
 ## Provenance
 
 Upstream: <https://github.com/sh00bx/webos-ds5-raw-acl> (MIT).
-Vendored verbatim from commit **`d1557da`** (`daemon/ds5_txd.c`).
+Vendored from commit **`d1557da`** (`daemon/ds5_txd.c`) **plus one local patch**
+(jail uid via `argv[4]`, see "Local patch" below). It is no longer byte-identical
+to upstream — carry the patch forward on the next re-vendor, or the fix is gone
+without a conflict marker.
 
 Until 2026-08-04 this was pinned to **`7bbe0ba`** on the reasoning that it was the
 revision whose binary had been running on the TV, so bundling would change only
@@ -35,18 +38,39 @@ of them is what "reviewed but never run" turned into here.
 traffic nor paint over a live session (`IDLE_LB_HIDRAW_QUIET_MS`), which is the
 second writer the 08-03 review removed.
 
-The vendored `.c` is **never edited here**, not even for the app-id rename to
-`com.aurora.ds5`: its built-in socket paths are argv fallbacks only, and
-`ds5-tmpld.sh` always passes the three rendezvous paths explicitly. So the file
-still spells the old jail directory in its `argv` defaults, and that is
-deliberate — editing it would break the byte-for-byte reproduction below for no
-runtime gain. Fix it upstream in `webos-ds5-raw-acl` and re-vendor if it ever
-starts to matter.
+## Local patch — jail uid via `argv[4]` (2026-08-06)
+
+The rule used to be "the vendored `.c` is **never edited here**", on the grounds
+that everything app-id-specific reaches the daemon through argv. That held for
+the three socket paths — and hid the one value it did *not* hold for.
+
+`JAIL_UID` was compiled in as `6261`, the jail uid of `com.aurora.gamestream`,
+and is the `SO_PEERCRED` / `SCM_CREDENTIALS` gate for both the hid-fd broker and
+the ACL inject socket. webOS assigns a jail uid per app id, so renaming the app
+to `com.aurora.ds5` moved it to `5895`; the daemon then rejected every request
+from the app it exists to serve. It failed **silently**: the app only learns "no
+fd" from the broker and reports the `ENOENT` of its own direct `open()`, so the
+only trace was `[txd] broker rejected peer uid=5895` in the daemon's own log.
+DS5 passthrough was dead with the host side provably healthy.
+
+So the uid now arrives the same way the paths do — as `argv[4]`, read by
+`ds5-tmpld.sh` off the app's jail directory, which follows any future rename by
+itself. Two deliberate choices:
+
+* **No usable `argv[4]` means root only** (`JAIL_UID_DEFAULT 0`), not a fallback
+  number. Falling back to `6261` would hand the gate to a *different* app that is
+  still installed on the device, i.e. open it instead of closing it.
+* The startup line names the accepted uid and the broker's rejection line names
+  the expected one, so the next app-id change fails loudly instead of silently.
+
+Fix it upstream in `webos-ds5-raw-acl` and drop this patch when re-vendoring from
+a commit that carries it.
 
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
-    # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da)
+    # md5 0939f76761c39ebe702f3aae6eb624fc, 78504 bytes   (d1557da + jail-uid patch)
+    # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da, unpatched)
     # md5 c87110415dd38bfeea92ea27444f8e6f, 78412 bytes   (7bbe0ba, superseded)
 
 Two traps if you ever build it by hand:

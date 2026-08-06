@@ -148,7 +148,25 @@
                                     * handle (sniff-pin); cached handle is revalidated O(1)
                                     * on every wakeup in between */
 #define DRAIN_CAP           1024   /* max reports drained per poll wakeup (anti-flood) */
-#define JAIL_UID            6261   /* aurora jail uid — only sender allowed to inject */
+/* Fallback when the launcher passes no usable jail uid: accept NOBODY but root.
+ *
+ * The jail uid is the only non-root peer allowed to inject on the ACL socket and
+ * the only one the hid-fd broker serves — and webOS assigns it PER APP ID, so it
+ * cannot be a compile-time constant. The launcher reads the live value off the
+ * app's own jail directory and passes it as argv[4] (see main()).
+ *
+ * This used to be 6261, hardcoded. Renaming the app com.aurora.gamestream ->
+ * com.aurora.ds5 moved the uid to 5895 and the daemon rejected every request;
+ * it failed SILENTLY, because the app only ever learns "no fd" and then reports
+ * the ENOENT of its own direct open(). Hence the startup line naming the
+ * accepted uid, and the expected uid in the broker's rejection line.
+ * (Only the broker path logs a rejection; the ACL datagram path counts it
+ * silently into the shared `dropped` tally.)
+ *
+ * Falling back to a *number* would be worse than falling back to nothing:
+ * 6261 still belongs to the old app, which is still installed, so a missing
+ * argv[4] would hand the gate to a different app instead of closing it. */
+#define JAIL_UID_DEFAULT    0
 #define DS5_VID             0x054c /* Sony      } primary device; the broker additionally */
 #define DS5_PID             0x0ce6 /* DualSense } allows a small game-pad list, see PAD_ALLOW */
 
@@ -966,7 +984,7 @@ static void scan_reconcile(void){
 
 /* Write `len` bytes to `path` atomically (temp+rename), never following a symlink.
  *
- * We are ROOT writing into the JAILED app's own tmp (uid 6261 creates files there
+ * We are ROOT writing into the JAILED app's own tmp (the jail uid creates files there
  * too) under fully predictable names, so the temp name must be treated as hostile:
  * O_CREAT|O_EXCL|O_NOFOLLOW refuses to open anything we did not just create, and the
  * unlink() first is what makes O_EXCL usable (a planted symlink at "<path>.tmp"
@@ -1137,7 +1155,7 @@ static int bind_unix_dgram(const char *path){
     ua.sun_family=AF_UNIX; snprintf(ua.sun_path,sizeof ua.sun_path,"%s",path);
     unlink(path);
     if(bind(fd,(struct sockaddr*)&ua,sizeof ua)<0){ close(fd); return -1; }
-    chmod(path,0666);   /* the jailed uid (6261) must be able to sendto it */
+    chmod(path,0666);   /* the jailed uid must be able to sendto it */
     int one=1; setsockopt(fd,SOL_SOCKET,SO_PASSCRED,&one,sizeof one);  /* recv SCM_CREDENTIALS */
     int rcv=1<<20; setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&rcv,sizeof rcv);
     int fl=fcntl(fd,F_GETFL,0); if(fl>=0) fcntl(fd,F_SETFL,fl|O_NONBLOCK);
@@ -1154,7 +1172,7 @@ static int bind_unix_stream(const char *path){
     ba.sun_family=AF_UNIX; snprintf(ba.sun_path,sizeof ba.sun_path,"%s",path);
     unlink(path);
     if(bind(fd,(struct sockaddr*)&ba,sizeof ba)<0){ close(fd); return -1; }
-    chmod(path,0666);   /* the jailed uid (6261) must be able to connect */
+    chmod(path,0666);   /* the jailed uid must be able to connect */
     int fl=fcntl(fd,F_GETFL,0); if(fl>=0) fcntl(fd,F_SETFL,fl|O_NONBLOCK);
     if(listen(fd,8)<0){ close(fd); return -1; }
     return fd;
@@ -1206,8 +1224,12 @@ static int is_allowed_pad_hidraw(int fd){
     return 0;
 }
 
+/* The jail uid we accept, set once from argv[4] before any thread starts (see
+ * main()); read-only afterwards, so the sockets' threads need no synchronisation. */
+static uid_t g_jail_uid = (uid_t)JAIL_UID_DEFAULT;
+
 /* True iff a connected peer's uid is allowed to drive us (jail app or root). */
-static int uid_ok(uid_t u){ return u==(uid_t)JAIL_UID || u==0; }
+static int uid_ok(uid_t u){ return u==g_jail_uid || u==0; }
 
 /* Extract the sender's SCM_CREDENTIALS from a recvmsg() control buffer and check
  * the uid. Rejects (0) if no credentials are present. */
@@ -1281,7 +1303,7 @@ static void *broker_thread(void *arg){
         /* Authenticate the peer before doing any privileged work for it. */
         struct ucred uc; socklen_t ucl=sizeof uc;
         if(getsockopt(conn,SOL_SOCKET,SO_PEERCRED,&uc,&ucl)<0){ close(conn); continue; }
-        if(!uid_ok(uc.uid)){ fprintf(stderr,"[txd] broker rejected peer uid=%u\n",uc.uid); send_fd(conn,-1,'E'); close(conn); continue; }
+        if(!uid_ok(uc.uid)){ fprintf(stderr,"[txd] broker rejected peer uid=%u (accepting %u or root)\n",uc.uid,(unsigned)g_jail_uid); send_fd(conn,-1,'E'); close(conn); continue; }
         struct timeval tv={.tv_sec=2,.tv_usec=0};
         setsockopt(conn,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
         char req[80]; ssize_t n=recv(conn,req,sizeof req-1,0);
@@ -1880,6 +1902,29 @@ int main(int argc,char**argv){
     g_tmpl_path           = argc>2?argv[2]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl";
     const char *hidfd_path= argc>3?argv[3]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock";
 
+    /* argv[4]: the jail uid allowed to drive us, passed by ds5-tmpld.sh which
+     * reads it off the app's jail directory — an app-ID change then carries
+     * through without a rebuild. Anything unparsable, out of range or 0 keeps
+     * the built-in default: this is a security gate (every peer it admits gets
+     * RW access to an allowlisted pad's hidraw), so a bad argument must never
+     * widen it. Parsed before any thread exists, so g_jail_uid is settled by
+     * the time a socket can accept. */
+    if (argc > 4) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long v = strtoul(argv[4], &end, 10);
+        if (errno == 0 && end && end != argv[4] && *end == '\0' && v > 0 && v <= 65534) {
+            g_jail_uid = (uid_t)v;
+        } else {
+            fprintf(stderr, "[txd] unusable jail uid '%s' -> accepting root only\n", argv[4]);
+        }
+    }
+    if (g_jail_uid) {
+        fprintf(stderr, "[txd] accepting peer uid %u (and root)\n", (unsigned)g_jail_uid);
+    } else {
+        fprintf(stderr, "[txd] no jail uid given -> accepting root ONLY\n");
+    }
+
     /* Leave the MAIN thread's comm at its default (argv[0] basename "ds5_txd"): the
      * launcher and management scripts (enforce_single.sh, revert_until_up.sh, etc.)
      * identify the daemon with `pkill -x ds5_txd`, which matches the comm — renaming
@@ -1890,7 +1935,7 @@ int main(int argc,char**argv){
 
     /* Pin the file-creation mask: the readiness/telemetry records now take their
      * mode from open(...,0644) alone (write_record_atomic no longer fchmod()s —
-     * that used to chmod a symlink's target), and the JAILED app (uid 6261) must be
+     * that used to chmod a symlink's target), and the JAILED app (the jail uid) must be
      * able to read them, so an inherited umask must not strip o+r. */
     umask(0022);
 

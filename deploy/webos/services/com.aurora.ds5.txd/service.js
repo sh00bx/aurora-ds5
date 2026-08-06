@@ -3,7 +3,7 @@
  *
  * This exists for exactly one reason: ds5_txd needs to run as root (it opens an
  * HCI MONITOR socket and writes raw ACL frames), and the aurora app itself is
- * jailed as uid 6261. Shipping the daemon inside the IPK and letting Homebrew
+ * jailed under its own per-app-ID uid. Shipping the daemon inside the IPK and letting Homebrew
  * Channel's elevate-service strip the jailer off THIS service's unit is what
  * removes the last hand-installed piece from the TV.
  *

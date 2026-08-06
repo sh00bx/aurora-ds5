@@ -12,9 +12,10 @@
 # ds5_txd at NORMAL priority lets it interleave with (not preempt) the input
 # thread; injection is only ~94/s and the BT controller meters output to ~10ms,
 # so haptic stays smooth. Revert = delete the chrt loop.
-SOCK=/var/palm/jail/com.aurora.ds5/tmp/ds5_acl.sock
-TMPL=/var/palm/jail/com.aurora.ds5/tmp/ds5_acl_tmpl
-HIDFD=/var/palm/jail/com.aurora.ds5/tmp/ds5_hidfd.sock
+JAILDIR=/var/palm/jail/com.aurora.ds5
+SOCK=$JAILDIR/tmp/ds5_acl.sock
+TMPL=$JAILDIR/tmp/ds5_acl_tmpl
+HIDFD=$JAILDIR/tmp/ds5_hidfd.sock
 LOG=/tmp/ds5_txd.log
 PIDFILE=/tmp/ds5-tmpld.pid
 
@@ -155,7 +156,30 @@ while true; do
   # after every death. Open in APPEND mode: the in-loop 1MB cap truncates the
   # live file, and only an O_APPEND fd follows that truncation back to offset 0.
   [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
-  "$TXD_BIN" "$SOCK" "$TMPL" "$HIDFD" >>"$LOG" 2>&1 &
+  # The uid ds5_txd must accept on its sockets. webOS assigns a jail uid PER APP
+  # ID, and it used to be compiled into the daemon: renaming the app
+  # com.aurora.gamestream -> com.aurora.ds5 moved it 6261 -> 5895, the daemon
+  # kept rejecting the app ("broker rejected peer uid=5895") and DS5 passthrough
+  # died with nothing but an ENOENT on the app side. Read it off the jail
+  # directory instead — that is the app's own uid, and it follows any future
+  # rename by itself. Note the directory, not its tmp/: tmp is root-owned 1777.
+  #
+  # Re-read on EVERY respawn, not once at startup: this supervisor is detached
+  # and outlives app sessions, so a value sampled during a window where the jail
+  # directory was missing would otherwise stick for its whole lifetime — the
+  # same silent-wrong-gate failure this is meant to end. Costs one stat() per
+  # daemon death.
+  JAIL_UID=$(stat -c %u "$JAILDIR" 2>/dev/null)
+  case "$JAIL_UID" in
+    ''|*[!0-9]*)
+      JAIL_UID=
+      echo "$(date +%H:%M:%S) [tmpld] WARN: no jail uid from $JAILDIR - ds5_txd will accept root only" >>"$LOG"
+      ;;
+  esac
+  # $JAIL_UID intentionally UNQUOTED: it is digit-validated just above and must
+  # disappear entirely when empty, so the daemon falls back to its own default.
+  # shellcheck disable=SC2086
+  "$TXD_BIN" "$SOCK" "$TMPL" "$HIDFD" $JAIL_UID >>"$LOG" 2>&1 &
   TXD=$!
   # wait for bind + thread creation, then take ds5_txd off real-time priority
   i=0
