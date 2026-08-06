@@ -28,11 +28,18 @@
 #include <string.h>
 
 #define APPS_GRID_COLS 7
-/* Cover art is authored 600x800 (3:4, width:height). The grid sizes tiles from
- * the available *width* and derives the height from this ratio, so a tile fills
- * its column track exactly -- see update_grid_config(). */
-#define APPS_COVER_ASPECT_W 600
-#define APPS_COVER_ASPECT_H 800
+/* Tile aspect, width:height. The grid sizes tiles from the available *width* and
+ * derives the height from this ratio, so a tile fills its column track exactly
+ * -- see update_grid_config().
+ *
+ * 2:3 is what the covers actually are: Playnite/Steam library art is 600x900,
+ * and the Switch batch was normalised to the same. (Measured on the live
+ * library: 80 of 104 covers are 600x900, the rest 3:4.) The bundled fallback
+ * asset is 3:4, which is why this used to say 600x800 -- but sizing tiles 3:4
+ * letterboxes every real cover, and that letterboxing reads as yet more gap
+ * between the columns, which is the thing we were trying to get rid of. */
+#define APPS_COVER_ASPECT_W 2
+#define APPS_COVER_ASPECT_H 3
 
 typedef void (*action_cb_t)(apps_fragment_t *controller, lv_obj_t *buttons, uint16_t index);
 

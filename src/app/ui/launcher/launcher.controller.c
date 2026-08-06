@@ -712,8 +712,21 @@ static void launcher_clear_nav_key_focus(launcher_fragment_t *c) {
 
 static void launcher_clear_detail_key_focus(launcher_fragment_t *c) {
     lv_obj_t *f = lv_group_get_focused(c->detail_group);
-    if (f) {
-        lv_obj_clear_state(f, LV_STATE_FOCUS_KEY);
+    if (f == NULL) {
+        return;
+    }
+    lv_obj_clear_state(f, LV_STATE_FOCUS_KEY);
+    /* For the grid the selection ring is drawn on the focused *tile*, not on the
+     * grid object the group holds -- so clearing only the group's focused object
+     * leaves the tile lit and two zones look focused at the same time. */
+    if (lv_obj_check_type(f, &lv_gridview_class)) {
+        int index = lv_gridview_get_focused_index(f);
+        if (index >= 0) {
+            lv_obj_t *item = lv_gridview_get_item_view(f, index);
+            if (item != NULL) {
+                lv_obj_clear_state(item, LV_STATE_FOCUS_KEY);
+            }
+        }
     }
 }
 
