@@ -97,6 +97,6 @@ ls -la "${PROJECT_ROOT}/dist/"/*.ipk 2>/dev/null || true
 echo ""
 echo "To install on your TV:"
 echo "  1. Install webosbrew and dev-manager on the TV"
-echo "  2. Use: ares-install dist/com.aurora.gamestream_*_arm.ipk -d <TV_IP>"
+echo "  2. Use: ares-install dist/com.aurora.ds5_*_arm.ipk -d <TV_IP>"
 echo "  Or use webOS Dev Manager for easy installation"
 echo ""

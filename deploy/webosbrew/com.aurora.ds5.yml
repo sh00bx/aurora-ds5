@@ -1,0 +1,38 @@
+# Only needed to list Aurora DS5 in the OFFICIAL catalog: copy this file into a
+# fork of https://github.com/webosbrew/apps-repo under packages/ and open a Pull
+# Request. See docs/WEBOS_HOMEBREW.md.
+#
+# Installing from our own repo needs none of this — that path is /repo.json.
+
+title: Aurora DS5
+iconUri: https://raw.githubusercontent.com/sh00bx/aurora-ds5/main/deploy/webos/icon_large.png
+detailIconUri: https://raw.githubusercontent.com/sh00bx/aurora-ds5/main/deploy/webos/icon_large.png
+manifestUrl: https://github.com/sh00bx/aurora-ds5/releases/latest/download/com.aurora.ds5.manifest.json
+category: game
+pool: main
+description: |
+  **Aurora DS5** streams from a Sunshine or NVIDIA GameStream host to LG webOS TVs at up to
+  **4K 120fps HDR**. It is a fork of [Aurora](https://github.com/GuiDev1994/aurora-tv), itself a fork of
+  [Moonlight TV](https://github.com/mariotaku/moonlight-tv), and adds a **DualSense (DS5) transport that
+  ships inside the package**.
+
+  ![GitHub Release](https://img.shields.io/github/v/release/sh00bx/aurora-ds5)
+  ![GitHub Downloads](https://img.shields.io/github/downloads/sh00bx/aurora-ds5/total)
+
+  ## What the DS5 part does
+
+  webOS meters Bluetooth HID output to roughly 62 reports/s with 30–67 ms of air jitter, which is not
+  enough for controller audio. Aurora DS5 bundles a small root helper that writes raw HCI ACL frames
+  instead, so a DualSense gets **headset audio, microphone LED, player LED and haptics** while streaming.
+
+  The helper is started through the Homebrew Channel's own `elevate-service`, so **nothing has to be
+  copied onto the TV by hand**. Its API is restricted to the app before elevation happens — no other app
+  on the TV can reach it.
+
+  ## Notes
+
+  * App ID: `com.aurora.ds5`. It installs alongside, and does not replace,
+    Aurora (`com.aurora.gamestream`) or the Homebrew **Moonlight** (`com.limelight.webos`).
+  * **Root is optional.** Without a rooted TV the app behaves like upstream Aurora and falls back to the
+    plain hidraw controller path; only the DS5 audio/haptics transport needs elevation.
+  * Releases: [github.com/sh00bx/aurora-ds5/releases](https://github.com/sh00bx/aurora-ds5/releases)

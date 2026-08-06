@@ -26,15 +26,15 @@ const path = require('path');
 const { spawn } = require('child_process');
 const Service = require('webos-service');
 
-const SERVICE_ID = 'com.aurora.gamestream.ds5txd';
+const SERVICE_ID = 'com.aurora.ds5.txd';
 const service = new Service(SERVICE_ID);
 
 const HERE = __dirname;
 const SUPERVISOR = path.join(HERE, 'ds5-tmpld.sh');
 const TXD_BIN = path.join(HERE, 'ds5_txd');
 const PIDFILE = '/tmp/ds5-tmpld.pid';
-const SOCK = '/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock';
-const TMPL = '/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl';
+const SOCK = '/var/palm/jail/com.aurora.ds5/tmp/ds5_acl.sock';
+const TMPL = '/var/palm/jail/com.aurora.ds5/tmp/ds5_acl_tmpl';
 const LOG = '/tmp/ds5_txd.log';
 
 /* ds5_txd publishes its readiness record with a plain open()/write(), so the

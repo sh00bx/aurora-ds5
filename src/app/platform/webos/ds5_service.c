@@ -29,7 +29,7 @@
 #include "logging.h"
 #include "lunasynccall.h"
 
-#define DS5_SERVICE_ID "com.aurora.gamestream.ds5txd"
+#define DS5_SERVICE_ID "com.aurora.ds5.txd"
 
 #define HB_SERVICE "luna://org.webosbrew.hbchannel.service"
 
@@ -43,7 +43,7 @@
  * when it does not already exist, so writing a restricted one first makes it skip
  * the step entirely — there is never a window in which the API is public. The
  * restricted form grants the service's own group, which is the group appinstalld
- * already hands to com.aurora.gamestream and to nobody else.
+ * already hands to com.aurora.ds5 and to nobody else.
  *
  * The same branch repairs a public file left behind by an earlier build or by a
  * manual elevate-service run, and only then pays for an ls-control rescan.
@@ -106,7 +106,12 @@ static void *ds5_service_thread(void *arg) {
     if (need_elevate) {
         /* elevateService runs the very same elevate-service script the manual
          * path uses, with our id as its only argument — the app name it derives
-         * from that is com.aurora.gamestream, which is what we want. */
+         * from that is com.aurora.ds5, which is what we want.
+         *
+         * That derivation is literally serviceName.split('.').slice(0, -1), so
+         * the service id MUST stay "<app id>.<one segment>". Naming it
+         * com.aurora.ds5txd instead would make elevate-service look for an app
+         * called "com.aurora" and quietly elevate nothing. */
         commons_log_info("DS5TXD", "service is jailed — elevating");
         if (!HLunaServiceCallSync(HB_SERVICE "/elevateService", "{\"id\":\"" DS5_SERVICE_ID "\"}",
                                   true, &reply) || !reply_ok(reply)) {

@@ -7,7 +7,7 @@ The app talks to it over three AF_UNIX rendezvous points inside its own jail tmp
 `src/app/hid_passthrough/ctm/controllers/ds5_acl_tx.c` is the client half.
 
 It ships inside this IPK and is started by
-`deploy/webos/services/com.aurora.gamestream.ds5txd/` once that service has been
+`deploy/webos/services/com.aurora.ds5.txd/` once that service has been
 elevated out of its jail — see `src/app/platform/webos/ds5_service.c`. Before
 1.3.0 it had to be copied to `/var/lib/webosbrew/` and launched from a boot hook
 by hand, which is exactly what bundling it removes.
@@ -34,6 +34,14 @@ of them is what "reviewed but never run" turned into here.
 `d1557da` also carries the fix that the painter must neither count as session
 traffic nor paint over a live session (`IDLE_LB_HIDRAW_QUIET_MS`), which is the
 second writer the 08-03 review removed.
+
+The vendored `.c` is **never edited here**, not even for the app-id rename to
+`com.aurora.ds5`: its built-in socket paths are argv fallbacks only, and
+`ds5-tmpld.sh` always passes the three rendezvous paths explicitly. So the file
+still spells the old jail directory in its `argv` defaults, and that is
+deliberate — editing it would break the byte-for-byte reproduction below for no
+runtime gain. Fix it upstream in `webos-ds5-raw-acl` and re-vendor if it ever
+starts to matter.
 
 Reference build (this is what the CMake rule reproduces byte for byte):
 

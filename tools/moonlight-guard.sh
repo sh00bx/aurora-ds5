@@ -14,7 +14,7 @@ GM="${GM:-/var/lib/webosbrew/gamemode.sh}"
 APPMGR="luna://com.webos.applicationManager"
 # Aurora build app id (CMakeLists.txt WEBOS_APPINFO_ID). Used as a prefix match
 # so the foreground check fires for this build.
-MOON_ID="com.aurora.gamestream"
+MOON_ID="com.aurora.ds5"
 POLL="${POLL:-3}"          # seconds between checks
 LOCK=/tmp/moonlight-guard.lock
 
@@ -50,7 +50,7 @@ log() { echo "[guard $(date '+%H:%M:%S')] $*"; }
 # (so close_apps never touches the app being switched to) and restores after a
 # short debounce.
 FG_FILE="${FG_FILE:-/var/luna/preferences/last_foreground_app_id.json}"
-MOON_ID="${MOON_ID:-com.aurora.gamestream}"
+MOON_ID="${MOON_ID:-com.aurora.ds5}"
 OFF_DEBOUNCE="${OFF_DEBOUNCE:-2}"   # polls of non-foreground before restoring (rides transient fg blips)
 
 # Trigger = aurora PROCESS PRESENCE. The SAM last_foreground file proved

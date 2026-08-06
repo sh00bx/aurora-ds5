@@ -1,4 +1,12 @@
-<p>Aurora is a fork of <a href="https://github.com/mariotaku/moonlight-tv">Moonlight TV</a> for LG webOS, tuned for high-bitrate 4K/120Hz HDR streaming from a Sunshine or NVIDIA GameStream host, with an AMOLED-friendly dark theme and a UI built for TV remotes and gamepads.</p>
+<p>Aurora DS5 is a fork of <a href="https://github.com/GuiDev1994/aurora-tv">Aurora</a> &mdash; itself a fork of <a href="https://github.com/mariotaku/moonlight-tv">Moonlight TV</a> &mdash; for LG webOS, tuned for high-bitrate 4K/120Hz HDR streaming from a Sunshine or NVIDIA GameStream host, with an AMOLED-friendly dark theme and a UI built for TV remotes and gamepads. It adds a DualSense transport that ships inside the package.</p>
+
+<h2>DualSense (DS5) transport</h2>
+<p>webOS meters Bluetooth HID output to roughly 62 reports per second with 30&ndash;67 ms of air jitter, which is not enough to carry controller audio. Aurora DS5 bundles a small root helper that writes raw HCI ACL frames instead, so a DualSense gets headset audio, microphone LED, player LED and haptics while streaming.</p>
+<ul>
+  <li>The helper travels inside the package and is elevated through the Homebrew Channel's own <code>elevate-service</code> &mdash; nothing has to be copied onto the TV by hand.</li>
+  <li>Its service API is restricted to this app <i>before</i> elevation, so no other app on the TV can reach a root service.</li>
+  <li><i>Root is optional.</i> On a TV without it, the app falls back to the plain hidraw controller path and behaves like upstream Aurora.</li>
+</ul>
 
 <h2>Highlights</h2>
 <ul>

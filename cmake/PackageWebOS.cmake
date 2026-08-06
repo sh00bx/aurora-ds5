@@ -29,7 +29,7 @@ add_custom_command(OUTPUT "${DS5_TXD_BIN}"
         VERBATIM)
 add_custom_target(ds5-txd ALL DEPENDS "${DS5_TXD_BIN}")
 add_dependencies(moonlight ds5-txd)
-install(PROGRAMS "${DS5_TXD_BIN}" DESTINATION services/com.aurora.gamestream.ds5txd)
+install(PROGRAMS "${DS5_TXD_BIN}" DESTINATION services/com.aurora.ds5.txd)
 
 # Generate translations
 foreach (I18N_LOCALE ${I18N_LOCALES})

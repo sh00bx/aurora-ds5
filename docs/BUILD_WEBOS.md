@@ -73,13 +73,13 @@ If you use [webosbrew](https://webosbrew.org/):
 
 3. **Install the .ipk**
    ```bash
-   ares-install dist/com.aurora.gamestream_1.0.2_arm.ipk -d <TV_NAME>
+   ares-install dist/com.aurora.ds5_1.0.2_arm.ipk -d <TV_NAME>
    ```
    (Adjust the filename for your build version.)
 
 4. **Launch Aurora**
    ```bash
-   ares-launch com.aurora.gamestream -d <TV_NAME>
+   ares-launch com.aurora.ds5 -d <TV_NAME>
    ```
 
 ### Method B: dev-manager-desktop (GUI)
@@ -155,7 +155,7 @@ CMAKE_BUILD_TYPE=Release ./scripts/webos/build_for_lg.sh
 
 The resulting package will be at:
 ```
-dist/com.aurora.gamestream_1.0.2_arm.ipk
+dist/com.aurora.ds5_1.0.2_arm.ipk
 ```
 
 ### 3.4. Windows (Docker or WSL2)
@@ -222,4 +222,10 @@ The TV and PC do not need to be on the same physical network, but both must reac
 
 ## 5. webOS Homebrew catalog
 
-To list **Aurora** in the [Homebrew Channel](https://webosbrew.org/) app store ([repo.webosbrew.org](https://repo.webosbrew.org/)), submit a PR to [webosbrew/apps-repo](https://github.com/webosbrew/apps-repo) using [`deploy/webosbrew/com.aurora.gamestream.yml`](../deploy/webosbrew/com.aurora.gamestream.yml) and the checklist in **[WEBOS_HOMEBREW.md](WEBOS_HOMEBREW.md)**.
+Users install **Aurora DS5** from our own repository — `Settings → Add Repository` in the
+[Homebrew Channel](https://webosbrew.org/) app, with
+`https://raw.githubusercontent.com/sh00bx/aurora-ds5/main/repo.json`. Listing it in the official
+catalog ([repo.webosbrew.org](https://repo.webosbrew.org/)) instead means a PR to
+[webosbrew/apps-repo](https://github.com/webosbrew/apps-repo) using
+[`deploy/webosbrew/com.aurora.ds5.yml`](../deploy/webosbrew/com.aurora.ds5.yml). Both paths, the release
+procedure and the invariants that keep install URLs resolving: **[WEBOS_HOMEBREW.md](WEBOS_HOMEBREW.md)**.

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(MOONLIGHT_VERSION "1.3.1")
+set(MOONLIGHT_VERSION "1.4.0")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
@@ -90,7 +90,7 @@ if (TARGET_WEBOS)
     set(CMAKE_THREAD_LIBS_INIT "-lpthread" CACHE INTERNAL "webOS pthread")
     set(OS_LINUX TRUE)
 
-    set(WEBOS_APPINFO_ID "com.aurora.gamestream")
+    set(WEBOS_APPINFO_ID "com.aurora.ds5")
     set(CMAKE_INSTALL_RPATH "$ORIGIN/lib/backports:$ORIGIN/../lib/backports:$ORIGIN")
 
     # Hot-path performance flags. Target: LG G4 — 4x Cortex-A78 @ 1.4 GHz

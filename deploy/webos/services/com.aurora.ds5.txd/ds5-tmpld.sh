@@ -12,9 +12,9 @@
 # ds5_txd at NORMAL priority lets it interleave with (not preempt) the input
 # thread; injection is only ~94/s and the BT controller meters output to ~10ms,
 # so haptic stays smooth. Revert = delete the chrt loop.
-SOCK=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock
-TMPL=/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl
-HIDFD=/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock
+SOCK=/var/palm/jail/com.aurora.ds5/tmp/ds5_acl.sock
+TMPL=/var/palm/jail/com.aurora.ds5/tmp/ds5_acl_tmpl
+HIDFD=/var/palm/jail/com.aurora.ds5/tmp/ds5_hidfd.sock
 LOG=/tmp/ds5_txd.log
 PIDFILE=/tmp/ds5-tmpld.pid
 
