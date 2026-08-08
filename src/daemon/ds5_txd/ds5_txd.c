@@ -25,12 +25,14 @@
 //     * Inbound reports: the app may TAG a datagram with the target BT address
 //       ([0xA5][0x5A][addr LSB-first][report]); the daemon injects it onto the
 //       link bound to that address. An UNTAGGED datagram (legacy / single-pad /
-//       USB) routes to the PRIMARY link (g_links[0]) — byte-for-byte the old path.
+//       USB) routes to the link that is bound when EXACTLY ONE is — resolved by
+//       identity, not by slot index — and is refused otherwise.
 //     * Capture: HID-output seen on a NEW handle binds a FREE link slot (was:
 //       "ignore any other handle"). Beyond MAX_LINKS slots a further device is
 //       ignored (never flip-flops a bound link).
-//     * Readiness: the base template file still tracks the primary link (a 1-pad /
-//       untagged app reads it unchanged); each bound link ALSO publishes a
+//     * Readiness: the base template file carries that same single bound link and
+//       reads INVALID whenever zero or more than one is bound (a 1-pad / untagged
+//       app therefore reads it unchanged); each bound link ALSO publishes a
 //       per-address file <tmpl>.<aabbccddeeff> that the tagged app polls.
 //   Cross-controller resources that are physically shared stay shared: the one
 //   radio's scan state (off while ANY link is bound), the HCI command path
@@ -82,6 +84,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -160,8 +163,9 @@
  * it failed SILENTLY, because the app only ever learns "no fd" and then reports
  * the ENOENT of its own direct open(). Hence the startup line naming the
  * accepted uid, and the expected uid in the broker's rejection line.
- * (Only the broker path logs a rejection; the ACL datagram path counts it
- * silently into the shared `dropped` tally.)
+ * (BOTH paths now log a rejection: the broker per connection, the ACL datagram
+ * path rate-limited to 1/s — and the 10s stats line breaks the drop tally down
+ * per reason, so a climbing `cred:` names this failure on its own.)
  *
  * Falling back to a *number* would be worse than falling back to nothing:
  * 6261 still belongs to the old app, which is still installed, so a missing
@@ -337,6 +341,42 @@ static int is_audio_report(uint8_t id){ return id==0x36 || id==0x39; }
 static uint64_t now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull; }
 static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000ull+ts.tv_nsec/1000ull; }
 
+/* Read a small non-negative integer out of a ROOT-OWNED regular file; -1 if the
+ * file is absent, a symlink, not root-owned, or unparsable (both callers range-
+ * check, and -1 fails every range, so it needs no separate error path).
+ *
+ * The two live tunables below sit on predictable /tmp paths and steer the very
+ * parameters that are carefully SO_PEERCRED-gated when they arrive as an
+ * ACL_TAG_CTRL datagram, so they get an ownership gate of their own: O_NOFOLLOW
+ * refuses a planted symlink and fstat() on the OPEN fd (never the path) closes the
+ * swap race. This is defence in depth — the daemon's /tmp is the ROOT namespace's,
+ * not the jail's, so the app cannot reach these files at all. The file channel
+ * stays (rather than moving behind a second ctrl code) because the tunables must
+ * also work with no app attached: boot default and operator tuning.
+ *
+ * `warned` latches one line per call site: a refused file is re-read every second,
+ * so it must be neither silent (the operator's edit would just stop working) nor
+ * repeated. */
+static int read_root_int(const char *path, int *warned){
+    int fd=open(path,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if(fd<0) return -1;
+    struct stat st;
+    if(fstat(fd,&st)<0 || !S_ISREG(st.st_mode) || st.st_uid!=0){
+        if(warned && !*warned){
+            *warned=1;
+            fprintf(stderr,"[txd] ignoring %s: not a root-owned regular file\n",path);
+        }
+        close(fd); return -1;
+    }
+    char b[32]; ssize_t n=read(fd,b,sizeof b-1);
+    close(fd);
+    if(n<=0) return -1;
+    b[n]='\0';
+    char *end=NULL; long v=strtol(b,&end,10);
+    if(end==b || v<0 || v>100000) return -1;
+    return (int)v;
+}
+
 /* Max outstanding raw-ACL TX packets (a credit window), PER LINK. The inject path
  * bypasses the webOS BT one-outstanding metering: keeping it at 1 was the original
  * jitter wall, but removing the bound ENTIRELY lets our output backlog the
@@ -349,7 +389,8 @@ static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,
  * inject at full haptic rate; only under contention (input/video needing airtime)
  * do the credits lag, and output automatically backs off to whatever bandwidth is
  * left. Live-tunable via /tmp/ds5_inject_maxq (>=1; a large value approximates the
- * original unmetered path). Cached ~1/sec. It is PER LINK, so two pads each keep an
+ * original unmetered path; the file must be ROOT-OWNED). Cached ~1/sec. It is PER
+ * LINK, so two pads each keep an
  * independent window; the shared radio airtime is what actually arbitrates them.
  *
  * Default 12 (measured 2026-07-04 in-game): the DS5 speaker/haptics 0x36 audio
@@ -361,12 +402,12 @@ static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,
  * (180->5). 12 is the balance: drops ~14/10s, input 482/10s (~3% under floor). */
 #define INJECT_MAXQ_DEFAULT 12
 static int inject_maxq(void){
-    static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0;
+    static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0; static int warned=0;
     uint64_t n=now_us();
     if(last==0 || n-last>1000000ull){
         last=n;
-        FILE *f=fopen("/tmp/ds5_inject_maxq","r");
-        if(f){ int v=0; if(fscanf(f,"%d",&v)==1 && v>=1 && v<=1000) q=v; fclose(f); }
+        int v=read_root_int("/tmp/ds5_inject_maxq",&warned);
+        if(v>=1 && v<=1000) q=v;
     }
     return q;
 }
@@ -381,7 +422,8 @@ static int inject_maxq(void){
  * so input polling is unaffected -- the FIFO holds frames in OUR memory, not in
  * the controller. Sustained congestion overflows the FIFO -> drop-oldest, so
  * latency is bounded by N frames (~10.7ms each). Live-tunable via
- * /tmp/ds5_inject_fifo (0..FIFO_MAX). Cached ~1/sec. Each link has its own FIFO. */
+ * /tmp/ds5_inject_fifo (0..FIFO_MAX; the file must be ROOT-OWNED). Cached ~1/sec.
+ * Each link has its own FIFO. */
 #define FIFO_MAX             16
 #define FIFO_ENTRY_MAX       1024   /* == ASSERT_MAX: the worst-case on-air audio report
                                      * (0x36 = 398 B, batched 0x39 = 547 B; both fit)
@@ -396,12 +438,12 @@ static int inject_maxq(void){
 static int g_fifo_override=-1;   /* ACL_CTRL_FIFO_DEPTH; main thread only */
 
 static int inject_fifo(void){
-    static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0;
+    static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0; static int warned=0;
     uint64_t n=now_us();
     if(last==0 || n-last>1000000ull){
         last=n;
-        FILE *f=fopen("/tmp/ds5_inject_fifo","r");
-        if(f){ int v=-1; if(fscanf(f,"%d",&v)==1 && v>=0 && v<=FIFO_MAX) d=v; fclose(f); }
+        int v=read_root_int("/tmp/ds5_inject_fifo",&warned);
+        if(v>=0 && v<=FIFO_MAX) d=v;
     }
     /* Session override from the app (it knows whether the HOST runs the rate
      * servo that bounds a deep FIFO's parked latency) wins over the boot/file
@@ -665,10 +707,23 @@ static int any_link_bound_locked(void){
     for(int i=0;i<MAX_LINKS;i++) if(g_links[i].have) return 1;
     return 0;
 }
-static int count_links_bound_locked(void){
-    int n=0;
-    for(int i=0;i<MAX_LINKS;i++) if(g_links[i].have) n++;
-    return n;
+/* The ONE bound link, or NULL when zero or more than one is bound. "Primary" used
+ * to be encoded as the slot INDEX g_links[0], which is not an identity: free_slot()
+ * prefers a virgin slot, so a second pad binds g_links[1], and slot_for_addr() keeps
+ * a returning pad on whatever slot it had — a single bound pad is routinely NOT slot
+ * 0. Both the untagged inject path and the base readiness record resolve through
+ * here instead, so they fail CLOSED on ambiguity and otherwise name a real pad
+ * (whose address the inject path then passes as `expect`).
+ *
+ * `nbound` (may be NULL) receives how many were bound, so a caller can tell "no pad
+ * yet" (normal: the app is still hidraw-seeding) from "two pads, refusing" — the
+ * two fail identically here but mean very different things in the drop tally. */
+static struct ds5_link *sole_bound_link_locked(int *nbound){
+    struct ds5_link *only=NULL; int n=0;
+    for(int i=0;i<MAX_LINKS;i++)
+        if(g_links[i].have){ n++; only=&g_links[i]; }
+    if(nbound) *nbound=n;
+    return n==1 ? only : NULL;   /* >1 is ambiguous: an untagged sender cannot say which pad */
 }
 
 /* Bind (or rebind) link L to handle hh with the just-seen ACL header. Caller holds
@@ -724,12 +779,14 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
  * the window-full path) stayed wedged after a NOCP loss until the 1.5s idle
  * backstop rebound the link.
  *
- * `expect` (may be NULL) is the target bdaddr the caller ROUTED to (a tagged send).
- * The link is resolved by address, then g_lock is dropped and re-taken here, so a
- * capture-thread rebind of this slot to a DIFFERENT DualSense could slip into that
- * window; re-checking L->bound_addr against `expect` under THIS lock closes it — a
- * mismatch means the slot moved, so we skip (return -2) rather than buzz the wrong
- * pad. NULL (legacy untagged -> primary link) skips the check, unchanged.
+ * `expect` is the target bdaddr the caller ROUTED to. The link is resolved by
+ * address, then g_lock is dropped and re-taken here, so a capture-thread rebind of
+ * this slot to a DIFFERENT DualSense could slip into that window; re-checking
+ * L->bound_addr against `expect` under THIS lock closes it — a mismatch means the
+ * slot moved, so we skip (return -2) rather than buzz the wrong pad. NULL still
+ * skips the check, but NO caller passes it any more: the untagged path used to,
+ * and that is precisely how its datagrams landed on a foreign pad, so it now
+ * resolves the single bound link and passes THAT link's address.
  *
  * `from_app` separates APP-driven traffic (unix-socket datagrams, via
  * process_report/drain_fifo) from the daemon's OWN idle-lightbar paints: only
@@ -1069,14 +1126,23 @@ static void invalidate_stale_addr_files(void){
  * before calling, so there is no inversion. File I/O (in publish_record()) still
  * never runs under g_lock. MUST be called WITHOUT g_lock held.
  *
- * The BASE file (g_tmpl_path) tracks the PRIMARY link (g_links[0]) so a legacy
- * single-pad / untagged app reads it unchanged. Each link that has ever bound also
- * gets its per-address file, which the tagged app polls for its own controller. */
+ * The BASE file (g_tmpl_path) is what an untagged client reads (it is also what
+ * service.js's /status parses), and it carries the SINGLE bound link — INVALID when
+ * zero or more than one is bound, the same fail-closed rule the untagged inject path
+ * applies. It used to mirror g_links[0] unconditionally, which lied in both
+ * directions: a pad bound to slot 1 left the base record invalid while the transport
+ * was up (untagged client stuck on hidraw forever), and a 2-pad session left it valid
+ * while every untagged datagram was being refused (pad silent — the app stops seeding
+ * hidraw the moment it reads valid=1). Each link that has ever bound also gets its
+ * per-address file, which the tagged app polls for its own controller. */
 static void publish_all(void){
     struct { uint8_t valid; uint16_t nonce; uint8_t hdr[8]; uint8_t addr[6]; int has_addr;
              uint8_t prev[6]; int prev_valid; } s[MAX_LINKS];
+    int sole;
     pthread_mutex_lock(&g_pub_lock);
     pthread_mutex_lock(&g_lock);
+    {   struct ds5_link *sl=sole_bound_link_locked(NULL);
+        sole = sl ? (int)(sl-g_links) : -1; }
     for(int i=0;i<MAX_LINKS;i++){
         s[i].valid   = g_links[i].have ? 1 : 0;
         s[i].nonce   = g_links[i].nonce;
@@ -1088,7 +1154,8 @@ static void publish_all(void){
         g_links[i].prev_valid = 0;   /* consumed: this publisher writes it below */
     }
     pthread_mutex_unlock(&g_lock);
-    publish_record(g_tmpl_path, s[0].valid, s[0].nonce, s[0].valid ? s[0].hdr : NULL);
+    if(sole>=0) publish_record(g_tmpl_path, 1, s[sole].nonce, s[sole].hdr);
+    else        publish_record(g_tmpl_path, 0, 0, NULL);
     for(int i=0;i<MAX_LINKS;i++){
         /* Evicted identity first: valid=0 for a pad whose slot was taken over
          * (see ds5_link.prev_addr), unless that pad meanwhile lives in another
@@ -1232,19 +1299,30 @@ static uid_t g_jail_uid = (uid_t)JAIL_UID_DEFAULT;
 static int uid_ok(uid_t u){ return u==g_jail_uid || u==0; }
 
 /* Extract the sender's SCM_CREDENTIALS from a recvmsg() control buffer and check
- * the uid. Rejects (0) if no credentials are present. */
-static int cred_ok(struct msghdr *mh){
+ * the uid. Rejects (0) if no credentials are present. `peer_uid` (may be NULL)
+ * receives the observed uid, or -1 when the datagram carried no credentials, so
+ * the caller can NAME the rejected peer — a wrong jail uid is the misconfiguration
+ * the argv[4] patch exists to make loud, and it is invisible from a bare 0. */
+static int cred_ok(struct msghdr *mh, long *peer_uid){
+    if(peer_uid) *peer_uid=-1;
     for(struct cmsghdr *c=CMSG_FIRSTHDR(mh); c; c=CMSG_NXTHDR(mh,c)){
         if(c->cmsg_level==SOL_SOCKET && c->cmsg_type==SCM_CREDENTIALS &&
            c->cmsg_len==CMSG_LEN(sizeof(struct ucred))){
             struct ucred uc; memcpy(&uc,CMSG_DATA(c),sizeof uc);
+            if(peer_uid) *peer_uid=(long)uc.uid;
             return uid_ok(uc.uid);
         }
     }
     return 0;
 }
 
-/* Send status byte + (optionally) one fd as SCM_RIGHTS on a stream conn. */
+/* Send status byte + (optionally) one fd as SCM_RIGHTS on a stream conn.
+ * MSG_NOSIGNAL is the per-call half of the SIGPIPE defence (main() ignores the
+ * signal process-wide; this keeps the guarantee even if that ever regresses) —
+ * a peer that dropped its read end must yield EPIPE here, not a dead daemon.
+ * Returns the sendmsg() result; <0 means the fd never reached the app, which is
+ * worth a line because the app only ever learns "no fd" and then reports the
+ * ENOENT of its own direct open(). */
 static int send_fd(int conn, int fd, char status){
     char c=status;
     struct iovec iov; iov.iov_base=&c; iov.iov_len=1;
@@ -1258,7 +1336,9 @@ static int send_fd(int conn, int fd, char status){
         cm->cmsg_level=SOL_SOCKET; cm->cmsg_type=SCM_RIGHTS; cm->cmsg_len=CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(cm),&fd,sizeof(int));
     }
-    return (int)sendmsg(conn,&msg,0);
+    ssize_t sr=sendmsg(conn,&msg,MSG_NOSIGNAL);
+    if(sr<0) fprintf(stderr,"[txd] broker reply '%c' not delivered errno=%d (%s)\n",status,errno,strerror(errno));
+    return (int)sr;
 }
 
 static void *broker_thread(void *arg){
@@ -1320,8 +1400,9 @@ static void *broker_thread(void *arg){
             }
         }
         if(hfd>=0){
-            send_fd(conn,hfd,'O');
-            fprintf(stderr,"[txd] broker handed fd for %s\n",req);
+            /* Only claim the hand-off once it actually left: send_fd() logs the
+             * failure itself, so a lone "handed fd" line now means the app has it. */
+            if(send_fd(conn,hfd,'O')>0) fprintf(stderr,"[txd] broker handed fd for %s\n",req);
             close(hfd);   /* app now holds its own ref via SCM_RIGHTS */
         } else {
             send_fd(conn,-1,'E');
@@ -1898,6 +1979,16 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
 }
 
 int main(int argc,char**argv){
+    /* FIRST statement: a peer that closes or shuts down its read end before we
+     * finish replying must never take the ROOT daemon down with it. The broker
+     * writes a status byte back on every accepted connection — including the
+     * REJECTION path, so any local process could kill us by connecting and
+     * shutting down. We have no use for SIGPIPE on any socket we own; the
+     * write paths already handle EPIPE via their errno branches. This cannot be
+     * inherited from the launcher either: libuv's uv__process_child_init resets
+     * every disposition to SIG_DFL before exec. */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *sock_path = argc>1?argv[1]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock";
     g_tmpl_path           = argc>2?argv[2]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl";
     const char *hidfd_path= argc>3?argv[3]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock";
@@ -1956,9 +2047,13 @@ int main(int argc,char**argv){
     g_rawfd=rawfd;   /* published before the capture thread starts (policy writes) */
 
     /* AF_UNIX datagram socket the jailed app sends reports to (non-blocking, 1MB
-     * recv buffer, SO_PASSCRED — see bind_unix_dgram). Self-healed across remounts. */
+     * recv buffer, SO_PASSCRED — see bind_unix_dgram). Self-healed across remounts.
+     * A failed FIRST bind is the same transient condition the self-heal below already
+     * handles (jail tmp momentarily absent mid-relaunch, fd exhaustion at startup), so
+     * start with ufd=-1 and let the 500ms tick retry instead of exiting into the
+     * supervisor's respawn loop. poll() ignores a pollfd with fd<0, so this waits. */
     int ufd=bind_unix_dgram(sock_path);
-    if(ufd<0){ perror("[txd] bind unix"); return 1; }
+    if(ufd<0) perror("[txd] bind unix (retrying every 500ms)");
 
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
@@ -1990,6 +2085,12 @@ int main(int argc,char**argv){
     int minfo=open_mount_watch();   /* self-heal ds5_acl.sock across jail-tmp remounts */
     uint8_t rep[ACL_TAG_LEN+ACL_MAX_REPORT];   /* tag (optional) + report; inject framing in inject_one() */
     long injected=0, dropped=0, paced=0; uint64_t last_log=now_ms();
+    /* Per-reason breakdown of `dropped` (which stays the total, inject-path drops
+     * included). One shared counter could not tell a wrong jail uid from an
+     * oversized datagram from a pad that never bound — all three present as
+     * "drop climbing, no audio", and only the first is a misconfiguration. */
+    long d_cred=0, d_trunc=0, d_badlen=0, d_noninj=0, d_nolink=0, d_ambig=0;
+    uint64_t last_cred_log=0;   /* 1/s rate limit for the cred-rejection line */
     uint64_t last_stat=now_ms(); uint32_t stat_seq=0;   /* queue-telemetry publish (v9) */
     for(;;){
         struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
@@ -1999,17 +2100,23 @@ int main(int argc,char**argv){
 
         /* Mount table changed (or retry tick while rebinding / watch down): if our
          * node's path stopped resolving to a socket, Aurora remounted its tmp under
-         * us — bind a fresh node into the current top mount and re-publish readiness. */
+         * us — bind a fresh node into the current top mount and re-publish readiness.
+         * ufd<0 covers both a pending rebind AND a failed first bind, and it must be
+         * checked SEPARATELY from node_alive: a node can exist at the path without us
+         * owning it (a SIGKILLed instance's leftover, or one bind_unix_dgram left
+         * behind after a later step failed), and keying on node_alive alone would then
+         * poll a dead fd forever while the supervisor sees a live pid AND a live
+         * socket — permanently and silently dead, worse than exiting to be respawned. */
         if(pr==0 || pfd[1].revents){
             if(minfo<0) minfo=open_mount_watch();           /* retry a previously-failed watch */
             else if(pfd[1].revents) rearm_mount_watch(minfo);
-            if(!node_alive(sock_path)){
+            if(ufd<0 || !node_alive(sock_path)){
                 if(ufd>=0){ close(ufd); ufd=-1; }
                 int nu=bind_unix_dgram(sock_path);
                 if(nu>=0){
                     ufd=nu;
                     publish_all();   /* re-publish current state into the new mount */
-                    fprintf(stderr,"[txd] jail-tmp remount -> rebound ds5_acl.sock + re-published\n");
+                    fprintf(stderr,"[txd] ds5_acl.sock (re)bound + re-published: %s\n",sock_path);
                 }
             }
         }
@@ -2161,8 +2268,24 @@ int main(int argc,char**argv){
                 ssize_t n=recvmsg(ufd,&mh,0);
                 if(n<0){ if(errno==EINTR) continue; break; }   /* EAGAIN -> drained */
                 if(n==0) continue;                             /* zero-length datagram: skip, keep draining */
-                if(mh.msg_flags & MSG_TRUNC){ dropped++; continue; } /* oversized: never inject a truncated frame */
-                if(!cred_ok(&mh)){ dropped++; continue; }      /* peer-cred gate: jail uid only */
+                if(mh.msg_flags & MSG_TRUNC){ dropped++; d_trunc++; continue; } /* oversized: never inject a truncated frame */
+                {   /* Peer-cred gate: jail uid only. Rate-limited to 1/s because a
+                     * mismatched uid means EVERY report is refused (~94/s) — one line
+                     * per second is enough to name the problem without drowning the log,
+                     * and it mirrors the broker's rejection line so the two channels now
+                     * fail the same way out loud. */
+                    long puid;
+                    if(!cred_ok(&mh,&puid)){
+                        dropped++; d_cred++;
+                        uint64_t t=now_ms();
+                        if(t-last_cred_log>1000){
+                            last_cred_log=t;
+                            if(puid<0) fprintf(stderr,"[txd] report socket rejected a datagram with no SCM_CREDENTIALS (accepting uid %u or root)\n",(unsigned)g_jail_uid);
+                            else       fprintf(stderr,"[txd] report socket rejected peer uid=%ld (accepting %u or root)\n",puid,(unsigned)g_jail_uid);
+                        }
+                        continue;
+                    }
+                }
 
                 /* Route by tag kind (see ACL_TAG_*): an INJECT datagram goes to the
                  * link bound to that address; an ASSERT datagram only feeds the
@@ -2209,13 +2332,14 @@ int main(int argc,char**argv){
                     continue;
                 }
                 const uint8_t *report; int rlen; struct ds5_link *L; const uint8_t *expect=NULL;
+                uint8_t sole_addr[6];   /* backs `expect` on the untagged path (below) */
                 int tagged = (n>=(ssize_t)(ACL_TAG_LEN+1) && rep[0]==ACL_TAG_M0 &&
                               (rep[1]==ACL_TAG_INJECT || rep[1]==ACL_TAG_ASSERT));
                 if(tagged){
                     int is_assert=(rep[1]==ACL_TAG_ASSERT);
                     report=rep+ACL_TAG_LEN; rlen=(int)(n-ACL_TAG_LEN); expect=rep+2;
-                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
-                    if(!injectable(report[0])){ dropped++; continue; }
+                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; d_badlen++; continue; }
+                    if(!injectable(report[0])){ dropped++; d_noninj++; continue; }
                     if(is_assert){
                         /* Identity ASSERT: the app is seeding these exact bytes on
                          * hidraw right now; record them so the capture thread can
@@ -2236,24 +2360,37 @@ int main(int argc,char**argv){
                     pthread_mutex_lock(&g_lock);
                     L=link_by_addr(expect);
                     pthread_mutex_unlock(&g_lock);
-                    if(!L){ dropped++; continue; }             /* no link for this target (not ready) */
+                    if(!L){ dropped++; d_nolink++; continue; } /* no link for this target (not ready) */
                 } else {
-                    /* Legacy untagged -> primary link. FAIL CLOSED as soon as identity
-                     * matters: with more than one link bound, "the primary link" is not
-                     * an identity — g_links[0] is simply whoever was on air first — so an
-                     * untagged sender cannot know WHICH pad it is about to drive. That is
-                     * how an arming/output report meant for the pad the sender unbound
-                     * lands on the OTHER pad, whose kernel driver is still bound (two
-                     * writers on one L2CAP channel = the documented oscillation). One
-                     * bound link is unambiguous, so the single-pad/USB path is unchanged.
+                    /* Legacy untagged -> the SINGLE bound link, resolved by identity.
+                     * FAIL CLOSED as soon as identity matters: with more than one link
+                     * bound an untagged sender cannot know WHICH pad it is about to
+                     * drive. That is how an arming/output report meant for the pad the
+                     * sender unbound lands on the OTHER pad, whose kernel driver is
+                     * still bound (two writers on one L2CAP channel = the documented
+                     * oscillation). Resolving to whoever holds SLOT 0 had the same
+                     * effect with only ONE pad bound, because a single pad routinely
+                     * sits in slot 1 (free_slot prefers a virgin slot, slot_for_addr
+                     * keeps a returning pad on its old slot): the datagrams were then
+                     * written onto a slot-0 pad that never bound, and since the app
+                     * treats the successful sendto() as delivered and skips its hidraw
+                     * write, the real pad also went off air and could never bind —
+                     * self-sustaining. Carrying the resolved address in `expect` also
+                     * arms inject_one()'s re-check, so a capture-thread rebind between
+                     * resolve and inject skips instead of buzzing the wrong pad.
                      * Control datagrams are consumed above and stay untagged-friendly. */
+                    int nbound;
                     pthread_mutex_lock(&g_lock);
-                    int nbound=count_links_bound_locked();
+                    L=sole_bound_link_locked(&nbound);
+                    if(L) memcpy(sole_addr,L->bound_addr,6);
                     pthread_mutex_unlock(&g_lock);
-                    if(nbound>1){ dropped++; continue; }   /* ambiguous target: refuse */
-                    report=rep; rlen=(int)n; L=&g_links[0];
-                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; continue; }
-                    if(!injectable(report[0])){ dropped++; continue; }  /* only DS5 output reports */
+                    /* nbound==0 is the NORMAL pre-bind state (the app is still
+                     * hidraw-seeding), nbound>1 is a refusal — different counters. */
+                    if(!L){ dropped++; if(nbound) d_ambig++; else d_nolink++; continue; }
+                    expect=sole_addr;
+                    report=rep; rlen=(int)n;
+                    if(rlen<=0 || rlen>ACL_MAX_REPORT){ dropped++; d_badlen++; continue; }
+                    if(!injectable(report[0])){ dropped++; d_noninj++; continue; }  /* only DS5 output reports */
                 }
 
                 int idx=(int)(L-g_links);
@@ -2274,8 +2411,9 @@ int main(int argc,char**argv){
                     L->fifo_count,L->gap30,L->gap50,L->gap80);
                 if(lo>=(int)sizeof links) break;
             }
-            fprintf(stderr,"[txd] inj=%ld drop=%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d%s%s\n",
-                injected,dropped,paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d%s%s\n",
+                injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
+                paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 g_cmd_dead?" CMDDEAD":"", links);
             last_log=now_ms();
         }

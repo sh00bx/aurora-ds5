@@ -155,7 +155,16 @@ while true; do
   # respawn generation — the old O_TRUNC redirect wiped the crash evidence ~1s
   # after every death. Open in APPEND mode: the in-loop 1MB cap truncates the
   # live file, and only an O_APPEND fd follows that truncation back to offset 0.
-  [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+  #
+  # Rotate only a SUBSTANTIAL log. In a crash loop the respawns are ~1s apart and
+  # every generation is a handful of lines, so an unconditional mv pushed the FIRST
+  # failure out of $LOG.1 within seconds — destroying exactly the generation worth
+  # reading, and this loop is now the daemon's only exit path for a startup bind
+  # failure it used to `return 1` on. Below the threshold we leave the file alone:
+  # the short generations then ACCUMULATE in $LOG (append, still 1MB-capped) so the
+  # whole loop is readable in one place, while $LOG.1 keeps the last real run.
+  LOGSZ=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+  [ "${LOGSZ:-0}" -ge 2048 ] && mv -f "$LOG" "$LOG.1"
   # The uid ds5_txd must accept on its sockets. webOS assigns a jail uid PER APP
   # ID, and it used to be compiled into the daemon: renaming the app
   # com.aurora.gamestream -> com.aurora.ds5 moved it 6261 -> 5895, the daemon

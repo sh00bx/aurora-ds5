@@ -69,6 +69,7 @@ a commit that carries it.
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 000d81dbec1ee824bbb621af17aaa51c, 78676 bytes   (+ daemon hardening phase)
     # md5 0939f76761c39ebe702f3aae6eb624fc, 78504 bytes   (d1557da + jail-uid patch)
     # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da, unpatched)
     # md5 c87110415dd38bfeea92ea27444f8e6f, 78412 bytes   (7bbe0ba, superseded)
