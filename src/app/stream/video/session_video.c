@@ -389,10 +389,11 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
         if (vdec_stream_info.width == 0 || vdec_stream_info.height == 0) {
             stream_info_parse_size(decodeUnit, &vdec_stream_info);
         }
-        // mcc moved DECODE_UNIT timestamps from ms to us (upstream e356b2c/a3ebaaf, pulled
-        // in by the nanors rebase); convert back to the ms unit the uint32_t accumulator and
-        // the stats UI (streaming.controller "submitMs") expect.
-        vdec_temp_stats.totalSubmitTime += (uint32_t) ((LiGetMicroseconds() - decodeUnit->enqueueTimeUs) / 1000);
+        /* Both sides are microseconds since the same epoch (LiGetMicroseconds and
+         * DECODE_UNIT timestamps share it), and the accumulator stays in microseconds:
+         * a submit typically takes far less than a millisecond, so dividing per frame
+         * would floor most of them to zero and the overlay would read 0.00 ms. */
+        vdec_temp_stats.totalSubmitTimeUs += (uint32_t) (LiGetMicroseconds() - decodeUnit->enqueueTimeUs);
         vdec_temp_stats.submittedFrames++;
         if (need_idr_on_resume) {
             need_idr_on_resume = false;
@@ -488,10 +489,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     vdec_temp_stats.receivedBytes += (uint64_t) decodeUnit->fullLength;
 
     vdec_temp_stats.totalCaptureLatency += decodeUnit->frameHostProcessingLatency;
-    // mcc moved DECODE_UNIT timestamps from ms to us (upstream e356b2c/a3ebaaf, pulled
-    // in by the nanors rebase); convert back to the ms unit the uint32_t accumulator and
-    // the stats UI (streaming.controller "submitMs") expect.
-    vdec_temp_stats.totalReassemblyTime += (uint32_t) ((decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs) / 1000);
+    vdec_temp_stats.totalReassemblyTimeUs += (uint32_t) (decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs);
     vdec_stream_info.has_host_latency |= decodeUnit->frameHostProcessingLatency > 0;
     if (!vdec_warned_near_buffer_limit && buffer_initial_size > 0 &&
         (size_t) decodeUnit->fullLength > (buffer_initial_size * 9 / 10)) {

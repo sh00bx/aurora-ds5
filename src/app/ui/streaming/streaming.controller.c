@@ -213,7 +213,7 @@ static void streaming_refresh_latency(streaming_controller_t *controller, const 
     float parts[4] = {(float) dst->rtt, 0.0f, 0.0f, 0.0f};
     bool have[4] = {true, false, false, false};
     if (dst->submittedFrames) {
-        parts[3] = (float) dst->totalSubmitTime / (float) dst->submittedFrames;
+        parts[3] = (float) dst->totalSubmitTimeUs / (float) dst->submittedFrames / 1000.0f;
         have[3] = true;
         if (vdec_stream_info.has_host_latency) {
             parts[1] = (float) dst->totalCaptureLatency / (float) dst->submittedFrames / 10.0f;
@@ -371,7 +371,7 @@ bool streaming_refresh_stats() {
         bool have_decode = false;
         bool have_encode = false;
         if (dst->submittedFrames) {
-            submitMs = (float) dst->totalSubmitTime / (float) dst->submittedFrames;
+            submitMs = (float) dst->totalSubmitTimeUs / (float) dst->submittedFrames / 1000.0f;
             have_render = true;
             if (vdec_stream_info.has_host_latency) {
                 hostMs = (float) dst->totalCaptureLatency / (float) dst->submittedFrames / 10.0f;
