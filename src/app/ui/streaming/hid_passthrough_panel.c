@@ -525,7 +525,14 @@ static void update_latency_label(hid_pt_panel_t *panel)
         return;
     }
     int ms = (int) lv_slider_get_value(panel->latency_slider);
-    lv_label_set_text_fmt(panel->latency_label, locstr("Audio/haptics latency — %d ms (default: 100 ms)"), ms);
+    /* Read the default back from the same place Reset uses instead of naming a
+     * number here. A literal in this string has already gone stale once — the
+     * pt-BR translation still carries a msgid claiming 48 ms — and
+     * default_settings_for_item() is free to vary the value per controller. */
+    const logical_device_t *item = panel_selected_item(panel);
+    int def_ms = item ? (int) default_settings_for_item(item).latency_ms : 60;
+    lv_label_set_text_fmt(panel->latency_label,
+                          locstr("Audio/haptics latency — %d ms (default: %d ms)"), ms, def_ms);
 }
 
 static void update_speaker_label(hid_pt_panel_t *panel)

@@ -30,10 +30,14 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     memset(&settings, 0, sizeof(settings));
     settings.kind = TV_BRIDGE_KIND_HID;
     settings.audio_mode = TV_BRIDGE_AUDIO_AUTO;
-    settings.latency_ms = 100;
+    settings.latency_ms = 60;
     settings.haptics_gain_centi = 100;
-    settings.headset_volume_percent = 90;
-    settings.speaker_volume_percent = 90;
+    /* PERCENT, not raw bytes. The values that once sat in the ds5 branch below
+     * (0x4d/0x41) were raw bytes carried over verbatim from the tv_bridge_worker
+     * port, and because the DS5 raw volume range happens to be 0..0x64 they read
+     * as 77%/65% without anything looking wrong. */
+    settings.headset_volume_percent = 95;
+    settings.speaker_volume_percent = 95;
     settings.ds5_patch_high_nibble = 0xf;
     settings.ds5_patch_low_nibble = 0xd;
     settings.ds5_patch2_high_nibble = 0xf;
@@ -51,10 +55,6 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     const char *kind = bridge_kind_for_item(item);
     if (strcmp(kind, "ds5") == 0) {
         settings.kind = TV_BRIDGE_KIND_DS5;
-        /* No volume override: inherit the 90% defaults above. The old 0x4d/0x41
-         * here were RAW BYTES from the verbatim tv_bridge_worker port sitting in
-         * what is now a PERCENT field (DS5 raw volume range is 0..0x64 = percent
-         * 1:1), so DS5 pads silently defaulted to 77%/65% instead of 90%. */
         settings.block_bt_audio_sink = true;
     } else if (strcmp(kind, "ds4") == 0) {
         settings.kind = TV_BRIDGE_KIND_DS4;
