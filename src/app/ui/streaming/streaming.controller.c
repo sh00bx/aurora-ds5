@@ -31,9 +31,11 @@ static void open_keyboard(lv_event_t *event);
 
 static void toggle_vmouse(lv_event_t *event);
 
+#if defined(TARGET_WEBOS)
 static void open_hid_devices(lv_event_t *event);
 
 static void hid_panel_close_cb(void *userdata);
+#endif
 
 static void stream_fragment_del_timer_cb(lv_timer_t *timer);
 
@@ -577,12 +579,14 @@ static bool on_event(lv_fragment_t *self, int code, void *userdata) {
             }
             return true;
         }
+#if defined(TARGET_WEBOS)
         case USER_CLOSE_HID_PANEL: {
             if (streaming_hid_panel_shown()) {
                 hid_panel_close_cb(controller);
             }
             return true;
         }
+#endif
         case USER_TOGGLE_STATS_PIN: {
             streaming_toggle_stats_pin();
             return true;
@@ -741,13 +745,13 @@ static void toggle_vmouse(lv_event_t *event) {
     session_toggle_vmouse(app->session);
 }
 
-#if defined(TARGET_WEBOS)
 static void stream_fragment_del_timer_cb(lv_timer_t *timer) {
     lv_fragment_t *fragment = timer->user_data;
     lv_timer_del(timer);
     lv_fragment_del(fragment);
 }
 
+#if defined(TARGET_WEBOS)
 static void hid_panel_close_cb(void *userdata) {
     streaming_controller_t *controller = userdata;
     if (!controller || !controller->hid_panel) {

@@ -124,47 +124,6 @@ int hid_passthrough_manager_get_device(hid_passthrough_manager_t *manager, int i
     return 0;
 }
 
-static int hid_pt_find_device_index_by_path(const char *path) {
-    if (!path || !path[0]) {
-        return -1;
-    }
-    for (int i = 0; i < g_devices.count; ++i) {
-        int scan_index = first_scan_index_for_item(&g_devices.items[i]);
-        if (scan_index >= 0 && strcmp(g_scan.devices[scan_index].node, path) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-int hid_passthrough_manager_plug(hid_passthrough_manager_t *manager, const char *path) {
-    (void) manager;
-    int index = hid_pt_find_device_index_by_path(path);
-    if (index < 0) {
-        return -1;
-    }
-    logical_device_t *item = &g_devices.items[index];
-    if (plug_in_item(item)) {
-        item->plugged = true;
-        set_plug_key(item->key, true);
-        return 0;
-    }
-    return -1;
-}
-
-int hid_passthrough_manager_unplug(hid_passthrough_manager_t *manager, const char *path) {
-    (void) manager;
-    int index = hid_pt_find_device_index_by_path(path);
-    if (index < 0) {
-        return -1;
-    }
-    logical_device_t *item = &g_devices.items[index];
-    stop_session(item->key);
-    item->plugged = false;
-    set_plug_key(item->key, false);
-    return 0;
-}
-
 void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager) {
     (void) manager;
     enumerate_devices(&g_scan);

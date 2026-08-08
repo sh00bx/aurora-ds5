@@ -11,7 +11,6 @@
 #include "input/app_input.h"
 
 void hid_pt_prefs_init(void);
-void hid_pt_prefs_clear(void);
 
 /* Stable id: BT MAC without ':' (lowercase), else logical_device_t.key */
 void hid_pt_stable_id_for_logical(const logical_device_t *item, char *out, size_t out_len);

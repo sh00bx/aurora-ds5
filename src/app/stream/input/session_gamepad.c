@@ -57,8 +57,10 @@ static bool stream_input_gamepad_sends_moonlight(const stream_input_t *input,
 #if defined(TARGET_WEBOS)
     return !hid_pt_gamepad_is_moonlight_excluded(input, gamepad);
 #else
-    (void) input;
-    return !input->hid_passthrough;
+    /* No CTM bridge off webOS, so no pad is ever bridged as native HID — every
+     * pad that survived the checks above is a Moonlight pad, whatever the ini
+     * says about hid_passthrough. */
+    return true;
 #endif
 }
 

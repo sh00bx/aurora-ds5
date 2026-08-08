@@ -57,10 +57,6 @@ int hid_passthrough_manager_device_count(hid_passthrough_manager_t *manager);
 int hid_passthrough_manager_get_device(hid_passthrough_manager_t *manager, int index,
                                        hid_pt_device_info_t *info);
 
-int hid_passthrough_manager_plug(hid_passthrough_manager_t *manager, const char *path);
-
-int hid_passthrough_manager_unplug(hid_passthrough_manager_t *manager, const char *path);
-
 void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager);
 
 #else

@@ -80,11 +80,6 @@ void hid_pt_prefs_init(void)
     g_hid_pt_pref_count = 0;
 }
 
-void hid_pt_prefs_clear(void)
-{
-    g_hid_pt_pref_count = 0;
-}
-
 void hid_pt_stable_id_for_logical(const logical_device_t *item, char *out, size_t out_len)
 {
     if (!out || out_len == 0) {

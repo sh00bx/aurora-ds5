@@ -77,7 +77,17 @@ If you use [webosbrew](https://webosbrew.org/):
    ```
    (Adjust the filename for your build version.)
 
-4. **Launch Aurora**
+4. **Verify what actually landed**
+   ```bash
+   AURORA_TV_SSH=root@<TV_IP> ./scripts/webos/verify_install.sh
+   ```
+   Compares the md5 of the app binary and of the `ds5_txd` daemon inside the `.ipk`
+   with the copies now on the TV. Do this before believing any bug report about a
+   fix that "did not work": the version string is baked at configure time and
+   survives a stale build, and a git commit hash says nothing about which blob the
+   TV is running. Only the hash settles it.
+
+5. **Launch Aurora**
    ```bash
    ares-launch com.aurora.ds5 -d <TV_NAME>
    ```
@@ -172,6 +182,21 @@ wsl --install -d Ubuntu
 sudo apt-get install cmake gawk curl git build-essential
 ./scripts/webos/build_for_lg.sh
 ```
+
+### 3.5. Portability check
+
+Roughly half of the app sits behind `#if defined(TARGET_WEBOS)`. The TV build never
+compiles the other half, so calling a webOS-only function from outside its guard is
+invisible here and an undefined reference everywhere else. After touching a file
+that carries such a guard, build a desktop binary once:
+
+```bash
+./tools/check-portable.sh
+```
+
+It configures a separate build directory with the host compiler and builds it. It
+produces nothing that ships and does not touch the webOS build directory; it exists
+only so that a guard leak fails at once instead of on the next non-TV build.
 
 ---
 

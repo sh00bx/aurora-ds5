@@ -17,12 +17,10 @@ if (TARGET_WEBOS)
             ctm/controllers/controller_generic.c
             ctm/controllers/controller_steam_puck.c
             ctm/controllers/controller_flydigi.c
-            ctm/controllers/controller_xbox.c
-            ctm/monitor/ctm_monitor.c)
+            ctm/controllers/controller_xbox.c)
     target_include_directories(moonlight-lib PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/ctm
-            ${CMAKE_CURRENT_SOURCE_DIR}/ctm/controllers
-            ${CMAKE_CURRENT_SOURCE_DIR}/ctm/monitor)
+            ${CMAKE_CURRENT_SOURCE_DIR}/ctm/controllers)
     target_link_libraries(moonlight-lib PRIVATE enet pthread)
 endif()
