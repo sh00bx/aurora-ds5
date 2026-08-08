@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(MOONLIGHT_VERSION "1.4.10")
+set(MOONLIGHT_VERSION "1.4.11")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
@@ -69,7 +69,7 @@ if (BUILD_TESTS)
     enable_testing()
 endif ()
 
-set(I18N_LOCALES "cs" "de" "fr" "it" "nl" "pl" "pt-BR" "ro" "ru" "ja" "zh-CN")
+set(I18N_LOCALES "cs" "de" "fr" "it" "nl" "pl" "pt-BR" "ro" "ru" "ja" "zh-CN" "es-ES")
 list(LENGTH I18N_LOCALES I18N_LOCALES_LEN)
 
 set(FEATURE_FORCE_FULLSCREEN OFF)
