@@ -71,7 +71,7 @@ void gs_set_total_timeout(GS_CLIENT hnd, int timeout_secs);
 int gs_get_status(GS_CLIENT hnd, PSERVER_DATA server, const char *address, uint16_t port, bool unsupported);
 
 int gs_start_app(GS_CLIENT hnd, PSERVER_DATA server, PSTREAM_CONFIGURATION config, int appId, bool is_gfe, bool sops,
-                 bool localaudio, int gamepad_mask, const char *surround_params);
+                 bool localaudio, int gamepad_mask, const char *surround_params, bool vrr_requested);
 
 int gs_applist(GS_CLIENT hnd, const SERVER_DATA *server, PAPP_LIST *app_list);
 

@@ -161,7 +161,8 @@ int session_worker(session_t *session) {
     }
 #endif
     int ret = gs_start_app(client, server, &session->config.stream, appId, server->isGfe, session->config.sops,
-                           session->config.local_audio, gamepad_mask, surround_params);
+                           session->config.local_audio, gamepad_mask, surround_params,
+                           app_configuration != NULL && app_configuration->vrr);
     connect_mark(ret == GS_OK ? "gs_start_app ok" : "gs_start_app FAILED");
     if (ret != GS_OK) {
         session_set_state(session, STREAMING_ERROR);

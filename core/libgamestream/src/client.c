@@ -504,7 +504,7 @@ static void append_launch_mode_param(char *url, size_t url_len, int width, int h
 }
 
 int gs_start_app(GS_CLIENT hnd, PSERVER_DATA server, STREAM_CONFIGURATION *config, int appId, bool is_gfe, bool sops,
-                 bool localaudio, int gamepad_mask, const char* surround_params) {
+                 bool localaudio, int gamepad_mask, const char* surround_params, bool vrr_requested) {
     int ret = GS_OK;
     char *result = NULL;
     HTTP_DATA *data = NULL;
@@ -618,6 +618,12 @@ int gs_start_app(GS_CLIENT hnd, PSERVER_DATA server, STREAM_CONFIGURATION *confi
         append_param(url, sizeof(url), "surroundParams", surround_params);
     }
     append_param(url, sizeof(url), "continuousAudio", "1");
+    /* Sunshine forks read this to decide how deep the capture queue may grow: a VRR client
+     * gets the minimum depth (lower latency), a fixed-refresh one an adaptive queue. GFE
+     * doesn't know the parameter and ignores it, but there is no reason to send it there. */
+    if (!is_gfe && vrr_requested) {
+        append_param(url, sizeof(url), "clientVrrRequested", "1");
+    }
     if (!reconnect_same_app || !is_gfe) {
         if (config->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) {
             append_param(url, sizeof(url), "hdrMode", "1");

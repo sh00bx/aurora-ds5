@@ -54,6 +54,13 @@ typedef struct app_settings_t {
     bool hid_passthrough_autoplug;   /* auto-bridge connected game controllers on stream start + BT hotplug */
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
+    /**
+     * Tell the host the display is variable-refresh, via clientVrrRequested on the launch URL.
+     * Sunshine forks that honour it keep their capture queue at minimum depth instead of letting
+     * it grow adaptively, which trades a little jitter tolerance for lower latency. Off by
+     * default: on a fixed-refresh panel the deeper queue is the better trade.
+     */
+    bool vrr;
     bool hevc;
     /** Sunshine/Apollo: negotiate AV1 Main8/Main10 when decoder exposes SS4S_VIDEO_AV1. */
     bool av1;
