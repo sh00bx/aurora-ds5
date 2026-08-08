@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "backend/pcmanager.h"
 
@@ -55,7 +56,9 @@ typedef struct VIDEO_INFO {
 
 typedef struct AUDIO_INFO {
     const char *format;
-    const char* channels;
+    const char *channels;
+    /** Cumulative SS4S audio feed rejections this session — each one is a silent gap. */
+    uint32_t feedFailures;
 } AUDIO_INFO;
 
 typedef struct session_config_t {

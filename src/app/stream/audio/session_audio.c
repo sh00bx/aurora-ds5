@@ -100,6 +100,7 @@ static void aud_cleanup() {
 }
 
 static void aud_feed(char *sampleData, int sampleLength) {
+    SS4S_AudioFeedResult result;
     if (decoder != NULL) {
         // A NULL sample is the lost-packet placeholder; libopus renders concealment audio for it.
         int decode_len = opus_multistream_decode(decoder, (unsigned char *) sampleData, sampleLength,
@@ -109,9 +110,10 @@ static void aud_feed(char *sampleData, int sampleLength) {
             if (decode_len < 0) {
                 commons_log_warn("Session", "Audio decode failed: %s", opus_strerror(decode_len));
             }
+            audio_stream_info.feedFailures++;
             return;
         }
-        SS4S_PlayerAudioFeed(player, buffer, unit_size * decode_len);
+        result = SS4S_PlayerAudioFeed(player, buffer, unit_size * decode_len);
     } else {
         /*
          * Passthrough: the sink decodes Opus itself, so the libopus concealment the NULL
@@ -119,7 +121,19 @@ static void aud_feed(char *sampleData, int sampleLength) {
          * substitutes a silent frame, which keeps the audio timeline continuous instead of
          * dropping a frame's worth of it on every lost packet.
          */
-        SS4S_PlayerAudioFeed(player, (unsigned char *) sampleData, sampleLength);
+        result = SS4S_PlayerAudioFeed(player, (unsigned char *) sampleData, sampleLength);
+    }
+    /*
+     * A rejected feed is a silent gap nobody would otherwise notice: the stream keeps
+     * running, the stats keep counting frames, and only the sound is missing. Count them
+     * and log the first one plus every 50th, so a run of them shows up without flooding.
+     */
+    if (result != SS4S_AUDIO_FEED_OK) {
+        audio_stream_info.feedFailures++;
+        if (audio_stream_info.feedFailures == 1 || (audio_stream_info.feedFailures % 50) == 0) {
+            commons_log_warn("Session", "Audio feed rejected (#%u, result=%d)",
+                             (unsigned) audio_stream_info.feedFailures, (int) result);
+        }
     }
 }
 
