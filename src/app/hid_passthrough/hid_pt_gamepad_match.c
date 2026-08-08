@@ -167,18 +167,12 @@ app_gamepad_state_t *hid_pt_find_gamepad_for_logical(app_input_t *input,
         }
     }
 
-    if (app_input_get_gamepads_count(input) == 1) {
-        for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
-            app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
-            if (gp) {
-                item->moonlight_gs_id = (int8_t) gp->gs_id;
-                commons_log_info("HID-PT", "Matched %s to sole Moonlight slot %d",
-                                 item->name, gp->gs_id);
-                return gp;
-            }
-        }
-    }
-
+    /* NO sole-slot fallback: returning "the only enumerated pad" for a device
+     * that matched neither by identity nor by VID:PID binds a bridged pad to a
+     * bystander controller (one Xbox pad open, a DS5 auto-plugging before SDL
+     * enumerates it), and the exclusion then removes the Xbox pad from the host
+     * for the whole session. Stage 2 of hid_pt_moonlight_reconcile_exclusions
+     * covers the genuine late-enumeration case by VID:PID within one poll tick. */
     commons_log_warn("HID-PT", "No Moonlight gamepad match for HID device %s (vid=%s pid=%s)",
                      item->name, item->vid, item->pid);
     return NULL;
@@ -416,10 +410,35 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
                      gp->gs_id, item ? item->name : "?");
 }
 
+/* The logical device -- other than `except` -- that still bridges this Moonlight
+ * slot, or NULL. Identity matching is fuzzy enough for two logical devices to
+ * land on one gs_id, and clearing the bit for one of them re-announces a pad the
+ * other is still bridging: a duplicate ViGEm pad next to the real one. */
+static const logical_device_t *moonlight_slot_other_owner(int gs_id, const logical_device_t *except)
+{
+    if (gs_id < 0) {
+        return NULL;
+    }
+    for (int i = 0; i < g_devices.count; ++i) {
+        const logical_device_t *other = &g_devices.items[i];
+        if (other == except || !other->plugged || other->moonlight_gs_id != (int8_t) gs_id) {
+            continue;
+        }
+        return other;
+    }
+    return NULL;
+}
+
 static void moonlight_restore_gamepad(stream_input_t *input, app_gamepad_state_t *gp,
                                       logical_device_t *item)
 {
     if (!input || !gp || gp->gs_id < 0) {
+        return;
+    }
+    const logical_device_t *owner = moonlight_slot_other_owner(gp->gs_id, item);
+    if (owner) {
+        commons_log_info("HID-PT", "Moonlight slot %d stays excluded: still bridged by %s",
+                         gp->gs_id, owner->name);
         return;
     }
     input->moonlightExcludedMask &= (uint16_t) ~(1u << gp->gs_id);
@@ -449,6 +468,30 @@ void hid_pt_moonlight_restore(stream_input_t *input, logical_device_t *item)
     }
     app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
     moonlight_restore_gamepad(input, gp, item);
+}
+
+void hid_pt_moonlight_restore_slot(stream_input_t *input, int gs_id)
+{
+    if (!input || gs_id < 0) {
+        return;
+    }
+    app_gamepad_state_t *gp = gamepad_by_gs_id(input->input, (int8_t) gs_id);
+    if (gp) {
+        moonlight_restore_gamepad(input, gp, NULL);
+        return;
+    }
+    /* The pad left with the bridge (SDL closed it), so there is nobody to
+     * announce — but the exclusion bit MUST still go. gs_ids are recycled
+     * (app_input_gamepad_state_deinit keeps the id in the freed slot), so a bit
+     * left behind silently kills the next controller that inherits the slot. */
+    const logical_device_t *owner = moonlight_slot_other_owner(gs_id, NULL);
+    if (owner) {
+        commons_log_info("HID-PT", "Moonlight slot %d stays excluded: still bridged by %s",
+                         gs_id, owner->name);
+        return;
+    }
+    input->moonlightExcludedMask &= (uint16_t) ~(1u << (unsigned) gs_id);
+    commons_log_info("HID-PT", "Moonlight slot %d released after HID bridge ended", gs_id);
 }
 
 #endif /* TARGET_WEBOS */

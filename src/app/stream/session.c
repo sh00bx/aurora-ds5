@@ -75,6 +75,16 @@ session_t *session_create(app_t *app, const CONFIGURATION *config, const SERVER_
 #endif
     session_input_init(&session->input, session, &app->input, &session->config);
     hid_passthrough_manager_init(&session->hid_pt);
+#if defined(TARGET_WEBOS)
+    if (session->config.hid_passthrough) {
+        /* Which Moonlight slots the CTM bridge owns, decided HERE on the main
+         * thread: the walk dereferences gp->controller through SDL, and on the
+         * worker (its old home) it raced app_input_close_gamepad, which closes
+         * the SDL_GameController before clearing instance_id. The worker only
+         * reads the stored value when it builds gamepad_mask for gs_start_app. */
+        session->input.moonlightExcludedMask = hid_pt_moonlight_excluded_mask_at_start(&app->input);
+    }
+#endif
     SDL_ThreadFunction worker_fn = (SDL_ThreadFunction) session_worker;
 #if FEATURE_EMBEDDED_SHELL
     if (session_use_embedded(session)) {

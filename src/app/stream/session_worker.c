@@ -13,9 +13,6 @@
 #include "app_session.h"
 #include "backend/pcmanager/worker/worker.h"
 #include "app_settings.h"
-#if defined(TARGET_WEBOS)
-#include "hid_passthrough/hid_pt_gamepad_match.h"
-#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -156,7 +153,7 @@ int session_worker(session_t *session) {
     short gamepad_mask = app_input_gamepads_mask(&app->input);
 #if defined(TARGET_WEBOS)
     if (session->config.hid_passthrough) {
-        session->input.moonlightExcludedMask = hid_pt_moonlight_excluded_mask_at_start(&app->input);
+        /* Computed on the main thread in session_create; read-only here. */
         gamepad_mask &= (short) ~session->input.moonlightExcludedMask;
     }
 #endif

@@ -109,6 +109,10 @@ typedef struct {
     uint64_t plug_ms;               /* CLOCK_MONOTONIC ms at plug: lets the dead-
                                      * session reconcile tell an instant death
                                      * from a session that ran for a while */
+    int8_t moonlight_gs_id;         /* Moonlight slot excluded for this bridge;
+                                     * -1 = none. Survives the device leaving
+                                     * g_devices, so the teardown paths can still
+                                     * give the slot back. */
 } bridge_session_t;
 
 typedef struct {

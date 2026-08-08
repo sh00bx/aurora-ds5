@@ -849,6 +849,13 @@ static void plug_button_cb(lv_event_t *event) {
             stream_input_t *input = session_get_input(panel->session);
             if (input) {
                 hid_pt_moonlight_exclude(input, item);
+                /* Keep the resolved slot in the session record too: it is the only
+                 * copy that survives the device disappearing from g_devices, and
+                 * the reconcile's reap path needs it to give the slot back. */
+                int session_index = session_index_for_key(item->key);
+                if (session_index >= 0) {
+                    g_sessions[session_index].moonlight_gs_id = item->moonlight_gs_id;
+                }
             }
         }
     } else {

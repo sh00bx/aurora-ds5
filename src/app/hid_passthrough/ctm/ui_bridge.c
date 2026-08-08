@@ -427,6 +427,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
         g_sessions[index].port = port;
         g_sessions[index].controller = controller;
         g_sessions[index].plug_ms = mono_ms();
+        g_sessions[index].moonlight_gs_id = -1;   /* recorded by the plug caller */
         return true;
     }
     if (g_session_count >= MAX_SESSIONS) {
@@ -437,6 +438,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
     g_sessions[g_session_count].port = port;
     g_sessions[g_session_count].controller = controller;
     g_sessions[g_session_count].plug_ms = mono_ms();
+    g_sessions[g_session_count].moonlight_gs_id = -1;   /* recorded by the plug caller */
     g_session_count++;
     return true;
 }
@@ -771,9 +773,10 @@ void autoplug_reset(void)
  * sleeps / disconnects and reconnects mid-stream would come back wearing a stale
  * "plugged" flag and the reconcile would never re-bridge it. Reap any plugged key
  * whose device is gone: tear down the now-dead local session (stop_session also
- * BRIDGE_STOPs the host so it doesn't accumulate orphan virtual controllers) and
- * clear the flag, so the device is auto-plugged afresh when it returns. */
-static void autoplug_reap_vanished(void)
+ * BRIDGE_STOPs the host so it doesn't accumulate orphan virtual controllers),
+ * give its Moonlight slot back, and clear the flag, so the device is auto-plugged
+ * afresh when it returns. */
+static void autoplug_reap_vanished(stream_input_t *input)
 {
     for (int i = 0; i < g_plugged_key_count;) {
         bool present = false;
@@ -791,6 +794,15 @@ static void autoplug_reap_vanished(void)
          * g_plugged_keys (the latter shrinks via memmove), so do not advance i. */
         char key[96];
         snprintf(key, sizeof(key), "%s", g_plugged_keys[i]);
+        /* Release the Moonlight slot before stop_session drops the record that
+         * holds it — the device itself is already out of g_devices, so this is
+         * the last chance. Without it the slot stays excluded for the rest of the
+         * stream and the next controller to inherit that gs_id is announced to
+         * nobody. */
+        int si = session_index_for_key(key);
+        if (input && si >= 0) {
+            hid_pt_moonlight_restore_slot(input, g_sessions[si].moonlight_gs_id);
+        }
         stop_session(key);
         set_plug_key(key, false);
     }
@@ -850,7 +862,7 @@ static bool autoplug_node_is_peripheral(const logical_device_t *item)
 
 void hid_pt_autoplug_reconcile(stream_input_t *input)
 {
-    autoplug_reap_vanished();   /* drop stale plugged state for devices that left */
+    autoplug_reap_vanished(input);   /* drop stale plugged state for devices that left */
     autoplug_prune();           /* drop bookkeeping for devices that left */
 
     /* Before any plug work (and also during plug-failure cooldown ticks):
@@ -886,9 +898,17 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             int si = session_index_for_key(item->key);
             if (si >= 0 && ctm_controller_finished(g_sessions[si].controller)) {
                 bool instant = mono_ms() - g_sessions[si].plug_ms < 5000ull;
+                int gs_id = g_sessions[si].moonlight_gs_id;   /* stop_session drops the record */
                 stop_session(item->key);
                 item->plugged = false;
                 set_plug_key(item->key, false);
+                /* The bridge is gone, so the pad belongs to Moonlight again. Only
+                 * after item->plugged is cleared: the restore refuses to release a
+                 * slot that a still-plugged device owns, and until here that is
+                 * this very device. */
+                if (input) {
+                    hid_pt_moonlight_restore_slot(input, gs_id);
+                }
                 autoplug_entry_t *de = autoplug_entry_for(item->key, true);
                 if (de) {
                     if (!instant) {
@@ -904,6 +924,15 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
                     }
                 }
                 continue;
+            }
+            /* Keep the session record's slot in sync with the device: the
+             * exclusion is usually only resolved by the sweep above (SDL
+             * enumerates a BT pad seconds after the bridge claimed it), so the
+             * plug-time copy is often still -1. Never copy a -1 back: a pad that
+             * is momentarily un-enumerated clears item->moonlight_gs_id, and the
+             * record is exactly what the reap path needs afterwards. */
+            if (si >= 0 && item->moonlight_gs_id >= 0) {
+                g_sessions[si].moonlight_gs_id = item->moonlight_gs_id;
             }
             /* Already bridged (by us or manually): remember it so a later manual
              * plug-out is respected instead of being re-plugged on the next poll. */
@@ -936,6 +965,13 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             e->fail_count = 0;
             if (input) {
                 hid_pt_moonlight_exclude(input, item);
+                /* Keep the resolved slot in the session record too: it is the only
+                 * copy that survives the device disappearing from g_devices, and
+                 * the reap path below needs it to give the slot back. */
+                int psi = session_index_for_key(item->key);
+                if (psi >= 0) {
+                    g_sessions[psi].moonlight_gs_id = item->moonlight_gs_id;
+                }
             }
             log_append("auto-plugged %s (%s)", item->name, kind);
             /* success is cheap; keep going so a second controller plugs the same tick */

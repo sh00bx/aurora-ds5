@@ -38,6 +38,11 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input);
 void hid_pt_moonlight_exclude(struct stream_input_t *input, logical_device_t *item);
 void hid_pt_moonlight_restore(struct stream_input_t *input, logical_device_t *item);
 
+/// Give a Moonlight slot back by gs_id alone — for teardown paths whose logical
+/// device is already gone from g_devices (physically vanished, dead session), so
+/// the slot the bridge held cannot be looked up from a device any more.
+void hid_pt_moonlight_restore_slot(struct stream_input_t *input, int gs_id);
+
 /// Convergent exclusion sweep (1 Hz auto-plug poll): excludes the Moonlight
 /// slot of every bridged pad that slipped past the point-in-time guards, so a
 /// leaked parallel host pad heals within one tick instead of an app restart.
