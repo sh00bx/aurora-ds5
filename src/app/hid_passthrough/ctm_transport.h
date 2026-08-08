@@ -6,8 +6,12 @@
  * (hb_transport_t) and tv_bridge_worker.c (send_msg/recv_msg/connect_tcp/
  * dual-probe) into a single module so the framing + connect logic exists once.
  *
- * Behaviour matches the previously-proven worker path byte-for-byte:
- *   - TCP connect via getaddrinfo (hostname or IP), TCP_NODELAY + keepalive
+ * Behaviour matches the previously-proven worker path on the wire:
+ *   - TCP connect via getaddrinfo (hostname or IP), TCP_NODELAY + keepalive.
+ *     The connect itself is no longer the worker's blocking connect(2): it is
+ *     non-blocking with a bounded budget and a cancel fd, because the old one
+ *     could park a caller for the kernel's SYN-retry budget with no way out
+ *     (see ctm_transport_cancel). Same handshake, same socket options.
  *   - send stamps magic/version/timestamp and a monotonic sequence under a
  *     mutex (thread-safe: the input thread and session loop may both send)
  *   - recv validates magic + version + payload_len
@@ -36,7 +40,14 @@ typedef enum {
 
 typedef struct {
     ctm_transport_kind_t kind;
-    int fd;                     /* TCP socket; -1 otherwise */
+    /* PRIVATE. TCP socket; -1 otherwise. Do not touch from outside this module:
+     * only the owning session thread closes it, so any other thread that reads
+     * it races that close and can act on a descriptor number the kernel has
+     * already recycled. Use ctm_transport_cancel() to interrupt, and
+     * ctm_transport_pollfd() to wait on it. */
+    int fd;
+    int cancel_efd;             /* PRIVATE: sticky cancel, see ctm_transport_cancel */
+    pthread_mutex_t fd_mutex;   /* PRIVATE: fd publish/retire vs. cancel's shutdown */
     ctm_enet_client_t *enet;    /* borrowed; caller owns its lifecycle */
     pthread_mutex_t send_mutex; /* serializes TCP header+payload writes */
     uint32_t send_sequence;
@@ -78,6 +89,18 @@ int ctm_transport_service_wait(ctm_transport_t *t, unsigned int max_timeout_ms);
 
 /* 1 if connected (TCP fd open / ENet peer up), else 0. */
 int ctm_transport_connected(const ctm_transport_t *t);
+
+/* Interrupt everything that can block on this transport, from any thread: the
+ * connect poll, a recv waiting on a header, and a send parked on a full socket
+ * buffer. Sticky — once cancelled the transport stays cancelled (including
+ * across a disconnect/reconnect) until ctm_transport_destroy, so a wait that
+ * starts after the cancel still returns at once. This is how a stop request
+ * reaches the owning thread; callers never reach into t->fd themselves. */
+void ctm_transport_cancel(ctm_transport_t *t);
+
+/* The TCP fd, for poll(POLLIN) only; -1 when not on TCP. Owning session thread
+ * only, and only for the duration of the poll — see the note on t->fd. */
+int ctm_transport_pollfd(const ctm_transport_t *t);
 
 /* Close the TCP fd / disconnect ENet; return to idle (enet client preserved). */
 void ctm_transport_disconnect(ctm_transport_t *t);

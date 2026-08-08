@@ -2497,7 +2497,11 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             }
         } else {
             struct pollfd pfd;
-            pfd.fd = c->xport.fd; pfd.events = POLLIN; pfd.revents = 0;
+            /* Accessor, not c->xport.fd: the fd belongs to the transport and
+             * only this (the owning session) thread may hold it, and only for
+             * the length of the poll. The stop path no longer reaches in here —
+             * it goes through ctm_transport_cancel. */
+            pfd.fd = ctm_transport_pollfd(&c->xport); pfd.events = POLLIN; pfd.revents = 0;
             int pr = poll(&pfd, 1, timeout_ms);
             if (pr < 0) {
                 if (errno == EINTR) continue;
@@ -2850,7 +2854,12 @@ void ctm_controller_plug_out(ctm_controller_t *c)
 {
     if (!c) return;
     c->stop = 1;
-    if (c->xport.fd >= 0) shutdown(c->xport.fd, SHUT_RDWR);
+    /* Reaches the session thread wherever it is blocked — including inside the
+     * TCP connect, which the old shutdown(c->xport.fd) could not touch because
+     * the fd is not published until the connect returns. That gap is why a
+     * plug-out against a powered-down host used to hang the join, and with it
+     * the LVGL thread, for the kernel's whole SYN-retry budget. */
+    ctm_transport_cancel(&c->xport);
     if (c->wake_pipe[1] >= 0) (void)write(c->wake_pipe[1], "x", 1);
     if (c->session_started) {
         pthread_join(c->session_thread, NULL);
