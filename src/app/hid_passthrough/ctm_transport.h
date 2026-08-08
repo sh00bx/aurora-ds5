@@ -40,11 +40,12 @@ typedef enum {
 
 typedef struct {
     ctm_transport_kind_t kind;
-    /* PRIVATE. TCP socket; -1 otherwise. Do not touch from outside this module:
-     * only the owning session thread closes it, so any other thread that reads
-     * it races that close and can act on a descriptor number the kernel has
-     * already recycled. Use ctm_transport_cancel() to interrupt, and
-     * ctm_transport_pollfd() to wait on it. */
+    /* PRIVATE. TCP socket; -1 otherwise. Do not touch from outside this module.
+     * Closed only by ctm_transport_disconnect, which runs either on the owning
+     * session thread or on the UI thread once that thread has been joined; any
+     * other thread that reads this field races that close and can act on a
+     * descriptor number the kernel has already recycled. Use
+     * ctm_transport_cancel() to interrupt, and ctm_transport_pollfd() to wait. */
     int fd;
     int cancel_efd;             /* PRIVATE: sticky cancel, see ctm_transport_cancel */
     pthread_mutex_t fd_mutex;   /* PRIVATE: fd publish/retire vs. cancel's shutdown */
@@ -56,7 +57,9 @@ typedef struct {
 /* Initialize to idle. enet may be NULL (TCP-only). */
 void ctm_transport_init(ctm_transport_t *t, ctm_enet_client_t *enet);
 
-/* Destroy the mutex. Does not touch the (borrowed) enet client. */
+/* Close the cancel eventfd and destroy the mutexes. Does not touch the
+ * (borrowed) enet client, and does NOT close the TCP fd — call
+ * ctm_transport_disconnect first or the socket leaks. */
 void ctm_transport_destroy(ctm_transport_t *t);
 
 /* Wrap an already-accepted TCP socket (listen/server mode). */
@@ -90,12 +93,19 @@ int ctm_transport_service_wait(ctm_transport_t *t, unsigned int max_timeout_ms);
 /* 1 if connected (TCP fd open / ENet peer up), else 0. */
 int ctm_transport_connected(const ctm_transport_t *t);
 
-/* Interrupt everything that can block on this transport, from any thread: the
+/* Interrupt the three things this module can block on, from any thread: the TCP
  * connect poll, a recv waiting on a header, and a send parked on a full socket
  * buffer. Sticky — once cancelled the transport stays cancelled (including
  * across a disconnect/reconnect) until ctm_transport_destroy, so a wait that
- * starts after the cancel still returns at once. This is how a stop request
- * reaches the owning thread; callers never reach into t->fd themselves. */
+ * starts after the cancel still returns at once, and connect_once refuses to
+ * start another probe. This is how a stop request reaches the owning thread;
+ * callers never reach into t->fd themselves.
+ *
+ * Does NOT reach inside the borrowed ENet client: enet_client_connect and
+ * enet_client_disconnect run their own closed deadline loops (1200 ms / 200 ms
+ * as called from here) with no cancellation input, so a stop can still cost one
+ * in-flight ENet probe plus a disconnect budget. That is the residual, and it
+ * is bounded — do not read it as the cancel having failed. */
 void ctm_transport_cancel(ctm_transport_t *t);
 
 /* The TCP fd, for poll(POLLIN) only; -1 when not on TCP. Owning session thread

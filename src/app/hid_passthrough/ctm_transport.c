@@ -44,8 +44,10 @@ static int send_all(int fd, const void *data, size_t len)
 /* Read exactly len bytes, or fail. Interruptible: a header that only half
  * arrives used to park the session thread here forever, out of reach of the
  * stop path. Try-first/wait-second keeps the common case at the same single
- * syscall the old blocking recv cost — the caller already poll()ed the socket,
- * so the bytes are normally sitting there and only a short read waits. */
+ * syscall the old blocking recv cost — the session loop already poll()ed the
+ * socket before calling in, so the bytes are normally sitting there and only a
+ * short read waits. (The handshake path has no such poll and simply waits; it
+ * runs once per session, off any hot path.) */
 static int recv_all(int fd, void *data, size_t len, int cancel_fd)
 {
     uint8_t *p = (uint8_t *)data;
@@ -213,6 +215,15 @@ void ctm_transport_destroy(ctm_transport_t *t)
     pthread_mutex_destroy(&t->fd_mutex);
 }
 
+/* Has cancel already been signalled? Non-destructive: the eventfd is never
+ * drained (the cancel is sticky), so this only peeks at its readability. */
+static int cancel_pending(const ctm_transport_t *t)
+{
+    if (!t || t->cancel_efd < 0) return 0;
+    struct pollfd pfd = { .fd = t->cancel_efd, .events = POLLIN, .revents = 0 };
+    return poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN) != 0;
+}
+
 void ctm_transport_cancel(ctm_transport_t *t)
 {
     if (!t) return;
@@ -232,8 +243,14 @@ void ctm_transport_cancel(ctm_transport_t *t)
     pthread_mutex_lock(&t->fd_mutex);
     if (t->fd >= 0) shutdown(t->fd, SHUT_RDWR);
     pthread_mutex_unlock(&t->fd_mutex);
-    /* ENet needs nothing: its pump caps each wait at 10ms, so the owning thread
-     * sees the caller's stop flag on the next tick. */
+    /* ENet's PUMP needs nothing: it caps each wait at 10 ms, so the owning
+     * thread sees the caller's stop flag on the next tick. Its CONNECT and
+     * DISCONNECT are a different matter — enet_client_connect/_disconnect run
+     * closed deadline loops (1200 ms / 200 ms as called from here) that read no
+     * cancel token at all, and this eventfd does not reach inside them.
+     * connect_once therefore checks cancel_pending() before starting a probe,
+     * which bounds a cancelled connect at one already-running probe instead of
+     * one per retry; a disconnect can still cost its 200 ms. */
 }
 
 void ctm_transport_attach_tcp(ctm_transport_t *t, int fd)
@@ -250,6 +267,12 @@ int ctm_transport_connect_once(ctm_transport_t *t, const char *host, int port,
                                unsigned int enet_timeout_ms)
 {
     if (!t) return -1;
+
+    /* Already cancelled? Do not start a probe. enet_client_connect burns its
+     * whole budget against a host that DROPs rather than resets, and nothing
+     * inside it observes the cancel — so without this gate a stop request costs
+     * the caller one full ENet timeout for every remaining retry. */
+    if (cancel_pending(t)) return -1;
 
     /* 1) ENet first, brief timeout. */
     if (t->enet && enet_client_connect(t->enet, host, port, enet_timeout_ms) == 0) {
