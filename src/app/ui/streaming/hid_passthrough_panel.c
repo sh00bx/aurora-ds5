@@ -859,12 +859,23 @@ static void plug_button_cb(lv_event_t *event) {
             }
         }
     } else {
+        /* Third teardown path, alongside the reconcile's vanish-reap and
+         * zombie-session branches, and it needs the same care. Take the slot out
+         * of the session record before stop_session destroys it: matching the pad
+         * again afterwards only works while it is still enumerated in SDL, and a
+         * bridged pad usually is not — the exclusion bit would then stay set for
+         * the rest of the stream and kill whichever controller next inherits that
+         * gs_id. Clear item->plugged before the restore, or the owner guard
+         * refuses to release the slot this very device still claims. */
+        int session_index = session_index_for_key(item->key);
+        int gs_id = (session_index >= 0) ? g_sessions[session_index].moonlight_gs_id : -1;
         stop_session(item->key);
         ctm_clear_plug_error();
+        item->plugged = false;
         if (panel->session) {
             stream_input_t *input = session_get_input(panel->session);
             if (input) {
-                hid_pt_moonlight_restore(input, item);
+                hid_pt_moonlight_restore_slot(input, gs_id);
             }
         }
     }

@@ -339,6 +339,17 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
             if (!item->plugged || !vid_pid_equal_hex(item->vid, item->pid, vid, pid)) {
                 continue;
             }
+            /* One device, one slot. Without this a second same-model bridge never
+             * gets a slot recorded: both pads match the FIRST plugged device, whose
+             * moonlight_gs_id is simply overwritten, and the sibling stays at -1.
+             * moonlight_slot_other_owner() only recognises an owner through that
+             * field, so on teardown it would see the slot as unowned, clear the bit
+             * and announce an arrival for a pad another live bridge still holds.
+             * Stage 1 re-resolves the cache every tick, so a stale id cannot pin a
+             * device here. */
+            if (item->moonlight_gs_id >= 0 && item->moonlight_gs_id != (int8_t) gp->gs_id) {
+                continue;
+            }
             commons_log_warn("HID-PT", "sweep: excluding Moonlight slot %d by VID:PID of bridged %s",
                              gp->gs_id, item->name);
             moonlight_exclude_gamepad(input, gp, item);
@@ -459,15 +470,6 @@ void hid_pt_moonlight_exclude(stream_input_t *input, logical_device_t *item)
     }
     app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
     moonlight_exclude_gamepad(input, gp, item);
-}
-
-void hid_pt_moonlight_restore(stream_input_t *input, logical_device_t *item)
-{
-    if (!input || !item) {
-        return;
-    }
-    app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
-    moonlight_restore_gamepad(input, gp, item);
 }
 
 void hid_pt_moonlight_restore_slot(stream_input_t *input, int gs_id)

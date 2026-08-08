@@ -794,17 +794,21 @@ static void autoplug_reap_vanished(stream_input_t *input)
          * g_plugged_keys (the latter shrinks via memmove), so do not advance i. */
         char key[96];
         snprintf(key, sizeof(key), "%s", g_plugged_keys[i]);
-        /* Release the Moonlight slot before stop_session drops the record that
-         * holds it — the device itself is already out of g_devices, so this is
-         * the last chance. Without it the slot stays excluded for the rest of the
-         * stream and the next controller to inherit that gs_id is announced to
-         * nobody. */
+        /* Copy the slot out before stop_session drops the record that holds it,
+         * but hand it back only afterwards. The restore announces a controller
+         * ARRIVAL to the host, and until BRIDGE_STOP has run the native pad is
+         * still plugged there — announcing first opens a window where the host
+         * sees the same physical controller twice. Same ordering as the
+         * zombie-session branch below. Without the restore at all the slot stays
+         * excluded for the rest of the stream and the next controller to inherit
+         * that gs_id is announced to nobody. */
         int si = session_index_for_key(key);
-        if (input && si >= 0) {
-            hid_pt_moonlight_restore_slot(input, g_sessions[si].moonlight_gs_id);
-        }
+        int gs_id = (si >= 0) ? g_sessions[si].moonlight_gs_id : -1;
         stop_session(key);
         set_plug_key(key, false);
+        if (input) {
+            hid_pt_moonlight_restore_slot(input, gs_id);
+        }
     }
 }
 

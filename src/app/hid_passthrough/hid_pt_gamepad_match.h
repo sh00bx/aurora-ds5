@@ -36,11 +36,15 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
 uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input);
 
 void hid_pt_moonlight_exclude(struct stream_input_t *input, logical_device_t *item);
-void hid_pt_moonlight_restore(struct stream_input_t *input, logical_device_t *item);
 
-/// Give a Moonlight slot back by gs_id alone — for teardown paths whose logical
-/// device is already gone from g_devices (physically vanished, dead session), so
-/// the slot the bridge held cannot be looked up from a device any more.
+/// Give a Moonlight slot back by gs_id alone. This is the ONLY restore entry
+/// point, deliberately: every teardown path runs after the bridge is gone, and
+/// by then the pad is usually no longer enumerated in SDL, so re-deriving the
+/// slot from the logical device silently resolves nothing and leaves the
+/// exclusion bit set for the rest of the stream. Read the slot out of the
+/// session record before stop_session() destroys it, and call this afterwards —
+/// after clearing item->plugged, or the owner guard keeps the slot excluded on
+/// behalf of the very device being unplugged.
 void hid_pt_moonlight_restore_slot(struct stream_input_t *input, int gs_id);
 
 /// Convergent exclusion sweep (1 Hz auto-plug poll): excludes the Moonlight
