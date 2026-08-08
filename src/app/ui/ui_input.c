@@ -64,6 +64,10 @@ lv_group_t *app_input_get_group(app_ui_input_t *input) {
     return input->app_group;
 }
 
+bool app_input_has_modal_group(app_ui_input_t *input) {
+    return _lv_ll_get_tail(&input->modal_groups) != NULL;
+}
+
 void app_input_push_modal_group(app_ui_input_t *input, lv_group_t *group) {
     LV_ASSERT_NULL(group);
     lv_group_t **tail = _lv_ll_ins_tail(&input->modal_groups);

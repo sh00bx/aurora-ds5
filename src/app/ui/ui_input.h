@@ -49,6 +49,9 @@ void app_input_remove_modal_group(app_ui_input_t *input, lv_group_t *group);
 
 lv_group_t *app_input_get_group(app_ui_input_t *input);
 
+/** @return true while a dialog/popup group is on the stack and owns input. */
+bool app_input_has_modal_group(app_ui_input_t *input);
+
 void app_input_set_button_points(app_ui_input_t *input, const lv_point_t *points);
 
 bool ui_set_input_mode(app_ui_input_t *input, app_ui_input_mode_t mode);

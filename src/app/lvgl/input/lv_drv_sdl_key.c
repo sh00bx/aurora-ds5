@@ -7,6 +7,7 @@
 #include "platform/sdl/navkey_sdl.h"
 #include "ui/root.h"
 #include "ui/root.h"
+#include "ui/launcher/launcher.controller.h"
 #include "ui/streaming/streaming.controller.h"
 #include "ui/streaming/soft_keyboard.h"
 
@@ -34,6 +35,8 @@ static bool ui_modal_consumes_input(void) {
 static bool read_keyboard(app_ui_input_t *input, const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state);
 
 static bool read_event(const SDL_Event *event, lv_drv_sdl_key_t *state);
+
+static bool home_group_shortcut(const SDL_Event *event);
 
 static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data);
 
@@ -193,7 +196,19 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
                 }
             }
         }
-        if (!handled_modal && app->session != NULL && session_handle_input_event(app->session, &e)) {
+        /* Home-screen shortcuts that belong to no single widget. Gated on "no
+         * session" because inside a stream those buttons are the game's, and the
+         * session gets first refusal on everything below anyway. */
+        bool handled_shortcut = !handled_modal && app->session == NULL && home_group_shortcut(&e);
+        if (handled_shortcut) {
+            /* Consumed here, so it never reaches read_event(). Deliberately
+             * leaves state->state alone: forcing it to RELEASED -- as the
+             * session branch below does -- would look like the release of a key
+             * still being held, and LVGL restores the previous key on release,
+             * so an A held down while L1 is tapped would fire CLICKED and launch
+             * whatever tile the cursor is on. */
+            ui_set_input_mode(input, UI_INPUT_MODE_GAMEPAD);
+        } else if (!handled_modal && app->session != NULL && session_handle_input_event(app->session, &e)) {
             state->state = LV_INDEV_STATE_RELEASED;
         } else if (!handled_modal && !ui_modal_consumes_input()) {
             /* Avoid switching input mode while soft keyboard is open – prevents KEY ↔ GAMEPAD
@@ -280,6 +295,34 @@ static bool read_event(const SDL_Event *event, lv_drv_sdl_key_t *state) {
     (void) 0;
     state->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
     return true;
+}
+
+/**
+ * Controller shortcuts the home screen owns globally.
+ *
+ * L1/R1 page through the app groups of the platform filter, so a controller can
+ * change group from inside the grid without walking the cursor up to the filter
+ * row and back. They are deliberately not routed through NAVKEY/LV_KEY: the
+ * grid already spends LV_KEY_PREV/NEXT on paging, and a key would only ever
+ * reach whichever widget happens to be focused, not the home screen as a whole.
+ *
+ * Only the press edge is consumed; the matching release falls through to
+ * read_event(), which has no mapping for the shoulder buttons and ignores it.
+ *
+ * @return true if the event was consumed.
+ */
+static bool home_group_shortcut(const SDL_Event *event) {
+    if (event->type != SDL_CONTROLLERBUTTONDOWN) {
+        return false;
+    }
+    switch (event->cbutton.button) {
+        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+            return launcher_cycle_platform(-1);
+        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+            return launcher_cycle_platform(1);
+        default:
+            return false;
+    }
 }
 
 static bool read_keyboard(app_ui_input_t *input, const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state) {

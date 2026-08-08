@@ -600,6 +600,38 @@ static void launcher_apply_platform_selection(launcher_fragment_t *controller, i
     apps_set_platform_filter(apps, segment == 0 ? NULL : controller->platform_values[segment]);
 }
 
+bool launcher_cycle_platform(int dir) {
+    launcher_fragment_t *controller = current_instance;
+    if (controller == NULL || !controller->pane_initialized || dir == 0) {
+        return false;
+    }
+    /* Settings covers the whole game area, and a dialog owns input through its
+     * modal group -- in neither case is the filter row reachable, so a shoulder
+     * press must not silently reshuffle what is underneath. */
+    if (controller->settings_fragment != NULL ||
+        app_input_has_modal_group(&controller->global->ui.input)) {
+        return false;
+    }
+    /* Same test the FILTER zone uses for "is there anything to choose from". */
+    if (!launcher_zone_available(controller, LAUNCHER_ZONE_FILTER)) {
+        return false;
+    }
+    int segments = controller->platform_segments;
+    int next = (controller->platform_selected + (dir > 0 ? 1 : -1) + segments) % segments;
+    /* Move the matrix cursor along with the selection. The filter row's own
+     * left/right handler reads the cursor rather than the checked segment, so
+     * leaving it behind would make the next press there jump back. */
+    lv_btnmatrix_set_selected_btn(controller->platform_bar, (uint16_t) next);
+    launcher_apply_platform_selection(controller, next);
+    /* Applying a filter focuses the first tile of the new selection, which draws
+     * the grid's selection ring even when the cursor is somewhere else entirely
+     * -- two zones would look focused at once. */
+    if (controller->focus_zone != LAUNCHER_ZONE_GRID) {
+        launcher_clear_detail_key_focus(controller);
+    }
+    return true;
+}
+
 /**
  * Shorten a platform name for display.
  *

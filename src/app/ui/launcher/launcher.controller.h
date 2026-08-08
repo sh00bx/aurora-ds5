@@ -135,6 +135,20 @@ void launcher_attach_platform_bar_nav(launcher_fragment_t *controller);
 void launcher_nav_child_added(lv_event_t *event);
 
 /**
+ * Step the app-group filter one segment, wrapping around at both ends.
+ *
+ * Home-screen shortcut for the controller shoulder buttons, so switching group
+ * doesn't mean walking the cursor up out of the grid first. Works from any of
+ * the three zones and takes no controller argument on purpose: the caller is the
+ * input driver, which has no business knowing whether a launcher exists.
+ *
+ * @param dir negative to step left, positive to step right.
+ * @return true if a group change was applied, false when the home screen isn't
+ *         what's on screen or there is nothing to cycle through.
+ */
+bool launcher_cycle_platform(int dir);
+
+/**
  * Rebuild the platform filter segments from the app list.
  * @param names    platform names, or NULL when there is nothing to group by
  * @param count    number of entries in @p names
