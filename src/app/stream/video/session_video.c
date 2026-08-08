@@ -77,6 +77,18 @@ static unsigned long feed_error_first_ms = 0;
 // NOT_READY persists continuously well beyond any legitimate exclusive op.
 #define VDEC_NOT_READY_WEDGE_MS 5000
 static unsigned long not_ready_first_ms = 0;
+/*
+ * Minimum interval between IDR requests we forward to the host.
+ *
+ * When the sink asks for a keyframe (buffer full, decode error), the obvious answer is
+ * DR_NEED_IDR. But an IDR frame is several times the size of a P-frame, so feeding it
+ * refills the buffer that was already full and provokes the next request — a feedback
+ * loop that keeps the link saturated. IDR requests also share the control channel with
+ * gamepad input, so a flood of them shows up as input lag. Rate-limit them and drop the
+ * frames in between; the stream recovers on its own once the buffer drains.
+ */
+#define IDR_REQUEST_MIN_INTERVAL_MS 1000
+static unsigned long last_idr_request_ms = 0;
 static struct VIDEO_STATS vdec_temp_stats;
 static int vdec_stream_format = 0;
 static bool vdec_warned_near_buffer_limit;
@@ -270,6 +282,8 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     need_idr_on_resume = false;
     feed_error_count = 0;
     feed_error_first_ms = 0;
+    last_idr_request_ms = 0;  /* a new stream must never have its first keyframe request
+                               * swallowed by the previous stream's throttle window */
     not_ready_first_ms = 0;   /* the NOT_READY wedge watchdog must not carry a
                                * stale epoch from a stream that ended mid-
                                * NOT_READY: the next stream's first transient
@@ -386,7 +400,12 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
         }
         return DR_OK;
     } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
-        return DR_NEED_IDR;
+        unsigned long now = SDL_GetTicks();
+        if (last_idr_request_ms == 0 || now - last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
+            last_idr_request_ms = now;
+            return DR_NEED_IDR;
+        }
+        return DR_OK;
     } else if (result == SS4S_VIDEO_FEED_NOT_READY) {
         /* A transient NOT_READY (HDR toggle / resolution change) is expected. Only a
          * decoder that stays NOT_READY well past any legitimate exclusive operation
