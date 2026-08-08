@@ -141,9 +141,16 @@ int session_worker(session_t *session) {
     const char *surround_params = NULL;
 #if TARGET_WEBOS
     if (session->config.stream.audioConfiguration == AUDIO_CONFIGURATION_51_SURROUND) {
-        // Send standard channel order so all hosts use the same layout.
-        // This is then remapped to the WebOS order in opus_fix.c from SS4S.
-        surround_params = "642012345";
+        // webOS NDL Opus passthrough only accepts the mapping {0,1,4,5,2,3}
+        // (FL FR SL SR FC LFE). Asking the host for SDL order (012345) makes every
+        // 5.1 frame take the SS4S opus_fix re-encode path, which adds latency and
+        // drops out momentarily. The client-side Opus decoder emits channels in the
+        // requested mapping order too, so this layout is what the NDL 6-channel PCM
+        // sink expects either way.
+        // 6 ch, 4 streams, 2 coupled, FL FR SL SR FC LFE:
+        surround_params = "642014523";
+        commons_log_info("Session", "5.1 surroundParams=%s (webOS channel layout; skips opus_fix re-encode)",
+                         surround_params);
     }
 #endif
     short gamepad_mask = app_input_gamepads_mask(&app->input);
