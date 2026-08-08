@@ -163,6 +163,11 @@ while true; do
   # failure it used to `return 1` on. Below the threshold we leave the file alone:
   # the short generations then ACCUMULATE in $LOG (append, still 1MB-capped) so the
   # whole loop is readable in one place, while $LOG.1 keeps the last real run.
+  # This DELAYS the loss, it does not prevent it: a handful of lines per ~1s
+  # generation crosses 2048 bytes after roughly 5-7 respawns, and the batch after
+  # that overwrites $LOG.1. So a sustained crash loop still buries the first
+  # failure — after ~10-14 respawns instead of 1. Grab the log inside the first
+  # ~10s, or switch to a timestamped-generation scheme if that is not enough.
   LOGSZ=$(wc -c <"$LOG" 2>/dev/null || echo 0)
   [ "${LOGSZ:-0}" -ge 2048 ] && mv -f "$LOG" "$LOG.1"
   # The uid ds5_txd must accept on its sockets. webOS assigns a jail uid PER APP

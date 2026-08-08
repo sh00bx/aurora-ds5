@@ -359,7 +359,18 @@ static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,
  * repeated. */
 static int read_root_int(const char *path, int *warned){
     int fd=open(path,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
-    if(fd<0) return -1;
+    if(fd<0){
+        /* ENOENT is the normal case (no tunable set) and must stay quiet. Anything
+         * else is a refusal the operator needs to see — above all the ELOOP that
+         * O_NOFOLLOW raises on the planted symlink this gate exists for, which
+         * would otherwise be the one refusal that logs nothing at all. */
+        if(errno!=ENOENT && warned && !*warned){
+            *warned=1;
+            fprintf(stderr,"[txd] ignoring %s: open failed errno=%d (%s)\n",
+                    path,errno,strerror(errno));
+        }
+        return -1;
+    }
     struct stat st;
     if(fstat(fd,&st)<0 || !S_ISREG(st.st_mode) || st.st_uid!=0){
         if(warned && !*warned){
@@ -2258,7 +2269,7 @@ int main(int argc,char**argv){
             }
         }
         if(ufd>=0 && (pfd[0].revents&POLLIN)){
-            int maxq=inject_maxq();     /* per-wakeup constants (fopen /tmp ~1/s, never under g_lock) */
+            int maxq=inject_maxq();     /* per-wakeup constants (root-owned /tmp read ~1/s, never under g_lock) */
             int fdepth=inject_fifo();
             for(int drained=0; drained<DRAIN_CAP; drained++){
                 struct iovec iov={.iov_base=rep,.iov_len=sizeof rep};
@@ -2290,8 +2301,8 @@ int main(int argc,char**argv){
                 /* Route by tag kind (see ACL_TAG_*): an INJECT datagram goes to the
                  * link bound to that address; an ASSERT datagram only feeds the
                  * identity ring and is never injected; an untagged one (legacy/USB)
-                 * goes to the PRIMARY link (g_links[0]) — byte-for-byte the old
-                 * single-pad path. */
+                 * goes to the link that is bound when EXACTLY ONE is — resolved by
+                 * identity, not by slot number — and is refused otherwise. */
                 /* Control datagram: consumed here, never routed to a link.
                  * n>=3 (not 4): the payload-less IDLE_LB_CLEAR is exactly 3 bytes. */
                 if(n>=3 && rep[0]==ACL_TAG_M0 && rep[1]==ACL_TAG_CTRL){
@@ -2368,14 +2379,20 @@ int main(int argc,char**argv){
                      * drive. That is how an arming/output report meant for the pad the
                      * sender unbound lands on the OTHER pad, whose kernel driver is
                      * still bound (two writers on one L2CAP channel = the documented
-                     * oscillation). Resolving to whoever holds SLOT 0 had the same
-                     * effect with only ONE pad bound, because a single pad routinely
-                     * sits in slot 1 (free_slot prefers a virgin slot, slot_for_addr
-                     * keeps a returning pad on its old slot): the datagrams were then
-                     * written onto a slot-0 pad that never bound, and since the app
-                     * treats the successful sendto() as delivered and skips its hidraw
-                     * write, the real pad also went off air and could never bind —
-                     * self-sustaining. Carrying the resolved address in `expect` also
+                     * oscillation). Resolving to whoever holds SLOT 0 was wrong for a
+                     * second reason: slot 0 is not an identity, and a single pad
+                     * routinely sits in slot 1 (free_slot prefers a virgin slot,
+                     * slot_for_addr keeps a returning pad on its old slot). Two real
+                     * failure modes came out of that, neither of which was a wrong-pad
+                     * write — inject_one() gates on L->have, so an unbound slot 0 was
+                     * never written to. (a) ONE pad in slot 1: the BASE readiness record
+                     * mirrored slot 0 and so read invalid, the client kept seeding
+                     * hidraw and simply never got the raw-ACL bypass. (b) TWO pads
+                     * bound: the base record read VALID off slot 0, so the client
+                     * stopped seeding hidraw and sent — and the ambiguity refusal above
+                     * then dropped every datagram, taking that pad off air with nothing
+                     * to fall back to. Case (b) is what the fail-closed base record
+                     * fixes. Carrying the resolved address in `expect` also
                      * arms inject_one()'s re-check, so a capture-thread rebind between
                      * resolve and inject skips instead of buzzing the wrong pad.
                      * Control datagrams are consumed above and stay untagged-friendly. */

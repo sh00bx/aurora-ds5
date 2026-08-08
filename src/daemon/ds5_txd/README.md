@@ -15,10 +15,10 @@ by hand, which is exactly what bundling it removes.
 ## Provenance
 
 Upstream: <https://github.com/sh00bx/webos-ds5-raw-acl> (MIT).
-Vendored from commit **`d1557da`** (`daemon/ds5_txd.c`) **plus one local patch**
-(jail uid via `argv[4]`, see "Local patch" below). It is no longer byte-identical
-to upstream — carry the patch forward on the next re-vendor, or the fix is gone
-without a conflict marker.
+Vendored from commit **`d1557da`** (`daemon/ds5_txd.c`) **plus two local patches**
+— jail uid via `argv[4]`, and the daemon-hardening set (both under "Local patches"
+below). It is no longer byte-identical to upstream — carry **both** forward on the
+next re-vendor, or the fixes are gone without a conflict marker.
 
 Until 2026-08-04 this was pinned to **`7bbe0ba`** on the reasoning that it was the
 revision whose binary had been running on the TV, so bundling would change only
@@ -38,7 +38,11 @@ of them is what "reviewed but never run" turned into here.
 traffic nor paint over a live session (`IDLE_LB_HIDRAW_QUIET_MS`), which is the
 second writer the 08-03 review removed.
 
-## Local patch — jail uid via `argv[4]` (2026-08-06)
+## Local patches
+
+Two, both of which must survive a re-vendor. Checklist below; details follow.
+
+### 1. Jail uid via `argv[4]` (2026-08-06)
 
 The rule used to be "the vendored `.c` is **never edited here**", on the grounds
 that everything app-id-specific reaches the daemon through argv. That held for
@@ -66,10 +70,48 @@ itself. Two deliberate choices:
 Fix it upstream in `webos-ds5-raw-acl` and drop this patch when re-vendoring from
 a commit that carries it.
 
+### 2. Daemon hardening (2026-08-09)
+
+Five independent changes, from the phase-5 refactor. Each is small and each is
+load-bearing; re-check all five against any re-vendored source.
+
+* **A local peer can no longer kill the daemon.** `SIGPIPE` is ignored at startup
+  and every reply `sendmsg()` carries `MSG_NOSIGNAL`, so a client that closes its
+  socket between request and reply gets an `EPIPE` return instead of taking the
+  root process down with it. Verified off-device: the pre-patch `sendmsg(...,0)`
+  really is fatal on both the reject and the `SCM_RIGHTS` paths.
+* **Untagged datagrams route by identity, not by slot 0.** An untagged (legacy /
+  USB) report now goes to the single bound link when exactly one is bound, and is
+  refused otherwise; the base readiness record fails closed the same way. The old
+  slot-0 rule left a lone pad in slot 1 permanently un-accelerated, and with two
+  pads bound it reported ready while refusing every datagram — the pad went
+  silent with nothing to fall back to. **Visible behaviour change:** in a 2-pad
+  session the base record now reads `valid=0`, so a legacy untagged client and
+  `service.js /status` report not-ready.
+* **Per-reason drop counters** (`d_nolink`, `d_ambig`, `d_badlen`, `d_noninj`, …)
+  in the 10 s stats line, so a refusal is diagnosable instead of one opaque total.
+  Zero-links-bound is counted apart from the genuine ambiguity refusal: the
+  former is the normal pre-bind state while the app is still hidraw-seeding.
+* **A failed startup socket bind is no longer fatal** — it retries every 500 ms
+  and logs once. Note the supervisor still kills and respawns after ~12 s of a
+  missing socket (`ds5-tmpld.sh`), so this covers failures that clear inside
+  ~10 s; the respawn remains the backstop for anything longer.
+* **`/tmp` tunables are ownership-gated.** `read_root_int()` opens with
+  `O_NOFOLLOW|O_CLOEXEC` and `fstat()`s the **fd**, requiring a root-owned
+  regular file, so a planted symlink or a swap between check and open is refused
+  — and the refusal is logged once per call site rather than silently disabling
+  the operator's tuning.
+
+Still open from that phase and deliberately not done here: hardening
+`ds5-tmpld.sh`'s `>>"$LOG"` append against a symlink plant on the predictable
+`/tmp/ds5_txd.log` path. It is only a real primitive if `/tmp` is `1777` on the
+device — check that first, because getting it wrong breaks logging outright, and
+logging is what makes the rest of this observable.
+
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
-    # md5 000d81dbec1ee824bbb621af17aaa51c, 78676 bytes   (+ daemon hardening phase)
+    # md5 a5524813257d2b8a0e67cadfc170da62, 78676 bytes   (+ daemon hardening phase)
     # md5 0939f76761c39ebe702f3aae6eb624fc, 78504 bytes   (d1557da + jail-uid patch)
     # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da, unpatched)
     # md5 c87110415dd38bfeea92ea27444f8e6f, 78412 bytes   (7bbe0ba, superseded)
