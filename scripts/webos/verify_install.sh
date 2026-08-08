@@ -53,14 +53,31 @@ ar p "${IPK}" data.tar.gz | tar xzf - -C "${STAGE}"
 
 # The two blobs that carry code: the app binary and the root transport daemon.
 # Anything else in the IPK is data and shows up as a behaviour change anyway.
-BLOBS=$(cd "${STAGE}" && ls usr/palm/applications/*/bin/aurora usr/palm/services/*/ds5_txd 2>/dev/null)
+#
+# Resolve each one separately, and swallow the failure. A single `ls A B` exits
+# non-zero when EITHER glob misses, and under `set -e` that killed the script
+# outright: an IPK missing one blob exited silently before printing anything, the
+# "contains neither" branch below could never run, and the blob that WAS present
+# never got checked. A verifier that dies quietly is worse than no verifier.
+STATUS=0
+BLOBS=
+for PATTERN in 'usr/palm/applications/*/bin/aurora' 'usr/palm/services/*/ds5_txd'; do
+  # shellcheck disable=SC2086
+  FOUND=$(cd "${STAGE}" && ls ${PATTERN} 2>/dev/null || true)
+  if [ -z "${FOUND}" ]; then
+    echo "  ABSENT   ${PATTERN} — not in the IPK (packaging problem?)"
+    STATUS=1
+    continue
+  fi
+  BLOBS="${BLOBS} ${FOUND}"
+done
+
 if [ -z "${BLOBS}" ]; then
   echo "IPK ${IPK} contains neither bin/aurora nor ds5_txd — wrong package?"
   exit 1
 fi
 
 echo "Reference: ${IPK}"
-STATUS=0
 for BLOB in ${BLOBS}; do
   BUILT=$(cd "${STAGE}" && md5sum "${BLOB}" | cut -d' ' -f1)
   TV_PATH="/media/developer/apps/${BLOB}"
