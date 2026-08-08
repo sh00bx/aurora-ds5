@@ -76,6 +76,13 @@ int app_init(app_t *app, app_settings_loader *settings_loader, int argc, char *a
     SDL_SetHint(SDL_HINT_WEBOS_HIDAPI_IGNORE_BLUETOOTH_DEVICES, "0x057e/0x0000");
     if (app->settings.syskey_capture) {
         SDL_SetHint(SDL_HINT_WEBOS_ACCESS_POLICY_KEYS_HOME, "true");
+        /* A USB keyboard's left Super arrives as the webOS *home* key — the hint
+         * above is documented as "home key. (L_Super on keyboard)". Without it the
+         * compositor keeps the key and opens the launcher ribbon, so the host never
+         * sees a Windows key at all. META is the webOS-8+ companion policy for the
+         * meta key proper; asking for both is what makes Super reach us on TVs that
+         * split the two, and is a no-op on the ones that don't. */
+        SDL_SetHint(SDL_HINT_WEBOS_ACCESS_POLICY_KEYS_META, "true");
         SDL_SetHint(SDL_HINT_WEBOS_ACCESS_POLICY_RIBBON, "false");
     }
 #else
@@ -143,6 +150,32 @@ void app_run_loop(app_t *app) {
     app_process_events(app);
     lv_task_handler();
     SDL_Delay(1);
+}
+
+/*
+ * Log the keys webOS is known to fight us over, once per physical press.
+ *
+ * The compositor is the only reader of a USB keyboard's evdev node, and what it
+ * forwards to a Wayland client is not something the client can see it decide: a
+ * key the compositor keeps is simply a key that never arrives. So the only way to
+ * tell "webOS ate it" apart from "we mapped it wrong" is to record what actually
+ * reaches us. Restricted to the function/meta/media keys because those are the
+ * contested ones — logging every keystroke would put game input into the system
+ * log for no diagnostic gain.
+ */
+static void log_contested_key(const SDL_KeyboardEvent *key) {
+    SDL_Scancode sc = key->keysym.scancode;
+    bool contested = (sc >= SDL_SCANCODE_F1 && sc <= SDL_SCANCODE_F12) ||
+                     (sc >= SDL_SCANCODE_F13 && sc <= SDL_SCANCODE_F24) ||
+                     sc == SDL_SCANCODE_LGUI || sc == SDL_SCANCODE_RGUI ||
+                     sc == SDL_SCANCODE_MUTE || sc == SDL_SCANCODE_VOLUMEUP ||
+                     sc == SDL_SCANCODE_VOLUMEDOWN ||
+                     (unsigned int) sc == SDL_SCANCODE_WEBOS_HOME;
+    if (!contested) {
+        return;
+    }
+    commons_log_info("Input", "contested key reached the app: scancode=%d sym=%d name='%s' mod=0x%04x",
+                     (int) sc, (int) key->keysym.sym, SDL_GetScancodeName(sc), (unsigned int) key->keysym.mod);
 }
 
 static int app_event_filter(void *userdata, SDL_Event *event) {
@@ -265,6 +298,9 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
         case SDL_CONTROLLERTOUCHPADUP:
         case SDL_CONTROLLERSENSORUPDATE:
         case SDL_TEXTINPUT: {
+            if (event->type == SDL_KEYDOWN && !event->key.repeat) {
+                log_contested_key(&event->key);
+            }
             if (event->type == SDL_MOUSEMOTION) {
                 bool updated = app_text_input_state_update(&app->ui.input);
                 if (updated && !app->ui.input.text_input_active && app->session != NULL) {

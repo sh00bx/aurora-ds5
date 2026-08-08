@@ -148,6 +148,13 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     set_string(&config->decoder, "auto");
     config->audio_device = NULL;
     config->sops = true;
+#if FEATURE_INPUT_EVKBD
+    /* On by default: without it webOS keeps the keys it has opinions about (F12
+     * becomes TV volume) and they never reach the host, which is the opposite of
+     * what someone plugging a keyboard into a streaming client wants. Costs
+     * nothing when no keyboard is attached — the scan simply finds none. */
+    config->keyboard_capture = true;
+#endif
     config->localaudio = false;
     config->fullscreen = true;
     if (!config->fullscreen) {
@@ -253,6 +260,9 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "virtual_mouse", config->virtual_mouse);
 #if FEATURE_INPUT_EVMOUSE
     ini_write_bool(fp, "hardware_mouse", config->hardware_mouse);
+#endif
+#if FEATURE_INPUT_EVKBD
+    ini_write_bool(fp, "keyboard_capture", config->keyboard_capture);
 #endif
     ini_write_bool(fp, "swap_abxy", config->swap_abxy);
     ini_write_int(fp, "stick_deadzone", config->stick_deadzone);
@@ -460,6 +470,10 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
     } else if (INI_NAME_MATCH("hardware_mouse")) {
 #if FEATURE_INPUT_EVMOUSE
         config->hardware_mouse = INI_IS_TRUE(value);
+#endif
+    } else if (INI_NAME_MATCH("keyboard_capture")) {
+#if FEATURE_INPUT_EVKBD
+        config->keyboard_capture = INI_IS_TRUE(value);
 #endif
     } else if (INI_NAME_MATCH("stick_deadzone")) {
         set_int(&config->stick_deadzone, value);

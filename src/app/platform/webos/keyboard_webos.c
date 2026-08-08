@@ -27,9 +27,18 @@ bool stream_input_webos_intercept_remote_keys(stream_input_t *input, const SDL_K
             return true;
         }
         case SDL_SCANCODE_WEBOS_HOME: {
-            /* During streaming, forward Home to the host (e.g. Reshade); ribbon when idle/view-only. */
+            /* webOS folds two physically different keys onto this one scancode: the
+             * remote's Home button and a USB keyboard's left Super. That is not a
+             * guess — the TV's own xkb keycode table maps <IR_KEY_HOME> to
+             * Qt::Key_Super_L, and the SDL hint that unlocks the key is documented
+             * as "home key. (L_Super on keyboard)".
+             *
+             * So the two intents collide, and system-key capture is the switch
+             * between them: with it on the user has asked for host system keys, and
+             * a Windows key that arrives as VK_HOME opens nothing. With it off we
+             * keep forwarding Home (Reshade et al) and the ribbon behaviour. */
             if (session != NULL && !input->view_only) {
-                *keyCode = VK_HOME;
+                *keyCode = app_configuration->syskey_capture ? VK_LWIN : VK_HOME;
                 return false;
             }
             if (event->state == SDL_RELEASED) {

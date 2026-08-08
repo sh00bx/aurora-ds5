@@ -318,6 +318,7 @@ void session_config_init(app_t *app, session_config_t *config, const SERVER_DATA
     }
     config->vmouse = app_config->virtual_mouse;
     config->hardware_mouse = app_config->hardware_mouse;
+    config->keyboard_capture = app_config->keyboard_capture;
     config->local_audio = app_config->localaudio;
     config->view_only = app_config->viewonly;
     config->sops = app_config->sops;

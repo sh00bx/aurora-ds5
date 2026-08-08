@@ -58,6 +58,12 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     pref_checkbox(view, locstr("Capture system keys"), &app_configuration->syskey_capture, false);
     pref_desc_label(view, locstr("Capture and send system keys (e.g. Meta/Win key) to host computer."), false);
 
+#if FEATURE_INPUT_EVKBD
+    pref_checkbox(view, locstr("Use keyboard hardware"), &app_configuration->keyboard_capture, false);
+    pref_desc_label(view, locstr("Take exclusive control of a plugged keyboard while streaming, so every key "
+                                 "reaches the host. Without it the TV keeps keys like F12 for volume."), false);
+#endif
+
     pref_header(view, locstr("Mouse"));
 
 #if FEATURE_INPUT_EVMOUSE

@@ -45,6 +45,7 @@ typedef struct app_settings_t {
     bool viewonly;
     bool absmouse;
     bool hardware_mouse;
+    bool keyboard_capture;
     bool virtual_mouse;
     bool swap_abxy;
     bool syskey_capture;

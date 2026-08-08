@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(MOONLIGHT_VERSION "1.4.6")
+set(MOONLIGHT_VERSION "1.4.9")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
@@ -78,6 +78,7 @@ set(FEATURE_I18N_LANGUAGE_SETTINGS OFF)
 set(FEATURE_SURROUND_SOUND ON)
 set(FEATURE_CHECK_MODULE_OS_VERSION OFF)
 set(FEATURE_INPUT_EVMOUSE OFF)
+set(FEATURE_INPUT_EVKBD OFF)
 set(FEATURE_INPUT_LIBCEC ON)
 set(FEATURE_EMBEDDED_SHELL OFF)
 set(FEATURE_WINDOW_FULLSCREEN_DESKTOP ON)
@@ -299,6 +300,10 @@ if (TARGET_WEBOS)
     set(FEATURE_INPUT_LIBCEC OFF)
     set(FEATURE_WINDOW_FULLSCREEN_DESKTOP OFF)
     set(FEATURE_INPUT_EVMOUSE ON)
+    # Reading the keyboard's evdev node directly is the only way past the
+    # compositor's grip on keys like F12; the app is granted the `compositor`
+    # group at launch, so it needs no privileged helper for it.
+    set(FEATURE_INPUT_EVKBD ON)
 
     target_compile_definitions(moonlight-lib PUBLIC TARGET_WEBOS OS_LINUX _GNU_SOURCE APPID="${WEBOS_APPINFO_ID}")
     target_compile_definitions(moonlight-lib PUBLIC GAMECONTROLLERDB_PLATFORM="webOS" GAMECONTROLLERDB_PLATFORM_USE="Linux")

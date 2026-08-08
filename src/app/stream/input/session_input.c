@@ -47,23 +47,42 @@ void session_input_init(stream_input_t *input, session_t *session, app_input_t *
         session_evmouse_init(&input->evmouse, session);
     }
 #endif
+#if FEATURE_INPUT_EVKBD
+    if (!config->view_only && config->keyboard_capture) {
+        session_evkbd_init(&input->evkbd, session);
+    }
+#endif
 }
 
 void session_input_deinit(stream_input_t *input) {
-#if FEATURE_INPUT_EVMOUSE
+#if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
     const session_config_t *config = &input->session->config;
+#endif
+#if FEATURE_INPUT_EVMOUSE
     if (!config->view_only && config->hardware_mouse) {
         session_evmouse_deinit(&input->evmouse);
+    }
+#endif
+#if FEATURE_INPUT_EVKBD
+    if (!config->view_only && config->keyboard_capture) {
+        session_evkbd_deinit(&input->evkbd);
     }
 #endif
 }
 
 void session_input_interrupt(stream_input_t *input) {
     pointer_gesture_reset(input);
-#if FEATURE_INPUT_EVMOUSE
+#if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
     const session_config_t *config = &input->session->config;
+#endif
+#if FEATURE_INPUT_EVMOUSE
     if (!config->view_only && config->hardware_mouse) {
         session_evmouse_interrupt(&input->evmouse);
+    }
+#endif
+#if FEATURE_INPUT_EVKBD
+    if (!config->view_only && config->keyboard_capture) {
+        session_evkbd_interrupt(&input->evkbd);
     }
 #endif
 }
@@ -95,19 +114,38 @@ void session_input_stopped(stream_input_t *input) {
 }
 
 void session_input_screen_keyboard_opened(stream_input_t *input) {
-#if FEATURE_INPUT_EVMOUSE
+#if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
     const session_config_t *config = &input->session->config;
+#endif
+#if FEATURE_INPUT_EVMOUSE
     if (config->hardware_mouse) {
         session_evmouse_disable(&input->evmouse);
+    }
+#endif
+#if FEATURE_INPUT_EVKBD
+    if (config->keyboard_capture) {
+        /* Give the keyboard back to webOS while the on-screen keyboard is up, so
+         * the overlay can be driven the ordinary way. Release the keys we are
+         * holding first — a grabbed key that goes up after the ungrab would never
+         * produce a release for the host. */
+        stream_input_flush_pressed_keys(input);
+        session_evkbd_disable(&input->evkbd);
     }
 #endif
 }
 
 void session_input_screen_keyboard_closed(stream_input_t *input) {
-#if FEATURE_INPUT_EVMOUSE
+#if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
     const session_config_t *config = &input->session->config;
+#endif
+#if FEATURE_INPUT_EVMOUSE
     if (config->hardware_mouse) {
         session_evmouse_enable(&input->evmouse);
+    }
+#endif
+#if FEATURE_INPUT_EVKBD
+    if (config->keyboard_capture) {
+        session_evkbd_enable(&input->evkbd);
     }
 #endif
     stream_input_flush_pressed_keys(input);

@@ -14,6 +14,12 @@
 
 #endif
 
+#if FEATURE_INPUT_EVKBD
+
+#include "session_evkbd.h"
+
+#endif
+
 typedef struct app_input_t app_input_t;
 typedef struct session_config_t session_config_t;
 typedef struct session_t session_t;
@@ -53,6 +59,9 @@ typedef struct stream_input_t {
     session_input_vmouse_t vmouse;
 #if FEATURE_INPUT_EVMOUSE
     session_evmouse_t evmouse;
+#endif
+#if FEATURE_INPUT_EVKBD
+    session_evkbd_t evkbd;
 #endif
 } stream_input_t;
 

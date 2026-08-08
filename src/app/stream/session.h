@@ -64,6 +64,7 @@ typedef struct session_config_t {
     bool view_only;
     bool local_audio;
     bool hardware_mouse;
+    bool keyboard_capture;
     bool vmouse;
     uint8_t stick_deadzone;
     bool hid_passthrough;
