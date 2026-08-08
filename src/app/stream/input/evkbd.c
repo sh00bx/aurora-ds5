@@ -20,6 +20,10 @@ typedef struct dev_fd_t {
 struct evkbd_t {
     SDL_mutex *lock;
     bool listening;
+    /* Sticky, never cleared: an interrupt that lands between the worker deciding
+     * to listen and evkbd_listen() setting `listening` would otherwise be
+     * overwritten by it, and nobody is left to stop the loop afterwards. */
+    bool interrupted;
     dev_fd_t fds[EVKBD_MAX_FDS];
     int nfds;
 };
@@ -198,11 +202,34 @@ static bool is_listening(evkbd_t *kbd) {
     return listening;
 }
 
+/*
+ * Retire a device that has gone away. Once the node is dead its fd reports
+ * POLLHUP|POLLERR forever, which select() counts as readable, so leaving it in
+ * the table spins this loop at 100% for the rest of the stream. The trigger is
+ * not only a physical unplug: is_keyboard() accepts Bluetooth keyboards, and
+ * those idle-disconnect on their own.
+ */
+static void drop_fd(evkbd_t *kbd, int index) {
+    SDL_LockMutex(kbd->lock);
+    int fd = kbd->fds[index].fd;
+    if (kbd->fds[index].grabbed) {
+        ioctl(fd, EVIOCGRAB, 0);
+    }
+    close(fd);
+    for (int i = index; i + 1 < kbd->nfds; i++) {
+        kbd->fds[i] = kbd->fds[i + 1];
+    }
+    kbd->nfds--;
+    int remaining = kbd->nfds;
+    SDL_UnlockMutex(kbd->lock);
+    commons_log_info("EvKbd", "Device on fd %d is gone, dropped it (%d left)", fd, remaining);
+}
+
 void evkbd_listen(evkbd_t *kbd, evkbd_listener_t listener, void *userdata) {
     if (SDL_LockMutex(kbd->lock) != 0) {
         return;
     }
-    if (kbd->listening) {
+    if (kbd->listening || kbd->interrupted) {
         SDL_UnlockMutex(kbd->lock);
         return;
     }
@@ -225,15 +252,21 @@ void evkbd_listen(evkbd_t *kbd, evkbd_listener_t listener, void *userdata) {
         if (select(maxfd + 1, &fds, NULL, NULL, &timeout) <= 0) {
             continue;
         }
-        for (int i = 0; i < kbd->nfds; i++) {
+        for (int i = 0; i < kbd->nfds;) {
             if (!FD_ISSET(kbd->fds[i].fd, &fds)) {
+                i++;
                 continue;
             }
             struct input_event raw;
-            if (read(kbd->fds[i].fd, &raw, sizeof(raw)) != (ssize_t) sizeof(raw)) {
+            ssize_t got = read(kbd->fds[i].fd, &raw, sizeof(raw));
+            if (got == 0 || (got < 0 && errno != EINTR && errno != EAGAIN)) {
+                /* Do not advance: drop_fd() compacted the table, so fds[i] is
+                 * now the entry that used to follow it. */
+                drop_fd(kbd, i);
                 continue;
             }
-            if (raw.type != EV_KEY) {
+            i++;
+            if (got != (ssize_t) sizeof(raw) || raw.type != EV_KEY) {
                 continue;
             }
             evkbd_event_t event = {
@@ -243,6 +276,10 @@ void evkbd_listen(evkbd_t *kbd, evkbd_listener_t listener, void *userdata) {
             };
             listener(&event, userdata);
         }
+        if (kbd->nfds == 0) {
+            commons_log_info("EvKbd", "No keyboards left, stopping listener");
+            break;
+        }
     }
 }
 
@@ -250,6 +287,7 @@ void evkbd_interrupt(evkbd_t *kbd) {
     if (kbd == NULL || SDL_LockMutex(kbd->lock) != 0) {
         return;
     }
+    kbd->interrupted = true;
     kbd->listening = false;
     SDL_UnlockMutex(kbd->lock);
 }

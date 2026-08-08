@@ -65,6 +65,18 @@ static struct KeysDown *_pressed_keys;
 
 static int keydown_count = 0;
 
+/*
+ * _pressed_keys, keydown_count and _pending_key_combo have two producers: the
+ * SDL/LVGL main thread (TV remote, on-screen keyboard, host-side macros) and,
+ * whenever a USB keyboard is grabbed, the evkbd worker thread that calls
+ * stream_input_handle_key() directly. A spin lock rather than an SDL_mutex
+ * because file statics have no place to own a mutex's lifecycle, and because
+ * every critical section here is a handful of pointer writes. Strictly a leaf:
+ * never held across LiSend*(), session_interrupt() or an allocation, so a key
+ * never waits on anything -- this is an input path.
+ */
+static SDL_SpinLock _keys_lock = 0;
+
 #define REMOTE_OK_RIGHT_CLICK_HOLD_MS 600
 
 #if TARGET_WEBOS
@@ -84,6 +96,12 @@ static bool isSystemKeyCaptureActive() {
 #if TARGET_WEBOS
 
 static bool is_webos_remote_ok_key(const SDL_KeyboardEvent *event) {
+    /* A grabbed keyboard's Enter arrives on the very same scancode, and holding
+     * Enter in a game must not turn into a right click. The evkbd worker's tag is
+     * the only thing that tells the two apart. */
+    if (event->windowID == STREAM_INPUT_EVKBD_WINDOW_ID) {
+        return false;
+    }
     return event->keysym.sym == SDLK_RETURN || event->keysym.sym == SDLK_KP_ENTER ||
            event->keysym.scancode == SDL_SCANCODE_RETURN || event->keysym.scancode == SDL_SCANCODE_KP_ENTER;
 }
@@ -130,9 +148,15 @@ static bool stream_input_handle_remote_ok_long_press(stream_input_t *input, cons
 
 void performPendingSpecialKeyCombo(stream_input_t *input) {
     // The caller must ensure all keys are up
+    SDL_AtomicLock(&_keys_lock);
     SDL_assert_release(keys_len(_pressed_keys) == 0);
+    enum KeyCombo combo = _pending_key_combo;
+    // Reset pending key combo before acting on it: the quit combo re-enters the
+    // input teardown, and the lock must not be held while it does.
+    _pending_key_combo = KeyComboMax;
+    SDL_AtomicUnlock(&_keys_lock);
 
-    switch (_pending_key_combo) {
+    switch (combo) {
         case KeyComboQuit:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Detected quit key combo");
@@ -170,9 +194,6 @@ void performPendingSpecialKeyCombo(stream_input_t *input) {
         default:
             break;
     }
-
-    // Reset pending key combo
-    _pending_key_combo = KeyComboMax;
 }
 
 void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *event) {
@@ -185,6 +206,7 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
     char modifiers;
 
     // Check for our special key combos
+    SDL_AtomicLock(&_keys_lock);
     if ((event->state == SDL_PRESSED) &&
         (event->keysym.mod & KMOD_CTRL) &&
         (event->keysym.mod & KMOD_ALT) &&
@@ -218,8 +240,10 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
             }
         }
     }
+    bool combo_pending = _pending_key_combo != KeyComboMax;
+    SDL_AtomicUnlock(&_keys_lock);
 
-    if (event->state == SDL_PRESSED && _pending_key_combo != KeyComboMax) {
+    if (event->state == SDL_PRESSED && combo_pending) {
         // Ignore further key presses until the special combo is raised
         return;
     }
@@ -475,32 +499,39 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
         keyFlags = SS_KBE_FLAG_NON_NORMALIZED;
     }
 
-    // Track the key state, so we always know which keys are down
+    // Track the key state, so we always know which keys are down. The node is
+    // allocated and released outside the lock, which must never block.
+    struct KeysDown *added = event->state == SDL_PRESSED ? keys_new() : NULL;
+    struct KeysDown *removed = NULL;
+    SDL_AtomicLock(&_keys_lock);
     if (event->state == SDL_PRESSED) {
-        struct KeysDown *node = keys_new();
-        node->keyCode = keyCode;
-        node->keyFlags = keyFlags;
-        _pressed_keys = keys_append(_pressed_keys, node);
+        added->keyCode = keyCode;
+        added->keyFlags = keyFlags;
+        _pressed_keys = keys_append(_pressed_keys, added);
     } else {
-        struct KeysDown *node = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
-        if (node) {
-            _pressed_keys = keys_remove(_pressed_keys, node);
-            free(node);
+        removed = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
+        if (removed) {
+            _pressed_keys = keys_remove(_pressed_keys, removed);
         }
     }
-
     if (!input->view_only) {
         if (event->state == SDL_PRESSED) {
             keydown_count++;
         } else if (event->state == SDL_RELEASED) {
             keydown_count--;
         }
+    }
+    bool combo_ready = _pending_key_combo != KeyComboMax && keys_len(_pressed_keys) == 0;
+    SDL_AtomicUnlock(&_keys_lock);
+    free(removed);
+
+    if (!input->view_only) {
         LiSendKeyboardEvent2(0x8000 | keyCode,
                              event->state == SDL_PRESSED ? KEY_ACTION_DOWN : KEY_ACTION_UP,
                              modifiers, keyFlags);
     }
 
-    if (_pending_key_combo != KeyComboMax && keys_len(_pressed_keys) == 0) {
+    if (combo_ready) {
         int keys;
         const Uint8 *keyState = SDL_GetKeyboardState(&keys);
 
@@ -517,8 +548,11 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
 }
 
 void stream_input_handle_text(stream_input_t *input, const SDL_TextInputEvent *event) {
-    if (keydown_count) {
-        commons_log_verbose("Input", "Ignoring duplicated text input %s. Pressed keys: %d", event->text, keydown_count);
+    SDL_AtomicLock(&_keys_lock);
+    int pressed = keydown_count;
+    SDL_AtomicUnlock(&_keys_lock);
+    if (pressed) {
+        commons_log_verbose("Input", "Ignoring duplicated text input %s. Pressed keys: %d", event->text, pressed);
         return;
     }
     size_t len = strlen(event->text);
@@ -532,19 +566,22 @@ void stream_input_send_key_event(stream_input_t *input, short keyCode, bool keyD
     if (input->view_only) {
         return;
     }
+    struct KeysDown *added = keyDown ? keys_new() : NULL;
+    struct KeysDown *removed = NULL;
+    SDL_AtomicLock(&_keys_lock);
     if (keyDown) {
-        struct KeysDown *node = keys_new();
-        node->keyCode = keyCode;
-        _pressed_keys = keys_append(_pressed_keys, node);
+        added->keyCode = keyCode;
+        _pressed_keys = keys_append(_pressed_keys, added);
         keydown_count++;
     } else {
-        struct KeysDown *node = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
-        if (node) {
-            _pressed_keys = keys_remove(_pressed_keys, node);
-            free(node);
+        removed = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
+        if (removed) {
+            _pressed_keys = keys_remove(_pressed_keys, removed);
             keydown_count--;
         }
     }
+    SDL_AtomicUnlock(&_keys_lock);
+    free(removed);
     LiSendKeyboardEvent(0x8000 | keyCode,
                        keyDown ? KEY_ACTION_DOWN : KEY_ACTION_UP,
                        modifiers);
@@ -554,16 +591,24 @@ void stream_input_flush_pressed_keys(stream_input_t *input) {
     if (input->view_only) {
         return;
     }
-    while (_pressed_keys) {
-        struct KeysDown *n = _pressed_keys;
+    // Detach the whole list first, so the releases below go out with the lock
+    // dropped and a key arriving on the evkbd worker meanwhile is simply the
+    // start of the next batch.
+    SDL_AtomicLock(&_keys_lock);
+    struct KeysDown *pressed = _pressed_keys;
+    _pressed_keys = NULL;
+    keydown_count = 0;
+    _pending_key_combo = KeyComboMax;
+    SDL_AtomicUnlock(&_keys_lock);
+
+    while (pressed) {
+        struct KeysDown *n = pressed;
         short kc = n->keyCode;
         // Release with the same flags byte the press went out with: Sunshine keys
         // its pressed-key map on the (vk, flags) pair, so a flags=0 release for a
         // NON_NORMALIZED press is discarded and the key auto-repeats forever.
         LiSendKeyboardEvent2(0x8000 | kc, KEY_ACTION_UP, 0, n->keyFlags);
-        _pressed_keys = keys_remove(_pressed_keys, n);
+        pressed = keys_remove(pressed, n);
         free(n);
     }
-    keydown_count = 0;
-    _pending_key_combo = KeyComboMax;
 }

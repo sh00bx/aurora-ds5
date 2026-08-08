@@ -397,6 +397,12 @@ static void on_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     LV_UNUSED(view);
     current_instance = NULL;
     apps_fragment_t *controller = (apps_fragment_t *) self;
+    /* lv_fragment_del_obj() deletes the view before it calls us, so these three
+     * already point at freed heap. Retracting the segments below re-enters the
+     * launcher's zone router, which would read the grid's flags. */
+    controller->applist = NULL;
+    controller->appload = NULL;
+    controller->apperror = NULL;
     controller->show_hidden_apps = false;
     /* The bar outlives this fragment (it belongs to the top bar), so retract the
      * segments -- otherwise switching hosts leaves the previous host's platforms
@@ -1257,12 +1263,7 @@ void apps_set_platform_filter(apps_fragment_t *controller, const char *platform)
 }
 
 void apps_relayout(apps_fragment_t *controller) {
-    if (controller == NULL || controller->applist == NULL) {
-        return;
-    }
-    /* Reached indirectly from on_destroy_view() (retracting the platform bar
-     * re-runs the layout), where the grid is already on its way out. */
-    if (!controller->base.managed->obj_created || controller->base.managed->destroying_obj) {
+    if (controller == NULL) {
         return;
     }
     lv_coord_t prev_w = controller->col_width, prev_h = controller->col_height;
@@ -1284,7 +1285,7 @@ void apps_relayout(apps_fragment_t *controller) {
 }
 
 void apps_focus_rail(apps_fragment_t *controller) {
-    if (!controller || !controller->applist) {
+    if (!controller) {
         return;
     }
     if (lv_obj_has_flag(controller->applist, LV_OBJ_FLAG_HIDDEN)) {

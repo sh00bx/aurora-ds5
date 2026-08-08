@@ -13,6 +13,11 @@ typedef struct session_evkbd_t {
     struct evkbd_t *dev;
     SDL_bool started;
     SDL_bool disabled;
+    /* Sticky record of an interrupt, so one issued while the worker is still
+     * inside evkbd_open_default() -- when there is no evkbd_t to interrupt yet --
+     * is not lost, which used to leave the listener running with nothing able to
+     * stop it and SDL_WaitThread() blocking the LVGL thread forever. */
+    SDL_bool interrupted;
     /* Modifier state rebuilt from the raw key stream: with the device grabbed SDL
      * never sees these keys, so SDL_GetModState() would report nothing. */
     SDL_Keymod mods;

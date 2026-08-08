@@ -775,12 +775,27 @@ static void launcher_layout_changed(launcher_fragment_t *controller) {
     apps_relayout(launcher_apps_fragment(controller));
 }
 
+/**
+ * The apps fragment, but only while its objects exist.
+ *
+ * Teardown reaches back in here: apps' on_destroy_view() retracts the platform
+ * segments, which re-runs the layout and can move focus, and by then LVGL has
+ * already deleted the fragment's objects (lv_fragment_del_obj() calls
+ * lv_obj_del() before obj_deleted_cb). Answering NULL for that window is what
+ * keeps every caller off freed heap, so no caller needs a liveness test of its
+ * own.
+ */
 static apps_fragment_t *launcher_apps_fragment(launcher_fragment_t *controller) {
     if (controller == NULL || controller->detail == NULL) {
         return NULL;
     }
-    return (apps_fragment_t *) lv_fragment_manager_find_by_container(controller->base.child_manager,
-                                                                     controller->detail);
+    apps_fragment_t *apps = (apps_fragment_t *) lv_fragment_manager_find_by_container(controller->base.child_manager,
+                                                                                      controller->detail);
+    if (apps == NULL || apps->base.managed == NULL || !apps->base.managed->obj_created ||
+        apps->base.managed->destroying_obj) {
+        return NULL;
+    }
+    return apps;
 }
 
 static bool launcher_zone_available(launcher_fragment_t *controller, launcher_zone_t zone) {
@@ -794,7 +809,7 @@ static bool launcher_zone_available(launcher_fragment_t *controller, launcher_zo
                    !lv_obj_has_flag(controller->filter_row, LV_OBJ_FLAG_HIDDEN);
         case LAUNCHER_ZONE_GRID: {
             apps_fragment_t *apps = launcher_apps_fragment(controller);
-            if (apps == NULL || apps->applist == NULL) {
+            if (apps == NULL) {
                 /* No app list, but the error panel's buttons live in the same
                  * group and still need to be reachable. */
                 return lv_group_get_obj_count(controller->detail_group) > 0;
@@ -850,7 +865,7 @@ static void launcher_focus_zone(launcher_fragment_t *controller, launcher_zone_t
 
     if (zone == LAUNCHER_ZONE_GRID) {
         apps_fragment_t *apps = launcher_apps_fragment(controller);
-        if (apps != NULL && apps->applist != NULL && !lv_obj_has_flag(apps->applist, LV_OBJ_FLAG_HIDDEN)) {
+        if (apps != NULL && !lv_obj_has_flag(apps->applist, LV_OBJ_FLAG_HIDDEN)) {
             /* Point the group at the grid explicitly instead of inheriting
              * whatever it last had focused -- after an error or a load spinner
              * that is the actions matrix or the spinner, and the grid would

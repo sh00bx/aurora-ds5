@@ -174,6 +174,7 @@ void session_evkbd_init(session_evkbd_t *kbd, session_t *session) {
     kbd->dev = NULL;
     kbd->started = SDL_FALSE;
     kbd->disabled = SDL_FALSE;
+    kbd->interrupted = SDL_FALSE;
     kbd->mods = KMOD_NONE;
     kbd->thread = SDL_CreateThread((SDL_ThreadFunction) kbd_worker, "sessevkbd", kbd);
     kbd->started = SDL_TRUE;
@@ -200,6 +201,7 @@ void session_evkbd_interrupt(session_evkbd_t *kbd) {
         return;
     }
     SDL_LockMutex(kbd->lock);
+    kbd->interrupted = SDL_TRUE;
     if (kbd->dev != NULL) {
         evkbd_interrupt(kbd->dev);
     }
@@ -252,8 +254,13 @@ static int kbd_worker(session_evkbd_t *kbd) {
         commons_log_info("Session", "No physical keyboard to capture");
         return 0;
     }
-    commons_log_info("Session", "EvKbd captured %d keyboard(s)", evkbd_device_count(dev));
-    evkbd_listen(dev, kbd_listener, kbd);
+    SDL_LockMutex(kbd->lock);
+    SDL_bool interrupted = kbd->interrupted;
+    SDL_UnlockMutex(kbd->lock);
+    if (!interrupted) {
+        commons_log_info("Session", "EvKbd captured %d keyboard(s)", evkbd_device_count(dev));
+        evkbd_listen(dev, kbd_listener, kbd);
+    }
     set_dev(kbd, NULL);
     evkbd_close(dev);
     commons_log_info("Session", "EvKbd released");
@@ -288,7 +295,7 @@ static void kbd_listener(const evkbd_event_t *event, void *userdata) {
     SDL_KeyboardEvent synthetic = {
             .type = event->pressed ? SDL_KEYDOWN : SDL_KEYUP,
             .timestamp = SDL_GetTicks(),
-            .windowID = 0,
+            .windowID = STREAM_INPUT_EVKBD_WINDOW_ID,
             .state = event->pressed ? SDL_PRESSED : SDL_RELEASED,
             .repeat = event->repeat ? 1 : 0,
             .keysym = {
@@ -297,10 +304,15 @@ static void kbd_listener(const evkbd_event_t *event, void *userdata) {
                     .mod = (Uint16) kbd->mods,
             },
     };
-
-    /* Safe to reach into the shared key bookkeeping from this thread: while the
-     * device is grabbed SDL delivers no keyboard events at all, and the moment we
-     * ungrab we also set `disabled`, so the two paths are never live at once. */
-    stream_input_handle_key(&session->input, &synthetic);
     SDL_UnlockMutex(kbd->lock);
+
+    /* Dispatched with kbd->lock released. stream_input_handle_key() can reach
+     * session_interrupt() through the quit combo, and that takes session->mutex
+     * and then comes back for kbd->lock via session_input_interrupt() -- holding
+     * kbd->lock across this call is the AB-BA that hung the app.
+     *
+     * The key bookkeeping this lands in is shared with the SDL main thread (the
+     * Magic Remote is never grabbed, so its keys keep arriving there); it carries
+     * its own lock. */
+    stream_input_handle_key(&session->input, &synthetic);
 }

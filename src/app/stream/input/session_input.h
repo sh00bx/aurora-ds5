@@ -24,6 +24,15 @@ typedef struct app_input_t app_input_t;
 typedef struct session_config_t session_config_t;
 typedef struct session_t session_t;
 
+/**
+ * windowID stamped on the synthetic key events the evkbd worker feeds into
+ * stream_input_handle_key(), so the handlers can tell a physical key from a TV
+ * remote key that lands on the same scancode (Enter / the remote's OK). A
+ * sentinel rather than a real id: SDL hands window ids out from 1 upwards and
+ * this app only ever creates one window, so nothing can collide with it.
+ */
+#define STREAM_INPUT_EVKBD_WINDOW_ID 0xEB4Du
+
 typedef struct session_input_vmouse_t {
     struct {
         bool active;

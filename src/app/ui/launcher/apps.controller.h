@@ -75,6 +75,12 @@ typedef struct {
 
 extern const lv_fragment_class_t apps_controller_class;
 
+/*
+ * Both calls below reach straight into the fragment's objects, so pass only a
+ * fragment that came out of launcher_apps_fragment() -- that is the one place
+ * that filters out the teardown window in which those objects are already gone.
+ */
+
 /** Move focus into the game grid. */
 void apps_focus_rail(apps_fragment_t *controller);
 
