@@ -15,6 +15,7 @@
 #include "input/input_gamepad.h"
 #include "app_session.h"
 #include "session_worker.h"
+#include "stream/video/session_video.h"
 #include "stream/input/session_virt_mouse.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
 #if defined(TARGET_WEBOS)
@@ -247,6 +248,25 @@ void streaming_set_hdr(session_t *session, bool hdr) {
     commons_log_info("Session", "HDR is %s", hdr ? "enabled" : "disabled");
     SS_HDR_METADATA hdr_metadata;
     if (!hdr) {
+        /*
+         * On a 10-bit stream the NDL pipeline already runs in HDR mode, and passing NULL
+         * here makes the webOS backend tear the media pipeline down and reload it
+         * (NDL_DirectMediaUnload + NDL_DirectMediaLoad in ndl_video.c:SetHDRInfo). That
+         * races with the frames still arriving and crashes the decoder. The host keeps
+         * sending a 10-bit bitstream either way, so leave the HDR path up and ignore the
+         * request. Hosts that flip HDR per frame (moonshine, Sunshine forks streaming an
+         * SDR title with HDR enabled) hit this on every launch. — moonlight-tv#593
+         *
+         * The guard reads the format the host actually negotiated, not what the client
+         * declared support for: a client that merely *can* do MAIN10 must still be able
+         * to disable HDR on an 8-bit stream.
+         */
+        int fmt = vdec_negotiated_format();
+        if (fmt & (VIDEO_FORMAT_H265_MAIN10 | VIDEO_FORMAT_AV1_MAIN10)) {
+            commons_log_info("Session", "HDR disable ignored on a 10-bit stream "
+                                        "(reloading the NDL pipeline mid-stream crashes the decoder)");
+            return;
+        }
         SS4S_PlayerVideoSetHDRInfo(session->player, NULL);
     } else if (LiGetHdrMetadata(&hdr_metadata)) {
         SS4S_VideoHDRInfo info = {

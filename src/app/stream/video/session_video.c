@@ -515,6 +515,10 @@ static inline void vdec_stats_write_end(void) {
     __atomic_add_fetch(&vdec_stats_seq, 1, __ATOMIC_RELAXED); /* even: consistent */
 }
 
+int vdec_negotiated_format(void) {
+    return vdec_stream_format;
+}
+
 void vdec_stats_snapshot(struct VIDEO_STATS *out) {
     unsigned s1, s2;
     do {
