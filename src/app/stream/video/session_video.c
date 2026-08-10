@@ -50,33 +50,17 @@ static unsigned vdec_slices_for_stream(int width, int height, int fps) {
     return VDEC_STREAM_SLICES_MIN;
 }
 
-static int vdec_stream_target_fps = 60;
-
-static int frames_since_idr = 0;
-
-static session_t *session = NULL;
-static SS4S_Player *player = NULL;
-static unsigned char *buffer = NULL;
-static size_t buffer_size = 0;
-static size_t buffer_initial_size = 0;
-static int lastFrameNumber;
-/* Set when SS4S_PlayerVideoFeed returns NOT_READY. Consumed on the next
- * successful Feed: ask Limelight for one IDR so the decoder can resync. */
-static bool need_idr_on_resume = false;
 // Escalating recovery for SS4S_VIDEO_FEED_ERROR: a single transient NDL
 // error drops the frame and requests an IDR; only N consecutive failures
 // within a short window interrupt the session (a wedged decoder fails
 // every Feed, so escalation still fires within a few frames).
 #define VDEC_FEED_ERROR_LIMIT 3
 #define VDEC_FEED_ERROR_WINDOW_MS 2000
-static int feed_error_count = 0;
-static unsigned long feed_error_first_ms = 0;
 // A transient NOT_READY (HDR toggle / resolution change) is expected and must
 // not tear down the stream. But a decoder that stays NOT_READY forever would
 // silently freeze with no recovery, so a generous watchdog still interrupts if
 // NOT_READY persists continuously well beyond any legitimate exclusive op.
 #define VDEC_NOT_READY_WEDGE_MS 5000
-static unsigned long not_ready_first_ms = 0;
 /*
  * Minimum interval between IDR requests we forward to the host.
  *
@@ -88,10 +72,50 @@ static unsigned long not_ready_first_ms = 0;
  * frames in between; the stream recovers on its own once the buffer drains.
  */
 #define IDR_REQUEST_MIN_INTERVAL_MS 1000
-static unsigned long last_idr_request_ms = 0;
-static struct VIDEO_STATS vdec_temp_stats;
-static int vdec_stream_format = 0;
-static bool vdec_warned_near_buffer_limit;
+
+/* Everything that belongs to ONE stream, i.e. to one vdec_delegate_setup() /
+ * vdec_delegate_cleanup() pair. Grouped so that "nothing here is read by the
+ * next stream" can be checked against one reset rather than against fifteen
+ * scattered assignments. */
+struct vdec_stream_state {
+    session_t *session;
+    SS4S_Player *player;
+    int stream_format;                  /* VIDEO_FORMAT_* the host negotiated */
+    int target_fps;
+    int frames_since_idr;
+    int lastFrameNumber;
+    /* Set when SS4S_PlayerVideoFeed returns NOT_READY. Consumed on the next
+     * successful Feed: ask Limelight for one IDR so the decoder can resync. */
+    bool need_idr_on_resume;
+    int feed_error_count;
+    unsigned long feed_error_first_ms;
+    unsigned long not_ready_first_ms;
+    unsigned long last_idr_request_ms;
+    bool warned_near_buffer_limit;
+    struct VIDEO_STATS temp_stats;
+#if defined(TARGET_WEBOS)
+    Uint32 soft_rec_high_since;
+    Uint32 soft_rec_cooldown_until;
+#endif
+};
+
+static struct vdec_stream_state vs;
+
+/* The decode-unit reassembly buffer is deliberately NOT part of the per-stream
+ * state (P15): it is allocated on the first setup() and kept — including any
+ * capacity a grow-on-demand realloc added — so a later stream's connection
+ * setup pays neither the multi-megabyte malloc nor the first-touch faults.
+ * Lifetime, stated here once: `data` is owned from the first successful
+ * setup() until either a setup() failure path frees it or the process exits;
+ * vdec_delegate_cleanup() does not free it, which is the entire point. */
+struct vdec_reassembly {
+    unsigned char *data;
+    size_t size;            /* capacity currently allocated at `data` */
+    size_t initial_size;    /* capacity a fresh stream asks for */
+};
+
+static struct vdec_reassembly reasm;
+
 VIDEO_STATS vdec_summary_stats;
 /* Seqlock for vdec_summary_stats: odd while vdec_stat_submit is mid-write.
  * Single writer (session thread); cross-thread readers use vdec_stats_snapshot. */
@@ -105,17 +129,14 @@ VIDEO_INFO vdec_stream_info;
 #define SOFT_REC_DROP_PERCENT 75
 #define SOFT_REC_LATENCY_MS 80.0f
 
-static Uint32 soft_rec_high_since = 0;
-static Uint32 soft_rec_cooldown_until = 0;
-
 static void soft_recovery_reset(void) {
-    soft_rec_high_since = 0;
-    soft_rec_cooldown_until = 0;
+    vs.soft_rec_high_since = 0;
+    vs.soft_rec_cooldown_until = 0;
 }
 
 static bool soft_recovery_is_4k(void) {
-    int w = session != NULL ? session->config.stream.width : 0;
-    int h = session != NULL ? session->config.stream.height : 0;
+    int w = vs.session != NULL ? vs.session->config.stream.width : 0;
+    int h = vs.session != NULL ? vs.session->config.stream.height : 0;
     if (vdec_stream_info.width > 0 && vdec_stream_info.height > 0) {
         w = vdec_stream_info.width;
         h = vdec_stream_info.height;
@@ -129,7 +150,7 @@ static bool soft_recovery_pressure(const struct VIDEO_STATS *dst) {
      * exist in our ss4s at all — we decode via NDL. So pressure is detected from the
      * two signals that do carry data here: frames arriving but not decoding, and the
      * decoder latency ss4s computes itself. */
-    float target = (float) vdec_stream_target_fps;
+    float target = (float) vs.target_fps;
     if (target < 1.0f) {
         target = 60.0f;
     }
@@ -143,38 +164,38 @@ static bool soft_recovery_pressure(const struct VIDEO_STATS *dst) {
 }
 
 static void soft_recovery_tick(const struct VIDEO_STATS *dst) {
-    if (session == NULL || !session->config.soft_recovery || session->abr == NULL) {
+    if (vs.session == NULL || !vs.session->config.soft_recovery || vs.session->abr == NULL) {
         return;
     }
     if (!soft_recovery_is_4k()) {
-        soft_rec_high_since = 0;
+        vs.soft_rec_high_since = 0;
         return;
     }
     Uint32 now = SDL_GetTicks();
-    if (soft_rec_cooldown_until != 0 && now < soft_rec_cooldown_until) {
+    if (vs.soft_rec_cooldown_until != 0 && now < vs.soft_rec_cooldown_until) {
         return;
     }
     if (!soft_recovery_pressure(dst)) {
-        soft_rec_high_since = 0;
+        vs.soft_rec_high_since = 0;
         return;
     }
-    if (soft_rec_high_since == 0) {
-        soft_rec_high_since = now;
+    if (vs.soft_rec_high_since == 0) {
+        vs.soft_rec_high_since = now;
         return;
     }
-    if (now - soft_rec_high_since < SOFT_REC_SUSTAIN_MS) {
+    if (now - vs.soft_rec_high_since < SOFT_REC_SUSTAIN_MS) {
         return;
     }
-    if (adaptive_bitrate_request_drop(session->abr, SOFT_REC_DROP_PERCENT, SOFT_REC_HOLD_MS,
+    if (adaptive_bitrate_request_drop(vs.session->abr, SOFT_REC_DROP_PERCENT, SOFT_REC_HOLD_MS,
                                       "4K decode backlog")) {
         commons_log_info("Session",
                          "Soft recovery: sustained 4K backlog (receivedFps=%.1f decodedFps=%.1f "
                          "latency=%.1fms) -> request %d%% bitrate",
                          dst->receivedFps, dst->decodedFps, dst->avgDecoderLatency,
                          SOFT_REC_DROP_PERCENT);
-        soft_rec_cooldown_until = now + SOFT_REC_COOLDOWN_MS;
+        vs.soft_rec_cooldown_until = now + SOFT_REC_COOLDOWN_MS;
     }
-    soft_rec_high_since = 0;
+    vs.soft_rec_high_since = 0;
 }
 #endif
 
@@ -249,49 +270,48 @@ static const char *video_format_name(int videoFormat) {
 
 int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, void *context, int drFlags) {
     (void) drFlags;
-    session = context;
-    player = session->player;
-    buffer_initial_size = vdec_buffer_initial_bytes();
-    /* P15: reuse a persistent reassembly buffer across streams so the malloc
-     * stays off this connection-setup hot path. Allocate only on the first
-     * stream; a prior grow-on-demand keeps the larger capacity for reuse
-     * (the buffer is retained by vdec_delegate_cleanup, freed at process exit). */
-    if (buffer == NULL) {
-        buffer_size = buffer_initial_size;
-        buffer = malloc(buffer_size);
-        if (buffer) {
+    vs.session = context;
+    vs.player = vs.session->player;
+    reasm.initial_size = vdec_buffer_initial_bytes();
+    /* P15: allocate only on the first stream — see struct vdec_reassembly for
+     * why the buffer outlives one. */
+    if (reasm.data == NULL) {
+        reasm.size = reasm.initial_size;
+        reasm.data = malloc(reasm.size);
+        if (reasm.data) {
             /* Pre-fault the pages here (one-time, off the frame deadline) so the
              * first big IDR doesn't pay first-touch faults under MCL_ONFAULT.
              * NOT done on the grow-on-demand realloc path, which runs in
              * vdec_delegate_submit under the frame deadline. */
-            memset(buffer, 0, buffer_size);
+            memset(reasm.data, 0, reasm.size);
         }
     }
-    if (!buffer) {
+    if (!reasm.data) {
         /* Pre-alloc/fallback malloc failed: bail with a decoder error instead of
          * NULL-dereferencing in the reassembly memcpy on the first frame. */
-        commons_log_error("Session", "Failed to allocate video reassembly buffer (%zu bytes)", buffer_size);
-        buffer_size = 0;
+        commons_log_error("Session", "Failed to allocate video reassembly buffer (%zu bytes)", reasm.size);
+        reasm.size = 0;
         return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
-    memset(&vdec_temp_stats, 0, sizeof(vdec_temp_stats));
+    memset(&vs.temp_stats, 0, sizeof(vs.temp_stats));
     memset(&vdec_stream_info, 0, sizeof(vdec_stream_info));
-    vdec_stream_format = videoFormat;
+    vs.stream_format = videoFormat;
     vdec_stream_info.format = video_format_name(videoFormat);
-    lastFrameNumber = 0;
-    need_idr_on_resume = false;
-    feed_error_count = 0;
-    feed_error_first_ms = 0;
-    last_idr_request_ms = 0;  /* a new stream must never have its first keyframe request
-                               * swallowed by the previous stream's throttle window */
-    not_ready_first_ms = 0;   /* the NOT_READY wedge watchdog must not carry a
-                               * stale epoch from a stream that ended mid-
-                               * NOT_READY: the next stream's first transient
-                               * NOT_READY (normal at HDR start) would read as
-                               * a >5s wedge -> spurious decoder interrupt */
-    frames_since_idr = 0;
-    vdec_stream_target_fps = redrawRate > 0 ? redrawRate : 60;
-    vdec_warned_near_buffer_limit = false;
+    vs.lastFrameNumber = 0;
+    vs.need_idr_on_resume = false;
+    vs.feed_error_count = 0;
+    vs.feed_error_first_ms = 0;
+    vs.last_idr_request_ms = 0;  /* a new stream must never have its first keyframe
+                                  * request swallowed by the previous stream's
+                                  * throttle window */
+    vs.not_ready_first_ms = 0;   /* the NOT_READY wedge watchdog must not carry a
+                                  * stale epoch from a stream that ended mid-
+                                  * NOT_READY: the next stream's first transient
+                                  * NOT_READY (normal at HDR start) would read as
+                                  * a >5s wedge -> spurious decoder interrupt */
+    vs.frames_since_idr = 0;
+    vs.target_fps = redrawRate > 0 ? redrawRate : 60;
+    vs.warned_near_buffer_limit = false;
 #if defined(TARGET_WEBOS)
     soft_recovery_reset();
 #endif
@@ -307,12 +327,12 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
     info.height = height;
     /* Prefer host fractional refresh (e.g. 11988/100) for Starfish maxFrameRate / smooth
      * pacing so the decoder grid matches NTSC clientRefreshRateX100 when set. */
-    if (session != NULL && session->config.stream.clientRefreshRateX100 > 0 &&
-        (session->config.stream.clientRefreshRateX100 % 100) != 0) {
-        info.frameRateNumerator = session->config.stream.clientRefreshRateX100;
+    if (vs.session != NULL && vs.session->config.stream.clientRefreshRateX100 > 0 &&
+        (vs.session->config.stream.clientRefreshRateX100 % 100) != 0) {
+        info.frameRateNumerator = vs.session->config.stream.clientRefreshRateX100;
         info.frameRateDenominator = 100;
     } else {
-        info.frameRateNumerator = vdec_stream_target_fps;
+        info.frameRateNumerator = vs.target_fps;
         info.frameRateDenominator = 1;
     }
     switch (videoFormat) {
@@ -329,61 +349,59 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
             break;
         default: {
             commons_log_error("Session", "Unsupported codec %s", vdec_stream_info.format);
-            free(buffer);
-            buffer = NULL;
+            free(reasm.data);
+            reasm.data = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_UNSUPPORTED;
         }
     }
 
-    app_t *app = session->app;
+    app_t *app = vs.session->app;
     if (app->ss4s.video_cap.transform & SS4S_VIDEO_CAP_TRANSFORM_UI_EXCLUSIVE) {
         app_bus_post_sync(app, (bus_actionfunc) app_ui_close, &app->ui);
     }
 
-    switch (SS4S_PlayerVideoOpen(player, &info)) {
+    switch (SS4S_PlayerVideoOpen(vs.player, &info)) {
         case SS4S_VIDEO_OPEN_OK: {
             return 0;
         }
         case SS4S_VIDEO_OPEN_UNSUPPORTED_CODEC:
-            free(buffer);
-            buffer = NULL;
+            free(reasm.data);
+            reasm.data = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_UNSUPPORTED;
         default:
-            free(buffer);
-            buffer = NULL;
+            free(reasm.data);
+            reasm.data = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
 }
 
 void vdec_delegate_cleanup(void) {
-    assert(player != NULL);
-    /* P15: keep the reassembly buffer allocated across streams so the malloc
-     * stays off the connection-setup hot path; it is reused by the next
-     * vdec_delegate_setup and released at process exit. */
+    assert(vs.player != NULL);
+    /* P15: reasm.data is deliberately not freed here — see struct vdec_reassembly. */
 #if defined(TARGET_WEBOS)
     soft_recovery_reset();
 #endif
-    SS4S_PlayerVideoClose(player);
-    session = NULL;
+    SS4S_PlayerVideoClose(vs.player);
+    vs.session = NULL;
 }
 
 static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit) {
     if (result == SS4S_VIDEO_FEED_OK) {
-        feed_error_count = 0;
-        not_ready_first_ms = 0;
+        vs.feed_error_count = 0;
+        vs.not_ready_first_ms = 0;
         if (decodeUnit->frameType == FRAME_TYPE_IDR) {
-            frames_since_idr = 0;
+            vs.frames_since_idr = 0;
         } else {
-            frames_since_idr++;
+            vs.frames_since_idr++;
         }
         const int idr_ms = app_configuration ? app_configuration->idr_refresh_interval_ms : 0;
-        const bool hevc_stream = vdec_stream_format == VIDEO_FORMAT_H265 ||
-                                 vdec_stream_format == VIDEO_FORMAT_H265_MAIN10;
-        if (hevc_stream && idr_ms >= 500 && vdec_stream_target_fps > 0) {
-            const int frames_threshold = (vdec_stream_target_fps * idr_ms + 500) / 1000;
-            if (frames_threshold > 0 && frames_since_idr >= frames_threshold) {
+        const bool hevc_stream = vs.stream_format == VIDEO_FORMAT_H265 ||
+                                 vs.stream_format == VIDEO_FORMAT_H265_MAIN10;
+        if (hevc_stream && idr_ms >= 500 && vs.target_fps > 0) {
+            const int frames_threshold = (vs.target_fps * idr_ms + 500) / 1000;
+            if (frames_threshold > 0 && vs.frames_since_idr >= frames_threshold) {
                 LiRequestIdrFrame();
-                frames_since_idr = 0;
+                vs.frames_since_idr = 0;
             }
         }
         if (vdec_stream_info.width == 0 || vdec_stream_info.height == 0) {
@@ -393,17 +411,17 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
          * DECODE_UNIT timestamps share it), and the accumulator stays in microseconds:
          * a submit typically takes far less than a millisecond, so dividing per frame
          * would floor most of them to zero and the overlay would read 0.00 ms. */
-        vdec_temp_stats.totalSubmitTimeUs += (uint32_t) (LiGetMicroseconds() - decodeUnit->enqueueTimeUs);
-        vdec_temp_stats.submittedFrames++;
-        if (need_idr_on_resume) {
-            need_idr_on_resume = false;
+        vs.temp_stats.totalSubmitTimeUs += (uint32_t) (LiGetMicroseconds() - decodeUnit->enqueueTimeUs);
+        vs.temp_stats.submittedFrames++;
+        if (vs.need_idr_on_resume) {
+            vs.need_idr_on_resume = false;
             return DR_NEED_IDR;
         }
         return DR_OK;
     } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
         unsigned long now = SDL_GetTicks();
-        if (last_idr_request_ms == 0 || now - last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
-            last_idr_request_ms = now;
+        if (vs.last_idr_request_ms == 0 || now - vs.last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
+            vs.last_idr_request_ms = now;
             return DR_NEED_IDR;
         }
         return DR_OK;
@@ -411,15 +429,15 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
         /* A transient NOT_READY (HDR toggle / resolution change) is expected. Only a
          * decoder that stays NOT_READY well past any legitimate exclusive operation
          * gets torn down — otherwise the stream would silently freeze forever. */
-        need_idr_on_resume = true;
+        vs.need_idr_on_resume = true;
         unsigned long now = SDL_GetTicks();
-        if (not_ready_first_ms == 0) {
-            not_ready_first_ms = now;
-        } else if (now - not_ready_first_ms > VDEC_NOT_READY_WEDGE_MS) {
+        if (vs.not_ready_first_ms == 0) {
+            vs.not_ready_first_ms = now;
+        } else if (now - vs.not_ready_first_ms > VDEC_NOT_READY_WEDGE_MS) {
             commons_log_error("Session", "Video decoder wedged in NOT_READY for %lu ms; interrupting",
-                              now - not_ready_first_ms);
-            not_ready_first_ms = 0;
-            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+                              now - vs.not_ready_first_ms);
+            vs.not_ready_first_ms = 0;
+            session_interrupt(vs.session, false, STREAMING_INTERRUPT_DECODER);
         }
         return DR_OK;
     } else {
@@ -428,83 +446,83 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
          * VDEC_FEED_ERROR_LIMIT failures inside the window tear the session down (a truly
          * wedged decoder fails every Feed, so that still fires within a few frames). */
         unsigned long now = SDL_GetTicks();
-        if (feed_error_count == 0 || now - feed_error_first_ms > VDEC_FEED_ERROR_WINDOW_MS) {
-            feed_error_count = 0;
-            feed_error_first_ms = now;
+        if (vs.feed_error_count == 0 || now - vs.feed_error_first_ms > VDEC_FEED_ERROR_WINDOW_MS) {
+            vs.feed_error_count = 0;
+            vs.feed_error_first_ms = now;
         }
-        feed_error_count++;
-        if (feed_error_count >= VDEC_FEED_ERROR_LIMIT) {
-            commons_log_error("Session", "Video feed error %d (%d consecutive)", result, feed_error_count);
-            session_interrupt(session, false, STREAMING_INTERRUPT_DECODER);
+        vs.feed_error_count++;
+        if (vs.feed_error_count >= VDEC_FEED_ERROR_LIMIT) {
+            commons_log_error("Session", "Video feed error %d (%d consecutive)", result, vs.feed_error_count);
+            session_interrupt(vs.session, false, STREAMING_INTERRUPT_DECODER);
             return DR_OK;
         }
         commons_log_warn("Session", "Video feed error %d; dropping frame, requesting IDR (%d/%d)",
-                         result, feed_error_count, VDEC_FEED_ERROR_LIMIT);
+                         result, vs.feed_error_count, VDEC_FEED_ERROR_LIMIT);
         return DR_NEED_IDR;
     }
 }
 
 int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
-    if ((size_t) decodeUnit->fullLength > buffer_size) {
+    if ((size_t) decodeUnit->fullLength > reasm.size) {
         if ((size_t) decodeUnit->fullLength > DECODER_BUFFER_MAX_SIZE) {
             commons_log_error("Session", "Decode unit %d bytes exceeds %zu byte cap, dropping",
                               decodeUnit->fullLength, (size_t) DECODER_BUFFER_MAX_SIZE);
             return DR_NEED_IDR;
         }
-        size_t new_size = buffer_size > 0 ? buffer_size : buffer_initial_size;
+        size_t new_size = reasm.size > 0 ? reasm.size : reasm.initial_size;
         if (new_size == 0) {
             new_size = vdec_buffer_initial_bytes();
         }
         while (new_size < (size_t) decodeUnit->fullLength) {
             new_size *= 2;
         }
-        unsigned char *new_buffer = realloc(buffer, new_size);
+        unsigned char *new_buffer = realloc(reasm.data, new_size);
         if (new_buffer == NULL) {
             commons_log_error("Session", "Failed to grow decode buffer to %zu bytes", new_size);
             return DR_NEED_IDR;
         }
         commons_log_info("Session", "Grew decode buffer %zu -> %zu bytes (frame needed %d)",
-                         buffer_size, new_size, decodeUnit->fullLength);
-        buffer = new_buffer;
-        buffer_size = new_size;
+                         reasm.size, new_size, decodeUnit->fullLength);
+        reasm.data = new_buffer;
+        reasm.size = new_size;
     }
     unsigned long ticksms = SDL_GetTicks();
-    if (lastFrameNumber <= 0) {
-        vdec_temp_stats.measurementStartTimestamp = ticksms;
-        lastFrameNumber = decodeUnit->frameNumber;
+    if (vs.lastFrameNumber <= 0) {
+        vs.temp_stats.measurementStartTimestamp = ticksms;
+        vs.lastFrameNumber = decodeUnit->frameNumber;
     } else {
-        vdec_temp_stats.networkDroppedFrames += decodeUnit->frameNumber - (lastFrameNumber + 1);
-        vdec_temp_stats.totalFrames += decodeUnit->frameNumber - (lastFrameNumber + 1);
-        lastFrameNumber = decodeUnit->frameNumber;
+        vs.temp_stats.networkDroppedFrames += decodeUnit->frameNumber - (vs.lastFrameNumber + 1);
+        vs.temp_stats.totalFrames += decodeUnit->frameNumber - (vs.lastFrameNumber + 1);
+        vs.lastFrameNumber = decodeUnit->frameNumber;
     }
     unsigned stats_window_ms = streaming_stats_shown() ? 1000u : 2000u;
-    if (ticksms - vdec_temp_stats.measurementStartTimestamp > stats_window_ms) {
-        vdec_stat_submit(&vdec_temp_stats, ticksms);
-        memset(&vdec_temp_stats, 0, sizeof(vdec_temp_stats));
-        vdec_temp_stats.measurementStartTimestamp = ticksms;
+    if (ticksms - vs.temp_stats.measurementStartTimestamp > stats_window_ms) {
+        vdec_stat_submit(&vs.temp_stats, ticksms);
+        memset(&vs.temp_stats, 0, sizeof(vs.temp_stats));
+        vs.temp_stats.measurementStartTimestamp = ticksms;
     }
 
-    vdec_temp_stats.receivedFrames++;
-    vdec_temp_stats.totalFrames++;
-    vdec_temp_stats.receivedBytes += (uint64_t) decodeUnit->fullLength;
+    vs.temp_stats.receivedFrames++;
+    vs.temp_stats.totalFrames++;
+    vs.temp_stats.receivedBytes += (uint64_t) decodeUnit->fullLength;
 
-    vdec_temp_stats.totalCaptureLatency += decodeUnit->frameHostProcessingLatency;
-    vdec_temp_stats.totalReassemblyTimeUs += (uint32_t) (decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs);
+    vs.temp_stats.totalCaptureLatency += decodeUnit->frameHostProcessingLatency;
+    vs.temp_stats.totalReassemblyTimeUs += (uint32_t) (decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs);
     vdec_stream_info.has_host_latency |= decodeUnit->frameHostProcessingLatency > 0;
-    if (!vdec_warned_near_buffer_limit && buffer_initial_size > 0 &&
-        (size_t) decodeUnit->fullLength > (buffer_initial_size * 9 / 10)) {
-        vdec_warned_near_buffer_limit = true;
+    if (!vs.warned_near_buffer_limit && reasm.initial_size > 0 &&
+        (size_t) decodeUnit->fullLength > (reasm.initial_size * 9 / 10)) {
+        vs.warned_near_buffer_limit = true;
         commons_log_warn("Session", "Video frame size %d is near initial decoder buffer (%zu)",
-                         decodeUnit->fullLength, buffer_initial_size);
+                         decodeUnit->fullLength, reasm.initial_size);
     }
     size_t length = 0;
     PLENTRY entry = decodeUnit->bufferList;
     if (entry != NULL && entry->next == NULL) {
-        memcpy(buffer, entry->data, entry->length);
+        memcpy(reasm.data, entry->data, entry->length);
         length = (size_t) entry->length;
     } else {
         for (; entry != NULL; entry = entry->next) {
-            memcpy(buffer + length, entry->data, entry->length);
+            memcpy(reasm.data + length, entry->data, entry->length);
             length += entry->length;
         }
     }
@@ -515,7 +533,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     /* Host capture PTS (RTP 90kHz → µs); -1 = no host PTS, ss4s falls back to
      * arrival wall-clock. Only takes effect when smooth pacing env is ON. */
     const int64_t pts_us = decodeUnit->presentationTimeUs > 0 ? (int64_t) decodeUnit->presentationTimeUs : -1;
-    SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(player, buffer, length, flags, pts_us);
+    SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(vs.player, reasm.data, length, flags, pts_us);
     return vdec_finish_feed(result, decodeUnit);
 }
 
@@ -533,7 +551,7 @@ static inline void vdec_stats_write_end(void) {
 }
 
 int vdec_negotiated_format(void) {
-    return vdec_stream_format;
+    return vs.stream_format;
 }
 
 void vdec_stats_snapshot(struct VIDEO_STATS *out) {
@@ -569,7 +587,7 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
      * and — unlike the render-queue depth, which is Starfish/SMP-only — available
      * on our NDL decoder. */
     int latencyUs = 0;
-    if (player != NULL && SS4S_PlayerGetVideoLatency(player, 0, &latencyUs)) {
+    if (vs.player != NULL && SS4S_PlayerGetVideoLatency(vs.player, 0, &latencyUs)) {
         dst->avgDecoderLatency = (float) latencyUs / 1000.0f;
         vdec_stream_info.has_decoder_latency = true;
     } else {
@@ -589,21 +607,21 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
 
 
     if (show_stats) {
-        app_bus_post(session->app, (bus_actionfunc) streaming_refresh_stats, NULL);
+        app_bus_post(vs.session->app, (bus_actionfunc) streaming_refresh_stats, NULL);
     }
 }
 
 void stream_info_parse_size(PDECODE_UNIT decodeUnit, struct VIDEO_INFO *info) {
     if (decodeUnit->frameType != FRAME_TYPE_IDR) { return; }
-    if (vdec_stream_format & VIDEO_FORMAT_MASK_AV1) {
+    if (vs.stream_format & VIDEO_FORMAT_MASK_AV1) {
         return;
     }
     for (PLENTRY entry = decodeUnit->bufferList; entry != NULL; entry = entry->next) {
         if (entry->bufferType != BUFFER_TYPE_SPS) { continue; }
         sps_dimension_t dimension;
-        if (vdec_stream_format & VIDEO_FORMAT_MASK_H264) {
+        if (vs.stream_format & VIDEO_FORMAT_MASK_H264) {
             sps_parse_dimension_h264((const unsigned char *) &entry->data[4], &dimension);
-        } else if (vdec_stream_format & VIDEO_FORMAT_MASK_H265) {
+        } else if (vs.stream_format & VIDEO_FORMAT_MASK_H265) {
             sps_parse_dimension_hevc((const unsigned char *) &entry->data[4], &dimension);
         } else {
             info->width = info->height = -1;
