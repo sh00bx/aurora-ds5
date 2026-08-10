@@ -19,7 +19,9 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
                                       logical_device_t *item);
 
 /* How much evidence a caller demands of a match: the floor it passes to a
- * resolver, which then ignores every tier below it. */
+ * resolver, which then ignores every tier below it. Destructive callers -- the
+ * ones whose match takes a pad away from the host for the rest of the stream --
+ * ask for more than diagnostic ones. */
 #define HID_PT_CONF_FUZZY  30
 #define HID_PT_CONF_VIDPID 60
 #define HID_PT_CONF_EXACT  100
@@ -96,8 +98,9 @@ static bool gamepad_vid_pid(const app_gamepad_state_t *gamepad, uint16_t *vid, u
  *
  * One ordered table answers "is this Moonlight pad that bridged device?". Each
  * row is a PURE predicate over the (pad, logical device) pair; everything that
- * is not a property of the pair -- ordering, ambiguity, whether a match may be
- * cached -- belongs to the resolvers below and is written exactly once there.
+ * is not a property of the pair -- ordering, ambiguity, which slots are already
+ * spoken for, whether a match may be cached -- belongs to the resolvers below
+ * and is written exactly once there.
  *
  * The plan this table came from listed a SERIAL_MAC row between EXACT_ID and
  * the VID:PID rows. It is deliberately absent: it would have fired when the
@@ -154,6 +157,30 @@ static const hid_pt_tier_t g_tiers[] = {
 
 #define HID_PT_TIER_COUNT ((int) (sizeof(g_tiers) / sizeof(g_tiers[0])))
 
+/* True when a PLUGGED logical device other than `except` already answers for
+ * this Moonlight slot. One device, one slot: two same-model bridges otherwise
+ * both resolve to the first pad, the sibling keeps moonlight_gs_id == -1, and on
+ * teardown moonlight_slot_other_owner() sees the slot as unowned, clears the
+ * exclusion bit and announces an arrival for a pad the other bridge still holds.
+ * Stage 2 of the sweep has carried this rule for a while; the resolver is where
+ * it belongs. */
+static bool slot_claimed_by_other(short gs_id, const logical_device_t *except)
+{
+    if (gs_id < 0) {
+        return false;
+    }
+    for (int i = 0; i < g_devices.count; ++i) {
+        const logical_device_t *d = &g_devices.items[i];
+        if (d == except || !d->plugged) {
+            continue;
+        }
+        if (d->moonlight_gs_id == (int8_t) gs_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Which Moonlight pad IS this logical device, using only tiers at or above
  * min_confidence. Tier-major: the strongest kind of evidence decides across ALL
  * pads before a weaker kind is consulted anywhere. The old cascade was pad-major
@@ -188,6 +215,9 @@ static hid_pt_match_t hid_pt_resolve(app_input_t *input, logical_device_t *item,
                 continue;
             }
             matched++;
+            if (slot_claimed_by_other(gp->gs_id, item)) {
+                continue;
+            }
             if (!pick || (item->moonlight_gs_id >= 0 && gp->gs_id == item->moonlight_gs_id)) {
                 pick = gp;
             }
@@ -332,7 +362,10 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
             continue;
         }
         plugged++;
-        hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_FUZZY);
+        /* Destructive: whatever this resolves gets removed from the host.
+         * Identity, or a VID:PID that can only mean this device -- never a
+         * name that merely looks similar. */
+        hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_VIDPID);
         if (!m.gamepad || m.gamepad->gs_id < 0) {
             continue;
         }
@@ -424,8 +457,9 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
             /* Record which bridged device owns the slot we are about to take
              * away, so the teardown paths can give it back to the right one.
              * resolve_logical commits the binding itself, for the tiers whose
-             * evidence may be cached. */
-            resolve_logical(gp, HID_PT_CONF_FUZZY, true);
+             * evidence may be cached -- which is why the floor here costs
+             * nothing: the tier it excludes could not have bound anyway. */
+            resolve_logical(gp, HID_PT_CONF_VIDPID, true);
         }
     }
     return mask;
@@ -458,9 +492,11 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
 }
 
 /* The logical device -- other than `except` -- that still bridges this Moonlight
- * slot, or NULL. Identity matching is fuzzy enough for two logical devices to
- * land on one gs_id, and clearing the bit for one of them re-announces a pad the
- * other is still bridging: a duplicate ViGEm pad next to the real one. */
+ * slot, or NULL. Clearing the exclusion bit while another device still bridges
+ * that slot re-announces a pad the other is holding: a duplicate ViGEm pad next
+ * to the real one. Both resolvers and stage 2 of the sweep now refuse a slot
+ * another plugged device claims, so two devices should not reach one gs_id in
+ * the first place -- this is the check that does not depend on that holding. */
 static const logical_device_t *moonlight_slot_other_owner(int gs_id, const logical_device_t *except)
 {
     if (gs_id < 0) {
@@ -504,7 +540,8 @@ void hid_pt_moonlight_exclude(stream_input_t *input, logical_device_t *item)
     if (!input || !item) {
         return;
     }
-    hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_FUZZY);
+    /* Destructive: same floor as the sweep. */
+    hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_VIDPID);
     if (!m.gamepad) {
         commons_log_warn("HID-PT", "No Moonlight gamepad match for HID device %s (vid=%s pid=%s)",
                          item->name, item->vid, item->pid);
