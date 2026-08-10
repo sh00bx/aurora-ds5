@@ -592,20 +592,28 @@ void launcher_attach_platform_bar_nav(launcher_fragment_t *controller) {
  * btn_cnt and the size of ctrl_bits), the per-button control flags, and the
  * cursor btn_id_sel. lv_btnmatrix_set_map() reallocates and zeroes ctrl_bits
  * when the button count changes but never touches btn_id_sel, and the widget
- * only clears the cursor on DEFOCUSED/LEAVE -- which this fork's zone switch
- * never sends. A bar that shrank therefore kept a cursor pointing past the new
- * ctrl_bits, and the next LEFT/PRESSED read (or RELEASED write) went out of
- * bounds. Setting the CHECKED bit after the map, and the cursor after that, is
- * what keeps them in step. This is the only place that writes any of the three
- * once the bar is live; launcher.view.c writes the initial empty map when it
- * creates the widget, which leaves btn_cnt at 0 and the cursor at NONE.
+ * only clears the cursor on DEFOCUSED/LEAVE/PRESS_LOST -- none of which this
+ * fork's zone switch sends. A bar that shrank therefore kept a cursor pointing
+ * past the new ctrl_bits, and the next LEFT/PRESSED read (or RELEASED write)
+ * went out of bounds. Setting the CHECKED bit after the map, and the cursor
+ * after that, is what keeps them in step. This is the only place that writes the
+ * map/ctrl/cursor triple after the widget is constructed; construction time is
+ * the exception -- launcher.view.c writes the initial empty map and then calls
+ * lv_btnmatrix_set_btn_ctrl_all() on it (launcher.view.c:232), which is harmless
+ * only because btn_cnt is still 0 and the cursor still NONE at that point.
  *
- * @param remap rebuild the map as well. Only the segment rebuild needs it: the
- *              two selection paths run from inside the button matrix's own event
- *              handling (LV_EVENT_KEY post-callback, and LV_EVENT_VALUE_CHANGED
- *              nested in LV_EVENT_RELEASED), where re-entering set_map() would
- *              recompute the button geometry the widget is still working with,
- *              for a map whose contents did not change.
+ * @param remap rebuild the map as well. Only a change to the segment set needs
+ *              it; re-applying a map whose contents did not change would make
+ *              lv_btnmatrix recompute the button geometry for nothing, and both
+ *              selection paths that run from inside the widget's own event
+ *              handling (launcher_platform_bar_key on the LV_EVENT_KEY
+ *              post-callback, launcher_platform_bar_clicked on the
+ *              LV_EVENT_VALUE_CHANGED nested in LV_EVENT_RELEASED) would be
+ *              pulling the geometry out from under the in-flight event. The
+ *              third caller, launcher_cycle_platform() (L1/R1, from
+ *              home_group_shortcut() on SDL_CONTROLLERBUTTONDOWN), has no
+ *              lv_btnmatrix event on the stack, but passes remap=false for the
+ *              same first reason: it only moves the selection.
  */
 static void launcher_platform_bar_sync(launcher_fragment_t *c, int segments, int selected, bool remap) {
     if (c->platform_bar == NULL) {

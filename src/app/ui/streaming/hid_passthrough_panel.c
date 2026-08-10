@@ -659,7 +659,10 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         lv_slider_set_value(panel->latency_slider, latency, LV_ANIM_OFF);
         update_latency_label(panel);
     }
-    if (panel->audio_dropdown && !panel_dropdown_is_open(panel, NULL)) {
+    /* Asked about this dropdown by name, not via panel->active_dropdown: that
+     * field is only written when the list is opened with OK, so a list the
+     * pointer indev (magic remote) opened would answer "closed" and get reset. */
+    if (panel->audio_dropdown && !panel_dropdown_is_open(panel, panel->audio_dropdown)) {
         lv_dropdown_set_selected(panel->audio_dropdown, (uint16_t) settings->audio_mode);
     }
     if (panel->speaker_slider) {
@@ -1114,6 +1117,13 @@ static void refresh_devices(hid_pt_panel_t *panel) {
         hid_passthrough_manager_rescan(mgr);
     }
 
+    /* The device the user was on, captured before the resolve below is allowed to
+     * silently re-point the selection at row 0. The focus restore further down
+     * compares against it: a control kept across a *device* change would hand the
+     * user's arrow keys to a different controller's settings. */
+    char prev_key[sizeof(panel->selected_key)];
+    snprintf(prev_key, sizeof(prev_key), "%s", panel->selected_key);
+
     int selected = -1;
     if (panel->selected_key[0]) {
         for (int i = 0; i < g_devices.count; ++i) {
@@ -1137,9 +1147,15 @@ static void refresh_devices(hid_pt_panel_t *panel) {
      * else. The option controls are created once in the constructor and only
      * shown/hidden, so they survive the rebuild and can be focused again by
      * pointer. Not done on the very first render: the group is then focused on
-     * whatever the constructor added first, which is not a place the user chose. */
+     * whatever the constructor added first, which is not a place the user chose.
+     * Only for the same device: the option controls are shared by every row, so
+     * without the key test a pad disappearing under the cursor would leave focus
+     * (and edit mode) sitting on a slider that now writes the *next* pad's
+     * settings. When the device changed, fall through to focus_initial_target(),
+     * which moves the cursor visibly back to the list. */
     lv_obj_t *prev_focus = lv_group_get_focused(panel->group);
-    bool keep_focus = panel->have_rendered && panel_is_option_control(panel, prev_focus);
+    bool same_device = strcmp(prev_key, panel->selected_key) == 0;
+    bool keep_focus = panel->have_rendered && same_device && panel_is_option_control(panel, prev_focus);
     bool prev_editing = keep_focus && lv_group_get_editing(panel->group);
 
     uint64_t sig = device_list_signature();
@@ -1153,7 +1169,8 @@ static void refresh_devices(hid_pt_panel_t *panel) {
         update_row_styles(panel);
     }
     /* Before restoring focus, not after: this is what decides whether the control
-     * the user was on is still on screen for the newly selected device. */
+     * the user was on is still on screen for the selected device (the hidden test
+     * below reads the flags it sets). */
     update_device_options(panel);
     if (rerendered) {
         if (keep_focus && !panel_obj_is_hidden(panel, prev_focus)) {
