@@ -92,6 +92,12 @@ typedef struct {
 /* Bind the write callback. When: ctm_controller_create, before any session. */
 void ds5_audio_init(ds5_audio_t *a, ds5_audio_write_fn write, void *ctx);
 
+/* Drop everything a previous session left behind: both caches, both counters,
+ * the fill clock and the telemetry window. Keeps the configuration (enables,
+ * interval, write binding) and tx_audio_seq — see the body for why the seq
+ * must NOT restart. When: the top of every session, before the handshake. */
+void ds5_audio_reset(ds5_audio_t *a);
+
 /* Effective fill slot period: the batched 0x39 carries TWO 10.67ms frames per
  * report, so slots come at twice the configured (0x36-scale) interval. Valid
  * only while plc_have36 is armed (reads the cached report id). */

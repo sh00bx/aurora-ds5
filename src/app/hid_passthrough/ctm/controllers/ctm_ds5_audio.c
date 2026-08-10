@@ -26,6 +26,33 @@ void ds5_audio_init(ds5_audio_t *a, ds5_audio_write_fn write, void *ctx)
     a->write_ctx = ctx;
 }
 
+void ds5_audio_reset(ds5_audio_t *a)
+{
+    if (!a) return;
+    a->plc_have = 0;
+    a->plc_audio_len = 0;
+    a->plc_repeat = 0;
+    a->plc_have36 = 0;
+    a->plc_last36_len = 0;
+    a->plc_last_real_us = 0;
+    a->plc_fill_next_us = 0;
+    a->plc_real_ctr = 0;
+    a->synth_debt = 0;
+    a->st_audio_omit = a->st_audio_conceal = a->st_audio_capdrop = 0;
+    a->st_audio_fill = a->st_fill_skip = a->st_fill_dupdrop = a->st_stale_drop = 0;
+    /* The cache BYTES stay: both readers gate on plc_have / plc_have36, which
+     * are now 0, so nothing can reach them before the next real frame
+     * overwrites them.
+     *
+     * tx_audio_seq deliberately keeps counting. It is the 4-bit BT sequence
+     * the pad uses to order audio, and a session can restart while the pad's
+     * own BT link never dropped (a link_down raised by a host-side send
+     * failure). Restarting the counter at 0 would hand that pad a backwards
+     * seq jump, which is exactly the stale-frame condition the shared counter
+     * exists to make impossible. It wraps every 16 frames anyway, so nothing
+     * accumulates across sessions. */
+}
+
 /* Fill bookkeeping for a REAL audio-carrying frame about to be written; also
  * the LATE-vs-LOST discriminator. Network stalls here are mostly jitter: the
  * "missing" frames arrive late, AFTER the fill already bridged their slots.

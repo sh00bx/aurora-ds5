@@ -1922,6 +1922,50 @@ static int handshake(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     return 0;
 }
 
+/* Drop every scrap of the previous session. run_session is re-entered on each
+ * reconnect and used to reset three things only; each of the rest survived on
+ * an incidental guard that happened to hide it (a 150 ms activity window, the
+ * 250 ms dedup TTL, an unsigned-underflow comparison) — and rumble_slot had no
+ * guard at all, so the first tick of a reconnected session wrote the rumble
+ * state the pad had when it fell off.
+ *
+ * Deliberately NOT reset: st_reports_in/out and st_coalesced/st_ui_neutralized
+ * (lifetime counters the UI panel shows), and the adaptive-latency trio, which
+ * is a controller with its own decay rather than leftover state — zeroing it
+ * mid-stream would step the pad's jitter buffer, not clean anything up.
+ * When: the top of run_session, before the handshake. */
+static void session_state_reset(ctm_controller_t *c)
+{
+    ds5_audio_reset(&c->audio);
+    /* Rumble: only the lengths gate a write, so a stale payload with len 0 is
+     * unreachable. */
+    c->rumble_slot_len[0] = c->rumble_slot_len[1] = 0;
+    c->rumble_rr = 0;
+    c->last_rumble_write_us = 0;
+    c->audio_last_us = 0;
+    /* 0x31 dedup cache: a match against the pre-reconnect frame would swallow
+     * the host's first rumble state of the new session. */
+    c->last31_len = 0;
+    c->last31_ts_us = 0;
+    /* Telemetry windows restart with the session so a 60 s line never mixes
+     * two of them. */
+    c->st_out_36 = c->st_out_39 = c->st_out_31 = c->st_out_32 = c->st_out_other = 0;
+    c->st_hid_ok = c->st_hid_eagain = c->st_hid_recovered = c->st_hid_dropped = 0;
+    c->st_dedup_skipped = 0;
+    c->st_rumble_coal = 0;
+    c->plc_log_next_us = 0;
+    c->last_pace_log_us = 0;
+    c->net_last_out_us = 0;
+    c->net_burst_cur = 0;
+    c->net_log_next_us = 0;
+    c->st_net_out = c->st_net_gaps30 = c->st_net_idle = 0;
+    c->st_net_gap_max_us = 0;
+    c->st_net_burst_max = 0;
+    c->st_net_skew_min = c->st_net_skew_max = c->st_net_skew_sum = 0;
+    /* Re-announce the overlay gate state on the first burst of the session. */
+    c->ui_gated_logged = 0;
+}
+
 /* Run one connected session: handshake, start the reader thread, then the
  * output/feature receive loop + paced drain until the link drops or stop. Tears
  * the reader thread down on exit. When: per successful connect, from session_main. */
@@ -1935,6 +1979,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     memset(&host_cfg, 0, sizeof(host_cfg));
     memset(paced_q, 0, sizeof(paced_q));
     c->link_down = 0;
+    session_state_reset(c);
 
     if (handshake(c, caps, report_desc, report_desc_len, &host_cfg) != 0) return;
 

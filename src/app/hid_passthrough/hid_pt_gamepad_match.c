@@ -18,13 +18,26 @@
 static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t *gp,
                                       logical_device_t *item);
 
-static bool mac_stable_ids_equal(const char *a, const char *b)
-{
-    if (!a || !b || !a[0] || !b[0]) {
-        return false;
-    }
-    return strcmp(a, b) == 0;
-}
+/* How much evidence a caller demands of a match: the floor it passes to a
+ * resolver, which then ignores every tier below it. */
+#define HID_PT_CONF_FUZZY  30
+#define HID_PT_CONF_VIDPID 60
+#define HID_PT_CONF_EXACT  100
+
+/* What a resolver found: the peer, the name of the tier that decided (for the
+ * log -- a DS5 that resolves by anything other than EXACT_ID is a symptom), and
+ * that tier's confidence. `gamepad`/`item` NULL means nothing resolved. */
+typedef struct {
+    app_gamepad_state_t *gamepad;
+    const char *tier;
+    int confidence;
+} hid_pt_match_t;
+
+typedef struct {
+    logical_device_t *item;
+    const char *tier;
+    int confidence;
+} hid_pt_logical_match_t;
 
 static bool vid_pid_equal_hex(const char *vid, const char *pid, uint16_t sdl_vid, uint16_t sdl_pid)
 {
@@ -68,149 +81,183 @@ static app_gamepad_state_t *gamepad_by_gs_id(app_input_t *input, int8_t gs_id)
     return NULL;
 }
 
-static int count_gamepads_vid_pid(app_input_t *input, uint16_t vid, uint16_t pid, app_gamepad_state_t **only_out)
+static bool gamepad_vid_pid(const app_gamepad_state_t *gamepad, uint16_t *vid, uint16_t *pid)
 {
-    int count = 0;
-    app_gamepad_state_t *last = NULL;
-    if (only_out) {
-        *only_out = NULL;
-    }
-    for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
-        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
-        if (!gp || !gp->controller) {
-            continue;
-        }
-        SDL_Joystick *joy = SDL_GameControllerGetJoystick(gp->controller);
-        if ((uint16_t) SDL_JoystickGetVendor(joy) == vid && (uint16_t) SDL_JoystickGetProduct(joy) == pid) {
-            count++;
-            last = gp;
-        }
-    }
-    if (only_out && count == 1) {
-        *only_out = last;
-    }
-    return count;
-}
-
-bool hid_pt_match_gamepad_to_logical(const app_gamepad_state_t *gamepad,
-                                     const logical_device_t *item)
-{
-    if (!gamepad || !gamepad->controller || !item) {
+    if (!gamepad || !gamepad->controller) {
         return false;
     }
-
-    char gamepad_id[96];
-    char logical_id[96];
-    hid_pt_stable_id_for_gamepad(gamepad, gamepad_id, sizeof(gamepad_id));
-    hid_pt_stable_id_for_logical(item, logical_id, sizeof(logical_id));
-    if (mac_stable_ids_equal(gamepad_id, logical_id)) {
-        return true;
-    }
-
     SDL_Joystick *joy = SDL_GameControllerGetJoystick(gamepad->controller);
-#if SDL_VERSION_ATLEAST(2, 0, 14)
-    const char *serial = SDL_JoystickGetSerial(joy);
-    if (serial && serial[0]) {
-        char serial_id[96];
-        hid_pt_stable_id_for_gamepad(gamepad, serial_id, sizeof(serial_id));
-        if (serial_id[0] && strlen(serial_id) == 12 && mac_stable_ids_equal(serial_id, logical_id)) {
-            return true;
-        }
-    }
-#endif
-    uint16_t vid = (uint16_t) SDL_JoystickGetVendor(joy);
-    uint16_t pid = (uint16_t) SDL_JoystickGetProduct(joy);
-    if (!vid_pid_equal_hex(item->vid, item->pid, vid, pid)) {
-        return false;
-    }
-
-    const char *sdl_name = SDL_JoystickName(joy);
-    if (names_match_fuzzy(sdl_name, item->name)) {
-        return true;
-    }
-
-    return gamepad_id[0] && logical_id[0] && strcmp(gamepad_id, logical_id) == 0;
+    *vid = (uint16_t) SDL_JoystickGetVendor(joy);
+    *pid = (uint16_t) SDL_JoystickGetProduct(joy);
+    return true;
 }
 
-app_gamepad_state_t *hid_pt_find_gamepad_for_logical(app_input_t *input,
-                                                     logical_device_t *item)
+/* ---- identity tiers -----------------------------------------------------
+ *
+ * One ordered table answers "is this Moonlight pad that bridged device?". Each
+ * row is a PURE predicate over the (pad, logical device) pair; everything that
+ * is not a property of the pair -- ordering, ambiguity, whether a match may be
+ * cached -- belongs to the resolvers below and is written exactly once there.
+ *
+ * The plan this table came from listed a SERIAL_MAC row between EXACT_ID and
+ * the VID:PID rows. It is deliberately absent: it would have fired when the
+ * pad's SDL serial normalised to the logical device's MAC, and since
+ * hid_pt_stable_id() became the single normalisation for both sides (commit
+ * "let a pad with an odd serial find its own auto-plug pref again"), that
+ * condition IS tier_exact_id(). A separate row could never have been reached.
+ */
+typedef struct {
+    const char *name;
+    int confidence;
+    bool (*match)(const app_gamepad_state_t *gamepad, const logical_device_t *item);
+    /* May a match at this tier be written into item->moonlight_gs_id? Only
+     * identity-grade evidence may: the cached slot survives across polls, so a
+     * guess cached here would keep answering for the rest of the session. */
+    bool binds;
+    /* Evidence that only holds when nothing else could be meant: the resolver
+     * refuses this tier unless exactly one candidate matches it. */
+    bool requires_unique;
+} hid_pt_tier_t;
+
+static bool tier_exact_id(const app_gamepad_state_t *gamepad, const logical_device_t *item)
 {
+    char gid[HID_PT_STABLE_ID_LEN];
+    char lid[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_gamepad(gamepad, gid, sizeof(gid));
+    hid_pt_stable_id_for_logical(item, lid, sizeof(lid));
+    return gid[0] && lid[0] && strcmp(gid, lid) == 0;
+}
+
+static bool tier_vidpid(const app_gamepad_state_t *gamepad, const logical_device_t *item)
+{
+    uint16_t vid = 0, pid = 0;
+    if (!gamepad_vid_pid(gamepad, &vid, &pid)) {
+        return false;
+    }
+    return vid_pid_equal_hex(item->vid, item->pid, vid, pid);
+}
+
+static bool tier_vidpid_name_fuzzy(const app_gamepad_state_t *gamepad, const logical_device_t *item)
+{
+    if (!tier_vidpid(gamepad, item)) {
+        return false;
+    }
+    SDL_Joystick *joy = SDL_GameControllerGetJoystick(gamepad->controller);
+    return names_match_fuzzy(SDL_JoystickName(joy), item->name);
+}
+
+static const hid_pt_tier_t g_tiers[] = {
+    {"EXACT_ID",          HID_PT_CONF_EXACT,  tier_exact_id,          true,  false},
+    {"VIDPID_UNIQUE",     HID_PT_CONF_VIDPID, tier_vidpid,            true,  true},
+    {"VIDPID_NAME_FUZZY", HID_PT_CONF_FUZZY,  tier_vidpid_name_fuzzy, false, false},
+};
+
+#define HID_PT_TIER_COUNT ((int) (sizeof(g_tiers) / sizeof(g_tiers[0])))
+
+/* Which Moonlight pad IS this logical device, using only tiers at or above
+ * min_confidence. Tier-major: the strongest kind of evidence decides across ALL
+ * pads before a weaker kind is consulted anywhere. The old cascade was pad-major
+ * and so let a low-numbered pad that matched only by fuzzy name beat a
+ * high-numbered pad that matched by identity. */
+static hid_pt_match_t hid_pt_resolve(app_input_t *input, logical_device_t *item, int min_confidence)
+{
+    hid_pt_match_t result = {NULL, NULL, 0};
     if (!input || !item) {
-        return NULL;
+        return result;
     }
 
-    if (item->moonlight_gs_id >= 0) {
-        app_gamepad_state_t *cached = gamepad_by_gs_id(input, item->moonlight_gs_id);
-        if (cached) {
-            return cached;
-        }
+    /* The pad behind the cached slot is gone, so the slot number means nothing
+     * now. Below, a still-live cached slot is only ever used to break a tie
+     * between pads that match a tier anyway -- it is never returned unchecked,
+     * which is what let one bad match stick for a whole session. */
+    if (item->moonlight_gs_id >= 0 && !gamepad_by_gs_id(input, item->moonlight_gs_id)) {
         item->moonlight_gs_id = -1;
     }
 
-    for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
-        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
-        if (gp && hid_pt_match_gamepad_to_logical(gp, item)) {
-            item->moonlight_gs_id = (int8_t) gp->gs_id;
-            return gp;
+    const short max_pads = app_input_get_max_gamepads(input);
+    for (int t = 0; t < HID_PT_TIER_COUNT; ++t) {
+        const hid_pt_tier_t *tier = &g_tiers[t];
+        if (tier->confidence < min_confidence) {
+            continue;
         }
-    }
-
-    unsigned int vid = 0, pid = 0;
-    if (item->vid[0] && item->pid[0] &&
-        sscanf(item->vid, "%x", &vid) == 1 && sscanf(item->pid, "%x", &pid) == 1) {
-        app_gamepad_state_t *only = NULL;
-        if (count_gamepads_vid_pid(input, (uint16_t) vid, (uint16_t) pid, &only) == 1 && only) {
-            item->moonlight_gs_id = (int8_t) only->gs_id;
-            commons_log_info("HID-PT", "Matched %s to Moonlight slot %d by VID:PID",
-                             item->name, only->gs_id);
-            return only;
+        int matched = 0;
+        app_gamepad_state_t *pick = NULL;
+        for (short i = 0; i < max_pads; ++i) {
+            app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
+            if (!gp || !gp->controller || !tier->match(gp, item)) {
+                continue;
+            }
+            matched++;
+            if (!pick || (item->moonlight_gs_id >= 0 && gp->gs_id == item->moonlight_gs_id)) {
+                pick = gp;
+            }
         }
+        if (tier->requires_unique && matched != 1) {
+            continue;
+        }
+        if (!pick) {
+            continue;
+        }
+        if (tier->binds && pick->gs_id >= 0) {
+            item->moonlight_gs_id = (int8_t) pick->gs_id;
+        }
+        result.gamepad = pick;
+        result.tier = tier->name;
+        result.confidence = tier->confidence;
+        return result;
     }
-
-    /* NO sole-slot fallback: returning "the only enumerated pad" for a device
-     * that matched neither by identity nor by VID:PID binds a bridged pad to a
-     * bystander controller (one Xbox pad open, a DS5 auto-plugging before SDL
-     * enumerates it), and the exclusion then removes the Xbox pad from the host
-     * for the whole session. Stage 2 of hid_pt_moonlight_reconcile_exclusions
-     * covers the genuine late-enumeration case by VID:PID within one poll tick. */
-    commons_log_warn("HID-PT", "No Moonlight gamepad match for HID device %s (vid=%s pid=%s)",
-                     item->name, item->vid, item->pid);
-    return NULL;
+    /* NO sole-slot fallback: "the only enumerated pad" for a device that matched
+     * on no tier binds a bridged pad to a bystander controller (one Xbox pad
+     * open, a DS5 auto-plugging before SDL enumerates it), and the exclusion
+     * then removes the Xbox pad from the host for the whole session. Stage 2 of
+     * hid_pt_moonlight_reconcile_exclusions covers the genuine late-enumeration
+     * case by VID:PID within one poll tick. */
+    return result;
 }
 
-logical_device_t *hid_pt_find_logical_for_gamepad(app_input_t *input,
-                                                  const app_gamepad_state_t *gamepad)
+/* The mirror of hid_pt_resolve: which bridged device IS this pad. `bind` asks
+ * for the match to be cached; it is honoured only for tiers that carry
+ * identity-grade evidence, so a predicate that runs over every pad can never
+ * rebind another pad's logical device and corrupt the slot/rumble routing. */
+static hid_pt_logical_match_t resolve_logical(const app_gamepad_state_t *gamepad,
+                                              int min_confidence, bool bind)
 {
-    (void) input;
+    hid_pt_logical_match_t result = {NULL, NULL, 0};
     if (!gamepad) {
-        return NULL;
+        return result;
     }
-    for (int i = 0; i < g_devices.count; ++i) {
-        logical_device_t *item = &g_devices.items[i];
-        if (hid_pt_match_gamepad_to_logical(gamepad, item)) {
-            item->moonlight_gs_id = (int8_t) gamepad->gs_id;
-            return item;
+    for (int t = 0; t < HID_PT_TIER_COUNT; ++t) {
+        const hid_pt_tier_t *tier = &g_tiers[t];
+        if (tier->confidence < min_confidence) {
+            continue;
         }
-    }
-    return NULL;
-}
-
-logical_device_t *hid_pt_peek_logical_for_gamepad(const app_gamepad_state_t *gamepad)
-{
-    // Lookup WITHOUT the moonlight_gs_id binding side effect: predicates
-    // (hid_pt_gamepad_is_autoplug) run for every pad, and letting a mere match
-    // rebind another pad's logical device corrupts the multi-DS5 slot/rumble
-    // bindings. Binding is committed only by hid_pt_find_logical_for_gamepad.
-    if (!gamepad) {
-        return NULL;
-    }
-    for (int i = 0; i < g_devices.count; ++i) {
-        logical_device_t *item = &g_devices.items[i];
-        if (hid_pt_match_gamepad_to_logical(gamepad, item)) {
-            return item;
+        int matched = 0;
+        logical_device_t *pick = NULL;
+        for (int d = 0; d < g_devices.count; ++d) {
+            logical_device_t *item = &g_devices.items[d];
+            if (!tier->match(gamepad, item)) {
+                continue;
+            }
+            matched++;
+            if (!pick) {
+                pick = item;
+            }
         }
+        if (tier->requires_unique && matched != 1) {
+            continue;
+        }
+        if (!pick) {
+            continue;
+        }
+        if (bind && tier->binds && gamepad->gs_id >= 0) {
+            pick->moonlight_gs_id = (int8_t) gamepad->gs_id;
+        }
+        result.item = pick;
+        result.tier = tier->name;
+        result.confidence = tier->confidence;
+        return result;
     }
-    return NULL;
+    return result;
 }
 
 bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad)
@@ -219,32 +266,17 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     if (!gamepad) {
         return false;
     }
-    // Primary: pref keyed by the gamepad's live SDL serial/MAC stable-id.
+    /* Primary: the pref keyed by this pad's own stable id. */
     if (hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
         return true;
     }
-    // Fallback for the stream-churn / mid-session re-enumeration race: the SDL
-    // serial can be transiently unreadable right after a (re)connect, so the
-    // stable-id degrades to sdl:vid:pid:guid and misses the MAC-keyed pref.
-    // Match to a known logical device (hid_pt_match_gamepad_to_logical also
-    // matches by VID:PID + name, robust to a missing serial) and check the
-    // auto-plug pref on the LOGICAL device (keyed by its own stored MAC). Without
-    // this a bridged DS5 leaks a parallel ViGEm/Xbox pad to the host and the game
-    // flaps between Xbox and DS5. Non-CTM pads have no auto-plug logical device.
-    //
-    // ONLY for genuinely serial-less pads (stable-id degraded to the sdl:
-    // vid:pid:guid form): with a readable serial the primary lookup above is
-    // authoritative, and running the fuzzy VID:PID+name fallback anyway would
-    // adopt another same-model pad's pref for a genuinely-new controller.
-    // Matching-independent stage: a pad whose VID:PID matches an already
-    // BRIDGED logical device never belongs in the Moonlight input path,
-    // regardless of whether identity matching works right now (every
-    // same-model pad in this setup gets auto-plugged). This is what stops the
-    // announce when SDL enumerates the pad only after the bridge claimed it.
-    if (gamepad->controller) {
-        SDL_Joystick *gjoy = SDL_GameControllerGetJoystick(gamepad->controller);
-        uint16_t gvid = (uint16_t) SDL_JoystickGetVendor(gjoy);
-        uint16_t gpid = (uint16_t) SDL_JoystickGetProduct(gjoy);
+    /* Matching-independent: a pad whose VID:PID matches an already BRIDGED
+     * logical device never belongs in the Moonlight input path, whether or not
+     * identity matching works right now (every same-model pad in this setup gets
+     * auto-plugged). This is what stops the announce when SDL enumerates the pad
+     * only after the bridge has claimed it. */
+    uint16_t gvid = 0, gpid = 0;
+    if (gamepad_vid_pid(gamepad, &gvid, &gpid)) {
         for (int d = 0; d < g_devices.count; ++d) {
             const logical_device_t *pl = &g_devices.items[d];
             if (pl->plugged && vid_pid_equal_hex(pl->vid, pl->pid, gvid, gpid)) {
@@ -253,30 +285,29 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
             }
         }
     }
-    char sid[96];
+    /* Fallback for the stream-churn / mid-session re-enumeration race: the SDL
+     * serial can be transiently unreadable right after a (re)connect, so this
+     * pad's stable id degrades to the synthetic per-model form and misses the
+     * MAC-keyed pref above. Resolve it to a known logical device instead and
+     * read the auto-plug pref there. Without this a bridged DS5 leaks a parallel
+     * ViGEm/Xbox pad to the host and the game flaps between Xbox and DS5.
+     *
+     * The confidence floor is the whole "only for serial-less pads" rule: with a
+     * readable serial only EXACT_ID is trusted, because a weaker match would
+     * hand a genuinely-new controller the pref of another same-model pad. A pad
+     * with no usable serial has nothing better available, so it may use the
+     * VID:PID tiers. No binding is requested -- this predicate runs for every
+     * pad, and a mere match must not rebind anything. */
+    char sid[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
-    logical_device_t *item = hid_pt_peek_logical_for_gamepad(gamepad);
-    if (!item || !hid_pt_prefs_auto_plugin_for_logical(item)) {
+    const int floor_confidence =
+        hid_pt_stable_id_is_synthetic(sid) ? HID_PT_CONF_FUZZY : HID_PT_CONF_EXACT;
+    hid_pt_logical_match_t m = resolve_logical(gamepad, floor_confidence, false);
+    if (!m.item || !hid_pt_prefs_auto_plugin_for_logical(m.item)) {
         return false;
     }
-    if (sid[0] && !hid_pt_stable_id_is_synthetic(sid)) {
-        // Readable serial but the gamepad-keyed pref above missed (fresh pref
-        // store, store/serial formatting drift): trust the logical device's
-        // auto-plug pref ONLY on an exact stable-id identity — same physical
-        // pad beyond doubt. The fuzzy VID:PID+name match stays reserved for
-        // serial-less pads, so another same-model controller can never adopt
-        // this pad's pref.
-        char lid[96];
-        hid_pt_stable_id_for_logical(item, lid, sizeof(lid));
-        if (!mac_stable_ids_equal(sid, lid)) {
-            return false;
-        }
-        commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (exact id)",
-                         item->name);
-        return true;
-    }
-    commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (serial-less gamepad)",
-                     item->name);
+    commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (%s)",
+                     m.item->name, m.tier);
     return true;
 }
 
@@ -301,14 +332,16 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
             continue;
         }
         plugged++;
-        app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
-        if (!gp || gp->gs_id < 0) {
+        hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_FUZZY);
+        if (!m.gamepad || m.gamepad->gs_id < 0) {
             continue;
         }
-        if (input->moonlightExcludedMask & (1u << (unsigned) gp->gs_id)) {
+        if (input->moonlightExcludedMask & (1u << (unsigned) m.gamepad->gs_id)) {
             continue;
         }
-        moonlight_exclude_gamepad(input, gp, item);
+        commons_log_info("HID-PT", "sweep: %s resolved to Moonlight slot %d via %s",
+                         item->name, m.gamepad->gs_id, m.tier);
+        moonlight_exclude_gamepad(input, m.gamepad, item);
     }
     if (plugged == 0) {
         return;
@@ -345,7 +378,9 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
              * moonlight_slot_other_owner() only recognises an owner through that
              * field, so on teardown it would see the slot as unowned, clear the bit
              * and announce an arrival for a pad another live bridge still holds.
-             * Stage 1 re-resolves the cache every tick, so a stale id cannot pin a
+             * Stage 1 walks the tier table from scratch every tick and clears a
+             * cached slot whose pad is gone -- it never hands back a cached
+             * binding without re-matching it -- so a stale id cannot pin a
              * device here. */
             if (item->moonlight_gs_id >= 0 && item->moonlight_gs_id != (int8_t) gp->gs_id) {
                 continue;
@@ -386,10 +421,11 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
         }
         if (hid_pt_gamepad_is_autoplug(input, gp)) {
             mask |= (uint16_t) (1u << gp->gs_id);
-            logical_device_t *item = hid_pt_find_logical_for_gamepad(input, gp);
-            if (item) {
-                item->moonlight_gs_id = (int8_t) gp->gs_id;
-            }
+            /* Record which bridged device owns the slot we are about to take
+             * away, so the teardown paths can give it back to the right one.
+             * resolve_logical commits the binding itself, for the tiers whose
+             * evidence may be cached. */
+            resolve_logical(gp, HID_PT_CONF_FUZZY, true);
         }
     }
     return mask;
@@ -468,8 +504,15 @@ void hid_pt_moonlight_exclude(stream_input_t *input, logical_device_t *item)
     if (!input || !item) {
         return;
     }
-    app_gamepad_state_t *gp = hid_pt_find_gamepad_for_logical(input->input, item);
-    moonlight_exclude_gamepad(input, gp, item);
+    hid_pt_match_t m = hid_pt_resolve(input->input, item, HID_PT_CONF_FUZZY);
+    if (!m.gamepad) {
+        commons_log_warn("HID-PT", "No Moonlight gamepad match for HID device %s (vid=%s pid=%s)",
+                         item->name, item->vid, item->pid);
+        return;
+    }
+    commons_log_info("HID-PT", "%s resolved to Moonlight slot %d via %s",
+                     item->name, m.gamepad->gs_id, m.tier);
+    moonlight_exclude_gamepad(input, m.gamepad, item);
 }
 
 void hid_pt_moonlight_restore_slot(stream_input_t *input, int gs_id)
