@@ -63,12 +63,19 @@ static unsigned vdec_slices_for_stream(int width, int height, int fps) {
 /*
  * Minimum interval between IDR requests we forward to the host.
  *
- * When the sink asks for a keyframe (buffer full, decode error), the obvious answer is
- * DR_NEED_IDR. But an IDR frame is several times the size of a P-frame, so feeding it
- * refills the buffer that was already full and provokes the next request — a feedback
- * loop that keeps the link saturated. IDR requests also share the control channel with
- * gamepad input, so a flood of them shows up as input lag. Rate-limit them and drop the
- * frames in between; the stream recovers on its own once the buffer drains.
+ * When something goes wrong with a frame (buffer full, decode error, decoder not
+ * ready) the obvious answer is DR_NEED_IDR. But an IDR frame is several times the
+ * size of a P-frame, so feeding it refills the buffer that was already full and
+ * provokes the next request — a feedback loop that keeps the link saturated. IDR
+ * requests also share the control channel with gamepad input, so a flood of them
+ * shows up as input lag. Rate-limit them and drop the frames in between; the
+ * stream recovers on its own once the buffer drains.
+ *
+ * Every recovery request goes through vdec_request_idr(): resume after
+ * NOT_READY, the sink's own REQUEST_KEYFRAME, the feed-error drop, and the two
+ * drops in vdec_delegate_submit (over the size cap, and realloc failure). The
+ * periodic HEVC refresh in vdec_finish_feed() deliberately does not — it is its
+ * own, user-configured interval and calls LiRequestIdrFrame() directly.
  */
 #define IDR_REQUEST_MIN_INTERVAL_MS 1000
 
@@ -392,6 +399,19 @@ void vdec_delegate_cleanup(void) {
     memset(&vs, 0, sizeof(vs));
 }
 
+/* Ask the host for a keyframe, at most once per IDR_REQUEST_MIN_INTERVAL_MS.
+ * Returns DR_NEED_IDR when the caller may forward the request, DR_OK when the
+ * window has not elapsed — the caller drops the frame either way, so a
+ * swallowed request costs at most the rest of the window in corruption. */
+static int vdec_request_idr(void) {
+    unsigned long now = SDL_GetTicks();
+    if (vs.last_idr_request_ms == 0 || now - vs.last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
+        vs.last_idr_request_ms = now;
+        return DR_NEED_IDR;
+    }
+    return DR_OK;
+}
+
 static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit) {
     if (result == SS4S_VIDEO_FEED_OK) {
         vs.feed_error_count = 0;
@@ -421,17 +441,21 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
         vs.temp_stats.totalSubmitTimeUs += (uint32_t) (LiGetMicroseconds() - decodeUnit->enqueueTimeUs);
         vs.temp_stats.submittedFrames++;
         if (vs.need_idr_on_resume) {
-            vs.need_idr_on_resume = false;
-            return DR_NEED_IDR;
+            int rc = vdec_request_idr();
+            if (rc == DR_NEED_IDR) {
+                vs.need_idr_on_resume = false;
+            }
+            /* Still latched when the throttle swallowed it, so the next
+             * successful feed after the window retries instead of leaving the
+             * decoder to resync on its own. */
+            return rc;
         }
         return DR_OK;
     } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
-        unsigned long now = SDL_GetTicks();
-        if (vs.last_idr_request_ms == 0 || now - vs.last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
-            vs.last_idr_request_ms = now;
-            return DR_NEED_IDR;
-        }
-        return DR_OK;
+        /* No webOS backend produces this: ndl_video.c's FeedVideoWithPTS returns
+         * only NOT_READY, ERROR or OK. Kept for the backends that do (mmal,
+         * steamlink, ss4s' Starfish/SMP module). */
+        return vdec_request_idr();
     } else if (result == SS4S_VIDEO_FEED_NOT_READY) {
         /* A transient NOT_READY (HDR toggle / resolution change) is expected. Only a
          * decoder that stays NOT_READY well past any legitimate exclusive operation
@@ -465,7 +489,7 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
         }
         commons_log_warn("Session", "Video feed error %d; dropping frame, requesting IDR (%d/%d)",
                          result, vs.feed_error_count, VDEC_FEED_ERROR_LIMIT);
-        return DR_NEED_IDR;
+        return vdec_request_idr();
     }
 }
 
@@ -474,7 +498,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         if ((size_t) decodeUnit->fullLength > DECODER_BUFFER_MAX_SIZE) {
             commons_log_error("Session", "Decode unit %d bytes exceeds %zu byte cap, dropping",
                               decodeUnit->fullLength, (size_t) DECODER_BUFFER_MAX_SIZE);
-            return DR_NEED_IDR;
+            return vdec_request_idr();
         }
         size_t new_size = reasm.size > 0 ? reasm.size : reasm.initial_size;
         if (new_size == 0) {
@@ -486,7 +510,7 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
         unsigned char *new_buffer = realloc(reasm.data, new_size);
         if (new_buffer == NULL) {
             commons_log_error("Session", "Failed to grow decode buffer to %zu bytes", new_size);
-            return DR_NEED_IDR;
+            return vdec_request_idr();
         }
         commons_log_info("Session", "Grew decode buffer %zu -> %zu bytes (frame needed %d)",
                          reasm.size, new_size, decodeUnit->fullLength);
