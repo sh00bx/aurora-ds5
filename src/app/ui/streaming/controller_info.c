@@ -15,11 +15,14 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ds5_hidfd.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
+#include "logging.h"
 
 #endif
 
@@ -33,6 +36,10 @@
 /* Battery moves slowly, so the hidraw reads are cached; a pad that connects
  * mid-stream shows up as soon as the cache turns over. */
 #define DS_SCAN_INTERVAL_MS 5000
+/* The worker stops after this long without a controller_info_collect() call,
+ * i.e. shortly after the stats overlay closes or the stream ends, and is
+ * started again by the next call. */
+#define DS_WORKER_IDLE_EXIT_MS 20000
 
 static bool is_dualsense(uint16_t vendor, uint16_t product) {
     return vendor == DS_VENDOR_SONY && (product == DS_PRODUCT_DS5 || product == DS_PRODUCT_EDGE);
@@ -73,10 +80,28 @@ typedef struct {
     bool claimed;
 } ds_node_t;
 
-static ds_node_t ds_nodes[CONTROLLER_INFO_MAX];
-static int ds_node_count = 0;
-static uint32_t ds_scan_ms = 0;
-static bool ds_scanned = false;
+/* One finished round of probing, as handed from the worker to the UI. */
+typedef struct {
+    ds_node_t nodes[CONTROLLER_INFO_MAX];
+    int count;
+} ds_snapshot_t;
+
+/* Reading a battery means opening a hidraw node and waiting for a report, which
+ * costs up to ~50 ms per node — and up to the ds5_hidfd broker's 2 s receive
+ * timeout when the jail's /dev cannot open it directly. That used to happen on
+ * the LVGL/SDL thread, inside the once-per-second stats refresh, where it stops
+ * the event pump and shows up as late remote and gamepad input.
+ *
+ * So a worker does the probing and publishes a finished snapshot, and
+ * controller_info_collect() only copies it. ds_lock guards the three objects
+ * below and is held for those copies only — never across a probe, an open() or
+ * a poll(). */
+static pthread_mutex_t ds_lock = PTHREAD_MUTEX_INITIALIZER;
+static ds_snapshot_t ds_published;                       /* worker -> UI */
+static char ds_wanted[CONTROLLER_INFO_MAX][DS_PATH_MAX]; /* UI -> worker */
+static int ds_wanted_count = 0;
+static uint32_t ds_wanted_ms = 0;                        /* SDL_GetTicks of the last collect() */
+static bool ds_worker_live = false;
 
 /* The DualSense `status` byte sits at offset 52 of the common input-report struct.
  * The report is prefixed by the report id plus, over Bluetooth, a 1-byte seq tag:
@@ -114,9 +139,12 @@ static int ds_parse_battery(const uint8_t *buf, int len, int *charging) {
 
 /* The app jail's /dev is a static snapshot taken at jail-build time, so a pad that
  * hot-plugged onto a minor the snapshot never covered cannot be opened directly;
- * ds5_txd hands the fd over instead. A broker that never answers would stall the
- * LVGL thread for its whole timeout, so one failed handover disables the fallback
- * for the rest of the run — the direct-open path keeps working either way. */
+ * ds5_txd hands the fd over instead. A broker that never answers costs the worker
+ * ds5_hidfd's full 2 s receive timeout per node per scan, which it would never
+ * catch up from, so one failed handover disables the fallback for the rest of the
+ * run — the direct-open path keeps working either way. The latch is plain because
+ * ds_open_node is reached only from the worker (ds_read_battery_node <-
+ * ds_probe_once <- ds_scan <- ds_worker_main are the only callers in this file). */
 static int ds_open_node(const char *node) {
     int fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd >= 0) {
@@ -144,7 +172,9 @@ static int ds_read_battery_node(const char *node, int *charging) {
     int result = -1;
     /* A DualSense in full-report mode streams ~250 reports/s, so a fresh one lands
      * within a few ms; the ~50ms cap only ever burns on a pad that reports nothing
-     * usable, and that runs once per scan interval. */
+     * usable. Blocking here is fine — this runs on the worker, and the poll timeout
+     * cannot be dropped to 0: hidraw queues only reports that arrive after open(),
+     * so a freshly opened fd is always empty and every probe would return "--". */
     for (int tries = 0; tries < 4 && result < 0; tries++) {
         struct pollfd p = {fd, POLLIN, 0};
         if (poll(&p, 1, 12) <= 0) {
@@ -200,22 +230,21 @@ static bool input_hidraw_node(const char *input_name, char *out, size_t outlen) 
  *
  * A DualSense exposes several /sys/class/input entries (pad, touchpad, motion
  * sensors) that all resolve to the same hidraw node, and a pad in the minimal
- * 10-byte report mode fails ds_parse_battery every time. The old dedupe ran
- * against ds_nodes[], which a probe only reaches after it succeeds, so those pads
- * were re-probed — and burned the full ~50 ms budget — once per input entry.
+ * 10-byte report mode fails ds_parse_battery every time, so without this each
+ * entry would burn the same node's full ~50 ms budget again.
  *
- * Failures are remembered in `probed`, deliberately not in ds_nodes[]: ds_claim()
+ * Failures are remembered in `probed`, deliberately not in out->nodes: ds_claim()
  * hands out the first unclaimed node when it has no path or MAC to match on, so a
  * failed probe parked in the node list would render as a confident "0%" on a pad
  * that is actually full. */
-static void ds_probe_once(char probed[][DS_PATH_MAX], int *probed_count,
+static void ds_probe_once(ds_snapshot_t *out, char probed[][DS_PATH_MAX], int *probed_count,
                           const char *dev_path, const char *mac) {
     for (int i = 0; i < *probed_count; i++) {
         if (strcmp(probed[i], dev_path) == 0) {
             return; /* one physical pad, several input devices */
         }
     }
-    if (*probed_count >= DS_MAX_PROBED || ds_node_count >= CONTROLLER_INFO_MAX) {
+    if (*probed_count >= DS_MAX_PROBED || out->count >= CONTROLLER_INFO_MAX) {
         return;
     }
     snprintf(probed[(*probed_count)++], DS_PATH_MAX, "%s", dev_path);
@@ -224,7 +253,7 @@ static void ds_probe_once(char probed[][DS_PATH_MAX], int *probed_count,
     if (pct < 0) {
         return;
     }
-    ds_node_t *node = &ds_nodes[ds_node_count++];
+    ds_node_t *node = &out->nodes[out->count++];
     snprintf(node->path, sizeof(node->path), "%s", dev_path);
     snprintf(node->uniq, sizeof(node->uniq), "%s", mac ? mac : "");
     node->percent = pct;
@@ -232,14 +261,17 @@ static void ds_probe_once(char probed[][DS_PATH_MAX], int *probed_count,
     node->claimed = false;
 }
 
-/* Rebuild the DualSense node cache off /sys/class/input.
+/* Build a fresh snapshot off /sys/class/input.
  *
  * NOT off /sys/class/hidraw: the app runs jailed, and that jail's /sys/class holds
  * only `input` and `net` — the hidraw class is simply absent there, which is also
  * why the passthrough code resolves nodes the same way. Bridged pads may have no
- * input device left at all, so their node paths are passed in separately. */
-static void ds_scan(const char *const *extra_paths, int extra_count) {
-    ds_node_count = 0;
+ * input device left at all, so their node paths are passed in separately.
+ *
+ * Runs on the worker thread and touches nothing shared: `out` is the caller's
+ * local, and `extra_paths` is a copy the caller already took under ds_lock. */
+static void ds_scan(ds_snapshot_t *out, const char extra_paths[][DS_PATH_MAX], int extra_count) {
+    memset(out, 0, sizeof(*out));
     char probed[DS_MAX_PROBED][DS_PATH_MAX];
     int probed_count = 0;
 
@@ -247,7 +279,7 @@ static void ds_scan(const char *const *extra_paths, int extra_count) {
     if (dir != NULL) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL && probed_count < DS_MAX_PROBED &&
-               ds_node_count < CONTROLLER_INFO_MAX) {
+               out->count < CONTROLLER_INFO_MAX) {
             if (strncmp(entry->d_name, "input", 5) != 0 || !isdigit((unsigned char) entry->d_name[5])) {
                 continue;
             }
@@ -277,53 +309,75 @@ static void ds_scan(const char *const *extra_paths, int extra_count) {
             }
             char dev_path[DS_PATH_MAX];
             snprintf(dev_path, sizeof(dev_path), "/dev/%s", node_name);
-            ds_probe_once(probed, &probed_count, dev_path, mac);
+            ds_probe_once(out, probed, &probed_count, dev_path, mac);
         }
         closedir(dir);
     }
 
     for (int i = 0; i < extra_count; i++) {
-        ds_probe_once(probed, &probed_count, extra_paths[i], NULL);
+        ds_probe_once(out, probed, &probed_count, extra_paths[i], NULL);
+    }
+}
+
+/* Scan, publish, sleep — until nobody has asked for a while. Started on demand
+ * by ds_request_and_snapshot() and detached; it clears ds_worker_live on its way
+ * out so the next request starts a fresh one. */
+static void *ds_worker_main(void *unused) {
+    (void) unused;
+    for (;;) {
+        char wanted[CONTROLLER_INFO_MAX][DS_PATH_MAX];
+        int wanted_count;
+        pthread_mutex_lock(&ds_lock);
+        if (SDL_GetTicks() - ds_wanted_ms > DS_WORKER_IDLE_EXIT_MS) {
+            ds_worker_live = false;
+            pthread_mutex_unlock(&ds_lock);
+            return NULL;
+        }
+        memcpy(wanted, ds_wanted, sizeof(wanted));
+        wanted_count = ds_wanted_count;
+        pthread_mutex_unlock(&ds_lock);
+
+        ds_snapshot_t snap;
+        ds_scan(&snap, wanted, wanted_count);
+
+        pthread_mutex_lock(&ds_lock);
+        ds_published = snap;
+        pthread_mutex_unlock(&ds_lock);
+
+        struct timespec ts = {
+                .tv_sec = DS_SCAN_INTERVAL_MS / 1000,
+                .tv_nsec = (long) (DS_SCAN_INTERVAL_MS % 1000) * 1000000L,
+        };
+        nanosleep(&ts, NULL);
     }
 }
 
 /* Hand out the reading for a pad: by hidraw path for a bridged device, by MAC for
  * an SDL one, and failing both the first node nobody claimed yet — with a single
  * pad that last case is the common one, since SDL only exposes a serial for pads
- * its HIDAPI driver owns. */
-static void ds_scan_refresh(const char *const *extra_paths, int extra_count) {
-    uint32_t now = SDL_GetTicks();
-    if (!ds_scanned || (now - ds_scan_ms) >= DS_SCAN_INTERVAL_MS) {
-        ds_scan(extra_paths, extra_count);
-        ds_scan_ms = now;
-        ds_scanned = true;
-    }
-    for (int i = 0; i < ds_node_count; i++) {
-        ds_nodes[i].claimed = false;
-    }
-}
-
-static const ds_node_t *ds_claim(const char *path, const char *mac) {
-    for (int i = 0; i < ds_node_count; i++) {
-        if (ds_nodes[i].claimed) {
+ * its HIDAPI driver owns. Claims are made against the caller's own copy of the
+ * snapshot, so nothing here touches shared state. */
+static const ds_node_t *ds_claim(ds_snapshot_t *ds, const char *path, const char *mac) {
+    for (int i = 0; i < ds->count; i++) {
+        if (ds->nodes[i].claimed) {
             continue;
         }
-        if (path && path[0] && strcmp(ds_nodes[i].path, path) == 0) {
-            ds_nodes[i].claimed = true;
-            return &ds_nodes[i];
+        if (path && path[0] && strcmp(ds->nodes[i].path, path) == 0) {
+            ds->nodes[i].claimed = true;
+            return &ds->nodes[i];
         }
-        if (mac && mac[0] && ds_nodes[i].uniq[0] && strcmp(ds_nodes[i].uniq, mac) == 0) {
-            ds_nodes[i].claimed = true;
-            return &ds_nodes[i];
+        if (mac && mac[0] && ds->nodes[i].uniq[0] && strcmp(ds->nodes[i].uniq, mac) == 0) {
+            ds->nodes[i].claimed = true;
+            return &ds->nodes[i];
         }
     }
     if (path && path[0]) {
         return NULL; /* a bridged pad is addressed by node; never guess for it */
     }
-    for (int i = 0; i < ds_node_count; i++) {
-        if (!ds_nodes[i].claimed) {
-            ds_nodes[i].claimed = true;
-            return &ds_nodes[i];
+    for (int i = 0; i < ds->count; i++) {
+        if (!ds->nodes[i].claimed) {
+            ds->nodes[i].claimed = true;
+            return &ds->nodes[i];
         }
     }
     return NULL;
@@ -333,7 +387,7 @@ static const ds_node_t *ds_claim(const char *path, const char *mac) {
  * bridged, connected means the bridge session is actually live. */
 typedef struct {
     char name[48];
-    char path[32];
+    char path[DS_PATH_MAX];   /* same width as ds_node_t::path — they are compared */
     char mac[20];
     uint16_t vendor, product;
     bool connected;
@@ -369,6 +423,62 @@ static int collect_bridged_devices(app_t *app, bridged_device_t *out, int max) {
         item->dualsense = is_dualsense(device.vendor_id, device.product_id);
     }
     return found;
+}
+
+/* The UI half of the hand-off: publish which bridged nodes the worker should
+ * also probe, take a private copy of whatever it published last, and make sure
+ * it is running.
+ *
+ * The bridged node paths have to travel this way because the worker must not
+ * reach into the passthrough manager itself — that state is unlocked and lives
+ * on the LVGL thread — so it is given nothing but a copy of the paths. The cost
+ * of that is one round of latency: a pad that is bridged now shows its charge
+ * from the next worker cycle, which is the same order of delay the 5 s cache
+ * always had.
+ *
+ * A pad's charge therefore also appears one refresh after the overlay opens
+ * rather than immediately, because the first snapshot does not exist yet. */
+static void ds_request_and_snapshot(const bridged_device_t *bridged, int bridged_count,
+                                    ds_snapshot_t *out) {
+    pthread_mutex_lock(&ds_lock);
+    ds_wanted_count = 0;
+    for (int i = 0; i < bridged_count && ds_wanted_count < CONTROLLER_INFO_MAX; i++) {
+        if (bridged[i].dualsense && bridged[i].path[0]) {
+            /* The precision keeps gcc from assuming an unterminated source array;
+             * collect_bridged_devices() always snprintf's this field. */
+            snprintf(ds_wanted[ds_wanted_count++], DS_PATH_MAX, "%.*s", DS_PATH_MAX - 1,
+                     bridged[i].path);
+        }
+    }
+    ds_wanted_ms = SDL_GetTicks();
+    *out = ds_published;
+    bool start = !ds_worker_live;
+    if (start) {
+        ds_worker_live = true;
+    }
+    pthread_mutex_unlock(&ds_lock);
+
+    for (int i = 0; i < out->count; i++) {
+        out->nodes[i].claimed = false; /* claims belong to this pass, not to the snapshot */
+    }
+
+    if (!start) {
+        return;
+    }
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, ds_worker_main, NULL) != 0) {
+        pthread_mutex_lock(&ds_lock);
+        ds_worker_live = false;
+        pthread_mutex_unlock(&ds_lock);
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            commons_log_warn("Session", "Battery worker thread failed to start; "
+                                        "DualSense rows fall back to SDL's coarse level");
+        }
+        return;
+    }
+    pthread_detach(tid);
 }
 
 #endif /* TARGET_WEBOS */
@@ -451,14 +561,8 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
     bridged_device_t bridged[CONTROLLER_INFO_MAX];
     int bridged_count = collect_bridged_devices(app, bridged, CONTROLLER_INFO_MAX);
 
-    const char *extra_paths[CONTROLLER_INFO_MAX];
-    int extra_count = 0;
-    for (int i = 0; i < bridged_count; i++) {
-        if (bridged[i].dualsense && bridged[i].path[0]) {
-            extra_paths[extra_count++] = bridged[i].path;
-        }
-    }
-    ds_scan_refresh(extra_paths, extra_count);
+    ds_snapshot_t ds;
+    ds_request_and_snapshot(bridged, bridged_count, &ds);
 
     /* Only a live bridge earns a row here. A pad that is merely plugged is being
      * driven by SDL, and turns up in the pass below with the badge that matches. */
@@ -476,7 +580,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
         listed_mac[found][0] = '\0';
         listed_id[found] = ((uint32_t) bridged[i].vendor << 16) | bridged[i].product;
         if (bridged[i].dualsense) {
-            const ds_node_t *node = ds_claim(bridged[i].path, NULL);
+            const ds_node_t *node = ds_claim(&ds, bridged[i].path, NULL);
             if (node) {
                 power_set_exact(info, node->percent, node->charging);
                 snprintf(listed_mac[found], sizeof(listed_mac[0]), "%s", node->uniq);
@@ -529,7 +633,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
         bool exact = false;
 #if defined(TARGET_WEBOS)
         if (is_dualsense(vendor, product)) {
-            const ds_node_t *node = ds_claim(NULL, mac);
+            const ds_node_t *node = ds_claim(&ds, NULL, mac);
             if (node) {
                 power_set_exact(info, node->percent, node->charging);
                 exact = true;
