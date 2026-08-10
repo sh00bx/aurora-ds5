@@ -59,10 +59,14 @@ static void power_set_exact(controller_info_t *info, int percent, bool charging)
 
 #if defined(TARGET_WEBOS)
 
-#define DS_MAX_NODES 24
+#define DS_PATH_MAX 32
+/* Distinct hidraw nodes one scan will touch. Higher than the node cap on
+ * purpose: nodes that report no usable battery never become entries, but they
+ * still have to be remembered so the scan does not probe them again. */
+#define DS_MAX_PROBED 8
 
 typedef struct {
-    char path[32];
+    char path[DS_PATH_MAX];
     char uniq[20]; /* normalized MAC, empty when the node reports none */
     int percent;
     bool charging;
@@ -192,21 +196,33 @@ static bool input_hidraw_node(const char *input_name, char *out, size_t outlen) 
     return found;
 }
 
-/* Add one node to the cache, reading its battery. Returns false when the pad has
- * nothing to say (wrong report mode, node not openable). */
-static bool ds_add_node(const char *dev_path, const char *mac) {
-    if (ds_node_count >= CONTROLLER_INFO_MAX) {
-        return false;
-    }
-    for (int i = 0; i < ds_node_count; i++) {
-        if (strcmp(ds_nodes[i].path, dev_path) == 0) {
-            return false; /* one physical pad, several input devices */
+/* Probe one hidraw node, at most once per scan — including when it says nothing.
+ *
+ * A DualSense exposes several /sys/class/input entries (pad, touchpad, motion
+ * sensors) that all resolve to the same hidraw node, and a pad in the minimal
+ * 10-byte report mode fails ds_parse_battery every time. The old dedupe ran
+ * against ds_nodes[], which a probe only reaches after it succeeds, so those pads
+ * were re-probed — and burned the full ~50 ms budget — once per input entry.
+ *
+ * Failures are remembered in `probed`, deliberately not in ds_nodes[]: ds_claim()
+ * hands out the first unclaimed node when it has no path or MAC to match on, so a
+ * failed probe parked in the node list would render as a confident "0%" on a pad
+ * that is actually full. */
+static void ds_probe_once(char probed[][DS_PATH_MAX], int *probed_count,
+                          const char *dev_path, const char *mac) {
+    for (int i = 0; i < *probed_count; i++) {
+        if (strcmp(probed[i], dev_path) == 0) {
+            return; /* one physical pad, several input devices */
         }
     }
+    if (*probed_count >= DS_MAX_PROBED || ds_node_count >= CONTROLLER_INFO_MAX) {
+        return;
+    }
+    snprintf(probed[(*probed_count)++], DS_PATH_MAX, "%s", dev_path);
     int chg = 0;
     int pct = ds_read_battery_node(dev_path, &chg);
     if (pct < 0) {
-        return false;
+        return;
     }
     ds_node_t *node = &ds_nodes[ds_node_count++];
     snprintf(node->path, sizeof(node->path), "%s", dev_path);
@@ -214,7 +230,6 @@ static bool ds_add_node(const char *dev_path, const char *mac) {
     node->percent = pct;
     node->charging = (chg == 0x01);
     node->claimed = false;
-    return true;
 }
 
 /* Rebuild the DualSense node cache off /sys/class/input.
@@ -225,11 +240,14 @@ static bool ds_add_node(const char *dev_path, const char *mac) {
  * input device left at all, so their node paths are passed in separately. */
 static void ds_scan(const char *const *extra_paths, int extra_count) {
     ds_node_count = 0;
+    char probed[DS_MAX_PROBED][DS_PATH_MAX];
+    int probed_count = 0;
 
     DIR *dir = opendir("/sys/class/input");
     if (dir != NULL) {
         struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL && ds_node_count < CONTROLLER_INFO_MAX) {
+        while ((entry = readdir(dir)) != NULL && probed_count < DS_MAX_PROBED &&
+               ds_node_count < CONTROLLER_INFO_MAX) {
             if (strncmp(entry->d_name, "input", 5) != 0 || !isdigit((unsigned char) entry->d_name[5])) {
                 continue;
             }
@@ -257,15 +275,15 @@ static void ds_scan(const char *const *extra_paths, int extra_count) {
             if (read_sysfs_attr(attr, value, sizeof(value))) {
                 normalize_mac(value, mac, sizeof(mac));
             }
-            char dev_path[32];
+            char dev_path[DS_PATH_MAX];
             snprintf(dev_path, sizeof(dev_path), "/dev/%s", node_name);
-            ds_add_node(dev_path, mac);
+            ds_probe_once(probed, &probed_count, dev_path, mac);
         }
         closedir(dir);
     }
 
     for (int i = 0; i < extra_count; i++) {
-        ds_add_node(extra_paths[i], NULL);
+        ds_probe_once(probed, &probed_count, extra_paths[i], NULL);
     }
 }
 
