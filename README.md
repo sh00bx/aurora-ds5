@@ -52,11 +52,17 @@ Details, hotkey layout, and stats field reference: [webOS build guide](docs/BUIL
 **Homebrew Channel (recommended).** In the Homebrew Channel app: **Settings → Add Repository**, then
 
 ```
-https://raw.githubusercontent.com/sh00bx/aurora-ds5/main/repo.json
+https://raw.githubusercontent.com/sh00bx/webos-apps/main/repo.json
 ```
 
-*Aurora DS5* then appears in the app list and updates in place with every release. Details and the other
-install paths: [docs/WEBOS_HOMEBREW.md](docs/WEBOS_HOMEBREW.md).
+*Aurora DS5* then appears in the app list and updates in place with every release. That URL is my
+[app channel](https://github.com/sh00bx/webos-apps) — one repository for all of my webOS apps, so
+adding it once also brings anything else published there.
+
+The older, Aurora-only URL (`.../sh00bx/aurora-ds5/main/repo.json`) still works. If you have it in the
+Homebrew Channel, replace it with the one above rather than keeping both, or Aurora shows up twice.
+
+Details and the other install paths: [docs/WEBOS_HOMEBREW.md](docs/WEBOS_HOMEBREW.md).
 
 - [Device Manager](https://github.com/webosbrew/dev-manager-desktop) — install the latest `.ipk` from [Releases](https://github.com/sh00bx/aurora-ds5/releases)
 - [webOS TV CLI](https://webostv.developer.lge.com/develop/tools/cli-installation) — `ares-install com.aurora.ds5_*_arm.ipk` ([build guide](docs/BUILD_WEBOS.md))
