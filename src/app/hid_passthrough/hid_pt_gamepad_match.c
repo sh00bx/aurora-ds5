@@ -11,8 +11,6 @@
 #include "stream/input/session_input.h"
 #include "logging.h"
 
-#include <SDL_version.h>
-#include <ctype.h>
 #include <string.h>
 
 static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t *gp,
