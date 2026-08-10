@@ -7,6 +7,7 @@
 #include "ctm_state.h"
 #include "ctm_hid.h"
 #include "ctm_bridge_protocol.h"
+#include "ctm_pad_table.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -484,7 +485,7 @@ static void tag_xpad_flydigi_candidates(scan_result_t *result)
 
 bool is_steam_puck_device(const device_info_t *dev)
 {
-    return dev && strcmp(dev->vid, "28de") == 0 && strcmp(dev->pid, "1304") == 0;
+    return dev && ctm_pad_kind_str(dev->vid, dev->pid) == CTM_PAD_KIND_PUCK;
 }
 
 bool is_xpad_only_scan_device(const device_info_t *dev)
@@ -496,15 +497,11 @@ bool is_xpad_only_scan_device(const device_info_t *dev)
 bool is_flydigi_composite_device(const device_info_t *dev)
 {
     if (!dev) return false;
-    if (strcmp(dev->vid, "04b4") == 0 && strcmp(dev->pid, "2412") == 0) return true;
+    if (ctm_pad_has_flag_str(dev->vid, dev->pid, CTM_PAD_COMPOSITE)) return true;
     if (dev->usb_busid[0] && is_flydigi_usb_busid(dev->usb_busid)) return true;
     if (dev->usb_busid[0] &&
         (contains_ci(dev->name, "flydigi") || contains_ci(dev->name, "vader") ||
          contains_ci(dev->name, "apex"))) {
-        return true;
-    }
-    if (is_xpad_compatible_pid(dev->vid, dev->pid) && dev->usb_busid[0] &&
-        is_flydigi_usb_busid(dev->usb_busid)) {
         return true;
     }
     return false;
@@ -517,43 +514,31 @@ bool is_flydigi_logical_device(const logical_device_t *item)
 
 bool is_ds5_device(const device_info_t *dev)
 {
-    return dev && strcmp(dev->vid, "054c") == 0 && strcmp(dev->pid, "0ce6") == 0;
+    return dev && ctm_pad_kind_str(dev->vid, dev->pid) == CTM_PAD_KIND_DS5;
 }
 
 bool is_ds4_device(const device_info_t *dev)
 {
-    return dev && strcmp(dev->vid, "054c") == 0 &&
-           (strcmp(dev->pid, "09cc") == 0 || strcmp(dev->pid, "05c4") == 0);
+    return dev && ctm_pad_kind_str(dev->vid, dev->pid) == CTM_PAD_KIND_DS4;
 }
 
 bool is_xbox_pid(const char *pid)
 {
-    return pid &&
-           (strcmp(pid, "02d1") == 0 || strcmp(pid, "02dd") == 0 ||
-            strcmp(pid, "02e0") == 0 || strcmp(pid, "02e3") == 0 ||
-            strcmp(pid, "02ea") == 0 ||
-            strcmp(pid, "02fd") == 0 || strcmp(pid, "0b00") == 0 ||
-            strcmp(pid, "0b05") == 0 || strcmp(pid, "0b0a") == 0 ||
-            strcmp(pid, "0b12") == 0 || strcmp(pid, "0b13") == 0 ||
-            strcmp(pid, "0b20") == 0);
+    return ctm_pad_pid_is_xbox(pid);
 }
 
 bool is_xbox_device(const device_info_t *dev)
 {
-    return dev && strcmp(dev->vid, "045e") == 0 &&
-           (is_xbox_pid(dev->pid) || contains_ci(dev->name, "xbox"));
+    if (!dev) return false;
+    if (ctm_pad_kind_str(dev->vid, dev->pid) == CTM_PAD_KIND_XBOX) return true;
+    /* Not a VID:PID fact, so not a table row: Microsoft ships pads this table
+     * does not list, and for those the product string is the only evidence. */
+    return ctm_pad_hex16(dev->vid) == CTM_PAD_VENDOR_MICROSOFT && contains_ci(dev->name, "xbox");
 }
 
 bool is_xpad_compatible_pid(const char *vid, const char *pid)
 {
-    if (!vid || !pid) return false;
-    if (strcmp(vid, "045e") == 0 &&
-        (strcmp(pid, "028e") == 0 || strcmp(pid, "028f") == 0 ||
-         strcmp(pid, "0291") == 0 || strcmp(pid, "0719") == 0 ||
-         is_xbox_pid(pid))) {
-        return true;
-    }
-    return false;
+    return ctm_pad_has_flag_str(vid, pid, CTM_PAD_XPAD_COMPATIBLE);
 }
 
 bool is_gulikit_named_device(const char *name)
@@ -600,8 +585,14 @@ void logical_key_for_device(const device_info_t *dev, char *out, size_t out_len)
 
 void logical_name_for_device(const device_info_t *dev, char *out, size_t out_len)
 {
+    /* The display name for everything the table knows by id. The branches below
+     * that do NOT read it are the ones whose condition is not a VID:PID fact:
+     * the Flydigi sysfs heuristics, Gulikit by name, and a Microsoft pad
+     * recognised only by its product string. */
+    const ctm_pad_desc_t *pad = dev ? ctm_pad_desc_find_str(dev->vid, dev->pid) : NULL;
+
     if (is_steam_puck_device(dev)) {
-        snprintf(out, out_len, "Valve Software Steam Controller Puck");
+        snprintf(out, out_len, "%s", ctm_pad_display_name(pad, "Steam Controller Puck"));
     } else if (is_flydigi_composite_device(dev)) {
         char mfg[TEXT_LEN] = {0};
         char prod[TEXT_LEN] = {0};
@@ -622,16 +613,20 @@ void logical_name_for_device(const device_info_t *dev, char *out, size_t out_len
         } else {
             snprintf(out, out_len, "Flydigi Controller");
         }
-    } else if (is_ds5_device(dev)) {
-        snprintf(out, out_len, "Sony DS5 Controller");
-    } else if (is_ds4_device(dev)) {
-        snprintf(out, out_len, "Sony DS4 Controller");
+    } else if (is_ds5_device(dev) || is_ds4_device(dev)) {
+        snprintf(out, out_len, "%s", ctm_pad_display_name(pad, "Sony Controller"));
     } else if (is_gulikit_named_device(dev->name)) {
         snprintf(out, out_len, "Gulikit Gamepad");
     } else if (is_xbox_device(dev)) {
-        snprintf(out, out_len, "Microsoft Xbox Controller");
+        /* Only a row that the table itself calls an Xbox controller may name
+         * this. A 360-era pad (kind XINPUT) whose product string happens to say
+         * "xbox" reaches this branch too, and has always been shown as the
+         * generic Microsoft name rather than its own row's. */
+        snprintf(out, out_len, "%s",
+                 ctm_pad_display_name((pad && pad->kind == CTM_PAD_KIND_XBOX) ? pad : NULL,
+                                      "Microsoft Xbox Controller"));
     } else if (dev && !dev->hidraw[0] && is_xpad_compatible_pid(dev->vid, dev->pid)) {
-        snprintf(out, out_len, "XInput-compatible Gamepad");
+        snprintf(out, out_len, "%s", ctm_pad_display_name(pad, "XInput-compatible Gamepad"));
     } else {
         snprintf(out, out_len, "%s", dev->name[0] ? dev->name : "Unnamed HID device");
     }
@@ -1191,16 +1186,10 @@ static bool gamepad_iface_candidate(uint16_t vendor_id, uint16_t usage_page, uin
         return true;
     }
     if (usage_page == 0 && usage == 0) {
-        switch (vendor_id) {
-            case 0x045e: case 0x054c: case 0x057e: case 0x04b4: case 0x3537:
-            case 0x2dc8: case 0x0e6f: case 0x1532: case 0x0738: case 0x046d:
-            case 0x20d6: case 0x24c6: case 0x2563: case 0x28de: case 0x0079:
-            case 0x0810: case 0x1038: case 0x146b: case 0x1949: case 0x1bad:
-            case 0x2378:
-                return true;
-            default:
-                break;
-        }
+        /* No usage at all: the vendor is the last evidence there is, and the
+         * allow-list is the same table that answers every other VID:PID
+         * question. */
+        return ctm_pad_vendor_makes_gamepads(vendor_id);
     }
     return false;
 }

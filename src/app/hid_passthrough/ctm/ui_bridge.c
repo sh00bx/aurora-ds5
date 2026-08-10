@@ -6,6 +6,7 @@
 
 #include "ctm_state.h"
 #include "ctm_bridge_protocol.h"
+#include "ctm_pad_table.h"
 #include "hid_pt_device_prefs.h"
 #include "hid_pt_gamepad_match.h"
 #include "stream/input/session_input.h"
@@ -24,6 +25,33 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+/* Is this logical device one of the Flydigi dongles? Four independent kinds of
+ * evidence, any one of them enough, and only the third is a VID:PID fact:
+ *   - the enumeration already keyed it as a Flydigi composite ("flydigi:<busid>");
+ *   - its USB bus id resolves to sysfs manufacturer/product strings that say so;
+ *   - its VID:PID is the Cypress bridge chip the dongles use (the table row);
+ *   - its name says Flydigi / Vader / Apex.
+ * default_settings_for_item() and bridge_kind_for_item() used to carry a copy of
+ * this each. The copies happened to agree; they were still two places to change
+ * and only one of them decides composite_passthrough. */
+static bool item_is_flydigi(const logical_device_t *item)
+{
+    if (!item) {
+        return false;
+    }
+    if (is_flydigi_logical_device(item)) {
+        return true;
+    }
+    if (item->usb_busid[0] && is_flydigi_usb_busid(item->usb_busid)) {
+        return true;
+    }
+    if (ctm_pad_has_flag_str(item->vid, item->pid, CTM_PAD_COMPOSITE)) {
+        return true;
+    }
+    return contains_ci(item->name, "flydigi") || contains_ci(item->name, "vader") ||
+           contains_ci(item->name, "apex");
+}
+
 tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *item)
 {
     tv_bridge_worker_settings_t settings;
@@ -44,20 +72,25 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     settings.ds5_patch2_low_nibble = 0x7;
     settings.auto_plugin = false;
 
-    if (is_flydigi_logical_device(item) ||
-        (item && item->usb_busid[0] && is_flydigi_usb_busid(item->usb_busid)) ||
-        (item && strcmp(item->vid, "04b4") == 0 && strcmp(item->pid, "2412") == 0) ||
-        (item && (contains_ci(item->name, "flydigi") || contains_ci(item->name, "vader") ||
-                  contains_ci(item->name, "apex")))) {
+    if (item_is_flydigi(item)) {
         settings.composite_passthrough = true;
     }
 
-    const char *kind = bridge_kind_for_item(item);
-    if (strcmp(kind, "ds5") == 0) {
-        settings.kind = TV_BRIDGE_KIND_DS5;
+    const ctm_pad_desc_t *pad = item ? ctm_pad_desc_find_str(item->vid, item->pid) : NULL;
+    switch (pad ? pad->kind : CTM_PAD_KIND_UNKNOWN) {
+        case CTM_PAD_KIND_DS5:
+            settings.kind = TV_BRIDGE_KIND_DS5;
+            break;
+        case CTM_PAD_KIND_DS4:
+            settings.kind = TV_BRIDGE_KIND_DS4;
+            break;
+        default:
+            break;
+    }
+    if (pad && (pad->flags & CTM_PAD_BLOCK_BT_AUDIO_SINK)) {
         settings.block_bt_audio_sink = true;
-    } else if (strcmp(kind, "ds4") == 0) {
-        settings.kind = TV_BRIDGE_KIND_DS4;
+    }
+    if (pad && (pad->flags & CTM_PAD_NO_HAPTICS)) {
         settings.haptics_gain_centi = 0;
     }
     if (item) {
@@ -488,17 +521,19 @@ void release_local_sessions_on_exit(void)
 const char *bridge_kind_for_item(const logical_device_t *item)
 {
     if (!item) return "hid";
-    if (strcmp(item->vid, "054c") == 0 && strcmp(item->pid, "0ce6") == 0) return "ds5";
-    if (strcmp(item->vid, "054c") == 0 &&
-        (strcmp(item->pid, "09cc") == 0 || strcmp(item->pid, "05c4") == 0)) return "ds4";
-    if (strcmp(item->vid, "045e") == 0 &&
-        (is_xbox_pid(item->pid) || contains_ci(item->name, "xbox"))) return "xbox";
-    if (strcmp(item->vid, "28de") == 0 && strcmp(item->pid, "1304") == 0) return "puck";
-    if (is_flydigi_logical_device(item) ||
-        (item->usb_busid[0] && is_flydigi_usb_busid(item->usb_busid)) ||
-        (strcmp(item->vid, "04b4") == 0 && strcmp(item->pid, "2412") == 0) ||
-        contains_ci(item->name, "flydigi") || contains_ci(item->name, "vader") ||
-        contains_ci(item->name, "apex")) {
+    switch (ctm_pad_kind_str(item->vid, item->pid)) {
+        case CTM_PAD_KIND_DS5: return "ds5";
+        case CTM_PAD_KIND_DS4: return "ds4";
+        case CTM_PAD_KIND_XBOX: return "xbox";
+        case CTM_PAD_KIND_PUCK: return "puck";
+        default: break;
+    }
+    /* Not a VID:PID fact, so not a table row: a Microsoft pad the table does not
+     * list, recognised only by its product string. */
+    if (ctm_pad_hex16(item->vid) == CTM_PAD_VENDOR_MICROSOFT && contains_ci(item->name, "xbox")) {
+        return "xbox";
+    }
+    if (item_is_flydigi(item)) {
         for (int i = 0; i < g_settings_count; ++i) {
             if (strcmp(g_settings[i].key, item->key) == 0) {
                 return g_settings[i].settings.composite_passthrough ? "flydigi" : "hid";
