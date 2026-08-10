@@ -207,8 +207,7 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
     t->unixfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (t->unixfd < 0) {
         acl_log(t, "unix socket failed errno=%d (staying on hidraw)", errno);
-        free(t);
-        return NULL;
+        goto fail;
     }
     int fl = fcntl(t->unixfd, F_GETFL, 0);
     if (fl >= 0) {
@@ -219,9 +218,7 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
 
     if (pthread_create(&t->poll_thread, NULL, acl_mon_thread, t) != 0) {
         acl_log(t, "readiness thread failed errno=%d (staying on hidraw)", errno);
-        close(t->unixfd);
-        free(t);
-        return NULL;
+        goto fail;
     }
     t->poll_started = 1;
     /* This session owns the pad's lightbar from here on: the host paints it, so
@@ -236,6 +233,26 @@ ds5_acl_tx_t *ds5_acl_tx_start(int hci_dev, const char *bt_mac,
     acl_log(t, "raw-ACL forwarder ON: sock=%s tag=%s (root ds5_txd does the inject)",
             sock, t->tagged ? machex : "none(legacy)");
     return t;
+
+    /* Both jumps here sit before the monitor thread exists — the socket failure
+     * precedes pthread_create, and a failed pthread_create creates no thread — so
+     * nothing else can be holding these fds and closing them here is unambiguous.
+     * The lightbar claim is taken further down, so there is none to release.
+     * Closing matters most in the failure that brings us here: the plausible cause
+     * of socket() failing is EMFILE, and leaking the two pipe fds on every attempt
+     * made the next plug-in strictly more likely to fail the same way. */
+fail:
+    if (t->unixfd >= 0) {
+        close(t->unixfd);
+    }
+    if (t->wake_pipe[0] >= 0) {
+        close(t->wake_pipe[0]);
+    }
+    if (t->wake_pipe[1] >= 0) {
+        close(t->wake_pipe[1]);
+    }
+    free(t);
+    return NULL;
 }
 
 /* [tag][report] as one atomic datagram (iovec: no report-body copy). */
