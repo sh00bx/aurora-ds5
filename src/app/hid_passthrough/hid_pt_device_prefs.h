@@ -40,12 +40,19 @@ void hid_pt_stable_id_for_gamepad(const app_gamepad_state_t *gamepad, char *out,
 bool hid_pt_stable_id_is_synthetic(const char *stable_id);
 
 bool hid_pt_prefs_get_auto_plugin(const char *stable_id);
-void hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled);
+
+/* Store (and persist) the auto-plug choice for one device. Returns false when
+ * the choice could NOT be stored -- an empty id, or a full table in which every
+ * slot belongs to a device that opted in. Callers must surface that: the UI
+ * checkbox reads its state from a different store, so a dropped write leaves the
+ * box ticked and the setting is simply gone after the next launch. */
+bool hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled);
 void hid_pt_prefs_flush(void);
 
 /* Emit the [hid_pt_devices] section into an already-open ini writer. Used by
  * settings_save() so a full-config rewrite preserves the per-device prefs
- * instead of truncating them. */
+ * instead of truncating them. Only devices that opted IN are written; an absent
+ * key reads as false. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);

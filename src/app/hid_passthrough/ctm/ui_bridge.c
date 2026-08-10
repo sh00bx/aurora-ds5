@@ -108,10 +108,13 @@ void hid_pt_sync_auto_plugin_pref(const logical_device_t *item)
     if (!item || !settings) {
         return;
     }
-    char stable_id[96];
+    char stable_id[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_logical(item, stable_id, sizeof(stable_id));
-    if (stable_id[0]) {
-        hid_pt_prefs_set_auto_plugin(stable_id, settings->auto_plugin);
+    if (!hid_pt_prefs_set_auto_plugin(stable_id, settings->auto_plugin)) {
+        /* The panel's checkbox reflects settings_for_item(), not the pref store,
+         * so it stays ticked whatever happens here. Say so where the user can
+         * see it, instead of letting the setting vanish at the next launch. */
+        ctm_set_plug_error("Auto-plug for %s could not be saved", item->name);
     }
 }
 

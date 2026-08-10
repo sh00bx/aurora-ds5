@@ -10,6 +10,7 @@
 #include "app.h"
 #include "app_settings.h"
 #include "ini_writer.h"
+#include "logging.h"
 #include "util/ini_ext.h"
 
 #include <ctype.h>
@@ -100,14 +101,32 @@ static hid_pt_pref_entry_t *pref_find(const char *stable_id)
 
 static hid_pt_pref_entry_t *pref_upsert(const char *stable_id)
 {
+    if (!stable_id || !stable_id[0]) {
+        return NULL;
+    }
     hid_pt_pref_entry_t *e = pref_find(stable_id);
     if (e) {
         return e;
     }
-    if (g_hid_pt_pref_count >= HID_PT_PREFS_MAX || !stable_id || !stable_id[0]) {
-        return NULL;
+    if (g_hid_pt_pref_count < HID_PT_PREFS_MAX) {
+        e = &g_hid_pt_prefs[g_hid_pt_pref_count++];
+    } else {
+        /* Full. An entry with auto_plugin == false and a missing entry are the
+         * same answer to every reader (pref_find -> NULL -> false), so the
+         * opted-out slot carries no information and is the one to reuse. This is
+         * what keeps the table from wedging: it used to be append-only for the
+         * app's whole lifetime, and once 32 controllers had ever been toggled,
+         * enabling auto-plug on the 33rd silently did nothing. */
+        for (int i = 0; i < g_hid_pt_pref_count; ++i) {
+            if (!g_hid_pt_prefs[i].auto_plugin) {
+                e = &g_hid_pt_prefs[i];
+                break;
+            }
+        }
+        if (!e) {
+            return NULL;
+        }
     }
-    e = &g_hid_pt_prefs[g_hid_pt_pref_count++];
     memset(e, 0, sizeof(*e));
     snprintf(e->id, sizeof(e->id), "%s", stable_id);
     return e;
@@ -170,14 +189,30 @@ bool hid_pt_prefs_get_auto_plugin(const char *stable_id)
     return e ? e->auto_plugin : false;
 }
 
-void hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled)
+bool hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled)
 {
-    hid_pt_pref_entry_t *e = pref_upsert(stable_id);
+    if (!stable_id || !stable_id[0]) {
+        commons_log_warn("HID-PT", "auto-plug pref dropped: device has no stable id");
+        return false;
+    }
+    hid_pt_pref_entry_t *e = pref_find(stable_id);
+    if (!e && !enabled) {
+        /* Nothing stored and nothing worth storing: a missing entry already
+         * reads as "no auto-plug". Do not consume a slot to record a default. */
+        return true;
+    }
     if (!e) {
-        return;
+        e = pref_upsert(stable_id);
+    }
+    if (!e) {
+        commons_log_warn("HID-PT",
+                         "auto-plug pref for %s NOT stored: all %d slots hold opted-in devices",
+                         stable_id, HID_PT_PREFS_MAX);
+        return false;
     }
     e->auto_plugin = enabled;
     hid_pt_prefs_flush();
+    return true;
 }
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item)
@@ -213,22 +248,39 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
     if (!id[0]) {
         return 1;
     }
-    hid_pt_pref_entry_t *e = pref_upsert(id);
-    if (!e) {
+    if (!INI_IS_TRUE(value)) {
+        /* Opted out reads the same as absent, so an older file's `= false`
+         * entries do not get to consume the table before the devices that
+         * actually opted in are parsed. */
         return 1;
     }
-    e->auto_plugin = INI_IS_TRUE(value);
+    hid_pt_pref_entry_t *e = pref_upsert(id);
+    if (!e) {
+        commons_log_warn("HID-PT", "auto-plug pref for %s dropped on load: table full", id);
+        return 1;
+    }
+    e->auto_plugin = true;
     return 1;
 }
 
 void hid_pt_prefs_write_section(FILE *fp)
 {
-    if (!fp || g_hid_pt_pref_count <= 0) {
+    if (!fp) {
         return;
     }
-    ini_write_section(fp, "hid_pt_devices");
+    /* Only opted-in devices go to disk. A `= false` line said exactly what its
+     * absence says, and writing them back made the section grow by one entry per
+     * controller that had ever been toggled, forever. */
+    bool wrote_header = false;
     for (int i = 0; i < g_hid_pt_pref_count; ++i) {
-        ini_write_bool(fp, g_hid_pt_prefs[i].id, g_hid_pt_prefs[i].auto_plugin);
+        if (!g_hid_pt_prefs[i].auto_plugin) {
+            continue;
+        }
+        if (!wrote_header) {
+            ini_write_section(fp, "hid_pt_devices");
+            wrote_header = true;
+        }
+        ini_write_bool(fp, g_hid_pt_prefs[i].id, true);
     }
 }
 
