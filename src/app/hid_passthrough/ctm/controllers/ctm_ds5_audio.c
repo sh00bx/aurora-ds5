@@ -1,5 +1,5 @@
 /* DS5 BT audio loss concealment — see ctm_ds5_audio.h for the two mechanisms
- * and the ownership rules. Moved out of controller_common.c unchanged. */
+ * and the ownership rules. */
 
 #define _GNU_SOURCE
 
@@ -33,23 +33,26 @@ void ds5_audio_init(ds5_audio_t *a, ds5_audio_write_fn write, void *ctx)
  * (~5 stalls/min measured -> unbounded buffer creep). The host audio packet
  * counter (0x36 byte 10 stride 1, 0x39 byte 9 stride 2) tells the cases
  * apart: a late real for a bridged slot carries a counter inside the
- * synth-covered window [real_ctr+step .. real_ctr+step*repeat] -> DROP it
+ * synth-covered window [real_ctr+step .. real_ctr+step*synth_debt] -> DROP it
  * (returns 1) and shrink the debt; a fresh post-loss frame jumped past the
  * window -> forward it and clear the debt. Either way the frame is the newest
- * real content: it re-arms the cache and the fill clock. */
+ * real content: it re-arms the cache and the fill clock.
+ *
+ * Reads and writes synth_debt only: the splice conceal's plc_repeat is a
+ * different quantity and using it here discarded real audio (see the header). */
 static int plc_fill_arm_real(ds5_audio_t *a, const uint8_t *data, size_t len,
                              uint8_t ctr, uint8_t step)
 {
     int stale = 0;
-    if (a->plc_have36 && a->plc_repeat > 0) {
+    if (a->plc_have36 && a->synth_debt > 0) {
         uint8_t d = (uint8_t)(ctr - a->plc_real_ctr);
-        if (d != 0 && d <= (uint8_t)(step * a->plc_repeat)) {
+        if (d != 0 && d <= (uint8_t)(step * a->synth_debt)) {
             stale = 1;
-            a->plc_repeat--;
+            a->synth_debt--;
             a->st_fill_dupdrop++;
         }
     }
-    if (!stale) a->plc_repeat = 0;
+    if (!stale) a->synth_debt = 0;
     if (len <= sizeof(a->plc_last36)) {
         memcpy(a->plc_last36, data, len);
         a->plc_last36_len = (uint16_t)len;
@@ -78,7 +81,7 @@ void ds5_audio_note_dropped(ds5_audio_t *a, const uint8_t *data, size_t len)
     if (data[0] == 0x39 && len == 547) ctr = data[9];
     else if (data[0] == 0x36) ctr = data[10];
     else return;
-    if (a->plc_repeat > 0) a->plc_repeat--;
+    if (a->synth_debt > 0) a->synth_debt--;
     a->plc_real_ctr = ctr;
     a->st_stale_drop++;
 }
@@ -105,6 +108,7 @@ int ds5_audio_plc(ds5_audio_t *a, uint8_t *data, size_t len)
             a->plc_have36 = 0;
             a->plc_fill_next_us = 0;
             a->plc_repeat = 0;
+            a->synth_debt = 0;
             return 0;
         }
         if (len == 547 && data[140] == 0xD3) {
@@ -149,11 +153,13 @@ int ds5_audio_plc(ds5_audio_t *a, uint8_t *data, size_t len)
          * "next frame due" clock (plc_fill_arm_real; runs only for real
          * arrivals — synth frames bypass this path, so the cache never feeds
          * on itself). Counter at byte 10, stride 1 per report. */
-        if (a->plc_fill_enabled) {
-            return plc_fill_arm_real(a, data, len, data[10], 1);
-        }
-        a->plc_repeat = 0;
-        return 0;
+        int stale = a->plc_fill_enabled
+                        ? plc_fill_arm_real(a, data, len, data[10], 1) : 0;
+        /* Real audio ends the splice run only when it is actually written: a
+         * stale frame is dropped, so the pad heard the cached block last and
+         * the cap must keep counting from where it was. */
+        if (!stale) a->plc_repeat = 0;
+        return stale;
     }
     a->st_audio_omit++;
     if (!a->plc_have || a->plc_repeat >= 12) {
@@ -198,7 +204,7 @@ void ds5_audio_stamp_tx_seq(ds5_audio_t *a, uint8_t *data, size_t len)
 /* Re-inject the last real audio frame (0x36 or batched 0x39) to fill a
  * transport gap, keeping the DS5's rate-matched speaker buffer topped up.
  * Stamps the shared client BT seq + a fresh audio packet counter, re-signs,
- * and rides the same output path as real reports. Capped by plc_repeat
+ * and rides the same output path as real reports. Capped by synth_debt
  * (~128ms of bridged outage either form) so a sustained outage stops
  * repeating stale audio.
  * When: the pump loop, once per overdue audio slot. Returns 1 if injected. */
@@ -206,7 +212,7 @@ int ds5_audio_inject_synth(ds5_audio_t *a)
 {
     if (!a->plc_fill_enabled || !a->plc_have36 || a->plc_last36_len < 12) return 0;
     /* Same ~128ms outage budget for both forms: 12 x 10.67ms or 6 x 21.33ms. */
-    if (a->plc_repeat >= (a->plc_last36[0] == 0x39 ? 6 : 12)) return 0;
+    if (a->synth_debt >= (a->plc_last36[0] == 0x39 ? 6 : 12)) return 0;
     size_t n = a->plc_last36_len;
     uint8_t rep[sizeof(a->plc_last36)];
     if (n > sizeof(rep)) return 0;
@@ -227,15 +233,15 @@ int ds5_audio_inject_synth(ds5_audio_t *a)
      * for a bridged slot then lands INSIDE this window and is dropped by
      * plc_fill_arm_real, so the pad's buffer never double-feeds. */
     if (rep[0] == 0x39) {
-        if (n > 9) rep[9] = (uint8_t)(a->plc_real_ctr + 2u * (uint8_t)(a->plc_repeat + 1));
+        if (n > 9) rep[9] = (uint8_t)(a->plc_real_ctr + 2u * (uint8_t)(a->synth_debt + 1));
     } else {
-        if (n > 10) rep[10] = (uint8_t)(a->plc_real_ctr + (uint8_t)(a->plc_repeat + 1));
+        if (n > 10) rep[10] = (uint8_t)(a->plc_real_ctr + (uint8_t)(a->synth_debt + 1));
     }
     ctm_bt_sign_output(rep, n);
 
     int sent = a->write ? a->write(a->write_ctx, rep, n) : 0;
     if (sent) {
-        a->plc_repeat++;
+        a->synth_debt++;
         a->st_audio_fill++;
     }
     return sent;

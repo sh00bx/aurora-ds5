@@ -46,6 +46,10 @@ typedef struct {
     int plc_have;
     uint16_t plc_audio_len;
     uint8_t plc_audio[260];
+    /* Consecutive audio-less 0x36 reports patched with the cached block, capped
+     * at 12. Splice-conceal ONLY: it must not touch synth_debt below, or an
+     * audio-less 0x36 makes the next genuinely fresh audio frame look like a
+     * late duplicate and drain_paced discards it. */
     int plc_repeat;
 
     /* --- timer fill state ------------------------------------------------ */
@@ -64,6 +68,13 @@ typedef struct {
     uint8_t plc_real_ctr;         /* host audio packet counter of the newest REAL
                                    * audio frame (0x36 byte 10 / 0x39 byte 9) — the
                                    * anchor for the synth-covered stale window */
+    /* Slots the fill has bridged with a synth and the host has not yet caught
+     * up on: the WIDTH of the stale window anchored at plc_real_ctr, and the
+     * outage budget (12 x 10.67ms of 0x36, or 6 x 21.33ms of 0x39). Written by
+     * ds5_audio_inject_synth (+1 per synth), by plc_fill_arm_real (-1 for a
+     * late real inside the window, 0 for a fresh one) and by
+     * ds5_audio_note_dropped (-1 for an in-window frame trimmed unwritten). */
+    int synth_debt;
 
     /* --- 60 s telemetry window (read + zeroed by the pump's PLC log) ------ */
     unsigned long st_audio_omit;
