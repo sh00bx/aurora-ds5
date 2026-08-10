@@ -701,6 +701,41 @@ static int flydigi_open_xinput_handshake(ctm_controller_t *c, ctmb_device_caps_t
     return fd;
 }
 
+/* Open the device for a session, in the order the tiers can succeed:
+ *
+ *   1. open_hid            — the classified hidraw node (every type).
+ *   2. flydigi_open_xinput_evdev_only — Flydigi XInput with NO hidraw on the
+ *      bus: synthetic caps + a placeholder pipe, gamepad via xpad evdev.
+ *   3. flydigi_open_xinput_handshake  — Flydigi XInput WITH hidraw siblings:
+ *      any non-mouse-filtered node will do for the handshake, since the
+ *      gamepad again comes from xpad evdev.
+ *
+ * Tier 3 can legitimately open a node tier 1 refuses: flydigi_select_node()
+ * goes through flydigi_handshake_hidraw_pick(), which skips mice, while tier
+ * 3's second chance goes through flydigi_hidraw_pick(), which does not.
+ *
+ * Used for the initial open AND for the post-link_down re-attach, which is the
+ * point: they must agree, or a session can be established that can never be
+ * re-established. Tier 2 sets flydigi_xinput_evdev_only and owns a pipe, so
+ * both are cleared here before the ladder runs again.
+ * When: session_main, once at start and once per link_down. Returns the fd. */
+static int open_device_any_tier(ctm_controller_t *c, ctmb_device_caps_t *caps,
+                                uint8_t *report_desc, uint32_t *report_desc_len)
+{
+    if (c->dummy_hid_pipe_wr >= 0) { close(c->dummy_hid_pipe_wr); c->dummy_hid_pipe_wr = -1; }
+    c->flydigi_xinput_evdev_only = 0;
+
+    int fd = open_hid(c, caps, report_desc, report_desc_len);
+    const int is_flydigi = c->ops && c->ops->kind && strcmp(c->ops->kind, "flydigi") == 0;
+    if (fd < 0 && is_flydigi && flydigi_is_xinput_evdev_only_for_busid(c->dev.usb_busid)) {
+        fd = flydigi_open_xinput_evdev_only(c, caps, report_desc, report_desc_len);
+    }
+    if (fd < 0 && is_flydigi) {
+        fd = flydigi_open_xinput_handshake(c, caps, report_desc, report_desc_len);
+    }
+    return fd;
+}
+
 /* EVIOCGRAB the device's evdev nodes so webOS doesn't double-consume input.
  * When: at session start, BT/DS only (gated by ops->grab_evdev). */
 static void grab_matching_evdev(ctm_controller_t *c)
@@ -1267,11 +1302,6 @@ static int find_xpad_iface_endpoints(ctm_controller_t *c, uint8_t *in_ep, uint8_
         rc = 0;
     }
     return rc;
-}
-
-static int find_xpad_iface_endpoint(ctm_controller_t *c, uint8_t *in_ep)
-{
-    return find_xpad_iface_endpoints(c, in_ep, NULL);
 }
 
 static void xpad_stop_rumble(ctm_controller_t *c)
@@ -2532,14 +2562,7 @@ static void *session_main(void *arg)
      * next to each ops table), then the env overrides on top. */
     apply_pump_policy(c);
 
-    c->hid_fd = open_hid(c, &caps, report_desc, &report_desc_len);
-    if (c->hid_fd < 0 && c->ops && strcmp(c->ops->kind, "flydigi") == 0 &&
-        flydigi_is_xinput_evdev_only_for_busid(c->dev.usb_busid)) {
-        c->hid_fd = flydigi_open_xinput_evdev_only(c, &caps, report_desc, &report_desc_len);
-    }
-    if (c->hid_fd < 0 && c->ops && strcmp(c->ops->kind, "flydigi") == 0) {
-        c->hid_fd = flydigi_open_xinput_handshake(c, &caps, report_desc, &report_desc_len);
-    }
+    c->hid_fd = open_device_any_tier(c, &caps, report_desc, &report_desc_len);
     if (c->hid_fd < 0) {
         ctl_log(c, "hid open failed path=%s errno=%d", c->dev.path, errno);
         if (c->acl_tx) {
@@ -2569,16 +2592,20 @@ static void *session_main(void *arg)
         /* Re-entry after a dropped controller link (the input thread's liveness
          * timeout, or a POLLHUP, set link_down): the hid_fd still points at the
          * pad that fell off BT, so without this we'd re-run run_session on a dead
-         * fd forever (input never recovers until a manual re-bridge). Reopen it to
-         * re-attach to the reconnected controller. open_hid validates VID:PID (so
-         * it never grabs the wrong node) and falls back to the root broker if the
-         * static jail node went stale; -1 just means the pad isn't back yet, so
-         * retry with a 500ms backoff until it re-pairs (or the stream stops). */
+         * fd forever (input never recovers until a manual re-bridge). Reopen it
+         * through the SAME tier ladder the initial open used — this used to call
+         * open_hid() alone, which cannot reach the nodes tiers 2 and 3 reach, so
+         * a session established on one of those could never re-attach and spun
+         * here at 500 ms forever with the gamepad feeder already stopped. Tier 1
+         * validates VID:PID (so it never grabs the wrong node) and falls back to
+         * the root broker if the static jail node went stale; -1 just means the
+         * device isn't back yet, so retry with a 500ms backoff until it
+         * re-appears (or the stream stops). */
         if (c->link_down) {
             if (c->hid_fd >= 0) { close(c->hid_fd); c->hid_fd = -1; }
             int announced = 0;
             while (!c->stop) {
-                int fd = open_hid(c, &caps, report_desc, &report_desc_len);
+                int fd = open_device_any_tier(c, &caps, report_desc, &report_desc_len);
                 if (fd >= 0) {
                     c->hid_fd = fd;
                     ctl_log(c, "controller re-attached after link loss");
