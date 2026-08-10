@@ -11,13 +11,14 @@
  *                             arrives, so an overdue slot is bridged by
  *                             re-injecting the last real frame.
  *
- * Ownership: every function here is called from the controller's session
- * thread (the pump) only, so the state needs no locking of its own. The one
- * thing it cannot do itself is write to the pad — it has no fd, no mutex and
- * no injector; the pump supplies a write callback at init.
+ * Locking: there is none, and nothing here checks. The contract the caller
+ * owes is that everything except ds5_audio_init runs on ONE thread — in this
+ * tree that is the controller's session thread, which is where the pump calls
+ * all of it from; ds5_audio_init runs once at controller-create time, before a
+ * session (and therefore that thread) exists.
  *
- * The pump owns a ds5_audio_t by value and passes &it; nothing else may hold
- * a pointer to it across a session. */
+ * The module has no fd, no mutex and no injector, so the one thing it cannot
+ * do itself is write to the pad: the pump supplies a write callback at init. */
 
 #include <stdbool.h>
 #include <stddef.h>

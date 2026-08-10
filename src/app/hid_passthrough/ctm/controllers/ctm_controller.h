@@ -94,8 +94,10 @@ typedef struct {
     bool raw_acl_output;          /* DS5: inject high-rate output via raw HCI-ACL
                                    * forwarder; falls back to hidraw on failure. */
 
-    /* Pump tunables for this type. Every ops table below sets one; a NULL
-     * policy is read as all-zero (every feature off, no watchdog). */
+    /* Pump tunables for this type. All six ops tables in this tree set one;
+     * apply_pump_policy() reads a NULL policy as all-zero (every feature off,
+     * no watchdog), so a type added without one gets the safe default rather
+     * than the DualSense's. */
     const ctm_pump_policy_t *policy;
 
     /* Does this type claim the device? Factory tries specific types first,

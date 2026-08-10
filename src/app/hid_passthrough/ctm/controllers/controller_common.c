@@ -136,8 +136,9 @@ struct ctm_controller {
     ctm_enet_client_t *enet;        /* process-owned client; borrowed by xport */
     int hid_fd;
     ds5_acl_tx_t *acl_tx;          /* DS5 raw-ACL forwarder (NULL = hidraw only) */
-    /* DS BT audio concealment state + counters, owned by this (the session)
-     * thread. Writes go through the audio_synth_write_cb below. */
+    /* DS BT audio concealment state + its 60s counters (ctm_ds5_audio.h).
+     * Unlocked — see the caller contract in that header. The synth frames it
+     * produces reach the pad through audio_synth_write_cb below. */
     ds5_audio_t audio;
     uint64_t plc_log_next_us;     /* next PLC/60s telemetry line */
     uint32_t last_pace_log_us;    /* last logged paced-drain interval (log-on-change) */
@@ -190,7 +191,7 @@ struct ctm_controller {
     uint8_t dedup_report_id;      /* output report id eligible for dedup; 0 = off */
     size_t last31_len;
     uint8_t last31[80];
-    uint64_t last31_ts_us;   /* when the cached 0x31 was last actually sent */
+    uint64_t last31_ts_us;   /* when the cached report was last actually sent */
     unsigned long st_dedup_skipped;
     int wake_pipe[2];
 
@@ -202,9 +203,11 @@ struct ctm_controller {
     volatile int stop;
     volatile int link_down;         /* input thread saw a send failure; run_session
                                      * exits so session_main retries the connect */
-    /* Liveness ticket for the input watchdog. Every reader that forwards a
-     * report stores 1 here; the watchdog (input_thread_main, on a poll
-     * timeout) reads-and-clears it and treats a set ticket as activity.
+    /* Liveness ticket for the input watchdog. The two readers that do NOT own
+     * last_rx_us — the composite sibling threads and the xpad evdev feeder —
+     * store 1 here per forwarded report; the watchdog (input_thread_main, on a
+     * poll timeout) reads-and-clears it and treats a set ticket as activity.
+     * The primary input thread needs no ticket: it updates last_rx_us itself.
      *
      * A flag rather than a timestamp on purpose: the composite sibling readers
      * and the xpad feeder run on their own threads, and a shared uint64_t
