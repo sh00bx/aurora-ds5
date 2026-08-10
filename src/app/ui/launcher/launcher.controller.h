@@ -31,7 +31,8 @@ typedef enum launcher_zone_t {
 
 /** Platform segments the filter bar can show, excluding the leading "All". */
 #define LAUNCHER_MAX_PLATFORMS 8
-/** Longest platform name/label handled by the filter bar, in bytes. */
+/** Longest platform label the filter bar draws, in bytes. Longer names are
+ * shortened for display only -- the filter itself is resolved by index. */
 #define LAUNCHER_PLATFORM_LABEL_MAX 40
 
 typedef struct launcher_fragment_t {
@@ -65,11 +66,11 @@ typedef struct launcher_fragment_t {
     lv_obj_t *platform_bar;
     /* Backing storage for the button-matrix map: lv_btnmatrix keeps the pointer
      * we hand it, so the strings have to outlive the call. Slot 0 is "All",
-     * the last entry is the "" terminator. Labels are the shortened names shown
-     * on screen; values are the platform names as the host reports them, which
-     * is what the filter actually matches on. */
+     * the last entry is the "" terminator. These are display labels only, and
+     * shortened to fit a segment; the group a segment stands for is its index
+     * (segment n = the apps fragment's platforms[n - 1]), so nothing here is
+     * ever compared against a host-reported name. */
     char platform_labels[LAUNCHER_MAX_PLATFORMS + 1][LAUNCHER_PLATFORM_LABEL_MAX];
-    char platform_values[LAUNCHER_MAX_PLATFORMS + 1][LAUNCHER_PLATFORM_LABEL_MAX];
     const char *platform_map[LAUNCHER_MAX_PLATFORMS + 2];
     /* Segment count including "All"; 0 while the bar is hidden. */
     int platform_segments;

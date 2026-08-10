@@ -89,6 +89,12 @@ void apps_relayout(apps_fragment_t *controller);
 
 /**
  * Restrict the grid to a single platform.
- * @param platform platform name to show, or NULL to show every app.
+ *
+ * Takes an index rather than a name so the caller never has to hold a copy of a
+ * host-reported group name: the filter bar's labels are truncated to fit a
+ * segment, and a truncated name matches no app at all.
+ *
+ * @param platform_index index into the platform list last published to the
+ *        launcher, or -1 to show every app. Out-of-range indices are ignored.
  */
-void apps_set_platform_filter(apps_fragment_t *controller, const char *platform);
+void apps_set_platform_filter_index(apps_fragment_t *controller, int platform_index);

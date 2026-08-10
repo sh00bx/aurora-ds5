@@ -79,6 +79,8 @@ static void applist_focus_leave(lv_event_t *event);
 
 static void gridview_focus_with_key_state(lv_obj_t *grid, int idx);
 
+static int apps_restorable_focus_position(const apps_fragment_t *controller);
+
 static void update_view_state(apps_fragment_t *controller);
 
 static void appitem_bind(apps_fragment_t *controller, lv_obj_t *item, apploader_item_t *app);
@@ -598,8 +600,7 @@ static void show_ok(apps_fragment_t *fragment) {
      * which added this unconditional refocus call -- upstream's show_ok()
      * has no such call at all. */
     if (lv_gridview_get_focused_index(fragment->applist) < 0) {
-        int idx = fragment->focus_backup >= 0 ? fragment->focus_backup : 0;
-        gridview_focus_with_key_state(fragment->applist, idx);
+        gridview_focus_with_key_state(fragment->applist, apps_restorable_focus_position(fragment));
     }
 }
 
@@ -867,11 +868,34 @@ static void gridview_focus_with_key_state(lv_obj_t *grid, int idx) {
     }
 }
 
+/**
+ * The stored grid position, bounded to what the grid can actually show.
+ *
+ * focus_backup is a position in the *filtered* grid, recorded when focus last
+ * left it, so a platform change or a shrinking app list can leave it past the
+ * end. lv_gridview_focus() rejects an out-of-range position without touching any
+ * state, and since the commons bump to 5d5af3c a shrink clears the grid's own
+ * focused_index -- together that left the grid visible with no cursor at all,
+ * re-attempted with the same stale index on every poll.
+ *
+ * @return a focusable position, or -1 when the grid has nothing to focus (which
+ *         lv_gridview_focus() reads as "clear the focus").
+ */
+static int apps_restorable_focus_position(const apps_fragment_t *controller) {
+    if (controller->visible_count <= 0) {
+        return -1;
+    }
+    int idx = controller->focus_backup;
+    if (idx < 0 || idx >= controller->visible_count) {
+        idx = 0;
+    }
+    return idx;
+}
+
 static void applist_focus_enter(lv_event_t *event) {
     if (event->target != event->current_target) { return; }
     apps_fragment_t *controller = lv_event_get_user_data(event);
-    int idx = controller->focus_backup >= 0 ? controller->focus_backup : 0;
-    gridview_focus_with_key_state(controller->applist, idx);
+    gridview_focus_with_key_state(controller->applist, apps_restorable_focus_position(controller));
 }
 
 static void applist_focus_leave(lv_event_t *event) {
@@ -1234,9 +1258,19 @@ static void apps_publish_platforms(apps_fragment_t *controller) {
                                    controller->platform_count, controller->platform_filter);
 }
 
-void apps_set_platform_filter(apps_fragment_t *controller, const char *platform) {
+void apps_set_platform_filter_index(apps_fragment_t *controller, int platform_index) {
     if (controller == NULL) {
         return;
+    }
+    const char *platform = NULL;
+    if (platform_index >= 0) {
+        if (platform_index >= controller->platform_count || controller->platforms == NULL) {
+            /* The bar is showing a segment this fragment no longer has a name
+             * for. Keep the current filter rather than applying a group that
+             * cannot be resolved -- an unresolvable filter empties the grid. */
+            return;
+        }
+        platform = controller->platforms[platform_index];
     }
     const char *current = controller->platform_filter;
     if ((current == NULL && platform == NULL) ||
@@ -1299,11 +1333,8 @@ void apps_focus_rail(apps_fragment_t *controller) {
      * focus last left it. Either can point past the end after a filter change or
      * a shrinking app list, so clamp before using it. */
     int idx = lv_gridview_get_focused_index(controller->applist);
-    if (idx < 0) {
-        idx = controller->focus_backup;
-    }
     if (idx < 0 || idx >= controller->visible_count) {
-        idx = 0;
+        idx = apps_restorable_focus_position(controller);
     }
     gridview_focus_with_key_state(controller->applist, idx);
 }

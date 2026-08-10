@@ -60,6 +60,10 @@ typedef struct {
     int list_width;
     uint64_t last_sig;
     bool have_rendered;
+    /* Set while panel_setup_focus_order() is emptying and refilling the focus
+     * group. LVGL auto-focuses the first object added to an empty group, which
+     * fires plug_focus_cb on row 0 and would rewrite the user's selection. */
+    bool rebuilding;
 } hid_pt_panel_t;
 
 #define DS_LATENCY_MIN 0
@@ -288,11 +292,24 @@ static void panel_group_add(hid_pt_panel_t *panel, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, panel_scroll_into_view_cb, LV_EVENT_FOCUSED, panel);
 }
 
+/**
+ * Rebuild the focus group: device rows first, then the option column.
+ *
+ * lv_group_remove_all_objs() clears obj_focus, and the very next
+ * lv_group_add_obj() sees head == tail and calls lv_group_refocus(), which sends
+ * LV_EVENT_FOCUSED to plug button 0. Without the guard that lands in
+ * plug_focus_cb -> panel_select_device(panel, 0) and overwrites both
+ * selected_index and selected_key, so the key-based restore in refresh_devices()
+ * has nothing left to restore. The flag only suppresses the *bookkeeping*; LVGL
+ * still parks its focus on plug button 0, which is why refresh_devices() puts
+ * focus back explicitly afterwards.
+ */
 static void panel_setup_focus_order(hid_pt_panel_t *panel)
 {
     if (!panel || !panel->group) {
         return;
     }
+    panel->rebuilding = true;
     lv_group_remove_all_objs(panel->group);
     for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
         if (panel->plug_buttons[i]) {
@@ -310,12 +327,13 @@ static void panel_setup_focus_order(hid_pt_panel_t *panel)
     panel_group_add(panel, panel->reset_settings_btn);
     panel_group_add(panel, panel->refresh_btn);
     panel_group_add(panel, panel->close_btn);
+    panel->rebuilding = false;
 }
 
 static void plug_focus_cb(lv_event_t *event)
 {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    if (!panel || lv_event_get_code(event) != LV_EVENT_FOCUSED) {
+    if (!panel || panel->rebuilding || lv_event_get_code(event) != LV_EVENT_FOCUSED) {
         return;
     }
     int index = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_target(event));
@@ -611,6 +629,19 @@ static void update_battery_label(hid_pt_panel_t *panel)
     lv_obj_clear_flag(panel->battery_label, LV_OBJ_FLAG_HIDDEN);
 }
 
+/**
+ * Push the stored settings back into the widgets.
+ *
+ * Runs on every 2 s refresh, not just on a selection change, so it has to keep
+ * its hands off a control the user currently owns. The audio dropdown is the one
+ * that loses data: while its list is open LVGL's key handler only moves
+ * sel_opt_id and fires no LV_EVENT_VALUE_CHANGED, so settings->audio_mode still
+ * holds the old value -- writing it back with lv_dropdown_set_selected() resets
+ * sel_opt_id *and* sel_opt_id_orig and re-scrolls the open list, and the user's
+ * eventual OK then commits the value they had already moved away from.
+ * The sliders deliberately get no such guard: they emit VALUE_CHANGED on every
+ * step, so the model is always current and the write-back is a no-op.
+ */
 static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
 {
     logical_device_t *item = panel_selected_item(panel);
@@ -628,7 +659,7 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         lv_slider_set_value(panel->latency_slider, latency, LV_ANIM_OFF);
         update_latency_label(panel);
     }
-    if (panel->audio_dropdown) {
+    if (panel->audio_dropdown && !panel_dropdown_is_open(panel, NULL)) {
         lv_dropdown_set_selected(panel->audio_dropdown, (uint16_t) settings->audio_mode);
     }
     if (panel->speaker_slider) {
@@ -1010,8 +1041,17 @@ static uint64_t device_list_signature(void) {
     for (int i = 0; i < g_devices.count; ++i) {
         const logical_device_t *item = &g_devices.items[i];
         unsigned char st = (unsigned char) (item->plugged ? 1 : 0);
+        /* The row label carries the " [A]" marker, so auto_plugin belongs in the
+         * signature: without it, ticking the checkbox left the marker stale until
+         * some unrelated device event happened to change the hash.
+         * settings_for_item() materialises the record for a device that has none
+         * yet -- render_device_list() does the same for every row it draws, so
+         * this adds no entry the renderer would not have added anyway. */
+        const tv_bridge_worker_settings_t *settings = settings_for_item(item);
+        unsigned char ap = (unsigned char) ((settings && settings->auto_plugin) ? 1 : 0);
         SIG_MIX(item->key, strlen(item->key));
         SIG_MIX(&st, 1);
+        SIG_MIX(&ap, 1);
     }
 #undef SIG_MIX
     return sig;
@@ -1038,11 +1078,37 @@ static void focus_initial_target(hid_pt_panel_t *panel) {
     }
 }
 
+/**
+ * True while @p obj sits under a hidden ancestor (or is hidden itself).
+ *
+ * Deliberately not lv_obj_is_visible(): that also answers "false" for a control
+ * that is merely scrolled out of the settings column, which is a place the user
+ * can legitimately be.
+ */
+static bool panel_obj_is_hidden(const hid_pt_panel_t *panel, lv_obj_t *obj)
+{
+    for (lv_obj_t *o = obj; o != NULL && o != panel->sheet; o = lv_obj_get_parent(o)) {
+        if (lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void refresh_devices(hid_pt_panel_t *panel) {
     if (!panel || !panel->session) {
         return;
     }
-    session_ensure_hid_passthrough(panel->session);
+    /* Only while the stream still owns its input. The panel is destroyed on
+     * USER_STREAM_FINISHED but hid_passthrough_manager_stop() already ran back at
+     * USER_STREAM_CLOSE (root.c), and the gap between the two spans
+     * LiStopConnection + gs_quit_app + pcmanager_update_by_host -- easily more
+     * than one 2 s tick. Calling ensure() in that window restarted the whole
+     * subsystem against a host that is already gone. session_has_input() is the
+     * same predicate root.c tests before it calls session_stop_input(). */
+    if (session_has_input(panel->session)) {
+        session_ensure_hid_passthrough(panel->session);
+    }
     hid_passthrough_manager_t *mgr = session_get_hid_passthrough(panel->session);
     if (mgr) {
         hid_passthrough_manager_rescan(mgr);
@@ -1064,16 +1130,42 @@ static void refresh_devices(hid_pt_panel_t *panel) {
     panel->selected_index = selected;
     update_status_label(panel);
 
+    /* Where the cursor was before the re-render. render_device_list() empties and
+     * refills the focus group, which parks LVGL's focus on plug button 0 and
+     * clears edit mode, so a user half-way through nudging a slider was thrown
+     * back into the device list with their arrow keys silently meaning something
+     * else. The option controls are created once in the constructor and only
+     * shown/hidden, so they survive the rebuild and can be focused again by
+     * pointer. Not done on the very first render: the group is then focused on
+     * whatever the constructor added first, which is not a place the user chose. */
+    lv_obj_t *prev_focus = lv_group_get_focused(panel->group);
+    bool keep_focus = panel->have_rendered && panel_is_option_control(panel, prev_focus);
+    bool prev_editing = keep_focus && lv_group_get_editing(panel->group);
+
     uint64_t sig = device_list_signature();
+    bool rerendered = false;
     if (!panel->have_rendered || sig != panel->last_sig) {
         panel->last_sig = sig;
         panel->have_rendered = true;
         render_device_list(panel);
-        focus_initial_target(panel);
+        rerendered = true;
     } else {
         update_row_styles(panel);
     }
+    /* Before restoring focus, not after: this is what decides whether the control
+     * the user was on is still on screen for the newly selected device. */
     update_device_options(panel);
+    if (rerendered) {
+        if (keep_focus && !panel_obj_is_hidden(panel, prev_focus)) {
+            lv_group_focus_obj(prev_focus);
+            if (prev_editing) {
+                /* lv_group_focus_obj() leaves edit mode on its way in. */
+                lv_group_set_editing(panel->group, true);
+            }
+        } else {
+            focus_initial_target(panel);
+        }
+    }
 }
 
 static void refresh_timer_cb(lv_timer_t *timer) {

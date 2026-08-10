@@ -585,19 +585,74 @@ void launcher_attach_platform_bar_nav(launcher_fragment_t *controller) {
     lv_obj_add_event_cb(bar, launcher_platform_bar_clicked, LV_EVENT_VALUE_CHANGED, controller);
 }
 
+/**
+ * Write every piece of the filter bar's widget state, always in this order.
+ *
+ * lv_btnmatrix keeps three things that have to agree: the map (which decides
+ * btn_cnt and the size of ctrl_bits), the per-button control flags, and the
+ * cursor btn_id_sel. lv_btnmatrix_set_map() reallocates and zeroes ctrl_bits
+ * when the button count changes but never touches btn_id_sel, and the widget
+ * only clears the cursor on DEFOCUSED/LEAVE -- which this fork's zone switch
+ * never sends. A bar that shrank therefore kept a cursor pointing past the new
+ * ctrl_bits, and the next LEFT/PRESSED read (or RELEASED write) went out of
+ * bounds. Setting the CHECKED bit after the map, and the cursor after that, is
+ * what keeps them in step. This is the only place that writes any of the three
+ * once the bar is live; launcher.view.c writes the initial empty map when it
+ * creates the widget, which leaves btn_cnt at 0 and the cursor at NONE.
+ *
+ * @param remap rebuild the map as well. Only the segment rebuild needs it: the
+ *              two selection paths run from inside the button matrix's own event
+ *              handling (LV_EVENT_KEY post-callback, and LV_EVENT_VALUE_CHANGED
+ *              nested in LV_EVENT_RELEASED), where re-entering set_map() would
+ *              recompute the button geometry the widget is still working with,
+ *              for a map whose contents did not change.
+ */
+static void launcher_platform_bar_sync(launcher_fragment_t *c, int segments, int selected, bool remap) {
+    if (c->platform_bar == NULL) {
+        return;
+    }
+    if (remap) {
+        lv_btnmatrix_set_map(c->platform_bar, c->platform_map);
+    }
+    if (segments <= 0) {
+        c->platform_selected = 0;
+        lv_btnmatrix_set_selected_btn(c->platform_bar, LV_BTNMATRIX_BTN_NONE);
+        return;
+    }
+    if (selected < 0 || selected >= segments) {
+        selected = 0;
+    }
+    lv_btnmatrix_set_btn_ctrl_all(c->platform_bar, LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT |
+                                                   LV_BTNMATRIX_CTRL_CHECKABLE);
+    lv_btnmatrix_set_btn_ctrl(c->platform_bar, (uint16_t) selected, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_btnmatrix_set_selected_btn(c->platform_bar, (uint16_t) selected);
+    /* Equal-width segments: one shared width per button keeps the control
+     * reading as a segmented control rather than ragged chips. */
+    lv_obj_set_width(c->platform_bar, LV_DPX(72) * segments);
+    c->platform_selected = selected;
+}
+
 static void launcher_apply_platform_selection(launcher_fragment_t *controller, int segment) {
     if (segment < 0 || segment >= controller->platform_segments) {
         return;
     }
-    controller->platform_selected = segment;
-    lv_btnmatrix_set_btn_ctrl(controller->platform_bar, (uint16_t) segment, LV_BTNMATRIX_CTRL_CHECKED);
+    launcher_platform_bar_sync(controller, controller->platform_segments, segment, false);
     apps_fragment_t *apps = launcher_apps_fragment(controller);
     if (apps == NULL) {
         return;
     }
-    /* Segment 0 is "All"; the rest map 1:1 onto the platform names. Filter on the
-     * value, not the shortened label that is drawn on the segment. */
-    apps_set_platform_filter(apps, segment == 0 ? NULL : controller->platform_values[segment]);
+    /* Segment 0 is "All"; segment n is controller->platforms[n - 1] over in the
+     * apps fragment. Resolving by index rather than by name is what keeps a group
+     * name longer than the label buffer usable: only the drawn label is
+     * truncated, the value the filter matches on is never copied here. */
+    apps_set_platform_filter_index(apps, segment - 1);
+    /* Applying a filter focuses the first tile of the new selection, which draws
+     * the grid's selection ring even when the cursor is somewhere else entirely
+     * -- two zones would look focused at once. This sits here rather than in
+     * launcher_cycle_platform() so the arrow-key and click paths get it too. */
+    if (controller->focus_zone != LAUNCHER_ZONE_GRID) {
+        launcher_clear_detail_key_focus(controller);
+    }
 }
 
 bool launcher_cycle_platform(int dir) {
@@ -618,17 +673,10 @@ bool launcher_cycle_platform(int dir) {
     }
     int segments = controller->platform_segments;
     int next = (controller->platform_selected + (dir > 0 ? 1 : -1) + segments) % segments;
-    /* Move the matrix cursor along with the selection. The filter row's own
-     * left/right handler reads the cursor rather than the checked segment, so
+    /* Moves the matrix cursor along with the checked segment. The filter row's
+     * own left/right handler reads the cursor rather than the checked segment, so
      * leaving it behind would make the next press there jump back. */
-    lv_btnmatrix_set_selected_btn(controller->platform_bar, (uint16_t) next);
     launcher_apply_platform_selection(controller, next);
-    /* Applying a filter focuses the first tile of the new selection, which draws
-     * the grid's selection ring even when the cursor is somewhere else entirely
-     * -- two zones would look focused at once. */
-    if (controller->focus_zone != LAUNCHER_ZONE_GRID) {
-        launcher_clear_detail_key_focus(controller);
-    }
     return true;
 }
 
@@ -676,47 +724,30 @@ void launcher_set_platform_segments(launcher_fragment_t *controller, const char 
     bool show = count > 1;
 
     int segments = 0;
+    int selected_segment = 0;
     if (show) {
         strncpy(controller->platform_labels[0], locstr("All"), LAUNCHER_PLATFORM_LABEL_MAX - 1);
         controller->platform_labels[0][LAUNCHER_PLATFORM_LABEL_MAX - 1] = '\0';
-        controller->platform_values[0][0] = '\0';
         controller->platform_map[0] = controller->platform_labels[0];
         segments = 1;
         for (int i = 0; i < count; i++) {
-            strncpy(controller->platform_values[segments], names[i], LAUNCHER_PLATFORM_LABEL_MAX - 1);
-            controller->platform_values[segments][LAUNCHER_PLATFORM_LABEL_MAX - 1] = '\0';
-            launcher_platform_display_name(controller->platform_values[segments],
-                                           controller->platform_labels[segments], LAUNCHER_PLATFORM_LABEL_MAX);
+            /* Only the drawn label is truncated into the fixed buffer. Which
+             * group a segment stands for is carried as its index, so a name
+             * longer than LAUNCHER_PLATFORM_LABEL_MAX can no longer become a
+             * filter value that matches nothing. */
+            launcher_platform_display_name(names[i], controller->platform_labels[segments],
+                                           LAUNCHER_PLATFORM_LABEL_MAX);
             controller->platform_map[segments] = controller->platform_labels[segments];
+            if (selected != NULL && selected_segment == 0 && strcmp(names[i], selected) == 0) {
+                selected_segment = segments;
+            }
             segments++;
         }
     }
     controller->platform_map[segments] = ""; /* map terminator */
     controller->platform_segments = segments;
 
-    lv_btnmatrix_set_map(controller->platform_bar, controller->platform_map);
-    if (segments > 0) {
-        lv_btnmatrix_set_btn_ctrl_all(controller->platform_bar,
-                                      LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT |
-                                      LV_BTNMATRIX_CTRL_CHECKABLE);
-        /* Equal-width segments: one shared width per button keeps the control
-         * reading as a segmented control rather than ragged chips. */
-        lv_obj_set_width(controller->platform_bar, LV_DPX(72) * segments);
-    }
-
-    int selected_segment = 0;
-    if (selected != NULL) {
-        for (int i = 1; i < segments; i++) {
-            if (strcmp(controller->platform_values[i], selected) == 0) {
-                selected_segment = i;
-                break;
-            }
-        }
-    }
-    controller->platform_selected = selected_segment;
-    if (segments > 0) {
-        lv_btnmatrix_set_btn_ctrl(controller->platform_bar, (uint16_t) selected_segment, LV_BTNMATRIX_CTRL_CHECKED);
-    }
+    launcher_platform_bar_sync(controller, segments, selected_segment, true);
 
     if (show) {
         lv_obj_clear_flag(controller->filter_row, LV_OBJ_FLAG_HIDDEN);
