@@ -18,7 +18,12 @@
 #include <string.h>
 
 #define HID_PT_PREFS_MAX 32
-#define HID_PT_STABLE_ID_LEN 96
+
+/* Prefix of the synthetic identity used for a pad with no usable serial. Chosen
+ * so hid_pt_stable_id() leaves it alone: '_' is inside the allowed set, ':'
+ * would have been stripped and the prefix would then be indistinguishable from
+ * a serial that happens to start with "sdl". */
+#define HID_PT_SYNTHETIC_PREFIX "sdl_"
 
 typedef struct {
     char id[HID_PT_STABLE_ID_LEN];
@@ -28,23 +33,56 @@ typedef struct {
 static hid_pt_pref_entry_t g_hid_pt_prefs[HID_PT_PREFS_MAX];
 static int g_hid_pt_pref_count;
 
-static void normalize_mac_to_stable_id(const char *src, char *out, size_t out_len)
+void hid_pt_stable_id(const char *raw, char *out, size_t out_len)
 {
     if (!out || out_len == 0) {
         return;
     }
     out[0] = '\0';
-    if (!src || !src[0]) {
+    if (!raw) {
         return;
     }
     size_t o = 0;
-    for (const char *p = src; *p && o + 1 < out_len; ++p) {
-        if (*p == ':' || *p == '-' || *p == ' ') {
-            continue;
+    for (const char *p = raw; *p && o + 1 < out_len; ++p) {
+        unsigned char c = (unsigned char) *p;
+        if (c == ':' || c == '-' || c == ' ') {
+            continue; /* MAC separators: aa:bb:cc, aa-bb-cc and "aa bb cc" are
+                       * the same address and must produce the same id. */
         }
-        out[o++] = (char) tolower((unsigned char) *p);
+        c = (unsigned char) tolower(c);
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || c == '_' || c == '.')) {
+            /* Serials and product strings are device-controlled and land in an
+             * ini key position; '=', '[', ';' or a newline in one would rewrite
+             * the config file's structure on the next flush. */
+            c = '_';
+        }
+        out[o++] = (char) c;
     }
     out[o] = '\0';
+}
+
+/* A normalised id that carries no identity. Firmware that leaves the serial or
+ * the sysfs `uniq` field unset reports "", "0" or "00:00:00:00:00:00", and a
+ * string of unprintables normalises to nothing but '_'. Every such device would
+ * otherwise share ONE pref entry, so one pad's auto-plug setting would apply to
+ * all of them. */
+static bool stable_id_is_blank(const char *id)
+{
+    if (!id || !id[0]) {
+        return true;
+    }
+    for (const char *p = id; *p; ++p) {
+        if (*p != '0' && *p != '_' && *p != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool hid_pt_stable_id_is_synthetic(const char *stable_id)
+{
+    return stable_id && strncmp(stable_id, HID_PT_SYNTHETIC_PREFIX,
+                                strlen(HID_PT_SYNTHETIC_PREFIX)) == 0;
 }
 
 static hid_pt_pref_entry_t *pref_find(const char *stable_id)
@@ -89,19 +127,14 @@ void hid_pt_stable_id_for_logical(const logical_device_t *item, char *out, size_
     if (!item) {
         return;
     }
-    if (valid_bt_address(item->mac)) {
-        normalize_mac_to_stable_id(item->mac, out, out_len);
-        return;
-    }
     if (item->mac[0]) {
-        normalize_mac_to_stable_id(item->mac, out, out_len);
-        if (out[0]) {
+        hid_pt_stable_id(item->mac, out, out_len);
+        if (!stable_id_is_blank(out)) {
             return;
         }
+        out[0] = '\0';
     }
-    if (item->key[0]) {
-        snprintf(out, out_len, "%s", item->key);
-    }
+    hid_pt_stable_id(item->key, out, out_len);
 }
 
 void hid_pt_stable_id_for_gamepad(const app_gamepad_state_t *gamepad, char *out, size_t out_len)
@@ -117,19 +150,18 @@ void hid_pt_stable_id_for_gamepad(const app_gamepad_state_t *gamepad, char *out,
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     const char *serial = SDL_JoystickGetSerial(joy);
     if (serial && serial[0]) {
-        normalize_mac_to_stable_id(serial, out, out_len);
-        if (strlen(out) == 12) {
+        hid_pt_stable_id(serial, out, out_len);
+        if (!stable_id_is_blank(out)) {
             return;
         }
-        snprintf(out, out_len, "%s", serial);
-        return;
+        out[0] = '\0';
     }
 #endif
     char guidstr[33];
     SDL_JoystickGetGUIDString(gamepad->guid, guidstr, sizeof(guidstr));
     uint16_t vid = (uint16_t) SDL_JoystickGetVendor(joy);
     uint16_t pid = (uint16_t) SDL_JoystickGetProduct(joy);
-    snprintf(out, out_len, "sdl:%04x:%04x:%s", vid, pid, guidstr);
+    snprintf(out, out_len, HID_PT_SYNTHETIC_PREFIX "%04x%04x_%s", vid, pid, guidstr);
 }
 
 bool hid_pt_prefs_get_auto_plugin(const char *stable_id)
@@ -170,7 +202,18 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
     if (!name || !name[0]) {
         return 0;
     }
-    hid_pt_pref_entry_t *e = pref_upsert(name);
+    /* Normalise on load, so keys written by an older build in one of the two
+     * pre-unification forms (a raw SDL serial, or a verbatim `hid:hidraw3` /
+     * `flydigi:1-1.2` enumeration key) resolve to the id the running code now
+     * derives for the same device, and get rewritten in that form on the next
+     * flush. Two legacy keys can normalise to one id; the later one wins, which
+     * is the same resolution a duplicate key already had. */
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id(name, id, sizeof(id));
+    if (!id[0]) {
+        return 1;
+    }
+    hid_pt_pref_entry_t *e = pref_upsert(id);
     if (!e) {
         return 1;
     }

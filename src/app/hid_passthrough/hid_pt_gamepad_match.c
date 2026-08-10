@@ -259,7 +259,7 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     if (!item || !hid_pt_prefs_auto_plugin_for_logical(item)) {
         return false;
     }
-    if (sid[0] && strncmp(sid, "sdl:", 4) != 0) {
+    if (sid[0] && !hid_pt_stable_id_is_synthetic(sid)) {
         // Readable serial but the gamepad-keyed pref above missed (fresh pref
         // store, store/serial formatting drift): trust the logical device's
         // auto-plug pref ONLY on an exact stable-id identity — same physical
