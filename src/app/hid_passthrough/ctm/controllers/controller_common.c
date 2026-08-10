@@ -2588,6 +2588,18 @@ static void *session_main(void *arg)
     (void)fcntl(c->wake_pipe[0], F_SETFL, fcntl(c->wake_pipe[0], F_GETFL, 0) | O_NONBLOCK);
     (void)fcntl(c->wake_pipe[1], F_SETFL, fcntl(c->wake_pipe[1], F_GETFL, 0) | O_NONBLOCK);
 
+    /* Reconnect pacing for a session that fails FAST. The 500ms sleep below is
+     * inside the connect-failure condition, so a session that connects and then
+     * aborts immediately (the flydigi abort path, where the xpad feeder cannot
+     * start) re-ran connect + ENUM + HELLO with no delay at all: tens of full
+     * handshakes per second, forever, from a SCHED_FIFO priority-15 thread,
+     * each carrying the composite enumeration blob. Elapsed-time based rather
+     * than failure-counting, so it cannot mistake a long, healthy session that
+     * happens to end for a hot loop. Nothing is streaming while this sleeps —
+     * the session is already down — and it aborts on stop within 50ms, so it
+     * does not delay plug-out. */
+    uint32_t backoff_ms = 0;
+
     while (!c->stop) {
         /* Re-entry after a dropped controller link (the input thread's liveness
          * timeout, or a POLLHUP, set link_down): the hid_fd still points at the
@@ -2632,11 +2644,25 @@ static void *session_main(void *arg)
 
         if (c->ops->grab_evdev) grab_matching_evdev(c);
         if (c->ops->on_plug_init) c->ops->on_plug_init(c, &c->xport);
+        uint64_t session_start_us = now_us();
         run_session(c, &caps, report_desc, report_desc_len);
+        uint64_t session_us = now_us() - session_start_us;
         release_evdev_grabs(c);
 
         ctm_transport_disconnect(&c->xport);
         if (!c->stop) ctl_log(c, "link lost; retrying probe loop");
+        if (session_us < 1000000ull) {
+            backoff_ms = backoff_ms ? (backoff_ms >= 2500 ? 5000 : backoff_ms * 2) : 500;
+            if (!c->stop) {
+                ctl_log(c, "session lasted %llums; waiting %ums before reconnecting",
+                        (unsigned long long)(session_us / 1000), backoff_ms);
+            }
+            for (uint32_t slept = 0; slept < backoff_ms && !c->stop; slept += 50) {
+                usleep(50000);
+            }
+        } else {
+            backoff_ms = 0;
+        }
     }
     if (c->acl_tx) {
         long inj = 0, drp = 0;
