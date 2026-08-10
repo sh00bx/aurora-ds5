@@ -23,7 +23,6 @@
 #include "app.h"
 
 #include <SDL.h>
-#include <assert.h>
 
 /* Starting capacity for the decode-unit reassembly buffer. Grows on
  * demand to accommodate larger frames (e.g. 4K IDR frames at high
@@ -89,7 +88,13 @@ struct vdec_stream_state {
     bool need_idr_on_resume;
     int feed_error_count;
     unsigned long feed_error_first_ms;
+    /* Epoch of the current NOT_READY run. Carrying one over from a stream that
+     * ended mid-NOT_READY would make the next stream's first transient
+     * NOT_READY (normal at HDR start) read as a >5 s wedge and interrupt it. */
     unsigned long not_ready_first_ms;
+    /* Epoch of the last IDR request forwarded to the host. Carrying one over
+     * would let the previous stream's throttle window swallow a new stream's
+     * first keyframe request. */
     unsigned long last_idr_request_ms;
     bool warned_near_buffer_limit;
     struct VIDEO_STATS temp_stats;
@@ -128,11 +133,6 @@ VIDEO_INFO vdec_stream_info;
 #define SOFT_REC_HOLD_MS 15000
 #define SOFT_REC_DROP_PERCENT 75
 #define SOFT_REC_LATENCY_MS 80.0f
-
-static void soft_recovery_reset(void) {
-    vs.soft_rec_high_since = 0;
-    vs.soft_rec_cooldown_until = 0;
-}
 
 static bool soft_recovery_is_4k(void) {
     int w = vs.session != NULL ? vs.session->config.stream.width : 0;
@@ -270,8 +270,14 @@ static const char *video_format_name(int videoFormat) {
 
 int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, void *context, int drFlags) {
     (void) drFlags;
+    /* One stream, one state. Starting from zero rather than from whatever the
+     * previous stream left behind is the whole reason these fields share an
+     * object; only the four that need a non-zero start are assigned below. */
+    memset(&vs, 0, sizeof(vs));
     vs.session = context;
     vs.player = vs.session->player;
+    vs.stream_format = videoFormat;
+    vs.target_fps = redrawRate > 0 ? redrawRate : 60;
     reasm.initial_size = vdec_buffer_initial_bytes();
     /* P15: allocate only on the first stream — see struct vdec_reassembly for
      * why the buffer outlives one. */
@@ -293,28 +299,11 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
         reasm.size = 0;
         return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
-    memset(&vs.temp_stats, 0, sizeof(vs.temp_stats));
+    /* vdec_stream_info is an extern other translation units read directly
+     * (streaming.controller.c), so it is not part of vs and keeps its own
+     * reset here. */
     memset(&vdec_stream_info, 0, sizeof(vdec_stream_info));
-    vs.stream_format = videoFormat;
     vdec_stream_info.format = video_format_name(videoFormat);
-    vs.lastFrameNumber = 0;
-    vs.need_idr_on_resume = false;
-    vs.feed_error_count = 0;
-    vs.feed_error_first_ms = 0;
-    vs.last_idr_request_ms = 0;  /* a new stream must never have its first keyframe
-                                  * request swallowed by the previous stream's
-                                  * throttle window */
-    vs.not_ready_first_ms = 0;   /* the NOT_READY wedge watchdog must not carry a
-                                  * stale epoch from a stream that ended mid-
-                                  * NOT_READY: the next stream's first transient
-                                  * NOT_READY (normal at HDR start) would read as
-                                  * a >5s wedge -> spurious decoder interrupt */
-    vs.frames_since_idr = 0;
-    vs.target_fps = redrawRate > 0 ? redrawRate : 60;
-    vs.warned_near_buffer_limit = false;
-#if defined(TARGET_WEBOS)
-    soft_recovery_reset();
-#endif
 
     if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
         vdec_stream_info.width = width;
@@ -376,13 +365,31 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
 }
 
 void vdec_delegate_cleanup(void) {
-    assert(vs.player != NULL);
+    if (vs.player == NULL) {
+        /* No live stream to close. moonlight-common-c pairs cleanup() with a
+         * successful setup() exactly once (Connection.c only advances past
+         * STAGE_VIDEO_STREAM_START when startVideoStream returned 0, and only
+         * that stage calls stopVideoStream), so this should not happen — but
+         * the assert that used to stand here is compiled out by -DNDEBUG in
+         * every shipped build, and since cleanup now clears vs.player, an
+         * unpaired second call would dereference NULL inside ss4s. */
+        return;
+    }
     /* P15: reasm.data is deliberately not freed here — see struct vdec_reassembly. */
-#if defined(TARGET_WEBOS)
-    soft_recovery_reset();
-#endif
     SS4S_PlayerVideoClose(vs.player);
-    vs.session = NULL;
+    /* The stream is over, so its state ends with it. This is what the grouping
+     * buys: previously only `session` was cleared here, and `stream_format`
+     * kept the last stream's value. streaming_set_hdr() reads that value
+     * through vdec_negotiated_format(), and the host can deliver an HDR-off
+     * notification in the gap between one stream's cleanup and the next
+     * stream's setup — moonlight-common-c starts the control stream
+     * (STAGE_CONTROL_STREAM_START, Connection.c) before it calls
+     * VideoCallbacks.setup() (STAGE_VIDEO_STREAM_START). A stale MAIN10 there
+     * made an 8-bit stream answer "10-bit, ignore the disable". Zero means
+     * "nothing negotiated", which that guard already handles correctly: it
+     * matches neither MAIN10 bit, so the disable falls through to
+     * SS4S_PlayerVideoSetHDRInfo(NULL). */
+    memset(&vs, 0, sizeof(vs));
 }
 
 static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit) {
