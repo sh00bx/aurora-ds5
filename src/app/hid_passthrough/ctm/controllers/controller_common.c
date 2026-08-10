@@ -187,7 +187,7 @@ struct ctm_controller {
                                    * audio form is on air during the 0x39 A/B. */
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
     int hid_wait_ms;
-    int dedup_enabled;
+    uint8_t dedup_report_id;      /* output report id eligible for dedup; 0 = off */
     size_t last31_len;
     uint8_t last31[80];
     uint64_t last31_ts_us;   /* when the cached 0x31 was last actually sent */
@@ -202,6 +202,19 @@ struct ctm_controller {
     volatile int stop;
     volatile int link_down;         /* input thread saw a send failure; run_session
                                      * exits so session_main retries the connect */
+    /* Liveness ticket for the input watchdog. Every reader that forwards a
+     * report stores 1 here; the watchdog (input_thread_main, on a poll
+     * timeout) reads-and-clears it and treats a set ticket as activity.
+     *
+     * A flag rather than a timestamp on purpose: the composite sibling readers
+     * and the xpad feeder run on their own threads, and a shared uint64_t
+     * microsecond stamp neither stores atomically on 32-bit ARM nor is worth a
+     * clock read per input report. A 32-bit relaxed store is one instruction
+     * with no syscall, no lock and no ordering requirement — the watchdog only
+     * needs to know "something arrived in the last 250 ms window", and a lost
+     * race just defers the observation by one poll timeout, far inside the
+     * multi-second timeout it feeds. */
+    volatile uint32_t rx_tick;
 
     /* Feature worker (lazy-started per session, joined in run_session teardown
      * BEFORE the transport is released so its c_send replies stay valid). */
@@ -848,7 +861,7 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
         return 2;
     }
     ds5_audio_stamp_tx_seq(&c->audio, patched, patched_len);
-    if (c->dedup_enabled && patched_len >= 8 && patched[0] == 0x31) {
+    if (c->dedup_report_id && patched_len >= 8 && patched[0] == c->dedup_report_id) {
         /* TTL on the dedup match: DS5_ACL_TX_SENT only means the datagram reached
          * the root daemon; the daemon can still drop the frame latest-wins on a
          * full credit window with no feedback channel. Without a TTL one such
@@ -883,10 +896,11 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
              * or the host's identical resends of this very frame (a rumble OFF, a
              * trigger effect) would all dedup-match a frame that never reached the
              * pad: rumble stuck on until a byte-different 0x31 happens to arrive.
-             * Scoped to 0x31: the cache only ever holds a 0x31, and a dropped 0x36
-             * audio frame says nothing about the delivered rumble state — clearing
-             * on it would defeat dedup exactly under congestion. */
-            if (patched[0] == 0x31) c->last31_len = 0;
+             * Scoped to the deduped id: the cache only ever holds that report,
+             * and a dropped 0x36 audio frame says nothing about the delivered
+             * rumble state — clearing on it would defeat dedup exactly under
+             * congestion. */
+            if (c->dedup_report_id && patched[0] == c->dedup_report_id) c->last31_len = 0;
             c->st_hid_dropped++;
             return -1;
         }
@@ -916,7 +930,9 @@ static int hid_write_report(ctm_controller_t *c, const uint8_t *data, size_t len
         c->st_reports_out++;
         return 0;
     }
-    if (patched[0] == 0x31) c->last31_len = 0;   /* frame not delivered: never let it satisfy future dedup (0x31-scoped: the cache only holds a 0x31) */
+    /* frame not delivered: never let it satisfy future dedup (scoped to the
+     * deduped id, the only report the cache ever holds) */
+    if (c->dedup_report_id && patched[0] == c->dedup_report_id) c->last31_len = 0;
     c->st_hid_dropped++;
     return -1;
 }
@@ -1388,6 +1404,7 @@ static void xpad_send_report(ctm_controller_t *c, const xpad_evdev_state_t *st)
     }
     if (c_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, c->xpad_in_ep, buf, sizeof(buf)) == 0) {
         c->st_reports_in++;
+        __atomic_store_n(&c->rx_tick, 1u, __ATOMIC_RELAXED);
     }
 }
 
@@ -1514,6 +1531,7 @@ static void *composite_reader_main(void *arg)
             if (n > 0) {
                 if (c_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, ci->in_ep, buf, (size_t)n) != 0) break;
                 c->st_reports_in++;
+                __atomic_store_n(&c->rx_tick, 1u, __ATOMIC_RELAXED);
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
@@ -1548,8 +1566,16 @@ static void *input_thread_main(void *arg)
      * silence means the link is down. Signal link_down so run_session tears the
      * session down and session_main reconnects (same recovery path as the
      * c_send-failure case below), instead of spinning on a dead fd and wedging
-     * the bridge (which also froze the whole app on a mid-session BT reconnect). */
-    const uint64_t liveness_us = 2000000ull;
+     * the bridge (which also froze the whole app on a mid-session BT reconnect).
+     *
+     * That premise is type-specific, so the timeout comes from the type's pump
+     * policy and 0 disables the check entirely — see ctm_pump_policy_t. And
+     * because a composite type can be alive on a sibling interface or the xpad
+     * feeder while THIS fd is quiet, activity from those readers counts too,
+     * via the rx_tick ticket they set. */
+    const ctm_pump_policy_t *policy = c->ops ? c->ops->policy : NULL;
+    const uint64_t liveness_us = policy
+        ? (uint64_t)policy->input_idle_timeout_ms * 1000ull : 0ull;
     uint64_t last_rx_us = now_us();
     while (!c->stop && !c->link_down) {
         struct pollfd pfds[2];
@@ -1562,7 +1588,12 @@ static void *input_thread_main(void *arg)
         int pr = poll(pfds, 2, 250);
         if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) {
-            if (now_us() - last_rx_us > liveness_us) {
+            if (__atomic_exchange_n(&c->rx_tick, 0u, __ATOMIC_RELAXED)) {
+                /* A sibling interface or the xpad feeder forwarded something
+                 * since the last timeout: the device is alive, this fd just
+                 * is not the one it talks on. */
+                last_rx_us = now_us();
+            } else if (liveness_us && now_us() - last_rx_us > liveness_us) {
                 ctl_log(c, "no input for %llums, link presumed down",
                         (unsigned long long)((now_us() - last_rx_us) / 1000));
                 c->link_down = 1;
@@ -2352,6 +2383,103 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     c->comp_count = 0;
 }
 
+/* --- pump policy + env overrides ------------------------------------------
+ * One env-overridable pump tunable. The DEFAULT is deliberately NOT in this
+ * table: it comes from the type's ctm_pump_policy_t. That is also why lo/hi
+ * are applied only to a value the environment actually supplied — clamping an
+ * unset knob would drag a type that says 0 on purpose up to the DS5's floor. */
+typedef enum {
+    KNOB_INT,           /* number, clamped to [lo,hi], stored as int */
+    KNOB_U32,           /* number, clamped to [lo,hi], stored as uint32_t */
+    KNOB_FLAG_UNLESS_0, /* int: on unless the value is exactly "0" */
+    KNOB_FLAG_IF_1,     /* int: on only if the value is exactly "1" */
+} ctm_knob_kind_t;
+
+typedef struct {
+    const char *env;
+    size_t off;                 /* offset into ctm_controller_t */
+    ctm_knob_kind_t kind;
+    long lo, hi;                /* KNOB_INT / KNOB_U32 only */
+} ctm_env_knob_t;
+
+static const ctm_env_knob_t k_knobs[] = {
+    { "CTM_HID_WAIT_MS",       offsetof(ctm_controller_t, hid_wait_ms),
+      KNOB_INT, 0, 20 },
+    { "CTM_RUMBLE_MIN_US",     offsetof(ctm_controller_t, rumble_min_us),
+      KNOB_U32, 8000, 200000 },
+    { "CTM_AUDIO_PLC_FILL_US", offsetof(ctm_controller_t, audio.plc_fill_interval_us),
+      KNOB_U32, 5000, 20000 },
+    { "CTM_AUDIO_PLC",         offsetof(ctm_controller_t, audio.plc_enabled),
+      KNOB_FLAG_UNLESS_0, 0, 0 },
+    { "CTM_AUDIO_PLC_FILL",    offsetof(ctm_controller_t, audio.plc_fill_enabled),
+      KNOB_FLAG_IF_1, 0, 0 },
+    { "CTM_ADAPT_LATENCY",     offsetof(ctm_controller_t, adapt_enabled),
+      KNOB_FLAG_IF_1, 0, 0 },
+};
+
+/* Seed the pump tunables from the type's policy, then let the environment
+ * override them. Runs for EVERY type: the knobs used to live inside
+ * `if (ops->raw_acl_output)`, so setting one had no effect on anything but a
+ * DS5, and the fields simply stayed 0. The policy defaults reproduce those
+ * zeros, so with no env set every type behaves exactly as before.
+ * When: once per session thread, before the HID open. */
+static void apply_pump_policy(ctm_controller_t *c)
+{
+    static const ctm_pump_policy_t k_policy_off = {0};
+    const ctm_pump_policy_t *p = (c->ops && c->ops->policy) ? c->ops->policy : &k_policy_off;
+
+    c->hid_wait_ms = p->hid_eagain_wait_ms;
+    c->dedup_report_id = p->dedup_report_id;
+    c->rumble_min_us = p->rumble_min_us;
+    c->adapt_enabled = p->adaptive_latency ? 1 : 0;
+    c->audio.plc_enabled = p->audio_plc ? 1 : 0;
+    c->audio.plc_fill_enabled = p->audio_plc_fill ? 1 : 0;
+    /* Not per type: the fill's slot period is a property of the DS5's ~100 Hz
+     * audio clock, not of the controller. 16000 = 1.5x the 0x36 slot period
+     * (10667; 0x39 doubles both via ds5_audio_fill_eff_us -> 32000 vs 21334).
+     * The old 10000 default sat BELOW the real cadence, so every marginally
+     * late real frame drew a synth — a duplicate-injection storm on a jittery
+     * link. 1.5 slots means a synth fires only for a genuinely stalled slot,
+     * still early enough to bridge a 60ms pad buffer. */
+    c->audio.plc_fill_interval_us = 16000;
+
+    for (size_t i = 0; i < sizeof(k_knobs) / sizeof(k_knobs[0]); ++i) {
+        const ctm_env_knob_t *k = &k_knobs[i];
+        const char *v = getenv(k->env);
+        if (!v) continue;
+        void *field = (char *)c + k->off;
+        switch (k->kind) {
+            case KNOB_INT:
+            case KNOB_U32: {
+                long n = atol(v);
+                if (n < k->lo) n = k->lo;
+                if (n > k->hi) n = k->hi;
+                if (k->kind == KNOB_INT) *(int *)field = (int)n;
+                else *(uint32_t *)field = (uint32_t)n;
+                break;
+            }
+            case KNOB_FLAG_UNLESS_0:
+                *(int *)field = strcmp(v, "0") != 0 ? 1 : 0;
+                break;
+            case KNOB_FLAG_IF_1:
+                *(int *)field = strcmp(v, "1") == 0 ? 1 : 0;
+                break;
+        }
+    }
+    /* CTM_DEDUP is a kill switch over a report id, not a boolean field: only
+     * "0" is meaningful; anything else keeps the type's own id. */
+    const char *denv = getenv("CTM_DEDUP");
+    if (denv && strcmp(denv, "0") == 0) c->dedup_report_id = 0;
+    /* The fill is a mode of the PLC, not an independent feature. */
+    if (!c->audio.plc_enabled) c->audio.plc_fill_enabled = 0;
+
+    ctl_log(c, "pump policy: idle=%ums hidwait=%dms dedup=0x%02x rumble_min=%uus "
+               "plc=%d fill=%d(%uus) adapt=%d",
+            p->input_idle_timeout_ms, c->hid_wait_ms, c->dedup_report_id,
+            c->rumble_min_us, c->audio.plc_enabled, c->audio.plc_fill_enabled,
+            c->audio.plc_fill_interval_us, c->adapt_enabled);
+}
+
 /* Session thread body: open HID + wake pipe once, then the dual-probe
  * connect -> grab -> run_session -> release -> disconnect loop until plug_out.
  * When: the controller's own thread, started by plug_in. */
@@ -2398,84 +2526,11 @@ static void *session_main(void *arg)
             ctl_log(c, "raw-ACL output disabled by CTM_RAW_ACL=0 (daemon-free hidraw path; "
                        "needs 0x39 host audio)");
         }
-        const char *penv = getenv("CTM_AUDIO_PLC");
-        c->audio.plc_enabled = (!penv || strcmp(penv, "0") != 0);
-        ctl_log(c, "audio PLC %s", c->audio.plc_enabled ? "enabled" : "disabled");
-        /* Timer-driven loss concealment: on by default when PLC is on. The
-         * interval targets the DS5's ~100 Hz audio clock (10 ms); a lost frame
-         * that leaves a slot unfilled past one interval is re-injected. */
-        const char *fenv = getenv("CTM_AUDIO_PLC_FILL");
-        /* DEFAULT OFF again since 1.3.1 — the latency slider is the truth.
-         *
-         * The fill was built for the daemon-free path, where a network stall
-         * landed on top of 30–67ms of air jitter and blew past a 60ms pad
-         * buffer. With the raw-ACL transport shipping in this IPK that air hop
-         * is gone, and a stall inside the buffer's own budget needs no synthetic
-         * frame at all. Leaving it on was not free: its trigger is purely
-         * receive-side (a real 0x39 more than ds5_audio_fill_eff_us late, measured
-         * from ARRIVAL — the transport does not enter), so it kept firing at
-         * 2–5/s on ordinary network jitter, and every single fire re-armed the
-         * adaptive latency ramp below for 10s. Measured over a 14-minute Ratchet
-         * session: 1317 fills, ramp pinned at +40ms the entire time, i.e. a
-         * slider set to 60 silently ran at 100.
-         *
-         * The 07-08 seq regression it once had (synth nibble overtakes LATE real
-         * frames -> valid-CRC-but-silent pad) stays designed out by the
-         * client-authoritative tx_audio_seq, so turning it back on is safe:
-         * CTM_AUDIO_PLC_FILL=1, which is what the daemon-free fallback wants. */
-        c->audio.plc_fill_enabled = c->audio.plc_enabled && fenv && strcmp(fenv, "1") == 0;
-        const char *fienv = getenv("CTM_AUDIO_PLC_FILL_US");
-        /* Default 16000 = 1.5x the 0x36 slot period (10667; 0x39 doubles both
-         * via ds5_audio_fill_eff_us -> 32000 vs 21334). The old 10000 default sat
-         * BELOW the real cadence, so every marginally-late real frame drew a
-         * synth — a duplicate-injection storm on a jittery link. 1.5 slots
-         * means a synth fires only for a genuinely stalled slot, still early
-         * enough to bridge a 60ms pad buffer. */
-        int fival = fienv ? atoi(fienv) : 16000;
-        if (fival < 5000) fival = 5000;
-        if (fival > 20000) fival = 20000;
-        c->audio.plc_fill_interval_us = (uint32_t)fival;
-        ctl_log(c, "audio PLC fill %s (%u us)",
-                c->audio.plc_fill_enabled ? "enabled" : "disabled", c->audio.plc_fill_interval_us);
-        /* Rumble min-interval while audio is live (see the drain block). The
-         * one-outstanding budget leaves ~15 rumble slots/s beside 0x39 audio;
-         * 48ms (~21/s) is a slight overdraw the queue absorbs in bursts,
-         * chosen so artzox trigger-kick frames (25ms cadence) coalesce ~2:1
-         * instead of 3:1. */
-        const char *rmenv = getenv("CTM_RUMBLE_MIN_US");
-        long rmv = rmenv ? atol(rmenv) : 48000;
-        if (rmv < 8000) rmv = 8000;
-        if (rmv > 200000) rmv = 200000;
-        c->rumble_min_us = (uint32_t)rmv;
-        /* Adaptive pad latency: DEFAULT OFF since 1.3.1 — the slider value now
-         * passes through untouched and means what it says.
-         *
-         * One bridged stall armed this for 10s (see the fill block in
-         * run_session), so with
-         * fills running at a few per second it never decayed and simply added a
-         * permanent +40ms on top of whatever the user had dialled in. That was
-         * defensible while the daemon-free path had to absorb the air-jitter
-         * tail; it is not defensible now that the transport removes that tail,
-         * because it hands the latency straight back. Opt in with
-         * CTM_ADAPT_LATENCY=1 (only useful together with CTM_AUDIO_PLC_FILL=1,
-         * since nothing else arms it). */
-        const char *adenv = getenv("CTM_ADAPT_LATENCY");
-        c->adapt_enabled = adenv && strcmp(adenv, "1") == 0;
-        ctl_log(c, "rumble slotting min=%uus (audio-live), adaptive latency %s",
-                c->rumble_min_us, c->adapt_enabled ? "enabled (+40ms cap)" : "disabled");
-        const char *wenv = getenv("CTM_HID_WAIT_MS");
-        c->hid_wait_ms = wenv ? atoi(wenv) : 3;
-        if (c->hid_wait_ms < 0) {
-            c->hid_wait_ms = 0;
-        }
-        if (c->hid_wait_ms > 20) {
-            c->hid_wait_ms = 20;
-        }
-        ctl_log(c, "hid EAGAIN wait=%dms", c->hid_wait_ms);
-        const char *denv = getenv("CTM_DEDUP");
-        c->dedup_enabled = (!denv || strcmp(denv, "0") != 0);
-        ctl_log(c, "0x31 dedup %s", c->dedup_enabled ? "enabled" : "disabled");
     }
+
+    /* Pump policy: the type's measured defaults (ctm_pump_policy_t, defined
+     * next to each ops table), then the env overrides on top. */
+    apply_pump_policy(c);
 
     c->hid_fd = open_hid(c, &caps, report_desc, &report_desc_len);
     if (c->hid_fd < 0 && c->ops && strcmp(c->ops->kind, "flydigi") == 0 &&

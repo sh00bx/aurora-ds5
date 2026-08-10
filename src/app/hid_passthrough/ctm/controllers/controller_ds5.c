@@ -303,8 +303,55 @@ static void ds5_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
     p[36] |= 0x80;                    /* touch finger 2 up */
 }
 
+/* Pump policy. The DualSense is the type every one of these knobs was written
+ * for, so this literal is where their measured defaults live; the env vars in
+ * controller_common.c's k_knobs[] override them per session.
+ *
+ * input_idle_timeout_ms = 2000: a connected DS5 streams input reports
+ *   continuously (~250/s even idle) and the app's static jail hidraw node
+ *   never raises POLLHUP when the pad drops off BT, so multi-second silence is
+ *   the only available "link is gone" signal. This value is load-bearing —
+ *   raising or clearing it re-introduces the mid-session-BT-reconnect wedge
+ *   that froze the whole app.
+ *
+ * rumble_min_us = 48000: the BT one-outstanding budget leaves ~15 rumble
+ *   slots/s beside 0x39 audio; 48 ms (~21/s) is a slight overdraw the queue
+ *   absorbs in bursts, chosen so artzox trigger-kick frames (25 ms cadence)
+ *   coalesce ~2:1 instead of 3:1.
+ *
+ * audio_plc_fill = false since 1.3.1 — the latency slider is the truth. The
+ *   fill was built for the daemon-free path, where a network stall landed on
+ *   top of 30-67 ms of air jitter and blew past a 60 ms pad buffer. With the
+ *   raw-ACL transport shipping in the IPK that air hop is gone, and a stall
+ *   inside the buffer's own budget needs no synthetic frame. Leaving it on was
+ *   not free: its trigger is purely receive-side (a real 0x39 more than
+ *   ds5_audio_fill_eff_us late, measured from ARRIVAL — the transport does not
+ *   enter), so it fired at 2-5/s on ordinary jitter, and every fire re-armed
+ *   the adaptive ramp for 10 s. Measured over a 14-minute Ratchet session:
+ *   1317 fills, ramp pinned at +40 ms throughout, i.e. a slider set to 60
+ *   silently ran at 100. The 07-08 seq regression it once had (synth nibble
+ *   overtakes LATE real frames -> valid-CRC-but-silent pad) stays designed out
+ *   by the client-authoritative tx_audio_seq, so CTM_AUDIO_PLC_FILL=1 is safe
+ *   to switch on — that is what the daemon-free fallback wants.
+ *
+ * adaptive_latency = false since 1.3.1, for the same reason: one bridged stall
+ *   armed it for 10 s, so with fills running a few per second it never decayed
+ *   and simply added a permanent +40 ms on top of whatever the user dialled in.
+ *   Opt in with CTM_ADAPT_LATENCY=1, only useful together with
+ *   CTM_AUDIO_PLC_FILL=1 since nothing else arms it. */
+static const ctm_pump_policy_t ds5_policy = {
+    .input_idle_timeout_ms = 2000,
+    .hid_eagain_wait_ms = 3,
+    .dedup_report_id = 0x31,
+    .rumble_min_us = 48000,
+    .audio_plc = true,
+    .audio_plc_fill = false,
+    .adaptive_latency = false,
+};
+
 const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .kind = "ds5",
+    .policy = &ds5_policy,
     .needs_host_config = true,
     .grab_evdev = true,
     .request_bt_mode = true,

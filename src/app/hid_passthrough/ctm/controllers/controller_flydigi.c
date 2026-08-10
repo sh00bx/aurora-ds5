@@ -41,8 +41,20 @@ static int flydigi_select_node(const ctm_controller_dev_t *dev, char *out, size_
     return -1;
 }
 
+/* Pump policy. input_idle_timeout_ms MUST stay 0. In XInput mode the bridged
+ * hidraw is the handshake node (or, in the worst case, the dongle's
+ * mouse-emulation interface); the gamepad itself arrives over the xpad evdev
+ * feeder, so that node is legitimately silent for as long as the user is not
+ * touching a hidraw-backed function. With a watchdog the session tore itself
+ * down every 2 s forever, and each teardown stopped the evdev feeder — i.e.
+ * the pad flapped for exactly as long as it was plugged in. */
+static const ctm_pump_policy_t flydigi_policy = {
+    .input_idle_timeout_ms = 0,
+};
+
 const ctm_controller_ops_t ctm_controller_flydigi_ops = {
     .kind = "flydigi",
+    .policy = &flydigi_policy,
     .matches = flydigi_matches,
     .select_node = flydigi_select_node,
     .on_plug_init = NULL,

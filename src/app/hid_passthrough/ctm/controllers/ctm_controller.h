@@ -35,6 +35,50 @@ typedef struct {
 
 typedef struct ctm_controller ctm_controller_t;   /* opaque; defined in stage 2 */
 
+/* Per-type pump policy: the knobs the shared pump used to hardcode for the
+ * DualSense. Every ops table carries one, so a type's behaviour is readable in
+ * one literal instead of spread over conditionals in controller_common.c.
+ *
+ * These are DEFAULTS. controller_common.c's k_knobs[] table lets an env var
+ * override each of them at session start — uniformly for every type, which is
+ * new: the getenv() block used to sit inside `if (ops->raw_acl_output)`, so
+ * five of these were silently inert for everything but the DS5. A type that
+ * wants a feature off must therefore say 0 here, not rely on never reaching
+ * the code. */
+typedef struct {
+    /* Declare the link down after this many ms with no input report and force
+     * a session teardown + reconnect. 0 = no watchdog.
+     *
+     * Only sound for a type whose bridged hidraw node genuinely streams while
+     * the pad is connected — a DS5/DS4 over BT emits ~250 reports/s even idle,
+     * so silence really does mean the link died (and the app's static jail
+     * hidraw node never raises POLLHUP when it does, which is why the timeout
+     * exists at all). For a type whose bridged node is silent by design — the
+     * Flydigi XInput handshake node, whose gamepad data arrives via the xpad
+     * evdev feeder, or any relay type that only reports on user action — this
+     * MUST stay 0: the watchdog would tear the session down every 2 s forever,
+     * killing gamepad input on each cycle. */
+    uint32_t input_idle_timeout_ms;
+    /* ms to wait for POLLOUT after a hidraw write returns EAGAIN before giving
+     * up on the report. 0 = don't wait. */
+    int      hid_eagain_wait_ms;
+    /* Output report id that may be skipped when byte-identical to the last one
+     * actually sent (bounded by DEDUP31_TTL_US). 0 = no dedup. */
+    uint8_t  dedup_report_id;
+    /* Minimum gap between rumble writes while an audio stream is live. Read
+     * only on the hidraw audio path (see the rumble-slot drain in the pump). */
+    uint32_t rumble_min_us;
+    /* DS BT audio concealment (ctm_ds5_audio.c). audio_plc = splice a cached
+     * audio block into a 0x36 that arrived without one; audio_plc_fill =
+     * additionally re-inject the last frame when a real one is overdue;
+     * adaptive_latency = raise the pad's jitter buffer while the fill bridges.
+     * The last two are OFF by design on every type — see the commentary at the
+     * DS5 literal for the measurements behind that. */
+    bool     audio_plc;
+    bool     audio_plc_fill;
+    bool     adaptive_latency;
+} ctm_pump_policy_t;
+
 typedef struct {
     const char *kind;   /* "ds5" / "ds4" / "xbox" / "steam_puck" / "generic" */
 
@@ -49,6 +93,10 @@ typedef struct {
                                    * gamepad interface IN endpoint (no hidraw). */
     bool raw_acl_output;          /* DS5: inject high-rate output via raw HCI-ACL
                                    * forwarder; falls back to hidraw on failure. */
+
+    /* Pump tunables for this type. Every ops table below sets one; a NULL
+     * policy is read as all-zero (every feature off, no watchdog). */
+    const ctm_pump_policy_t *policy;
 
     /* Does this type claim the device? Factory tries specific types first,
      * generic last. */

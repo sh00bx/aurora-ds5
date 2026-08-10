@@ -29,8 +29,16 @@ static bool xbox_matches(const ctm_controller_dev_t *dev)
            (xbox_pid(dev->pid) || (dev->name[0] && strcasestr(dev->name, "xbox")));
 }
 
+/* Pump policy: verbatim relay, no watchdog. An idle Xbox pad over BT does not
+ * stream the way a DualSense does, so an idle timeout here would be a
+ * flap generator, not a liveness check. */
+static const ctm_pump_policy_t xbox_policy = {
+    .input_idle_timeout_ms = 0,
+};
+
 const ctm_controller_ops_t ctm_controller_xbox_ops = {
     .kind = "xbox",
+    .policy = &xbox_policy,
     .matches = xbox_matches,
     .select_node = NULL,
     .on_plug_init = NULL,   /* STAGE 2: reserved for BT init/handshake if needed */

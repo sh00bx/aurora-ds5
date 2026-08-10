@@ -15,8 +15,15 @@ static bool steam_puck_matches(const ctm_controller_dev_t *dev)
            strcmp(dev->pid, "1304") == 0;
 }
 
+/* Pump policy: composite relay, no watchdog — the puck's forwarded interfaces
+ * only report on user action, so silence is the normal idle state. */
+static const ctm_pump_policy_t steam_puck_policy = {
+    .input_idle_timeout_ms = 0,
+};
+
 const ctm_controller_ops_t ctm_controller_steam_puck_ops = {
     .kind = "steam_puck",
+    .policy = &steam_puck_policy,
     .matches = steam_puck_matches,
     .select_node = NULL,    /* STAGE 2: pick the gamepad/vendor hidraw interface */
     .on_plug_init = NULL,   /* STAGE 2: SET_SETTINGS lizard-mode exit */

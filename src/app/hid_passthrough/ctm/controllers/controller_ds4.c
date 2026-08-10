@@ -111,8 +111,21 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     return 0;
 }
 
+/* Pump policy. The DS4 shares the DS5's BT premise — a connected pad streams
+ * input continuously, and the jail hidraw node never signals the drop — so it
+ * gets the same 2 s liveness watchdog, and nothing else.
+ *
+ * Everything below it stays 0 because none of it ever ran for this type: the
+ * DS4's audio output report is 0x15, while the concealment, the rumble slot
+ * and the dedup cache all key on the DS5's 0x36/0x39/0x31. Turning any of them
+ * on here would be new behaviour, not a restored default. */
+static const ctm_pump_policy_t ds4_policy = {
+    .input_idle_timeout_ms = 2000,
+};
+
 const ctm_controller_ops_t ctm_controller_ds4_ops = {
     .kind = "ds4",
+    .policy = &ds4_policy,
     .needs_host_config = true,
     .grab_evdev = true,
     .request_bt_mode = true,
