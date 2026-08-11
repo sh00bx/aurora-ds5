@@ -3,9 +3,10 @@ name: Build (webOS)
 on:
   workflow_dispatch:
   push:
-    # Don't run for tags
+    # Don't run for tags. Our release tags are ds5-v*, which never matched the
+    # upstream 'v*.*.*' pattern, so every release fired a second, identical build.
     tags-ignore:
-      - 'v*.*.*'
+      - '**'
     branches:
       - main
       - 'release/**'
