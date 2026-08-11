@@ -11,9 +11,12 @@
  * hidraw), so "what actually reached the device" is answerable in one place
  * instead of five.
  *
- * Threads: the write paths run on the controller's session thread. The fd is
- * also read (never written) by the input thread's poll and dup()'d by the
- * feature worker; ctm_hid_io_fd() exists for exactly those two. */
+ * Threads: every write path is reached from the controller's session thread
+ * (the pump's rumble drain, the paced drain, handle_message) — but nothing
+ * here relies on that: the writes are serialised by this object's own mutex
+ * and the counters are relaxed atomics, so a future caller on another thread
+ * costs accuracy nowhere. The fd is additionally read by the input thread's
+ * poll and dup()'d by the feature worker; ctm_hid_io_fd() exists for those. */
 
 #include <stdbool.h>
 #include <stddef.h>

@@ -9,7 +9,8 @@
  * reach the controller ONLY through the functions below, so the state each
  * module owns lives in its own struct and cannot be aliased from another.
  *
- * Nothing outside ctm/controllers/ includes this header. */
+ * Internal to ctm/controllers/ — check with
+ * `grep -rl ctm_controller_priv.h src/` before assuming otherwise. */
 
 #include <stdarg.h>
 #include <stdbool.h>
