@@ -575,6 +575,26 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
     return 0;
 }
 
+/* The USB bus id a logical device's Flydigi lookups should run against: the one
+ * the model resolved, else the one encoded in a "flydigi:<busid>" key, else "".
+ * Emptying @p out on every miss is what lets the callers keep treating "" as
+ * "not a Flydigi we can address" instead of reading whatever was on the stack. */
+static void flydigi_busid_for_item(const logical_device_t *item, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!item) {
+        return;
+    }
+    if (item->usb_busid[0]) {
+        snprintf(out, out_len, "%s", item->usb_busid);
+    } else if (starts_with(item->key, "flydigi:")) {
+        snprintf(out, out_len, "%s", item->key + strlen("flydigi:"));
+    }
+}
+
 static int flydigi_hidraw_pick(const char *usb_busid, const logical_device_t *only_item)
 {
     int best_idx = -1;
@@ -652,12 +672,8 @@ bool flydigi_is_xinput_mode_for_busid(const char *usb_busid)
 bool flydigi_is_xinput_mode(const logical_device_t *item)
 {
     if (!item) return false;
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     return flydigi_is_xinput_mode_for_busid(busid);
 }
 
@@ -700,12 +716,8 @@ bool flydigi_is_xinput_evdev_only(const logical_device_t *item)
     if (!item) {
         return false;
     }
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     return flydigi_is_xinput_evdev_only_for_busid(busid);
 }
 
@@ -714,12 +726,8 @@ int flydigi_xpad_scan_index_for_item(const logical_device_t *item)
     if (!item) {
         return -1;
     }
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     if (!flydigi_is_xinput_evdev_only_for_busid(busid)) {
         return -1;
     }
@@ -794,12 +802,8 @@ int flydigi_handshake_hidraw_path_for_busid(const char *usb_busid, char *out, si
 int flydigi_handshake_hidraw_path_for_item(const logical_device_t *item, char *out, size_t out_len)
 {
     if (!item || !out || out_len == 0) return -1;
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     int pick = flydigi_handshake_hidraw_pick(busid[0] ? busid : NULL, item);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
@@ -818,12 +822,8 @@ int flydigi_hidraw_path_for_busid(const char *usb_busid, char *out, size_t out_l
 int flydigi_hidraw_path_for_item(const logical_device_t *item, char *out, size_t out_len)
 {
     if (!item || !out || out_len == 0) return -1;
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     int pick = flydigi_hidraw_pick(busid[0] ? busid : NULL, item);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
@@ -905,12 +905,8 @@ int flydigi_xpad_evdev_path_for_item(const logical_device_t *item, char *out, si
     if (!item || !out || out_len == 0) {
         return -1;
     }
-    char busid[64] = {0};
-    if (item->usb_busid[0]) {
-        snprintf(busid, sizeof(busid), "%s", item->usb_busid);
-    } else if (starts_with(item->key, "flydigi:")) {
-        snprintf(busid, sizeof(busid), "%s", item->key + strlen("flydigi:"));
-    }
+    char busid[64];
+    flydigi_busid_for_item(item, busid, sizeof(busid));
     if (!busid[0]) {
         return -1;
     }
