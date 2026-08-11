@@ -127,6 +127,8 @@ typedef struct {
     tv_bridge_worker_settings_t settings;
     unsigned int headset_volume_percent;
     unsigned int speaker_volume_percent;
+    uint32_t seq;   /* creation order, so a full table evicts the oldest record
+                     * that no longer belongs to a present or bridged device */
 } ui_device_settings_t;
 
 /* One USB interface of a composite device (from the device-dir sysfs walk). */

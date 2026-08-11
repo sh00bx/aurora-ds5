@@ -100,24 +100,65 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     return settings;
 }
 
+/* The oldest settings record that belongs to neither a device in the current
+ * model nor a live bridge session, or NULL when every record is in use.
+ *
+ * Overwritten in place rather than compacted: settings_for_item() hands out
+ * pointers into this table and callers hold them across a few statements, so
+ * shifting the array would move records under them. */
+static ui_device_settings_t *settings_record_to_evict(void)
+{
+    ui_device_settings_t *oldest = NULL;
+    for (int i = 0; i < g_settings_count; ++i) {
+        if (logical_device_by_key(g_settings[i].key)) {
+            continue;   /* still enumerated: the user can still see and change it */
+        }
+        if (session_index_for_key(g_settings[i].key) >= 0) {
+            continue;   /* still bridged */
+        }
+        if (!oldest || g_settings[i].seq < oldest->seq) {
+            oldest = &g_settings[i];
+        }
+    }
+    return oldest;
+}
+
 ui_device_settings_t *ui_record_for_item(const logical_device_t *item)
 {
+    static uint32_t seq;
     if (!item) return NULL;
     for (int i = 0; i < g_settings_count; ++i) {
         if (strcmp(g_settings[i].key, item->key) == 0) {
             return &g_settings[i];
         }
     }
-    if (g_settings_count >= MAX_DEVICES) {
-        return NULL;
+
+    ui_device_settings_t *record;
+    if (g_settings_count < MAX_DEVICES) {
+        record = &g_settings[g_settings_count++];
+    } else {
+        /* The table fills up because the keys churn: a Bluetooth DS5 is keyed
+         * "hid:hidrawN" and picks up a different minor whenever it sleeps and
+         * reconnects, so a long run accumulates one dead record per cycle.
+         * Returning NULL here stopped auto-plug dead (the reconcile treats a
+         * NULL settings pointer as "not auto") and made a manual plug bridge
+         * the pad with ctm_controller_create()'s calloc'd zeros — kind HID
+         * instead of DS5, 0 ms latency, 0 % volumes, no haptics — with no
+         * diagnostic anywhere. Evict a record for a device that is neither
+         * present nor bridged instead; those are exactly the dead ones. */
+        record = settings_record_to_evict();
+        if (!record) {
+            return NULL;
+        }
+        log_append("settings table full; dropping saved settings for %s", record->key);
     }
-    snprintf(g_settings[g_settings_count].key, sizeof(g_settings[0].key), "%s", item->key);
-    g_settings[g_settings_count].settings = default_settings_for_item(item);
-    g_settings[g_settings_count].headset_volume_percent =
-        g_settings[g_settings_count].settings.headset_volume_percent;
-    g_settings[g_settings_count].speaker_volume_percent =
-        g_settings[g_settings_count].settings.speaker_volume_percent;
-    return &g_settings[g_settings_count++];
+    memset(record, 0, sizeof(*record));
+    record->seq = ++seq;
+    snprintf(record->key, sizeof(record->key), "%s", item->key);
+    record->settings = default_settings_for_item(item);
+    record->headset_volume_percent = record->settings.headset_volume_percent;
+    record->speaker_volume_percent = record->settings.speaker_volume_percent;
+    return record;
 }
 
 tv_bridge_worker_settings_t *settings_for_item(const logical_device_t *item)
@@ -777,9 +818,15 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         goto fail_bridge;
     }
     tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (settings) {
-        ctm_controller_set_settings(controller, settings);
+    if (!settings) {
+        /* Every record in the settings table belongs to a present or bridged
+         * device, so there is nothing to evict. Bridging anyway would hand the
+         * controller its calloc'd zeros — generic HID kind, no volumes, no
+         * haptics — and look like a successful plug. */
+        ctm_set_plug_error("No settings slot for %s", item->name);
+        goto fail_bridge;
     }
+    ctm_controller_set_settings(controller, settings);
     /* Composite: forward cached USB enumeration so the host builds the device. */
     if (strcmp(kind, "puck") == 0 || strcmp(kind, "flydigi") == 0) {
         char enum_key[64];
