@@ -1,5 +1,9 @@
-/* What is left of ui_devices.c while it is being split: the logical-device
- * model, which moves to ctm_model.c next and empties this file. */
+/* The logical device model: fold the scan's per-interface device_info_t rows
+ * into one logical_device_t per physical controller, keep the plugged and
+ * expanded key sets the panel renders from, and answer "which scan row
+ * represents this device".
+ *
+ * Split out of ui_devices.c; the code is unchanged. */
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE

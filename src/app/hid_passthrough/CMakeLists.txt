@@ -7,10 +7,10 @@ if (TARGET_WEBOS)
             hid_pt_gamepad_match.c
             hid_passthrough_manager.c
             ctm/ctm_state.c
-            ctm/ui_devices.c
             ctm/ctm_classify.c
             ctm/ctm_dev_composite.c
             ctm/ctm_enumerate.c
+            ctm/ctm_model.c
             ctm/ui_bridge.c
             ctm/controllers/controller_common.c
             ctm/controllers/ctm_composite.c
