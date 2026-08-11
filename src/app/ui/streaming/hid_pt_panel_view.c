@@ -57,8 +57,9 @@ static void dropdown_key_cb(lv_event_t *event)
     }
 }
 
-/* The sheet is the group's fallback target: it only handles a key when it is
- * itself the object the key was sent to, never one bubbled up from a child. */
+/* Registered on the sheet, which sits above every control in the tree. It acts
+ * only on a key event the sheet itself was the target of, so a key delivered to
+ * a control is handled by that control's own registration and not twice. */
 static void sheet_key_cb(lv_event_t *event)
 {
     hid_pt_view_t *view = lv_event_get_user_data(event);

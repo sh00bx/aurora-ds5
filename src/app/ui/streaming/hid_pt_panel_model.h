@@ -8,8 +8,9 @@
  * translation units (the widget layer in hid_pt_panel_view.c and the wiring in
  * hid_passthrough_panel.c) get devices as plain values -- a key, a label, a
  * plugged flag, a block of control values -- and can therefore not reach
- * g_devices, g_sessions, g_settings or g_agent_host at all. Only
- * hid_pt_panel_model.c includes ctm_state.h.
+ * g_devices, g_sessions, g_settings or g_agent_host at all. Of the panel's
+ * three translation units, only this module's includes ctm_state.h, so those
+ * names are not even declared in the other two.
  *
  * Everything here runs on the LVGL thread. That is not a property this module
  * enforces; it is the same contract root.c states for every other CTM caller,

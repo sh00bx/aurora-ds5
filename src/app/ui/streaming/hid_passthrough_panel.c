@@ -3,19 +3,21 @@
 /**
  * The HID passthrough panel's wiring.
  *
- * Three files, one job each: hid_pt_panel_view.c builds and drives the widgets
- * and knows nothing about devices; hid_pt_panel_model.c owns the selection and
- * is the only place that touches the CTM globals; this file is what connects
- * them, and the only place where a widget event meets a device.
+ * Three files, one job each. hid_pt_panel_view.c builds and drives the widgets;
+ * its TU has no include path to the model, so it cannot name a device.
+ * hid_pt_panel_model.c owns the selection and is the panel's only door to the
+ * CTM globals; this TU in turn has no include path to ctm_state.h. That leaves
+ * this file as the one place where a widget event meets a device.
  *
- * The two directions are separate on purpose:
+ * The two directions are kept apart:
  *   - sync_customize_ui_from_settings() and update_device_options() push the
  *     model into the widgets. They run on the 2 s refresh as well as on a
  *     selection change, so they must not overwrite a control the user currently
- *     owns -- see the comment on sync_customize_ui_from_settings().
- *   - customize_setting_changed() and the two checkbox handlers push the
- *     widgets into the model, and are only ever reached from a widget's
- *     LV_EVENT_VALUE_CHANGED, i.e. from a change the user just made.
+ *     owns -- see the comment on sync_customize_ui_from_settings() for the one
+ *     control where that is enforced, and why the sliders need no such guard.
+ *   - customize_setting_changed(), and the composite and auto-plug branches of
+ *     panel_value_changed(), push the widgets into the model. Every caller is a
+ *     widget's LV_EVENT_VALUE_CHANGED, i.e. a change the user just made.
  */
 
 #include "hid_passthrough_panel.h"
@@ -38,6 +40,11 @@ typedef struct {
     hid_pt_view_t view;
     hid_pt_model_t model;
     session_t *session;
+    /* Stored, and nothing in this file calls them. The panel asks to be closed
+     * by pushing USER_CLOSE_HID_PANEL (panel_request_close()); the one caller,
+     * streaming.controller.c, handles that event and invokes its own close
+     * callback there, so nothing is lost today. A different caller that passed
+     * a callback here would simply never see it run. */
     hid_passthrough_panel_close_cb on_close;
     void *on_close_userdata;
     lv_timer_t *refresh_timer;
