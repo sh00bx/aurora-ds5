@@ -6,12 +6,75 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
 BRANDING = ROOT / "src" / "app" / "res" / "branding"
 SPLASH_SOURCE = BRANDING / "aurora_splash.png"
 ICON_SOURCE = BRANDING / "aurora_icon.png"
+
+# The fork installs next to upstream Aurora and gets its own home-screen tile,
+# so the icon has to say which one it is. The arch leaves a dark band below its
+# feet; the mark sits there rather than on top of any artwork. Sized off the
+# tile, not the canvas, so it survives the 130 px webOS icon.
+DS5_MARK_TEXT = "DS5"
+DS5_MARK_FONT = Path("/usr/share/fonts/truetype/lato/Lato-Black.ttf")
+DS5_MARK_CAP_FRACTION = 0.098  # of tile height
+DS5_MARK_TRACKING = 0.14  # em
+DS5_MARK_BASELINE = 0.90  # fraction of tile height, from the tile top
+DS5_MARK_FILL = (234, 240, 255, 250)
+DS5_MARK_GLOW = (120, 190, 255, 90)
+
+
+def tile_bounds(im: Image.Image) -> tuple[int, int, int, int]:
+    """Bounding box of the rounded tile inside the transparent/black canvas."""
+    rgb = im.convert("RGB")
+    # The tile body is a very dark navy but never pure black; the canvas is.
+    mask = rgb.point(lambda v: 255 if v > 4 else 0).convert("L")
+    box = mask.getbbox()
+    if box is None:
+        return 0, 0, im.width, im.height
+    return box
+
+
+def draw_ds5_mark(icon: Image.Image) -> Image.Image:
+    """Stamp a small DS5 wordmark into the dark band below the arch."""
+    out = icon.convert("RGBA")
+    left, top, right, bottom = tile_bounds(out)
+    tile_w = right - left
+    tile_h = bottom - top
+
+    cap = max(1, int(round(tile_h * DS5_MARK_CAP_FRACTION)))
+    if not DS5_MARK_FONT.is_file():
+        raise SystemExit(f"Missing font for the DS5 mark: {DS5_MARK_FONT}")
+    # Ask for a size whose cap height matches the target rather than trusting
+    # the nominal point size, which includes ascender and descender slack.
+    probe = ImageFont.truetype(str(DS5_MARK_FONT), cap)
+    probe_cap = probe.getbbox("D")[3] - probe.getbbox("D")[1]
+    font = ImageFont.truetype(str(DS5_MARK_FONT), max(1, int(round(cap * cap / probe_cap))))
+
+    tracking = int(round(font.size * DS5_MARK_TRACKING))
+    widths = [font.getbbox(ch)[2] - font.getbbox(ch)[0] for ch in DS5_MARK_TEXT]
+    total = sum(widths) + tracking * (len(DS5_MARK_TEXT) - 1)
+
+    layer = Image.new("RGBA", out.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    baseline = top + int(round(tile_h * DS5_MARK_BASELINE))
+    x = left + (tile_w - total) // 2
+    for ch, w in zip(DS5_MARK_TEXT, widths):
+        box = font.getbbox(ch)
+        draw.text((x - box[0], baseline - box[3]), ch, font=font, fill=DS5_MARK_FILL)
+        x += w + tracking
+
+    # A soft cool glow echoes the arch's light and keeps the mark from reading
+    # as a sticker pasted on black.
+    glow = Image.new("RGBA", out.size, (0, 0, 0, 0))
+    glow.paste(Image.new("RGBA", out.size, DS5_MARK_GLOW), (0, 0), layer)
+    glow = glow.filter(ImageFilter.GaussianBlur(max(1, font.size // 6)))
+
+    out.alpha_composite(glow)
+    out.alpha_composite(layer)
+    return out
 
 
 def resize_square(im: Image.Image, size: int) -> Image.Image:
@@ -40,7 +103,7 @@ def main() -> int:
         return 1
 
     splash_src = Image.open(SPLASH_SOURCE)
-    icon_src = Image.open(ICON_SOURCE)
+    icon_src = draw_ds5_mark(Image.open(ICON_SOURCE))
 
     icon_96 = resize_square(icon_src, 96)
     icon_130 = resize_square(icon_src, 130)
