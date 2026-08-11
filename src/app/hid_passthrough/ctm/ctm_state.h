@@ -307,8 +307,13 @@ void enumerate_devices(scan_result_t *result);
 int puck_usb_device_dir(const char *vid, const char *pid, char *out, size_t out_len);
 int composite_usb_device_dir_by_busid(const char *usb_busid, char *out, size_t out_len);
 int composite_enumerate_ifaces(const char *usbdir, composite_if_t *out, int max);
-int composite_enum_capture(const char *usb_busid, const char *vid, const char *pid);
-int puck_enum_capture(const char *vid, const char *pid);
+/* Capture (or confirm) the composite USB enumeration for one device and report
+ * the cache key it landed under in @p out_key — pass NULL when the key is not
+ * wanted. On failure out_key is emptied: there is no entry to attribute to this
+ * device, and picking some other entry is how the host got told to build the
+ * wrong composite. Returns 0 on success. */
+int composite_enum_capture(const char *usb_busid, const char *vid, const char *pid,
+                           char *out_key, size_t out_key_len);
 const composite_enum_t *composite_enum_lookup(const char *key);
 uint8_t *build_composite_enum_payload(const char *key, int *out_len);
 int best_scan_index_for_item(const logical_device_t *item);

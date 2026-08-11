@@ -134,9 +134,9 @@ void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager) {
         const logical_device_t *item = &g_devices.items[i];
         const char *kind = bridge_kind_for_item(item);
         if (strcmp(kind, "puck") == 0) {
-            puck_enum_capture(item->vid, item->pid);
+            composite_enum_capture(NULL, item->vid, item->pid, NULL, 0);
         } else if (strcmp(kind, "flydigi") == 0) {
-            composite_enum_capture(item->usb_busid, item->vid, item->pid);
+            composite_enum_capture(item->usb_busid, item->vid, item->pid, NULL, 0);
         }
     }
 

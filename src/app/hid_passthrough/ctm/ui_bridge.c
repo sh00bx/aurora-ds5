@@ -563,20 +563,25 @@ void node_session_key(const logical_device_t *item, int scan_index, char *out, s
 /* Serialize cached composite enumeration into CTMB_MSG_ENUM payload. */
 static void enum_lookup_key_for_item(const logical_device_t *item, char *out, size_t out_len)
 {
-    if (item && item->usb_busid[0]) {
+    out[0] = '\0';
+    if (!item) {
+        return;
+    }
+    if (item->usb_busid[0]) {
         snprintf(out, out_len, "%s", item->usb_busid);
         return;
     }
-    if (item && strcmp(item->vid, "28de") == 0 && strcmp(item->pid, "1304") == 0) {
-        composite_enum_capture(NULL, item->vid, item->pid);
-        for (int i = 0; i < COMPOSITE_ENUM_MAX_CACHE; ++i) {
-            if (g_composite_enums[i].hdr.valid) {
-                snprintf(out, out_len, "%s", g_composite_enums[i].hdr.key);
-                return;
-            }
-        }
+    /* No resolvable bus id — the sysfs gap this fallback exists for. The
+     * capture keys itself on the usbdir basename, which nothing else here can
+     * reconstruct, so ask it for the key it used. This used to return the first
+     * cache entry with valid != 0 without comparing it to the item at all, and
+     * did so even when the capture had just FAILED: a puck plugged after a
+     * Flydigi was handed the Flydigi's descriptors and the host built a
+     * Flydigi. An empty out fails the plug in the caller, which is the right
+     * answer when nothing can be attributed to this device. */
+    if (ctm_pad_kind_str(item->vid, item->pid) == CTM_PAD_KIND_PUCK) {
+        composite_enum_capture(NULL, item->vid, item->pid, out, out_len);
     }
-    out[0] = '\0';
 }
 
 static bool plug_in_scan_index(logical_device_t *item, int scan_index, const char *session_key)
@@ -609,7 +614,7 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
             snprintf(busid_key, sizeof(busid_key), "%s", item->key + strlen("flydigi:"));
         }
         if (busid_key[0]) {
-            composite_enum_capture(busid_key, item->vid, item->pid);
+            composite_enum_capture(busid_key, item->vid, item->pid, NULL, 0);
         }
     }
     snprintf(cmd, sizeof(cmd), "BRIDGE_START %s %d %s", kind, port, busid);
@@ -686,13 +691,14 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         char enum_key[64];
         enum_lookup_key_for_item(item, enum_key, sizeof(enum_key));
         int elen = 0;
-        uint8_t *epl = build_composite_enum_payload(enum_key, &elen);
+        uint8_t *epl = enum_key[0] ? build_composite_enum_payload(enum_key, &elen) : NULL;
         if (epl) {
             ctm_controller_set_enum_payload(controller, epl, elen);
             free(epl);
             log_append("forwarding composite enumeration to host (%d bytes, key=%s)", elen, enum_key);
         } else {
-            ctm_set_plug_error("Composite enum missing for %s (tap Refresh)", enum_key);
+            ctm_set_plug_error("Composite enum missing for %s (tap Refresh)",
+                               enum_key[0] ? enum_key : item->name);
             ctm_controller_destroy(controller);
             snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
             (void)send_agent_command(cmd, response, sizeof(response));

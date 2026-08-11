@@ -1182,8 +1182,10 @@ static const char *composite_enum_key_for_device(const char *usb_busid, const ch
     return key;
 }
 
-int composite_enum_capture(const char *usb_busid, const char *vid, const char *pid)
+int composite_enum_capture(const char *usb_busid, const char *vid, const char *pid,
+                           char *out_key, size_t out_key_len)
 {
+    if (out_key && out_key_len) out_key[0] = '\0';
     char usbdir[256];
     if (usb_busid && usb_busid[0] &&
         composite_usb_device_dir_by_busid(usb_busid, usbdir, sizeof(usbdir)) == 0) {
@@ -1204,6 +1206,7 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
     uint64_t identity = hid_pt_usb_identity_hash(usbdir);
     const composite_enum_t *live = composite_enum_lookup(key);
     if (live && live->hdr.identity == identity && strcmp(live->hdr.usbdir, usbdir) == 0) {
+        if (out_key && out_key_len) snprintf(out_key, out_key_len, "%s", key);
         return 0;
     }
     if (!identity) {
@@ -1278,12 +1281,8 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
                    cache->ifs[i].cls, cache->ifs[i].rdesc_len,
                    cache->ifs[i].node[0] ? cache->ifs[i].node : "-");
     }
+    if (out_key && out_key_len) snprintf(out_key, out_key_len, "%s", key);
     return 0;
-}
-
-int puck_enum_capture(const char *vid, const char *pid)
-{
-    return composite_enum_capture(NULL, vid, pid);
 }
 
 #define LG_VENDOR_ID 0x005du
