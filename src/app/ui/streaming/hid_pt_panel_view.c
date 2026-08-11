@@ -294,6 +294,44 @@ bool hid_pt_view_is_rebuilding(const hid_pt_view_t *view)
     return view && view->rebuilding;
 }
 
+hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    if (!view || !obj) {
+        return HID_PT_WK_NONE;
+    }
+    if (hid_pt_view_plug_row_of(view, obj) >= 0) {
+        return HID_PT_WK_PLUG;
+    }
+    const struct {
+        lv_obj_t *const *slot;
+        hid_pt_widget_kind_t kind;
+    } table[] = {
+            {&view->composite_cb,       HID_PT_WK_CHECKBOX},
+            {&view->auto_plugin_cb,     HID_PT_WK_CHECKBOX},
+            {&view->latency_slider,     HID_PT_WK_SLIDER},
+            {&view->speaker_slider,     HID_PT_WK_SLIDER},
+            {&view->headset_slider,     HID_PT_WK_SLIDER},
+            {&view->haptics_slider,     HID_PT_WK_SLIDER},
+            {&view->audio_dropdown,     HID_PT_WK_DROPDOWN},
+            {&view->reset_settings_btn, HID_PT_WK_OPTION_BTN},
+            {&view->refresh_btn,        HID_PT_WK_HEADER_BTN},
+            {&view->close_btn,          HID_PT_WK_HEADER_BTN},
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
+        if (*table[i].slot == obj) {
+            return table[i].kind;
+        }
+    }
+    /* The hand-written list this table replaced also accepted any child of the
+     * haptics row, and the haptics slider is the only one of those that is in
+     * the table above. Kept so the answer for the row's other child, the label,
+     * is the one it has always been. */
+    if (view->haptics_row && lv_obj_get_parent(obj) == view->haptics_row) {
+        return HID_PT_WK_OPTION_OTHER;
+    }
+    return HID_PT_WK_NONE;
+}
+
 int hid_pt_view_plug_row_of(const hid_pt_view_t *view, lv_obj_t *obj)
 {
     if (!view || !obj) {

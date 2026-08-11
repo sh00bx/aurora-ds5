@@ -36,6 +36,32 @@ typedef enum {
     HID_PT_CTL_CLOSE,
 } hid_pt_ctl_t;
 
+/**
+ * What the panel's key handling needs to know about an object.
+ *
+ * The order matters: everything from HID_PT_WK_CHECKBOX on is an option
+ * control, i.e. lives in the right-hand pane, which is what
+ * hid_pt_view_kind_is_option() tests.
+ */
+typedef enum {
+    HID_PT_WK_NONE = 0,
+    /** A plug button in the device list. */
+    HID_PT_WK_PLUG,
+    /** A button in the sheet header: Refresh or Close. */
+    HID_PT_WK_HEADER_BTN,
+    HID_PT_WK_CHECKBOX,
+    HID_PT_WK_SLIDER,
+    HID_PT_WK_DROPDOWN,
+    HID_PT_WK_OPTION_BTN,
+    /** Some other part of an option row, e.g. the haptics label. */
+    HID_PT_WK_OPTION_OTHER,
+} hid_pt_widget_kind_t;
+
+static inline bool hid_pt_view_kind_is_option(hid_pt_widget_kind_t kind)
+{
+    return kind >= HID_PT_WK_CHECKBOX;
+}
+
 typedef struct {
     void *userdata;
     /** A control the user just changed (LV_EVENT_VALUE_CHANGED). */
@@ -118,6 +144,9 @@ bool hid_pt_view_has_row(const hid_pt_view_t *view, int row);
 void hid_pt_view_set_row_selected(hid_pt_view_t *view, int row, bool selected);
 
 void hid_pt_view_set_plug_label(hid_pt_view_t *view, int row, bool plugged);
+
+/** Which of the panel's controls @p obj is, or HID_PT_WK_NONE. */
+hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *obj);
 
 /* ---- focus -------------------------------------------------------------- */
 
