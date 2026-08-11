@@ -453,9 +453,9 @@ static uint64_t mono_ms(void)
 
 /* Tear down session @p index completely: unplug and destroy the local
  * controller, tell the host to drop its half of the bridge, and remove the
- * record. Currently reached only from stop_session(); the other two teardown
- * paths (release_local_sessions_on_exit, add_session's replace branch) still
- * have their own copies and do NOT send BRIDGE_STOP. */
+ * record. The only way a bridge ends: stop_session(), the stream-teardown
+ * sweep and add_session()'s replace branch all funnel through here, which is
+ * what keeps BRIDGE_STOP from being forgotten by one of them again. */
 static void session_teardown(int index)
 {
     if (index < 0 || index >= g_session_count) {
@@ -485,11 +485,19 @@ static void session_teardown(int index)
 bool add_session(const char *key, const char *busid, ctm_controller_t *controller, int port)
 {
     int index = session_index_for_key(key);
+    if (index >= 0 && g_sessions[index].controller &&
+        g_sessions[index].controller != controller) {
+        /* A different live bridge already holds this key. It needs the full
+         * teardown, not just a local destroy: its busid is not the one the
+         * caller just started (make_bridge_busid increments a sequence), so
+         * without a BRIDGE_STOP the agent keeps that virtual controller and its
+         * port bound for the rest of the run. Dropping the record here and
+         * falling through to the append path also frees the slot, which is what
+         * lets the append succeed on a table that was at MAX_SESSIONS. */
+        session_teardown(index);
+        index = -1;
+    }
     if (index >= 0) {
-        if (g_sessions[index].controller && g_sessions[index].controller != controller) {
-            ctm_controller_plug_out(g_sessions[index].controller);
-            ctm_controller_destroy(g_sessions[index].controller);
-        }
         snprintf(g_sessions[index].busid, sizeof(g_sessions[index].busid), "%s", busid ? busid : "");
         g_sessions[index].port = port;
         g_sessions[index].controller = controller;
@@ -517,14 +525,17 @@ void stop_session(const char *key)
 
 void release_local_sessions_on_exit(void)
 {
-    for (int i = 0; i < g_session_count; ++i) {
-        if (g_sessions[i].controller) {
-            ctm_controller_plug_out(g_sessions[i].controller);
-            ctm_controller_destroy(g_sessions[i].controller);
-            g_sessions[i].controller = NULL;
-        }
+    /* Every stream end reaches here (session_stop_input -> manager_stop). It
+     * used to destroy the controllers and zero the count without telling the
+     * host anything, so the agent kept one live virtual controller per pad,
+     * bound to 48055, 48056, ... — while next_bridge_port() allocates from the
+     * now-empty local table and hands out 48055 again for the next stream in
+     * the same app run. session_teardown() sends the BRIDGE_STOP and does the
+     * bookkeeping; it always removes the record it is given, so index 0
+     * terminates the loop. */
+    while (g_session_count > 0) {
+        session_teardown(0);
     }
-    g_session_count = 0;
 }
 
 const char *bridge_kind_for_item(const logical_device_t *item)
