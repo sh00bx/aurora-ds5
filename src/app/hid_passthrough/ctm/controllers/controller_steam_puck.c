@@ -15,8 +15,17 @@ static bool steam_puck_matches(const ctm_controller_dev_t *dev)
            strcmp(dev->pid, "1304") == 0;
 }
 
-/* Pump policy: composite relay, no watchdog — the puck's forwarded interfaces
- * only report on user action, so silence is the normal idle state. */
+/* Pump policy: composite relay, no watchdog.
+ *
+ * Structural, not measured: this type is composite, so the node the watchdog
+ * thread polls is one of seven forwarded interfaces and the device can be fully
+ * alive on any of the others. (The rx_tick ticket covers the siblings that
+ * actually forward, but the primary can still be the quiet one.)
+ *
+ * The idle report rate itself was never measured, and neither was whether this
+ * dongle's jail node raises POLLHUP on unplug — so what 0 costs here is not
+ * known either. If a dongle drop is ever observed to wedge the bridge, that is
+ * the measurement to take first. */
 static const ctm_pump_policy_t steam_puck_policy = {
     .input_idle_timeout_ms = 0,
 };

@@ -160,8 +160,13 @@ static const hid_pt_tier_t g_tiers[] = {
  * both resolve to the first pad, the sibling keeps moonlight_gs_id == -1, and on
  * teardown moonlight_slot_other_owner() sees the slot as unowned, clears the
  * exclusion bit and announces an arrival for a pad the other bridge still holds.
- * Stage 2 of the sweep has carried this rule for a while; the resolver is where
- * it belongs. */
+ *
+ * Used by hid_pt_resolve() (drop a pad whose slot someone else owns) and by
+ * resolve_logical()'s binding step (never CACHE such a slot). Stage 2 of the
+ * sweep enforces the DUAL rule -- `item->moonlight_gs_id >= 0 &&
+ * item->moonlight_gs_id != gp->gs_id`, i.e. skip a device that already claims a
+ * DIFFERENT slot. The two tests answer different questions and neither implies
+ * the other; both are needed. */
 static bool slot_claimed_by_other(short gs_id, const logical_device_t *except)
 {
     if (gs_id < 0) {
@@ -277,7 +282,11 @@ static hid_pt_logical_match_t resolve_logical(const app_gamepad_state_t *gamepad
         if (!pick) {
             continue;
         }
-        if (bind && tier->binds && gamepad->gs_id >= 0) {
+        /* Same one-device-one-slot rule hid_pt_resolve applies: caching a slot
+         * that another plugged bridge already answers for would give
+         * moonlight_slot_other_owner() two owners for one gs_id. */
+        if (bind && tier->binds && gamepad->gs_id >= 0 &&
+            !slot_claimed_by_other((short) gamepad->gs_id, pick)) {
             pick->moonlight_gs_id = (int8_t) gamepad->gs_id;
         }
         result.item = pick;
@@ -286,6 +295,53 @@ static hid_pt_logical_match_t resolve_logical(const app_gamepad_state_t *gamepad
         return result;
     }
     return result;
+}
+
+/* Record who to hand this Moonlight slot back to when identity matching cannot
+ * decide. NOT a match: it settles nothing about who gets excluded (the caller
+ * already decided that from the auto-plug pref), it only writes the ownership
+ * the teardown paths read. Rule is stage 2's: the first PLUGGED device of this
+ * pad's model that holds no slot yet.
+ *
+ * Needed because two same-model bridges whose stable ids do not match their SDL
+ * pads make VIDPID_UNIQUE ambiguous, which drops the whole match below every
+ * binding tier -- and nothing downstream repairs it. Stage 1 of the sweep
+ * refuses that tier for the same reason, and stage 2 skips every pad already in
+ * moonlightExcludedMask, which is precisely the bit the caller is setting. With
+ * no record item->moonlight_gs_id stays -1, ui_bridge never copies a slot into
+ * the session record, and both reap paths hand -1 to
+ * hid_pt_moonlight_restore_slot(): the slot stays excluded for the rest of the
+ * stream and the next controller to inherit that gs_id is announced to nobody. */
+static void record_slot_owner(const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || gamepad->gs_id < 0) {
+        return;
+    }
+    for (int d = 0; d < g_devices.count; ++d) {
+        /* Somebody already answers for this slot -- including whatever
+         * resolve_logical() just bound. Plugged or not: a second owner is what
+         * this must never create. */
+        if (g_devices.items[d].moonlight_gs_id == (int8_t) gamepad->gs_id) {
+            return;
+        }
+    }
+    uint16_t vid = 0, pid = 0;
+    if (!gamepad_vid_pid(gamepad, &vid, &pid)) {
+        return;
+    }
+    for (int d = 0; d < g_devices.count; ++d) {
+        logical_device_t *item = &g_devices.items[d];
+        if (!item->plugged || item->moonlight_gs_id >= 0) {
+            continue;
+        }
+        if (!vid_pid_equal_hex(item->vid, item->pid, vid, pid)) {
+            continue;
+        }
+        item->moonlight_gs_id = (int8_t) gamepad->gs_id;
+        commons_log_info("HID-PT", "slot %d recorded as owned by bridged %s (no identity match)",
+                         gamepad->gs_id, item->name);
+        return;
+    }
 }
 
 bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad)
@@ -456,8 +512,12 @@ uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
              * away, so the teardown paths can give it back to the right one.
              * resolve_logical commits the binding itself, for the tiers whose
              * evidence may be cached -- which is why the floor here costs
-             * nothing: the tier it excludes could not have bound anyway. */
+             * nothing: the tier it excludes could not have bound anyway.
+             * record_slot_owner() covers the case it cannot decide; see there
+             * for why leaving the slot unowned strands it for the whole
+             * stream. */
             resolve_logical(gp, HID_PT_CONF_VIDPID, true);
+            record_slot_owner(gp);
         }
     }
     return mask;
@@ -492,9 +552,14 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
 /* The logical device -- other than `except` -- that still bridges this Moonlight
  * slot, or NULL. Clearing the exclusion bit while another device still bridges
  * that slot re-announces a pad the other is holding: a duplicate ViGEm pad next
- * to the real one. Both resolvers and stage 2 of the sweep now refuse a slot
- * another plugged device claims, so two devices should not reach one gs_id in
- * the first place -- this is the check that does not depend on that holding. */
+ * to the real one.
+ *
+ * The resolvers make that state unlikely, not impossible: hid_pt_resolve()
+ * drops a pad whose slot another plugged device owns and resolve_logical()
+ * refuses to cache one, but moonlight_exclude_gamepad() writes the slot into
+ * whatever device its caller passed, unconditionally, and stage 2 of the sweep
+ * checks only the dual rule (a device already claiming a DIFFERENT slot).
+ * So this check stands on its own and must not be deleted as redundant. */
 static const logical_device_t *moonlight_slot_other_owner(int gs_id, const logical_device_t *except)
 {
     if (gs_id < 0) {

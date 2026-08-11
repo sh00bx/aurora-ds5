@@ -93,11 +93,26 @@ typedef struct {
  * the event pump and shows up as late remote and gamepad input.
  *
  * So a worker does the probing and publishes a finished snapshot, and
- * controller_info_collect() only copies it. ds_lock guards the three objects
- * below and is held for those copies only — never across a probe, an open() or
- * a poll(). */
+ * controller_info_collect() only copies it. ds_lock guards every variable below
+ * and is held for those copies only — never across a probe, an open() or a
+ * poll().
+ *
+ * How old a published snapshot may be before it is discarded instead of shown.
+ * The worker idle-exits without clearing what it published, so between overlay
+ * sessions ds_published can be arbitrarily old — an hour-old percentage
+ * rendered through power_set_exact() as "87%" is a confident lie, and since
+ * ds_claim() falls back to "first unclaimed node" for SDL pads with no serial
+ * it can even be a lie about a pad that has since disconnected. Two scan
+ * intervals: short enough that nothing survives the worker's idle exit
+ * (DS_WORKER_IDLE_EXIT_MS is 20 s), long enough for an ordinary cycle (5 s
+ * sleep plus the probe round). A round slowed by several ds5_hidfd broker
+ * timeouts can still overrun it — the row then reads "-" for one refresh,
+ * which is the failure this is meant to prefer. */
+#define DS_SNAPSHOT_MAX_AGE_MS (2 * DS_SCAN_INTERVAL_MS)
+
 static pthread_mutex_t ds_lock = PTHREAD_MUTEX_INITIALIZER;
 static ds_snapshot_t ds_published;                       /* worker -> UI */
+static uint32_t ds_published_ms = 0;                     /* SDL_GetTicks of that publish */
 static char ds_wanted[CONTROLLER_INFO_MAX][DS_PATH_MAX]; /* UI -> worker */
 static int ds_wanted_count = 0;
 static uint32_t ds_wanted_ms = 0;                        /* SDL_GetTicks of the last collect() */
@@ -342,6 +357,7 @@ static void *ds_worker_main(void *unused) {
 
         pthread_mutex_lock(&ds_lock);
         ds_published = snap;
+        ds_published_ms = SDL_GetTicks();
         pthread_mutex_unlock(&ds_lock);
 
         struct timespec ts = {
@@ -436,8 +452,11 @@ static int collect_bridged_devices(app_t *app, bridged_device_t *out, int max) {
  * from the next worker cycle, which is the same order of delay the 5 s cache
  * always had.
  *
- * A pad's charge therefore also appears one refresh after the overlay opens
- * rather than immediately, because the first snapshot does not exist yet. */
+ * A pad's charge therefore appears one refresh after the overlay opens rather
+ * than immediately — on EVERY open, not just the first in a process: the
+ * snapshot left behind by the last overlay session is discarded once it is
+ * older than DS_SNAPSHOT_MAX_AGE_MS, so a stale reading degrades to "-" instead
+ * of to a confident wrong percentage. */
 static void ds_request_and_snapshot(const bridged_device_t *bridged, int bridged_count,
                                     ds_snapshot_t *out) {
     pthread_mutex_lock(&ds_lock);
@@ -450,13 +469,22 @@ static void ds_request_and_snapshot(const bridged_device_t *bridged, int bridged
                      bridged[i].path);
         }
     }
-    ds_wanted_ms = SDL_GetTicks();
+    const uint32_t now = SDL_GetTicks();
+    ds_wanted_ms = now;
     *out = ds_published;
+    const uint32_t age = now - ds_published_ms;
     bool start = !ds_worker_live;
     if (start) {
         ds_worker_live = true;
     }
     pthread_mutex_unlock(&ds_lock);
+
+    /* Nothing invalidates ds_published when the worker idle-exits, so its age
+     * is the only thing separating "measured a moment ago" from "measured
+     * before the last overlay was closed". */
+    if (age > DS_SNAPSHOT_MAX_AGE_MS) {
+        out->count = 0;
+    }
 
     for (int i = 0; i < out->count; i++) {
         out->nodes[i].claimed = false; /* claims belong to this pass, not to the snapshot */

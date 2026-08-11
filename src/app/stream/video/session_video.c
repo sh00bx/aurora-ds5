@@ -401,8 +401,10 @@ void vdec_delegate_cleanup(void) {
 
 /* Ask the host for a keyframe, at most once per IDR_REQUEST_MIN_INTERVAL_MS.
  * Returns DR_NEED_IDR when the caller may forward the request, DR_OK when the
- * window has not elapsed — the caller drops the frame either way, so a
- * swallowed request costs at most the rest of the window in corruption. */
+ * window has not elapsed — every caller of THIS helper drops the frame either
+ * way, so a swallowed request costs at most the rest of the window in
+ * corruption. The resume latch in vdec_finish_feed's FEED_OK branch is not one
+ * of them and is deliberately unthrottled; see there. */
 static int vdec_request_idr(void) {
     unsigned long now = SDL_GetTicks();
     if (vs.last_idr_request_ms == 0 || now - vs.last_idr_request_ms >= IDR_REQUEST_MIN_INTERVAL_MS) {
@@ -440,15 +442,21 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
          * would floor most of them to zero and the overlay would read 0.00 ms. */
         vs.temp_stats.totalSubmitTimeUs += (uint32_t) (LiGetMicroseconds() - decodeUnit->enqueueTimeUs);
         vs.temp_stats.submittedFrames++;
+        /* Deliberately NOT routed through vdec_request_idr(). This latch is
+         * consumed once per NOT_READY->OK transition — one request per NDL
+         * ReloadMedia, never a flood — and the flap that arms it (an ERROR
+         * and/or a burst of NOT_READY in the same HDR toggle / size change) is
+         * exactly what arms the shared window, so the throttle would swallow
+         * the one request that matters, every time, for up to
+         * IDR_REQUEST_MIN_INTERVAL_MS. The asymmetry that makes that costly:
+         * this frame was fed SUCCESSFULLY, unlike every throttled caller's, so
+         * a swallowed request buys nothing and costs a second of decoding
+         * against a reference the decoder no longer has. The window is still
+         * stamped, so the throttled callers see this request. */
         if (vs.need_idr_on_resume) {
-            int rc = vdec_request_idr();
-            if (rc == DR_NEED_IDR) {
-                vs.need_idr_on_resume = false;
-            }
-            /* Still latched when the throttle swallowed it, so the next
-             * successful feed after the window retries instead of leaving the
-             * decoder to resync on its own. */
-            return rc;
+            vs.need_idr_on_resume = false;
+            vs.last_idr_request_ms = SDL_GetTicks();
+            return DR_NEED_IDR;
         }
         return DR_OK;
     } else if (result == SS4S_VIDEO_FEED_REQUEST_KEYFRAME) {
