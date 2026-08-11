@@ -197,14 +197,147 @@ const char *bus_label(const char *bus)
     return bus[0] ? bus : "-";
 }
 
+/* ---- port-path cache lifetime -------------------------------------------- */
+
+/* Who is in this USB device dir right now: idVendor:idProduct:serial, folded to
+ * 64 bits. 0 means "sysfs would not say" — a missing idVendor/idProduct, or a
+ * dir that no longer exists — and 0 is never equal to a captured identity, so
+ * every such case is a cache miss. serial is included when the device has one
+ * and simply absent when it does not, which is why two indistinguishable
+ * devices of the same model hash the same: they are interchangeable for every
+ * consumer of these caches. */
+uint64_t hid_pt_usb_identity_hash(const char *usbdir)
+{
+    if (!usbdir || !usbdir[0]) {
+        return 0;
+    }
+    char vendor[16] = {0};
+    char product[16] = {0};
+    char serial[64] = {0};
+    char path[320];
+    snprintf(path, sizeof(path), "%s/idVendor", usbdir);
+    read_text_file(path, vendor, sizeof(vendor));
+    snprintf(path, sizeof(path), "%s/idProduct", usbdir);
+    read_text_file(path, product, sizeof(product));
+    if (!vendor[0] || !product[0]) {
+        return 0;
+    }
+    snprintf(path, sizeof(path), "%s/serial", usbdir);
+    read_text_file(path, serial, sizeof(serial));
+
+    uint64_t hash = 1469598103934665603ULL;
+    const char *parts[3] = {vendor, product, serial};
+    for (int i = 0; i < 3; ++i) {
+        for (const unsigned char *b = (const unsigned char *)parts[i]; *b; ++b) {
+            hash ^= *b;
+            hash *= 1099511628211ULL;
+        }
+        hash ^= 0xffu;             /* separator, so "ab"+"c" != "a"+"bc" */
+        hash *= 1099511628211ULL;
+    }
+    return hash ? hash : 1;        /* 0 is reserved for "unknown" */
+}
+
+/* Still the same device in that port? Re-read at most once per model rebuild:
+ * three small sysfs reads, against a re-capture that walks /sys/class/input. */
+static bool port_cache_entry_still_current(hid_pt_port_cache_t *entry)
+{
+    if (entry->checked_generation == g_devices.generation && entry->identity != 0) {
+        return true;
+    }
+    entry->checked_generation = g_devices.generation;
+    uint64_t now = hid_pt_usb_identity_hash(entry->usbdir);
+    return now != 0 && now == entry->identity;
+}
+
+/* A live, identity-checked entry for @p key, or NULL. An entry whose port now
+ * holds a different device (or nothing) is dropped here rather than returned. */
+static hid_pt_port_cache_t *port_cache_find(void *base, size_t stride, int max, const char *key)
+{
+    if (!key || !key[0]) {
+        return NULL;
+    }
+    char *bytes = (char *)base;
+    for (int i = 0; i < max; ++i) {
+        hid_pt_port_cache_t *entry = (hid_pt_port_cache_t *)(bytes + (size_t)i * stride);
+        if (!entry->valid || strcmp(entry->key, key) != 0) {
+            continue;
+        }
+        if (port_cache_entry_still_current(entry)) {
+            return entry;
+        }
+        memset(entry, 0, stride);
+        return NULL;
+    }
+    return NULL;
+}
+
+/* An emptied entry for @p key, ready to be filled by the caller. Reuses the
+ * entry already holding the key, else a free slot, else evicts — preferring a
+ * slot whose device is gone, and only then the oldest claim. Refusing instead
+ * (which is what the old fixed tables did once full) permanently broke every
+ * later plug: "Composite enum missing" for the rest of the app run. */
+static hid_pt_port_cache_t *port_cache_claim(void *base, size_t stride, int max,
+                                             const char *key, const char *usbdir,
+                                             uint64_t identity)
+{
+    static uint32_t seq;
+    if (!key || !key[0] || max <= 0) {
+        return NULL;
+    }
+    char *bytes = (char *)base;
+    hid_pt_port_cache_t *slot = NULL;
+    hid_pt_port_cache_t *oldest = NULL;
+    for (int i = 0; i < max; ++i) {
+        hid_pt_port_cache_t *entry = (hid_pt_port_cache_t *)(bytes + (size_t)i * stride);
+        if (!entry->valid) {
+            if (!slot) slot = entry;
+            continue;
+        }
+        if (strcmp(entry->key, key) == 0) {
+            slot = entry;
+            break;
+        }
+        if (!oldest || entry->insert_seq < oldest->insert_seq) {
+            oldest = entry;
+        }
+    }
+    if (!slot) {
+        for (int i = 0; i < max && !slot; ++i) {
+            hid_pt_port_cache_t *entry = (hid_pt_port_cache_t *)(bytes + (size_t)i * stride);
+            if (entry->valid && !port_cache_entry_still_current(entry)) {
+                slot = entry;
+            }
+        }
+    }
+    if (!slot) {
+        slot = oldest;
+    }
+    if (!slot) {
+        return NULL;
+    }
+    memset(slot, 0, stride);
+    slot->valid = 1;
+    snprintf(slot->key, sizeof(slot->key), "%s", key);
+    snprintf(slot->usbdir, sizeof(slot->usbdir), "%s", usbdir ? usbdir : "");
+    slot->identity = identity;
+    slot->checked_generation = g_devices.generation;
+    slot->insert_seq = ++seq;
+    return slot;
+}
+
 #define USB_IDENTITY_CACHE_MAX 16
 
 typedef struct {
-    char usb_busid[64];
+    hid_pt_port_cache_t hdr;
     char manufacturer[TEXT_LEN];
     char product[TEXT_LEN];
-    int valid;
 } usb_identity_cache_t;
+
+_Static_assert(offsetof(usb_identity_cache_t, hdr) == 0,
+               "port cache helpers cast the entry address to hid_pt_port_cache_t *");
+_Static_assert(offsetof(composite_enum_t, hdr) == 0,
+               "port cache helpers cast the entry address to hid_pt_port_cache_t *");
 
 static usb_identity_cache_t g_usb_identity_cache[USB_IDENTITY_CACHE_MAX];
 
@@ -218,26 +351,6 @@ static bool flydigi_identity_text(const char *mfg, const char *prod)
     return false;
 }
 
-static usb_identity_cache_t *usb_identity_slot(const char *usb_busid)
-{
-    if (!usb_busid || !usb_busid[0]) return NULL;
-    for (int i = 0; i < USB_IDENTITY_CACHE_MAX; ++i) {
-        if (g_usb_identity_cache[i].valid &&
-            strcmp(g_usb_identity_cache[i].usb_busid, usb_busid) == 0) {
-            return &g_usb_identity_cache[i];
-        }
-    }
-    for (int i = 0; i < USB_IDENTITY_CACHE_MAX; ++i) {
-        if (!g_usb_identity_cache[i].valid) {
-            usb_identity_cache_t *slot = &g_usb_identity_cache[i];
-            snprintf(slot->usb_busid, sizeof(slot->usb_busid), "%s", usb_busid);
-            slot->valid = 1;
-            return slot;
-        }
-    }
-    return NULL;
-}
-
 int read_usb_identity_attrs(const char *usb_busid, char *mfg, size_t mfg_len,
                             char *prod, size_t prod_len)
 {
@@ -245,8 +358,12 @@ int read_usb_identity_attrs(const char *usb_busid, char *mfg, size_t mfg_len,
     if (prod && prod_len) prod[0] = '\0';
     if (!usb_busid || !usb_busid[0]) return -1;
 
-    usb_identity_cache_t *cached = usb_identity_slot(usb_busid);
-    if (cached && cached->manufacturer[0]) {
+    /* The hit test used to be "manufacturer[0] is set", which meant every
+     * device without a manufacturer string — most of them — re-walked
+     * /sys/class/input on every call. The entry's own validity answers it now. */
+    usb_identity_cache_t *cached = (usb_identity_cache_t *)port_cache_find(
+        g_usb_identity_cache, sizeof(g_usb_identity_cache[0]), USB_IDENTITY_CACHE_MAX, usb_busid);
+    if (cached) {
         if (mfg && mfg_len) snprintf(mfg, mfg_len, "%s", cached->manufacturer);
         if (prod && prod_len) snprintf(prod, prod_len, "%s", cached->product);
         return 0;
@@ -265,9 +382,19 @@ int read_usb_identity_attrs(const char *usb_busid, char *mfg, size_t mfg_len,
     snprintf(path, sizeof(path), "%s/product", usbdir);
     read_text_file(path, product, sizeof(product));
 
-    if (cached) {
-        snprintf(cached->manufacturer, sizeof(cached->manufacturer), "%s", manufacturer);
-        snprintf(cached->product, sizeof(cached->product), "%s", product);
+    /* Only cache what can be invalidated later: without an identity there is no
+     * way to notice the next device in this port, and that entry is exactly the
+     * one that would misclassify it as a Flydigi. Answer this call, cache
+     * nothing. */
+    uint64_t identity = hid_pt_usb_identity_hash(usbdir);
+    if (identity) {
+        usb_identity_cache_t *slot = (usb_identity_cache_t *)port_cache_claim(
+            g_usb_identity_cache, sizeof(g_usb_identity_cache[0]), USB_IDENTITY_CACHE_MAX,
+            usb_busid, usbdir, identity);
+        if (slot) {
+            snprintf(slot->manufacturer, sizeof(slot->manufacturer), "%s", manufacturer);
+            snprintf(slot->product, sizeof(slot->product), "%s", product);
+        }
     }
     if (mfg && mfg_len) snprintf(mfg, mfg_len, "%s", manufacturer);
     if (prod && prod_len) snprintf(prod, prod_len, "%s", product);
@@ -1034,32 +1161,13 @@ static uint8_t read_usb_full_speed_flag(const char *usbdir)
     return (strcmp(speed, "12") == 0 || strcmp(speed, "1.5") == 0) ? 1 : 0;
 }
 
-static composite_enum_t *composite_enum_slot(const char *key)
-{
-    if (!key || !key[0]) return NULL;
-    for (int i = 0; i < g_composite_enum_count; ++i) {
-        if (strcmp(g_composite_enums[i].key, key) == 0) {
-            return &g_composite_enums[i];
-        }
-    }
-    if (g_composite_enum_count >= COMPOSITE_ENUM_MAX_CACHE) {
-        return NULL;
-    }
-    composite_enum_t *slot = &g_composite_enums[g_composite_enum_count++];
-    memset(slot, 0, sizeof(*slot));
-    snprintf(slot->key, sizeof(slot->key), "%s", key);
-    return slot;
-}
-
 const composite_enum_t *composite_enum_lookup(const char *key)
 {
-    if (!key || !key[0]) return NULL;
-    for (int i = 0; i < g_composite_enum_count; ++i) {
-        if (g_composite_enums[i].valid && strcmp(g_composite_enums[i].key, key) == 0) {
-            return &g_composite_enums[i];
-        }
-    }
-    return NULL;
+    /* Identity-checked, like every other read of this table: a plug that
+     * resolves an enumeration captured from a device that has since left the
+     * port would hand the host the wrong descriptors. */
+    return (const composite_enum_t *)port_cache_find(
+        g_composite_enums, sizeof(g_composite_enums[0]), COMPOSITE_ENUM_MAX_CACHE, key);
 }
 
 static const char *composite_enum_key_for_device(const char *usb_busid, const char *usbdir)
@@ -1087,15 +1195,28 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
     }
 
     const char *key = composite_enum_key_for_device(usb_busid, usbdir);
-    composite_enum_t *cache = composite_enum_slot(key);
-    if (!cache) return -1;
-    if (cache->valid && strcmp(cache->usbdir, usbdir) == 0) {
+    /* The freshness test used to be usbdir == usbdir, i.e. port == port, which
+     * is true for every device that ever occupies that port: a Flydigi flipped
+     * from D-Input to XInput re-enumerates on the same port with a different
+     * VID/PID and a different interface layout, and the cached D-Input
+     * descriptors were forwarded to the Windows agent verbatim. Compare the
+     * device, not the socket it is in. */
+    uint64_t identity = hid_pt_usb_identity_hash(usbdir);
+    const composite_enum_t *live = composite_enum_lookup(key);
+    if (live && live->hdr.identity == identity && strcmp(live->hdr.usbdir, usbdir) == 0) {
         return 0;
     }
+    if (!identity) {
+        /* No idVendor/idProduct under usbdir: an entry captured now could never
+         * be told apart from the next device in this port, and a cache that
+         * cannot be invalidated is what this whole change is removing. */
+        return -1;
+    }
 
-    memset(cache, 0, sizeof(*cache));
-    snprintf(cache->key, sizeof(cache->key), "%s", key);
-    snprintf(cache->usbdir, sizeof(cache->usbdir), "%s", usbdir);
+    composite_enum_t *cache = (composite_enum_t *)port_cache_claim(
+        g_composite_enums, sizeof(g_composite_enums[0]), COMPOSITE_ENUM_MAX_CACHE,
+        key, usbdir, identity);
+    if (!cache) return -1;
     cache->full_speed = read_usb_full_speed_flag(usbdir);
 
     char attr[300];
@@ -1150,7 +1271,6 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
             }
         }
     }
-    cache->valid = 1;
     log_append("composite enum: %s key=%s desc=%dB ifaces=%d full_speed=%u serial=%s",
                usbdir, key, cache->descriptors_len, cache->if_count, cache->full_speed, cache->serial);
     for (int i = 0; i < cache->if_count; ++i) {
@@ -1638,7 +1758,7 @@ bool flydigi_has_pluggable_path(const logical_device_t *item)
 uint8_t *build_composite_enum_payload(const char *key, int *out_len)
 {
     const composite_enum_t *cache = composite_enum_lookup(key);
-    if (!cache || !cache->valid || !out_len) return NULL;
+    if (!cache || !out_len) return NULL;
     int size = (int)sizeof(ctmb_enum_info_t) + cache->descriptors_len;
     for (int i = 0; i < cache->if_count; ++i) {
         size += (int)sizeof(ctmb_enum_iface_t) + cache->ifs[i].rdesc_len;

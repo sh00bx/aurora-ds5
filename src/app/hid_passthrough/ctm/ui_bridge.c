@@ -569,9 +569,9 @@ static void enum_lookup_key_for_item(const logical_device_t *item, char *out, si
     }
     if (item && strcmp(item->vid, "28de") == 0 && strcmp(item->pid, "1304") == 0) {
         composite_enum_capture(NULL, item->vid, item->pid);
-        for (int i = 0; i < g_composite_enum_count; ++i) {
-            if (g_composite_enums[i].valid) {
-                snprintf(out, out_len, "%s", g_composite_enums[i].key);
+        for (int i = 0; i < COMPOSITE_ENUM_MAX_CACHE; ++i) {
+            if (g_composite_enums[i].hdr.valid) {
+                snprintf(out, out_len, "%s", g_composite_enums[i].hdr.key);
                 return;
             }
         }

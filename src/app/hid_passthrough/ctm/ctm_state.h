@@ -147,10 +147,33 @@ typedef struct {
     uint8_t rdesc[COMPOSITE_ENUM_MAX_RDESC];
 } composite_enum_if_t;
 
+/* Lifetime bookkeeping shared by every cache keyed on a USB PORT PATH.
+ *
+ * A usb_busid ("1-1") names a port, not a device: whatever is plugged in there
+ * next inherits the key. An entry therefore records the identity of the device
+ * it was captured from and is re-checked against sysfs; a mismatch is a miss.
+ * `identity` 0 means "sysfs could not say", which compares equal to nothing, so
+ * an unreadable or vanished device dir always misses. That direction is the
+ * cheap one — a miss costs a re-capture, a wrong hit ships one device's USB
+ * descriptors to the host as another's.
+ *
+ * Entries live in fixed tables whose first member must be this struct; the
+ * helpers in ui_devices.c enforce that with a _Static_assert rather than a
+ * comment. */
 typedef struct {
     int valid;
-    char key[64];                              /* usb_busid or usbdir basename */
-    char usbdir[256];
+    char key[64];                 /* usb_busid, or the usbdir basename when the
+                                   * bus id could not be resolved */
+    char usbdir[256];             /* sysfs device dir the entry was taken from */
+    uint64_t identity;            /* idVendor:idProduct:serial hash; 0 = unknown */
+    uint32_t checked_generation;  /* g_devices.generation of the last re-check */
+    uint32_t insert_seq;          /* claim order, for oldest-first eviction */
+} hid_pt_port_cache_t;
+
+uint64_t hid_pt_usb_identity_hash(const char *usbdir);
+
+typedef struct {
+    hid_pt_port_cache_t hdr;
     char serial[64];
     int descriptors_len;
     uint8_t descriptors[COMPOSITE_ENUM_MAX_DESC];
@@ -159,8 +182,9 @@ typedef struct {
     uint8_t full_speed;                        /* 1 = USB full-speed (12 Mbps) */
 } composite_enum_t;
 
+/* Slots are claimed anywhere in the table (a claim may evict), so there is no
+ * "count": iterate the whole array and test hdr.valid. */
 extern composite_enum_t g_composite_enums[COMPOSITE_ENUM_MAX_CACHE];
-extern int g_composite_enum_count;
 
 /* ---- headless global state (defined in ctm_state.c) --------------------- */
 extern scan_result_t g_scan;
