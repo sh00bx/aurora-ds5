@@ -1162,7 +1162,11 @@ static void session_state_reset(ctm_controller_t *c)
  * its own deadline variable and its own now_us() read, and then re-derive the
  * poll timeout from three of those deadlines by hand at the bottom. Each is a
  * named function on one context now, so a task's inputs are visible in its
- * signature and the loop body reads as the schedule it is. */
+ * signature and the loop body reads as the schedule it is.
+ *
+ * Each task also answers when it next wants to run, and the loop sleeps until
+ * the earliest of those, so there is exactly one place that decides how long
+ * the pump may sleep. */
 
 /* One session's pump state: the controller plus the two objects that live on
  * run_session's stack, plus the rate-servo feedback cursor. */
@@ -1177,9 +1181,15 @@ typedef struct {
     int fb_have_seq;
 } ctm_pump_t;
 
+/* One periodic pump task: do whatever is due at this instant, then return the
+ * absolute time it next wants to run — or 0 for "nothing pending" (the feature
+ * is off, or there is no work waiting). The loop's poll bound is the minimum of
+ * the non-zero answers, capped at 50 ms. */
+typedef uint64_t (*ctm_tick_t)(ctm_pump_t *p);
+
 /* Release paced output on its schedule, at the pace the current output path can
  * actually sustain. */
-static void tick_paced_drain(ctm_pump_t *p)
+static uint64_t tick_paced_drain(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
     /* The ~10.6ms host pace (~94/s) was sized for the BT one-outstanding wall
@@ -1215,6 +1225,7 @@ static void tick_paced_drain(ctm_pump_t *p)
                     eff_pace_us, p->host_cfg->bt_pace_us);
     }
     ctm_paced_drain(c->io, p->paced, eff_pace_us);
+    return ctm_paced_next_us(p->paced);   /* 0 once the ring is empty */
 }
 
 /* Rumble rides leftover air slots (stored latest-wins in handle_message): one
@@ -1223,10 +1234,9 @@ static void tick_paced_drain(ctm_pump_t *p)
  * 46.9/s of 0x39, so a sustained rumble stream physically cannot go faster
  * without starving audio. Latest-wins makes the cap lossless for state (newest
  * rumble always wins); envelope steps in between coalesce. */
-static void tick_rumble_slot(ctm_pump_t *p)
+static void rumble_slot_run(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->rumble_slot_len[0] && !c->rumble_slot_len[1]) return;
     uint64_t rnow = ctm_now_us();
     uint64_t min_gap = audio_live_since(rnow, ctm_hid_io_audio_last_us(c->io))
                            ? c->rumble_min_us : 16000ull;
@@ -1245,18 +1255,35 @@ static void tick_rumble_slot(ctm_pump_t *p)
     }
 }
 
+/* Wanted next at the earliest moment the rate cap allows another write. The
+ * deadline can already be in the past when an audio slot is due within 4 ms —
+ * that is the point: the drain gets the slot and this asks to be reconsidered
+ * immediately afterwards. */
+static uint64_t tick_rumble_slot(ctm_pump_t *p)
+{
+    ctm_controller_t *c = p->c;
+    if (!c->rumble_slot_len[0] && !c->rumble_slot_len[1]) return 0;
+    rumble_slot_run(p);
+    if (!c->rumble_slot_len[0] && !c->rumble_slot_len[1]) return 0;
+    uint64_t rnow = ctm_now_us();
+    return c->last_rumble_write_us +
+           (audio_live_since(rnow, ctm_hid_io_audio_last_us(c->io))
+                ? c->rumble_min_us : 16000ull);
+}
+
 /* Adaptive pad latency: slider baseline while the link is clean; when the fill
  * has to bridge stalls (adapt_hot_until_us armed by tick_plc_fill), raise the
  * pad's jitter buffer by up to +40ms in ~1.25s, decay ~8ms/s after 10s of
  * quiet. Applied per outbound report by ds5_patch_output via
  * ctm_controller_adapt_latency_ms — the same live-patch path the manual slider
  * uses. */
-static void tick_adapt_slew(ctm_pump_t *p)
+static uint64_t tick_adapt_slew(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->adapt_enabled) return;
+    if (!c->adapt_enabled) return 0;
     uint64_t anow = ctm_now_us();
-    if (c->adapt_slew_next_us != 0 && anow < c->adapt_slew_next_us) return;
+    if (c->adapt_slew_next_us != 0 && anow < c->adapt_slew_next_us)
+        return c->adapt_slew_next_us;
     c->adapt_slew_next_us = anow + 250000ull;
     uint32_t target = anow < c->adapt_hot_until_us ? 40u : 0u;
     uint32_t cur = __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED);
@@ -1268,22 +1295,23 @@ static void tick_adapt_slew(ctm_pump_t *p)
     if (cur != __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED)) {
         __atomic_store_n(&c->adapt_lat_add_ms, cur, __ATOMIC_RELAXED);
     }
+    return c->adapt_slew_next_us;
 }
 
 /* Forward the daemon's inject-queue telemetry (ds5_acl_tx_qstats <- "<tmpl>.st")
  * to the host ~4/s so its pacer can shed TV-side backlog. Capability-gated on
  * HOST_CONFIG reserved[0] — a CTM host advertises nothing and never sees the
  * message type. */
-static void tick_pace_feedback(ctm_pump_t *p)
+static uint64_t tick_pace_feedback(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!p->fb_enabled || !c->acl_tx) return;
+    if (!p->fb_enabled || !c->acl_tx) return 0;
     uint64_t fnow = ctm_now_us();
     if (p->fb_next_us == 0) {
         p->fb_next_us = fnow + 250000ull;
-        return;
+        return p->fb_next_us;
     }
-    if (fnow < p->fb_next_us) return;
+    if (fnow < p->fb_next_us) return p->fb_next_us;
     p->fb_next_us = fnow + 250000ull;
     ds5_acl_qstats_t qs;
     /* Only a record the daemon advanced since our last send is news; a frozen
@@ -1291,7 +1319,7 @@ static void tick_pace_feedback(ctm_pump_t *p)
      * its static pace margin. */
     if (!ds5_acl_tx_qstats(c->acl_tx, &qs) ||
         (p->fb_have_seq && qs.seq == p->fb_last_seq)) {
-        return;
+        return p->fb_next_us;
     }
     p->fb_last_seq = qs.seq;
     p->fb_have_seq = 1;
@@ -1304,6 +1332,7 @@ static void tick_pace_feedback(ctm_pump_t *p)
     fb.inj_total = qs.inj_total;
     fb.drop_total = qs.drop_total;
     ctm_ctl_send(c, CTMB_MSG_PACE_FEEDBACK, CTMB_FLAG_OK, 0, &fb, sizeof fb);
+    return p->fb_next_us;
 }
 
 /* Timer-driven audio-loss concealment. While the game's audio stream is active
@@ -1311,13 +1340,9 @@ static void tick_pace_feedback(ctm_pump_t *p)
  * re-inject the last frame so the DS5's rate-matched speaker buffer stays
  * topped up instead of draining into a dropout. Idle >150 ms of real audio ->
  * disarm (genuine silence, not loss). */
-static void tick_plc_fill(ctm_pump_t *p)
+static void plc_fill_run(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->audio.plc_fill_enabled || !c->audio.plc_have36 ||
-        ctm_paced_count(p->paced) != 0) {
-        return;
-    }
     uint64_t fnow = ctm_now_us();
     if (!audio_live_since(fnow, c->audio.plc_last_real_us)) {
         c->audio.plc_fill_next_us = 0;
@@ -1348,17 +1373,36 @@ static void tick_plc_fill(ctm_pump_t *p)
     }
 }
 
-/* PLC/60s: what the concealment and the output path actually did this window. */
-static void tick_plc_log(ctm_pump_t *p)
+/* Wanted next at the fill's own deadline. The "is a fill armed" test here is
+ * deliberately NOT gated on the paced ring being empty, unlike the run above:
+ * the ring can drain during the sleep this bounds, and an unbounded sleep would
+ * then miss the slot. That is the condition the hand-rolled bound used. */
+static uint64_t tick_plc_fill(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->audio.plc_enabled) return;
+    if (c->audio.plc_fill_enabled && c->audio.plc_have36 &&
+        ctm_paced_count(p->paced) == 0) {
+        plc_fill_run(p);
+    }
+    if (c->audio.plc_fill_enabled && c->audio.plc_have36 &&
+        c->audio.plc_fill_next_us != 0 &&
+        audio_live_since(ctm_now_us(), c->audio.plc_last_real_us)) {
+        return c->audio.plc_fill_next_us;
+    }
+    return 0;
+}
+
+/* PLC/60s: what the concealment and the output path actually did this window. */
+static uint64_t tick_plc_log(ctm_pump_t *p)
+{
+    ctm_controller_t *c = p->c;
+    if (!c->audio.plc_enabled) return 0;
     uint64_t pnow = ctm_now_us();
     if (c->plc_log_next_us == 0) {
         c->plc_log_next_us = pnow + 60000000ull;
-        return;
+        return c->plc_log_next_us;
     }
-    if (pnow < c->plc_log_next_us) return;
+    if (pnow < c->plc_log_next_us) return c->plc_log_next_us;
 
     long inj = 0, drp = 0;
     int rdy = 0;
@@ -1386,6 +1430,7 @@ static void tick_plc_log(ctm_pump_t *p)
     c->st_rumble_coal = 0;
     c->audio.st_stale_drop = 0;
     c->plc_log_next_us = pnow + 60000000ull;
+    return c->plc_log_next_us;
 }
 
 /* NET/60s: downlink arrival pattern + ENet link health (HOL probe, see
@@ -1393,15 +1438,15 @@ static void tick_plc_log(ctm_pump_t *p)
  * minimum cancels the TV<->host clock offset); drift between the two monotonic
  * clocks is ~ppm-scale, negligible per window against the >=30ms signal we are
  * looking for. */
-static void tick_net_log(ctm_pump_t *p)
+static uint64_t tick_net_log(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
     uint64_t nnow = ctm_now_us();
     if (c->net_log_next_us == 0) {
         c->net_log_next_us = nnow + 60000000ull;
-        return;
+        return c->net_log_next_us;
     }
-    if (nnow < c->net_log_next_us) return;
+    if (nnow < c->net_log_next_us) return c->net_log_next_us;
 
     if (c->st_net_out > 0) {
         int64_t davg = c->st_net_skew_sum / (int64_t)c->st_net_out - c->st_net_skew_min;
@@ -1427,6 +1472,7 @@ static void tick_net_log(ctm_pump_t *p)
     c->st_net_burst_max = 0;
     c->st_net_skew_min = c->st_net_skew_max = c->st_net_skew_sum = 0;
     c->net_log_next_us = nnow + 60000000ull;
+    return c->net_log_next_us;
 }
 
 /* Run one connected session: handshake, start the input thread (plus the
@@ -1504,7 +1550,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     }
 
     /* The periodic half of the pump, in the order it has always run. */
-    static void (*const k_ticks[])(ctm_pump_t *) = {
+    static const ctm_tick_t k_ticks[] = {
         tick_paced_drain,
         tick_rumble_slot,
         tick_adapt_slew,
@@ -1517,37 +1563,23 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     int link_alive = 1;
     while (!__atomic_load_n(&c->stop, __ATOMIC_RELAXED) &&
            !__atomic_load_n(&c->link_down, __ATOMIC_RELAXED) && link_alive) {
+        /* Fire everything due, and remember the earliest thing that is not.
+         * Nothing but this loop decides how long the pump may sleep: a task
+         * that wants to run at T cannot be slept past T, and a task that wants
+         * nothing cannot hold the sleep open. */
+        uint64_t next_due_us = 0;
         for (size_t i = 0; i < sizeof(k_ticks) / sizeof(k_ticks[0]); ++i) {
-            k_ticks[i](&pump);
+            uint64_t due = k_ticks[i](&pump);
+            if (due != 0 && (next_due_us == 0 || due < next_due_us)) next_due_us = due;
         }
 
+        /* 50 ms ceiling: the ENet timers still need servicing on an idle link,
+         * and a task that wants nothing must not park the pump indefinitely. */
         int timeout_ms = 50;
-        if (ctm_paced_count(&paced) > 0 && ctm_paced_next_us(&paced) != 0) {
+        if (next_due_us != 0) {
             uint64_t now = ctm_now_us();
-            uint64_t due = ctm_paced_next_us(&paced);
-            timeout_ms = due <= now ? 0 : (int)((due - now) / 1000u);
+            timeout_ms = next_due_us <= now ? 0 : (int)((next_due_us - now) / 1000u);
             if (timeout_ms > 50) timeout_ms = 50;
-        }
-        /* Bound the idle sleep by a pending rumble slot's earliest write time
-         * so it lands close to min_gap even without ENet wakeups to ride on. */
-        if (c->rumble_slot_len[0] || c->rumble_slot_len[1]) {
-            uint64_t rnow = ctm_now_us();
-            uint64_t due = c->last_rumble_write_us +
-                           (audio_live_since(rnow, ctm_hid_io_audio_last_us(c->io))
-                                ? c->rumble_min_us : 16000ull);
-            int rto = due <= rnow ? 0 : (int)((due - rnow) / 1000u);
-            if (rto < timeout_ms) timeout_ms = rto;
-        }
-        /* Bound the idle sleep by the next audio-fill deadline so a run of lost
-         * frames (no ENet wakeups to ride on) still gets concealed on time
-         * instead of in a late burst when the poll finally times out. */
-        if (c->audio.plc_fill_enabled && c->audio.plc_have36 && c->audio.plc_fill_next_us != 0) {
-            uint64_t now = ctm_now_us();
-            if (audio_live_since(now, c->audio.plc_last_real_us)) {
-                int fto = c->audio.plc_fill_next_us <= now
-                              ? 0 : (int)((c->audio.plc_fill_next_us - now) / 1000u);
-                if (fto < timeout_ms) timeout_ms = fto;
-            }
         }
         if (c->xport.kind == CTM_TRANSPORT_ENET) {
             /* Poll-driven pump: the reader thread wakes us via the client's
