@@ -451,6 +451,37 @@ static uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+/* Tear down session @p index completely: unplug and destroy the local
+ * controller, tell the host to drop its half of the bridge, and remove the
+ * record. Currently reached only from stop_session(); the other two teardown
+ * paths (release_local_sessions_on_exit, add_session's replace branch) still
+ * have their own copies and do NOT send BRIDGE_STOP. */
+static void session_teardown(int index)
+{
+    if (index < 0 || index >= g_session_count) {
+        return;
+    }
+    if (g_sessions[index].controller) {
+        ctm_controller_plug_out(g_sessions[index].controller);
+        ctm_controller_destroy(g_sessions[index].controller);
+        g_sessions[index].controller = NULL;
+    }
+    /* Tell the host to drop the bridge — but skip the (blocking) round-trip when
+     * the agent is already known unreachable: it would only time out, and the
+     * first failure flips g_agent_online, so a mass-disconnect against a dead host
+     * costs at most one connect timeout on the UI thread (not one per device). The
+     * host GCs orphan virtual controllers when it comes back anyway. */
+    if (g_sessions[index].port > 0 && g_agent_online) {
+        char cmd[160];
+        char response[256];
+        snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", g_sessions[index].busid);
+        (void)send_agent_command(cmd, response, sizeof(response));
+    }
+    memmove(&g_sessions[index], &g_sessions[index + 1],
+            (size_t)(g_session_count - index - 1) * sizeof(g_sessions[0]));
+    g_session_count--;
+}
+
 bool add_session(const char *key, const char *busid, ctm_controller_t *controller, int port)
 {
     int index = session_index_for_key(key);
@@ -481,29 +512,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
 
 void stop_session(const char *key)
 {
-    int index = session_index_for_key(key);
-    if (index < 0) {
-        return;
-    }
-    if (g_sessions[index].controller) {
-        ctm_controller_plug_out(g_sessions[index].controller);
-        ctm_controller_destroy(g_sessions[index].controller);
-        g_sessions[index].controller = NULL;
-    }
-    /* Tell the host to drop the bridge — but skip the (blocking) round-trip when
-     * the agent is already known unreachable: it would only time out, and the
-     * first failure flips g_agent_online, so a mass-disconnect against a dead host
-     * costs at most one connect timeout on the UI thread (not one per device). The
-     * host GCs orphan virtual controllers when it comes back anyway. */
-    if (g_sessions[index].port > 0 && g_agent_online) {
-        char cmd[160];
-        char response[256];
-        snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", g_sessions[index].busid);
-        (void)send_agent_command(cmd, response, sizeof(response));
-    }
-    memmove(&g_sessions[index], &g_sessions[index + 1],
-            (size_t)(g_session_count - index - 1) * sizeof(g_sessions[0]));
-    g_session_count--;
+    session_teardown(session_index_for_key(key));
 }
 
 void release_local_sessions_on_exit(void)
@@ -604,6 +613,11 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
     int port = next_bridge_port();
     char cmd[256];
     char busid[32];
+    /* Declared before the first `goto fail_bridge` so the label owns it: every
+     * failure after BRIDGE_START has to undo the host-side bridge, and the six
+     * copies of that unwind had already drifted into two shapes (with and
+     * without the controller destroy). */
+    ctm_controller_t *controller = NULL;
     const char *kind = bridge_kind_for_item(item);
     make_bridge_busid(item, busid, sizeof(busid));
     if (strcmp(kind, "flydigi") == 0) {
@@ -636,9 +650,7 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
             if (flydigi_xpad_evdev_path_for_item(item, cdev.path, sizeof(cdev.path)) != 0) {
                 ctm_set_plug_error("Flydigi XInput: xpad evdev not found (busid=%s)",
                                    item->usb_busid[0] ? item->usb_busid : "-");
-                snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-                (void)send_agent_command(cmd, response, sizeof(response));
-                return false;
+                goto fail_bridge;
             }
         } else if (flydigi_handshake_hidraw_path_for_item(item, cdev.path, sizeof(cdev.path)) != 0) {
             cdev.path[0] = '\0';
@@ -646,18 +658,14 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         if (!flydigi_has_pluggable_path(item)) {
             ctm_set_plug_error("Flydigi: no handshake hidraw or xpad path (busid=%s)",
                                item->usb_busid[0] ? item->usb_busid : "-");
-            snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-            (void)send_agent_command(cmd, response, sizeof(response));
-            return false;
+            goto fail_bridge;
         }
         if (flydigi_is_xinput_mode(item)) {
             char xpad_path[64];
             if (flydigi_xpad_evdev_path_for_item(item, xpad_path, sizeof(xpad_path)) != 0) {
                 ctm_set_plug_error("Flydigi XInput: xpad evdev not found (busid=%s)",
                                    item->usb_busid[0] ? item->usb_busid : "-");
-                snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-                (void)send_agent_command(cmd, response, sizeof(response));
-                return false;
+                goto fail_bridge;
             }
             if (cdev.path[0] == '\0') {
                 snprintf(cdev.path, sizeof(cdev.path), "%s", xpad_path);
@@ -665,9 +673,7 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         } else if (cdev.path[0] == '\0') {
             ctm_set_plug_error("Flydigi D-Input: no hidraw path (busid=%s)",
                                item->usb_busid[0] ? item->usb_busid : "-");
-            snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-            (void)send_agent_command(cmd, response, sizeof(response));
-            return false;
+            goto fail_bridge;
         }
     } else {
         snprintf(cdev.path, sizeof(cdev.path), "%s", dev->node);
@@ -675,12 +681,10 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
     snprintf(cdev.mac, sizeof(cdev.mac), "%s", item->mac);
     snprintf(cdev.usb_busid, sizeof(cdev.usb_busid), "%s", item->usb_busid);
 
-    ctm_controller_t *controller = ctm_controller_create(&cdev);
+    controller = ctm_controller_create(&cdev);
     if (!controller) {
         ctm_set_plug_error("Controller create failed");
-        snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-        (void)send_agent_command(cmd, response, sizeof(response));
-        return false;
+        goto fail_bridge;
     }
     tv_bridge_worker_settings_t *settings = settings_for_item(item);
     if (settings) {
@@ -699,24 +703,30 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         } else {
             ctm_set_plug_error("Composite enum missing for %s (tap Refresh)",
                                enum_key[0] ? enum_key : item->name);
-            ctm_controller_destroy(controller);
-            snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-            (void)send_agent_command(cmd, response, sizeof(response));
-            return false;
+            goto fail_bridge;
         }
     }
     if (ctm_controller_plug_in(controller, g_agent_host, port) != 0) {
         ctm_set_plug_error("Controller plug-in failed");
-        ctm_controller_destroy(controller);
-        snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
-        (void)send_agent_command(cmd, response, sizeof(response));
-        return false;
+        goto fail_bridge;
     }
     add_session(session_key, busid, controller, port);
     ctm_clear_plug_error();
     log_append("controller started kind=%s node=%s busid=%s host=%s port=%d",
                kind, cdev.path, busid, g_agent_host, port);
     return true;
+
+fail_bridge:
+    /* The one way out after BRIDGE_START succeeded: drop the controller if one
+     * was built and tell the host to tear the bridge down, so it does not keep
+     * an orphan virtual controller bound to `port`. The caller has already set
+     * the plug error that says why. */
+    if (controller) {
+        ctm_controller_destroy(controller);
+    }
+    snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", busid);
+    (void)send_agent_command(cmd, response, sizeof(response));
+    return false;
 }
 
 /* Plug the whole device using its first hidraw node (the default). When: the
