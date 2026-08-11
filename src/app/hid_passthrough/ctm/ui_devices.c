@@ -706,6 +706,23 @@ bool logical_device_can_expand(const logical_device_t *item)
             item->device_count > 1);
 }
 
+/* The one sanctioned way to get a logical device from outside the model: by the
+ * key it is identified by, resolved against the CURRENT g_devices. Returns NULL
+ * when the device is gone — callers must handle that rather than fall back to a
+ * remembered index, which after a rebuild names a different device. */
+logical_device_t *logical_device_by_key(const char *key)
+{
+    if (!key || !key[0]) {
+        return NULL;
+    }
+    for (int i = 0; i < g_devices.count; ++i) {
+        if (strcmp(g_devices.items[i].key, key) == 0) {
+            return &g_devices.items[i];
+        }
+    }
+    return NULL;
+}
+
 logical_device_t *find_or_add_logical_device(logical_result_t *logical, const device_info_t *dev, int scan_index)
 {
     char key[96];
@@ -743,7 +760,9 @@ logical_device_t *find_or_add_logical_device(logical_result_t *logical, const de
 
 void build_logical_devices(const scan_result_t *scan, logical_result_t *logical)
 {
+    uint32_t generation = logical->generation;
     memset(logical, 0, sizeof(*logical));
+    logical->generation = generation + 1;
     for (int i = 0; i < scan->count; ++i) {
         if (!device_should_list_in_ui(&scan->devices[i])) {
             continue;

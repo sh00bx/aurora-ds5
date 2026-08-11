@@ -99,6 +99,13 @@ typedef struct {
 typedef struct {
     logical_device_t items[MAX_DEVICES];
     int count;
+    /* Incremented by every build_logical_devices() rebuild. items[] is rebuilt
+     * from scratch in readdir order and then compacted, so an index taken at
+     * generation N addresses a different device at generation N+1. Anything
+     * that outlives one rebuild (an LVGL widget's user data, a remembered
+     * selection) must carry the key and re-resolve it, or carry the generation
+     * it was stamped at and check it. */
+    uint32_t generation;
 } logical_result_t;
 
 typedef struct {
@@ -264,6 +271,9 @@ void set_expand_key(const char *key, bool expanded);
 bool logical_device_can_expand(const logical_device_t *item);
 logical_device_t *find_or_add_logical_device(logical_result_t *logical,
                                              const device_info_t *dev, int scan_index);
+/* Resolve a logical device by key against the current g_devices; NULL if it is
+ * no longer there. Use this instead of holding an index across a rebuild. */
+logical_device_t *logical_device_by_key(const char *key);
 void build_logical_devices(const scan_result_t *scan, logical_result_t *logical);
 void enumerate_devices(scan_result_t *result);
 /* Resolve the puck's USB device dir (e.g. .../usb5/5-1) via /sys/class/input ->
