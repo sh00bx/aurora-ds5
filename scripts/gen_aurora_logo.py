@@ -77,6 +77,28 @@ def draw_ds5_mark(icon: Image.Image) -> Image.Image:
     return out
 
 
+def write_res_header(png: Path, header: Path, symbol: str) -> None:
+    """Re-emit the checked-in byte array the app compiles the image into.
+
+    src/app/res/gen/*.h is committed, not built, so regenerating a PNG without
+    regenerating its header silently leaves the old image in the binary while
+    every file on disk looks updated.
+    """
+    data = png.read_bytes()
+    lines = [
+        "  " + ", ".join(f"0x{b:02x}" for b in data[i:i + 16]) + ","
+        for i in range(0, len(data), 16)
+    ]
+    header.write_text(
+        "#pragma once\n"
+        f"const unsigned char res_{symbol}_data[] = {{\n"
+        + "\n".join(lines)
+        + "\n};\n"
+        f"extern const unsigned char res_{symbol}_data[];\n"
+        f"#define res_{symbol}_size {len(data)}\n"
+    )
+
+
 def resize_square(im: Image.Image, size: int) -> Image.Image:
     return im.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
 
@@ -120,6 +142,8 @@ def main() -> int:
     out_steam.mkdir(parents=True, exist_ok=True)
 
     icon_96.save(out_img / "moonlight.png", optimize=True)
+    out_gen = ROOT / "src" / "app" / "res" / "gen"
+    write_res_header(out_img / "moonlight.png", out_gen / "moonlight.h", "moonlight")
     wordmark_legacy = out_img / "aurora_wordmark.png"
     if wordmark_legacy.is_file():
         wordmark_legacy.unlink()
