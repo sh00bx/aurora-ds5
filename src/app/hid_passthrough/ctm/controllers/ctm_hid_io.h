@@ -12,11 +12,21 @@
  * instead of five.
  *
  * Threads: every write path is reached from the controller's session thread
- * (the pump's rumble drain, the paced drain, handle_message) — but nothing
- * here relies on that: the writes are serialised by this object's own mutex
- * and the counters are relaxed atomics, so a future caller on another thread
- * costs accuracy nowhere. The fd is additionally read by the input thread's
- * poll and dup()'d by the feature worker; ctm_hid_io_fd() exists for those. */
+ * (the pump's rumble drain, the paced drain, handle_message, on_plug_init) and
+ * the code relies on that. This object's mutex covers only the fd itself — the
+ * write()/poll(POLLOUT)/write() retry and the HIDIOCSFEATURE ioctl — so that a
+ * reader elsewhere cannot interleave with a two-step write. Everything else
+ * ctm_hid_io_write() touches is unsynchronised single-threaded state owned by
+ * the session thread: the 0x31 dedup cache (a read-compare-write across
+ * memcmp/memcpy, and a torn one silently swallows a rumble OFF as a dedup hit),
+ * audio_last_us (a plain 64-bit store, 32-bit on this target), and the borrowed
+ * ds5_audio_t that PLC and the tx-seq stamp mutate. A second writer thread
+ * would need all of that under the same mutex first; the relaxed counters are
+ * the only part that is already safe for one.
+ *
+ * The fd is additionally read by the input thread's poll, dup()'d for the
+ * feature worker, used as the composite fallback fd in handle_message, and
+ * closed/republished across a re-attach — ctm_hid_io_fd() serves all of those. */
 
 #include <stdbool.h>
 #include <stddef.h>

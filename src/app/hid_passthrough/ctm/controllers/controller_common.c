@@ -2072,7 +2072,11 @@ bool ctm_controller_finished(ctm_controller_t *c)
 
 /* Snapshot live bridging status for the UI panel. When: the UI status timer
  * (~500 ms). connected/transport/last_event are read under status_mutex; the
- * report counters are read advisorily (single-writer, monotonic). */
+ * report counters come from ctm_stats_t, so each one is a single relaxed atomic
+ * load against many writer threads (see the struct comment there). No lock and
+ * no ordering: the panel wants a recent number, not a consistent set of four,
+ * and the counters are statistics — advisory because of what they mean, not
+ * because anything makes them stable while this reads them. */
 void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out)
 {
     if (!c || !out) return;

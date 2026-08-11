@@ -238,11 +238,16 @@ uint64_t hid_pt_usb_identity_hash(const char *usbdir)
     return hash ? hash : 1;        /* 0 is reserved for "unknown" */
 }
 
-/* Still the same device in that port? Re-read at most once per model rebuild:
- * three small sysfs reads, against a re-capture that walks /sys/class/input. */
-static bool port_cache_entry_still_current(hid_pt_port_cache_t *entry)
+/* Still the same device in that port? @p reverify reads sysfs now; without it
+ * the answer is re-read at most once per model rebuild and the last answer
+ * stands for the rest of it — three small sysfs reads per caller per scan,
+ * against a re-capture that walks /sys/class/input. The memo is for the
+ * per-scan callers only: g_devices.generation advances once per
+ * hid_pt_rescan_model(), so anything that must not act on a stale answer
+ * between rescans (a plug lands off that cadence) has to pass reverify. */
+static bool port_cache_entry_still_current(hid_pt_port_cache_t *entry, bool reverify)
 {
-    if (entry->checked_generation == g_devices.generation && entry->identity != 0) {
+    if (!reverify && entry->checked_generation == g_devices.generation && entry->identity != 0) {
         return true;
     }
     entry->checked_generation = g_devices.generation;
@@ -251,8 +256,11 @@ static bool port_cache_entry_still_current(hid_pt_port_cache_t *entry)
 }
 
 /* A live, identity-checked entry for @p key, or NULL. An entry whose port now
- * holds a different device (or nothing) is dropped here rather than returned. */
-static hid_pt_port_cache_t *port_cache_find(void *base, size_t stride, int max, const char *key)
+ * holds a different device (or nothing) is dropped here rather than returned —
+ * decided by reading sysfs now when @p reverify, otherwise by the identity
+ * check this model rebuild already made (port_cache_entry_still_current). */
+static hid_pt_port_cache_t *port_cache_find(void *base, size_t stride, int max, const char *key,
+                                            bool reverify)
 {
     if (!key || !key[0]) {
         return NULL;
@@ -263,7 +271,7 @@ static hid_pt_port_cache_t *port_cache_find(void *base, size_t stride, int max, 
         if (!entry->valid || strcmp(entry->key, key) != 0) {
             continue;
         }
-        if (port_cache_entry_still_current(entry)) {
+        if (port_cache_entry_still_current(entry, reverify)) {
             return entry;
         }
         memset(entry, 0, stride);
@@ -305,7 +313,10 @@ static hid_pt_port_cache_t *port_cache_claim(void *base, size_t stride, int max,
     if (!slot) {
         for (int i = 0; i < max && !slot; ++i) {
             hid_pt_port_cache_t *entry = (hid_pt_port_cache_t *)(bytes + (size_t)i * stride);
-            if (entry->valid && !port_cache_entry_still_current(entry)) {
+            /* Eviction preference only: a memoised "still current" here costs
+             * at worst the oldest entry instead of a departed one, so this walk
+             * does not force a sysfs re-read of every slot. */
+            if (entry->valid && !port_cache_entry_still_current(entry, false)) {
                 slot = entry;
             }
         }
@@ -362,7 +373,8 @@ int read_usb_identity_attrs(const char *usb_busid, char *mfg, size_t mfg_len,
      * device without a manufacturer string — most of them — re-walked
      * /sys/class/input on every call. The entry's own validity answers it now. */
     usb_identity_cache_t *cached = (usb_identity_cache_t *)port_cache_find(
-        g_usb_identity_cache, sizeof(g_usb_identity_cache[0]), USB_IDENTITY_CACHE_MAX, usb_busid);
+        g_usb_identity_cache, sizeof(g_usb_identity_cache[0]), USB_IDENTITY_CACHE_MAX, usb_busid,
+        false);   /* per-scan caller: the once-per-rebuild identity check is the point */
     if (cached) {
         if (mfg && mfg_len) snprintf(mfg, mfg_len, "%s", cached->manufacturer);
         if (prod && prod_len) snprintf(prod, prod_len, "%s", cached->product);
@@ -496,16 +508,26 @@ static int hidraw_sysfs_device_path(const char *hidraw, char *out, size_t out_le
 /* Bluetooth hidraw nodes that have no USB bus id, so the two /sys/class/input
  * walks below are not repeated for them.
  *
- * Restricted to devices whose bus says Bluetooth, and keyed on (hidraw name,
- * phys) together rather than the name alone. Both restrictions are about the
- * same hazard: hidraw minors are recycled, so a USB pad that later becomes
- * hidraw3 must not inherit a Bluetooth pad's "no bus id". phys is the physical
- * topology path — the adapter address for a BT device — so the pair identifies
- * the device, a device with no phys is not memoised at all, and a device the
- * kernel calls Bluetooth cannot grow a USB bus id afterwards. A USB device
- * that failed to resolve (the jail sysfs gap) is deliberately NOT memoised:
- * that one could plausibly resolve on a later pass, and hiding a bus id the
- * device really has is the expensive direction.
+ * The hazard is that hidraw minors are recycled: a USB pad that later becomes
+ * hidraw3 must not inherit a Bluetooth pad's "no bus id". What blocks that is
+ * the bus gate in hidraw_busid_memoisable() below — only devices the kernel
+ * puts on the Bluetooth bus are written to the memo, and only those consult it,
+ * so a USB pad taking over the minor never reaches this table at all; and a
+ * device the kernel calls Bluetooth cannot grow a USB bus id afterwards.
+ *
+ * The key is (hidraw name, phys) rather than the name alone, but phys is only
+ * a cheap extra discriminator here, NOT an identity: for Bluetooth HID the
+ * kernel sets phys to the local adapter address, which every BT pad on this
+ * adapter shares (and steam_root_from_phys() below deliberately trims phys to a
+ * root several interfaces share). Among BT devices the pair therefore
+ * degenerates to the hidraw name. If the bus gate is ever relaxed — memoising
+ * USB negatives, or a device whose bus string is blank — phys will not carry
+ * the guarantee and the recycled-minor hazard comes straight back. A device
+ * with no phys at all is not memoised either.
+ *
+ * A USB device that failed to resolve (the jail sysfs gap) is deliberately NOT
+ * memoised for a second reason: that one could plausibly resolve on a later
+ * pass, and hiding a bus id the device really has is the expensive direction.
  *
  * Only negatives are cached. A wrong positive would attribute another device's
  * port to this one, which is the failure this phase removes everywhere else. */
@@ -1246,11 +1268,15 @@ static uint8_t read_usb_full_speed_flag(const char *usbdir)
 
 const composite_enum_t *composite_enum_lookup(const char *key)
 {
-    /* Identity-checked, like every other read of this table: a plug that
-     * resolves an enumeration captured from a device that has since left the
-     * port would hand the host the wrong descriptors. */
+    /* Identity re-read from sysfs on every call (reverify=true), not memoised
+     * per model rebuild the way the per-scan identity cache is: this table is
+     * read at plug time, and a plug happens when it happens, not on the rescan
+     * cadence — so the memoised answer can be a whole poll interval stale. An
+     * enumeration captured from a device that has since left the port would
+     * hand the host the wrong descriptors, and three sysfs reads per plug is a
+     * cheap way to not do that. */
     return (const composite_enum_t *)port_cache_find(
-        g_composite_enums, sizeof(g_composite_enums[0]), COMPOSITE_ENUM_MAX_CACHE, key);
+        g_composite_enums, sizeof(g_composite_enums[0]), COMPOSITE_ENUM_MAX_CACHE, key, true);
 }
 
 static const char *composite_enum_key_for_device(const char *usb_busid, const char *usbdir)
