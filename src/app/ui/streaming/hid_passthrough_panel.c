@@ -54,7 +54,16 @@ typedef struct {
     lv_obj_t *row_buttons[HID_PT_MAX_ROWS];
     lv_obj_t *plug_buttons[HID_PT_MAX_ROWS];
     lv_obj_t *plug_labels[HID_PT_MAX_ROWS];
+    /* The device key each rendered row is LABELLED with, stamped by
+     * render_device_list(). g_devices is rebuilt from scratch on the manager's
+     * 1 Hz poll (and synchronously from the SDL hotplug handlers) while this
+     * panel re-renders on its own 2 s timer, so between the two a g_devices
+     * index no longer names the device the user is looking at. Every click and
+     * every settings write resolves this key instead. */
+    char row_keys[HID_PT_MAX_ROWS][96];
     lv_obj_t *active_dropdown;
+    /* A ROW index into row_buttons/plug_buttons/plug_labels/row_keys — never an
+     * index into g_devices. The selected DEVICE is selected_key. */
     int selected_index;
     char selected_key[96];
     int list_width;
@@ -73,10 +82,31 @@ typedef struct {
 
 static logical_device_t *panel_selected_item(const hid_pt_panel_t *panel)
 {
-    if (!panel || panel->selected_index < 0 || panel->selected_index >= g_devices.count) {
+    return panel ? logical_device_by_key(panel->selected_key) : NULL;
+}
+
+/* The device a rendered row stands for, or NULL if it has left the model since
+ * the row was drawn. `row` is a row index, i.e. what the widgets carry. */
+static logical_device_t *panel_device_at_row(const hid_pt_panel_t *panel, int row)
+{
+    if (!panel || row < 0 || row >= HID_PT_MAX_ROWS) {
         return NULL;
     }
-    return &g_devices.items[panel->selected_index];
+    return logical_device_by_key(panel->row_keys[row]);
+}
+
+/* The row currently showing @p key, or -1. */
+static int panel_row_for_key(const hid_pt_panel_t *panel, const char *key)
+{
+    if (!panel || !key || !key[0]) {
+        return -1;
+    }
+    for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
+        if (panel->row_buttons[i] && strcmp(panel->row_keys[i], key) == 0) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static bool item_is_playstation_audio(const logical_device_t *item)
@@ -104,10 +134,10 @@ static bool selected_item_is_ds5(const hid_pt_panel_t *panel)
 
 static bool selected_item_is_flydigi(const hid_pt_panel_t *panel)
 {
-    if (!panel || panel->selected_index < 0 || panel->selected_index >= g_devices.count) {
+    const logical_device_t *item = panel_selected_item(panel);
+    if (!item) {
         return false;
     }
-    const logical_device_t *item = &g_devices.items[panel->selected_index];
     return is_flydigi_logical_device(item) ||
            (item->usb_busid[0] && is_flydigi_usb_busid(item->usb_busid)) ||
            (strcmp(item->vid, "04b4") == 0 && strcmp(item->pid, "2412") == 0) ||
@@ -125,10 +155,14 @@ static void style_row(lv_obj_t *row, bool selected) {
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 }
 
+/* Styled by key, not by index: this also runs on refreshes that did NOT
+ * re-render, where the rows still show the previous rebuild's order. */
 static void update_row_styles(hid_pt_panel_t *panel) {
-    for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
+    for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (panel->row_buttons[i]) {
-            style_row(panel->row_buttons[i], i == panel->selected_index);
+            style_row(panel->row_buttons[i],
+                      panel->selected_key[0] &&
+                          strcmp(panel->row_keys[i], panel->selected_key) == 0);
         }
     }
 }
@@ -136,7 +170,7 @@ static void update_row_styles(hid_pt_panel_t *panel) {
 static void panel_update_status(hid_pt_panel_t *panel);
 static void update_device_options(hid_pt_panel_t *panel);
 static void panel_setup_focus_order(hid_pt_panel_t *panel);
-static void panel_select_device(hid_pt_panel_t *panel, int index);
+static void panel_select_device(hid_pt_panel_t *panel, int row);
 static lv_obj_t *panel_first_option_target(hid_pt_panel_t *panel);
 static void panel_focus_current_plug(hid_pt_panel_t *panel);
 static bool panel_is_plug_button(const hid_pt_panel_t *panel, lv_obj_t *target);
@@ -177,13 +211,15 @@ static void panel_close_dropdown(hid_pt_panel_t *panel, lv_obj_t *dropdown)
     lv_group_focus_obj(dropdown);
 }
 
-static void panel_select_device(hid_pt_panel_t *panel, int index)
+/* @p row is a ROW index. The selection is stored as the key that row shows, so
+ * it keeps naming the same controller after g_devices is rebuilt underneath. */
+static void panel_select_device(hid_pt_panel_t *panel, int row)
 {
-    if (!panel || index < 0 || index >= g_devices.count) {
+    if (!panel || row < 0 || row >= HID_PT_MAX_ROWS || !panel->row_buttons[row]) {
         return;
     }
-    panel->selected_index = index;
-    snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", g_devices.items[index].key);
+    panel->selected_index = row;
+    snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", panel->row_keys[row]);
     update_row_styles(panel);
     update_device_options(panel);
 }
@@ -311,7 +347,7 @@ static void panel_setup_focus_order(hid_pt_panel_t *panel)
     }
     panel->rebuilding = true;
     lv_group_remove_all_objs(panel->group);
-    for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
+    for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (panel->plug_buttons[i]) {
             /* Plug buttons scroll the device list themselves in plug_focus_cb. */
             lv_group_add_obj(panel->group, panel->plug_buttons[i]);
@@ -336,9 +372,12 @@ static void plug_focus_cb(lv_event_t *event)
     if (!panel || panel->rebuilding || lv_event_get_code(event) != LV_EVENT_FOCUSED) {
         return;
     }
-    int index = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_target(event));
-    panel_select_device(panel, index);
-    lv_obj_scroll_to_view(panel->row_buttons[index], LV_ANIM_ON);
+    int row = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_target(event));
+    if (row < 0 || row >= HID_PT_MAX_ROWS || !panel->row_buttons[row]) {
+        return;
+    }
+    panel_select_device(panel, row);
+    lv_obj_scroll_to_view(panel->row_buttons[row], LV_ANIM_ON);
 }
 
 static void dropdown_arrow_preprocess_cb(lv_event_t *event)
@@ -510,12 +549,9 @@ static void panel_key_cb(lv_event_t *event) {
 
 static void composite_toggle_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    if (!panel || panel->selected_index < 0 || panel->selected_index >= g_devices.count) {
-        return;
-    }
-    logical_device_t *item = &g_devices.items[panel->selected_index];
+    logical_device_t *item = panel_selected_item(panel);
     tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!settings) {
+    if (!item || !settings) {
         return;
     }
     settings->composite_passthrough = lv_obj_has_state(panel->composite_cb, LV_STATE_CHECKED);
@@ -525,12 +561,9 @@ static void composite_toggle_cb(lv_event_t *event) {
 static void auto_plugin_toggle_cb(lv_event_t *event)
 {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    if (!panel || panel->selected_index < 0 || panel->selected_index >= g_devices.count) {
-        return;
-    }
-    logical_device_t *item = &g_devices.items[panel->selected_index];
+    logical_device_t *item = panel_selected_item(panel);
     tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!settings || !panel->auto_plugin_cb) {
+    if (!item || !settings || !panel->auto_plugin_cb) {
         return;
     }
     settings->auto_plugin = lv_obj_has_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
@@ -828,7 +861,7 @@ static void update_composite_row(hid_pt_panel_t *panel) {
     }
     bool show = selected_item_is_flydigi(panel);
     if (show) {
-        logical_device_t *item = &g_devices.items[panel->selected_index];
+        logical_device_t *item = panel_selected_item(panel);
         tv_bridge_worker_settings_t *settings = settings_for_item(item);
         if (settings) {
             if (settings->composite_passthrough) {
@@ -854,24 +887,34 @@ static void update_device_options(hid_pt_panel_t *panel)
 
 static void row_clicked_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    int index = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_current_target(event));
-    if (!panel || index < 0 || index >= g_devices.count) {
+    int row = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_current_target(event));
+    if (!panel || row < 0 || row >= HID_PT_MAX_ROWS || !panel->row_buttons[row]) {
         return;
     }
-    panel_select_device(panel, index);
-    if (panel->plug_buttons[index]) {
-        lv_group_focus_obj(panel->plug_buttons[index]);
+    panel_select_device(panel, row);
+    if (panel->plug_buttons[row]) {
+        lv_group_focus_obj(panel->plug_buttons[row]);
     }
 }
 
 static void plug_button_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    int index = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_current_target(event));
-    if (!panel || index < 0 || index >= g_devices.count) {
+    int row = (int) (intptr_t) lv_obj_get_user_data(lv_event_get_current_target(event));
+    if (!panel || row < 0 || row >= HID_PT_MAX_ROWS || !panel->row_buttons[row]) {
         return;
     }
 
-    logical_device_t *item = &g_devices.items[index];
+    /* Resolve the key the row is LABELLED with. The bare index this button used
+     * to carry addressed g_devices, which the manager's poll rebuilds in
+     * readdir order on a different cadence than this panel re-renders on, so a
+     * press could bridge the pad in the next row instead. NULL means the device
+     * left between the last render and the press: do nothing, and say so. */
+    logical_device_t *item = panel_device_at_row(panel, row);
+    if (!item) {
+        ctm_set_plug_error("%s is no longer connected", panel->row_keys[row]);
+        panel_update_status(panel);
+        return;
+    }
     bool requested_state = !item->plugged;
     if (requested_state) {
         ctm_clear_plug_error();
@@ -920,11 +963,11 @@ static void plug_button_cb(lv_event_t *event) {
      * deliberate plug-out is not re-plugged by the reconcile poll) until it
      * physically reconnects. */
     autoplug_mark_done(item->key);
-    panel->selected_index = index;
+    panel->selected_index = row;
     snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", item->key);
 
-    if (panel->plug_labels[index]) {
-        lv_label_set_text(panel->plug_labels[index], item->plugged ? locstr("Plug out") : locstr("Plug in"));
+    if (panel->plug_labels[row]) {
+        lv_label_set_text(panel->plug_labels[row], item->plugged ? locstr("Plug out") : locstr("Plug in"));
     }
     update_row_styles(panel);
     update_device_options(panel);
@@ -936,6 +979,7 @@ static void render_device_list(hid_pt_panel_t *panel) {
     memset(panel->row_buttons, 0, sizeof(panel->row_buttons));
     memset(panel->plug_buttons, 0, sizeof(panel->plug_buttons));
     memset(panel->plug_labels, 0, sizeof(panel->plug_labels));
+    memset(panel->row_keys, 0, sizeof(panel->row_keys));
 
     if (g_devices.count == 0) {
         lv_obj_t *empty = lv_label_create(panel->list);
@@ -956,13 +1000,15 @@ static void render_device_list(hid_pt_panel_t *panel) {
         const logical_device_t *item = &g_devices.items[i];
         lv_obj_t *row = lv_obj_create(panel->list);
         panel->row_buttons[i] = row;
+        /* What this row stands for, for as long as it exists. */
+        snprintf(panel->row_keys[i], sizeof(panel->row_keys[0]), "%s", item->key);
         lv_obj_set_width(row, LV_PCT(100));
         lv_obj_set_height(row, row_h);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
         lv_obj_add_event_cb(row, row_clicked_cb, LV_EVENT_CLICKED, panel);
         lv_obj_set_user_data(row, (void *) (intptr_t) i);
-        style_row(row, i == panel->selected_index);
+        style_row(row, panel->selected_key[0] && strcmp(item->key, panel->selected_key) == 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_hor(row, LV_DPX(14), 0);
@@ -1069,7 +1115,7 @@ static void focus_initial_target(hid_pt_panel_t *panel) {
         lv_group_focus_obj(panel->plug_buttons[panel->selected_index]);
         return;
     }
-    for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
+    for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (panel->plug_buttons[i]) {
             panel_select_device(panel, i);
             lv_group_focus_obj(panel->plug_buttons[i]);
@@ -1124,20 +1170,13 @@ static void refresh_devices(hid_pt_panel_t *panel) {
     char prev_key[sizeof(panel->selected_key)];
     snprintf(prev_key, sizeof(prev_key), "%s", panel->selected_key);
 
-    int selected = -1;
-    if (panel->selected_key[0]) {
-        for (int i = 0; i < g_devices.count; ++i) {
-            if (strcmp(g_devices.items[i].key, panel->selected_key) == 0) {
-                selected = i;
-                break;
-            }
-        }
-    }
-    if (selected < 0 && g_devices.count > 0) {
-        selected = 0;
+    /* The selection is a key; only its presence in the current model is decided
+     * here. Its ROW is resolved after the render decision below, because on a
+     * refresh that does not re-render the rows still carry the previous
+     * rebuild's order and a g_devices index would point at the wrong widget. */
+    if (!logical_device_by_key(panel->selected_key) && g_devices.count > 0) {
         snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", g_devices.items[0].key);
     }
-    panel->selected_index = selected;
     update_status_label(panel);
 
     /* Where the cursor was before the re-render. render_device_list() empties and
@@ -1168,6 +1207,8 @@ static void refresh_devices(hid_pt_panel_t *panel) {
     } else {
         update_row_styles(panel);
     }
+    /* Rows exist and are current as of here, so the selected key has a row. */
+    panel->selected_index = panel_row_for_key(panel, panel->selected_key);
     /* Before restoring focus, not after: this is what decides whether the control
      * the user was on is still on screen for the selected device (the hidden test
      * below reads the flags it sets). */
