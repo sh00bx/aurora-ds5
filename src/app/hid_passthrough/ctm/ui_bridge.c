@@ -721,7 +721,19 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
         ctm_set_plug_error("Controller plug-in failed");
         goto fail_bridge;
     }
-    add_session(session_key, busid, controller, port);
+    if (!add_session(session_key, busid, controller, port)) {
+        /* The session table is full (MAX_SESSIONS is half of MAX_DEVICES, and
+         * per-interface plugs each take a slot). The result used to be
+         * discarded here, after the session thread was already running: the
+         * only pointer to a live controller went out of scope, so nothing could
+         * ever stop it — session_index_for_key() would never find it, the
+         * plug-out button did nothing, the vanish reap could not reap it, and
+         * the stream-teardown sweep did not see it either, while the UI happily
+         * showed the device as bridged. Unwind instead. */
+        ctm_set_plug_error("Too many bridge sessions");
+        ctm_controller_plug_out(controller);
+        goto fail_bridge;
+    }
     ctm_clear_plug_error();
     log_append("controller started kind=%s node=%s busid=%s host=%s port=%d",
                kind, cdev.path, busid, g_agent_host, port);
