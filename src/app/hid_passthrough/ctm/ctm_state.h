@@ -261,7 +261,9 @@ int read_usb_identity_attrs(const char *usb_busid, char *mfg, size_t mfg_len,
                             char *prod, size_t prod_len);
 bool device_should_list_in_ui(const device_info_t *dev);
 bool is_xpad_only_scan_device(const device_info_t *dev);
-void usb_busid_from_hidraw_name(const char *hidraw, char *out, size_t out_len);
+/* The USB bus id for one scanned hidraw device, or "" when it has none.
+ * Memoises the negative for Bluetooth devices, which never gain one. */
+void usb_busid_for_scan_device(const device_info_t *dev, char *out, size_t out_len);
 int flydigi_hidraw_path_for_busid(const char *usb_busid, char *out, size_t out_len);
 int flydigi_hidraw_path_for_item(const logical_device_t *item, char *out, size_t out_len);
 int flydigi_handshake_hidraw_path_for_busid(const char *usb_busid, char *out, size_t out_len);

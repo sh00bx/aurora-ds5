@@ -493,12 +493,75 @@ static int hidraw_sysfs_device_path(const char *hidraw, char *out, size_t out_le
     return rc;
 }
 
-void usb_busid_from_hidraw_name(const char *hidraw, char *out, size_t out_len)
+/* Bluetooth hidraw nodes that have no USB bus id, so the two /sys/class/input
+ * walks below are not repeated for them.
+ *
+ * Restricted to devices whose bus says Bluetooth, and keyed on (hidraw name,
+ * phys) together rather than the name alone. Both restrictions are about the
+ * same hazard: hidraw minors are recycled, so a USB pad that later becomes
+ * hidraw3 must not inherit a Bluetooth pad's "no bus id". phys is the physical
+ * topology path — the adapter address for a BT device — so the pair identifies
+ * the device, a device with no phys is not memoised at all, and a device the
+ * kernel calls Bluetooth cannot grow a USB bus id afterwards. A USB device
+ * that failed to resolve (the jail sysfs gap) is deliberately NOT memoised:
+ * that one could plausibly resolve on a later pass, and hiding a bus id the
+ * device really has is the expensive direction.
+ *
+ * Only negatives are cached. A wrong positive would attribute another device's
+ * port to this one, which is the failure this phase removes everywhere else. */
+#define HIDRAW_NO_BUSID_MAX 32
+
+typedef struct {
+    char hidraw[32];
+    char phys[TEXT_LEN];
+    uint32_t seq;             /* 0 = free slot; otherwise write order */
+} hidraw_no_busid_t;
+
+static hidraw_no_busid_t g_hidraw_no_busid[HIDRAW_NO_BUSID_MAX];
+
+static bool hidraw_busid_memoisable(const device_info_t *dev)
 {
-    out[0] = '\0';
-    if (!hidraw || !hidraw[0]) {
+    return dev && dev->hidraw[0] && dev->phys[0] && strcmp(bus_label(dev->bus), "BT") == 0;
+}
+
+static bool hidraw_busid_known_absent(const device_info_t *dev)
+{
+    if (!hidraw_busid_memoisable(dev)) {
+        return false;
+    }
+    for (int i = 0; i < HIDRAW_NO_BUSID_MAX; ++i) {
+        if (g_hidraw_no_busid[i].seq &&
+            strcmp(g_hidraw_no_busid[i].hidraw, dev->hidraw) == 0 &&
+            strcmp(g_hidraw_no_busid[i].phys, dev->phys) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void hidraw_note_no_busid(const device_info_t *dev)
+{
+    static uint32_t seq;
+    if (!hidraw_busid_memoisable(dev)) {
         return;
     }
+    hidraw_no_busid_t *slot = &g_hidraw_no_busid[0];
+    for (int i = 0; i < HIDRAW_NO_BUSID_MAX; ++i) {
+        if (!g_hidraw_no_busid[i].seq) {
+            slot = &g_hidraw_no_busid[i];
+            break;
+        }
+        if (g_hidraw_no_busid[i].seq < slot->seq) {
+            slot = &g_hidraw_no_busid[i];   /* oldest, if nothing is free */
+        }
+    }
+    snprintf(slot->hidraw, sizeof(slot->hidraw), "%s", dev->hidraw);
+    snprintf(slot->phys, sizeof(slot->phys), "%s", dev->phys);
+    slot->seq = ++seq;
+}
+
+static void usb_busid_resolve_uncached(const char *hidraw, char *out, size_t out_len)
+{
     char real[PATH_MAX];
     if (hidraw_sysfs_device_path(hidraw, real, sizeof(real)) == 0) {
         usb_busid_from_sysfs_realpath(real, out, out_len);
@@ -540,6 +603,21 @@ void usb_busid_from_hidraw_name(const char *hidraw, char *out, size_t out_len)
     close(fd);
 }
 
+void usb_busid_for_scan_device(const device_info_t *dev, char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (!dev || !dev->hidraw[0]) {
+        return;
+    }
+    if (hidraw_busid_known_absent(dev)) {
+        return;
+    }
+    usb_busid_resolve_uncached(dev->hidraw, out, out_len);
+    if (!out[0]) {
+        hidraw_note_no_busid(dev);
+    }
+}
+
 static void logical_device_merge_fields(logical_device_t *item, const device_info_t *dev)
 {
     if (!item || !dev) return;
@@ -564,7 +642,7 @@ static void enrich_scan_usb_busids(scan_result_t *result)
         device_info_t *dev = &result->devices[i];
         if (dev->usb_busid[0]) continue;
         if (dev->hidraw[0]) {
-            usb_busid_from_hidraw_name(dev->hidraw, dev->usb_busid, sizeof(dev->usb_busid));
+            usb_busid_for_scan_device(dev, dev->usb_busid, sizeof(dev->usb_busid));
         } else if (dev->inputs[0]) {
             char link[PATH_MAX];
             snprintf(link, sizeof(link), "/sys/class/input/%s/device", dev->inputs);
@@ -585,7 +663,7 @@ static void enrich_scan_usb_busids(scan_result_t *result)
                 continue;
             }
             char peer[64] = {0};
-            usb_busid_from_hidraw_name(dev->hidraw, peer, sizeof(peer));
+            usb_busid_for_scan_device(dev, peer, sizeof(peer));
             if (peer[0] && strcmp(peer, anchor->usb_busid) == 0) {
                 snprintf(dev->usb_busid, sizeof(dev->usb_busid), "%s", anchor->usb_busid);
             }
@@ -1407,7 +1485,7 @@ static int flydigi_hidraw_pick(const char *usb_busid, const logical_device_t *on
         char peer_busid[64] = {0};
         snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
         if (!peer_busid[0]) {
-            usb_busid_from_hidraw_name(dev->hidraw, peer_busid, sizeof(peer_busid));
+            usb_busid_for_scan_device(dev, peer_busid, sizeof(peer_busid));
         }
         if (usb_busid && usb_busid[0]) {
             if (!peer_busid[0] || strcmp(peer_busid, usb_busid) != 0) continue;
@@ -1448,7 +1526,7 @@ static bool flydigi_has_gamepad_hidraw_for_busid(const char *usb_busid)
         char peer_busid[64] = {0};
         snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
         if (!peer_busid[0]) {
-            usb_busid_from_hidraw_name(dev->hidraw, peer_busid, sizeof(peer_busid));
+            usb_busid_for_scan_device(dev, peer_busid, sizeof(peer_busid));
         }
         if (!peer_busid[0] || strcmp(peer_busid, usb_busid) != 0) continue;
         if (gamepad_iface_score_for_device(dev) >= 90) return true;
@@ -1491,7 +1569,7 @@ bool flydigi_has_hidraw_for_busid(const char *usb_busid)
         char peer_busid[64] = {0};
         snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
         if (!peer_busid[0]) {
-            usb_busid_from_hidraw_name(dev->hidraw, peer_busid, sizeof(peer_busid));
+            usb_busid_for_scan_device(dev, peer_busid, sizeof(peer_busid));
         }
         if (peer_busid[0] && strcmp(peer_busid, usb_busid) == 0) {
             return true;
@@ -1581,7 +1659,7 @@ static int flydigi_handshake_hidraw_pick(const char *usb_busid, const logical_de
         char peer_busid[64] = {0};
         snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
         if (!peer_busid[0]) {
-            usb_busid_from_hidraw_name(dev->hidraw, peer_busid, sizeof(peer_busid));
+            usb_busid_for_scan_device(dev, peer_busid, sizeof(peer_busid));
         }
         if (usb_busid && usb_busid[0]) {
             if (!peer_busid[0] || strcmp(peer_busid, usb_busid) != 0) continue;
