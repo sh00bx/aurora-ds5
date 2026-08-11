@@ -10,6 +10,7 @@ if (TARGET_WEBOS)
             ctm/ui_devices.c
             ctm/ctm_classify.c
             ctm/ctm_dev_composite.c
+            ctm/ctm_enumerate.c
             ctm/ui_bridge.c
             ctm/controllers/controller_common.c
             ctm/controllers/ctm_composite.c
