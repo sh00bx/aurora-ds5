@@ -46,18 +46,25 @@ bool hid_passthrough_manager_active(const hid_passthrough_manager_t *manager);
 void hid_passthrough_manager_set_stream_input(hid_passthrough_manager_t *manager,
                                               struct stream_input_t *input);
 
-/* Rescan + per-device auto-plug reconcile. LVGL/main thread only. */
+/* The stream-time poll tick: request_rescan() with the stored stream input.
+ * LVGL/main thread only. */
 void hid_passthrough_manager_poll(hid_passthrough_manager_t *manager);
 
-void hid_passthrough_manager_reconcile(hid_passthrough_manager_t *manager,
-                                        struct stream_input_t *input);
+/* Ask for the device model to be rebuilt now, and auto-plug reconciled against
+ * @p input (NULL = the input this manager was given).
+ *
+ * The ONLY way to trigger enumeration from outside this module: the SDL hotplug
+ * handlers, session start and the panel's Refresh button all come through here,
+ * so one component decides when sysfs is walked and when g_devices.generation
+ * moves. It runs the scan immediately and never defers — a hotplug that arrived
+ * must not wait for the next tick. LVGL/main thread only. */
+void hid_passthrough_manager_request_rescan(hid_passthrough_manager_t *manager,
+                                            struct stream_input_t *input);
 
 int hid_passthrough_manager_device_count(hid_passthrough_manager_t *manager);
 
 int hid_passthrough_manager_get_device(hid_passthrough_manager_t *manager, int index,
                                        hid_pt_device_info_t *info);
-
-void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager);
 
 #else
 
@@ -112,13 +119,10 @@ static inline void hid_passthrough_manager_poll(hid_passthrough_manager_t *manag
     (void) manager;
 }
 
-static inline void hid_passthrough_manager_reconcile(hid_passthrough_manager_t *manager, void *input) {
+static inline void hid_passthrough_manager_request_rescan(hid_passthrough_manager_t *manager,
+                                                          void *input) {
     (void) manager;
     (void) input;
-}
-
-static inline void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager) {
-    (void) manager;
 }
 
 #endif

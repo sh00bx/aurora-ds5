@@ -1144,7 +1144,11 @@ static bool panel_obj_is_hidden(const hid_pt_panel_t *panel, lv_obj_t *obj)
     return false;
 }
 
-static void refresh_devices(hid_pt_panel_t *panel) {
+/* @p rescan: ask the manager to rebuild the model first. Only the Refresh
+ * button and the first render do — the periodic refresh just re-reads what the
+ * manager's own 1000 ms poll already keeps current, and running a second full
+ * sysfs enumeration on this panel's 2000 ms timer only duplicated it. */
+static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
     if (!panel || !panel->session) {
         return;
     }
@@ -1158,9 +1162,9 @@ static void refresh_devices(hid_pt_panel_t *panel) {
     if (session_has_input(panel->session)) {
         session_ensure_hid_passthrough(panel->session);
     }
-    hid_passthrough_manager_t *mgr = session_get_hid_passthrough(panel->session);
-    if (mgr) {
-        hid_passthrough_manager_rescan(mgr);
+    if (rescan) {
+        hid_passthrough_manager_request_rescan(session_get_hid_passthrough(panel->session),
+                                               session_get_input(panel->session));
     }
 
     /* The device the user was on, captured before the resolve below is allowed to
@@ -1229,13 +1233,13 @@ static void refresh_devices(hid_pt_panel_t *panel) {
 static void refresh_timer_cb(lv_timer_t *timer) {
     hid_pt_panel_t *panel = timer->user_data;
     if (panel && panel->container && lv_obj_is_valid(panel->container)) {
-        refresh_devices(panel);
+        refresh_devices(panel, false);
     }
 }
 
 static void refresh_button_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    refresh_devices(panel);
+    refresh_devices(panel, true);
 }
 
 static void panel_delete_cb(lv_event_t *e) {
@@ -1256,7 +1260,7 @@ static void panel_delete_cb(lv_event_t *e) {
 void hid_passthrough_panel_refresh(lv_obj_t *panel_root) {
     hid_pt_panel_t *panel = lv_obj_get_user_data(panel_root);
     if (panel) {
-        refresh_devices(panel);
+        refresh_devices(panel, true);
     }
 }
 

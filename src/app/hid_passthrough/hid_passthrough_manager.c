@@ -58,7 +58,9 @@ int hid_passthrough_manager_start(hid_passthrough_manager_t *manager, const char
     }
 
     manager->running = true;
-    hid_passthrough_manager_rescan(manager);
+    /* No rescan here. Both callers set the stream input and then ask for one
+     * immediately, so this was a second full sysfs enumeration back to back
+     * with the first, with nothing able to run in between. */
     return 0;
 }
 
@@ -124,8 +126,11 @@ int hid_passthrough_manager_get_device(hid_passthrough_manager_t *manager, int i
     return 0;
 }
 
-void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager) {
-    (void) manager;
+/* Re-enumerate sysfs, rebuild the logical model (which bumps
+ * g_devices.generation) and refresh the derived caches. Private on purpose:
+ * hid_passthrough_manager_request_rescan() is the only way in from outside, so
+ * there is exactly one component deciding when enumeration happens. */
+static void hid_pt_rescan_model(void) {
     enumerate_devices(&g_scan);
     build_logical_devices(&g_scan, &g_devices);
     publish_bt_macs();
@@ -143,20 +148,20 @@ void hid_passthrough_manager_rescan(hid_passthrough_manager_t *manager) {
     hid_pt_sync_plugged_state();
 }
 
-void hid_passthrough_manager_reconcile(hid_passthrough_manager_t *manager,
-                                       stream_input_t *input) {
+void hid_passthrough_manager_request_rescan(hid_passthrough_manager_t *manager,
+                                            stream_input_t *input) {
     if (!manager || !manager->running) {
         return;
     }
-    hid_pt_autoplug_reconcile(input);
+    hid_pt_rescan_model();
+    /* @p input is what the caller has in hand; the stored one is what the poll
+     * timer uses. They are the same &session->input in every current caller,
+     * but the parameter keeps each site honest about what it is reconciling. */
+    hid_pt_autoplug_reconcile(input ? input : manager->stream_input);
 }
 
 void hid_passthrough_manager_poll(hid_passthrough_manager_t *manager) {
-    if (!manager || !manager->running) {
-        return;
-    }
-    hid_passthrough_manager_rescan(manager);
-    hid_pt_autoplug_reconcile(manager->stream_input);
+    hid_passthrough_manager_request_rescan(manager, NULL);
 }
 
 #endif

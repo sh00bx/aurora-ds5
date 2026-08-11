@@ -358,8 +358,7 @@ void stream_input_handle_jdevice(stream_input_t *input, const SDL_JoyDeviceEvent
         if (hid_pt_gamepad_is_autoplug(input->input, gamepad)) {
             hid_passthrough_manager_t *mgr = session_get_hid_passthrough(input->session);
             if (mgr != NULL && hid_passthrough_manager_active(mgr)) {
-                hid_passthrough_manager_rescan(mgr);
-                hid_passthrough_manager_reconcile(mgr, input);
+                hid_passthrough_manager_request_rescan(mgr, input);
             }
             return;
         }

@@ -26,8 +26,7 @@ bool session_handle_input_event(session_t *session, const SDL_Event *event) {
         if (gp != NULL && hid_pt_gamepad_is_autoplug(in->input, gp)) {
             hid_passthrough_manager_t *mgr = session_get_hid_passthrough(session);
             if (mgr != NULL && hid_passthrough_manager_active(mgr)) {
-                hid_passthrough_manager_rescan(mgr);
-                hid_passthrough_manager_reconcile(mgr, in);
+                hid_passthrough_manager_request_rescan(mgr, in);
                 return true;  /* passthrough owns this pad; never announce it */
             }
         }
