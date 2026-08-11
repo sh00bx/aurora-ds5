@@ -63,8 +63,20 @@ bool ui_dispatch_userevent(app_t *app, int which, void *data1, void *data2);
 
 /**
  * @brief Check if GUI should consume input events, so it will not pass onto streaming
+ *
+ * A relaxed load of a published flag — callable from any thread, and it touches
+ * no LVGL object. Whoever owns the surfaces that block input must keep it up to
+ * date with ui_input_gate_publish().
  */
 bool ui_should_block_input();
+
+/**
+ * @brief Publish the input gate. LVGL thread only.
+ *
+ * Must be called after every change to whether a UI surface owns input, because
+ * the worker threads that read the gate cannot look at the surfaces themselves.
+ */
+void ui_input_gate_publish(bool blocked);
 
 void ui_display_size(app_ui_t *ui, int width, int height);
 

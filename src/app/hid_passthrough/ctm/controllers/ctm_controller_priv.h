@@ -49,8 +49,14 @@ static inline int ctm_hex_equals(const char *text, unsigned int value)
 
 /* ui/root.c — true while the streaming overlay / soft keyboard / HID panel owns
  * input. Declared here instead of including ui/root.h to keep the controller
- * layer free of LVGL headers; plain bool read, safe cross-thread (worst case
- * one report forwarded with stale gate state). */
+ * layer free of LVGL headers.
+ *
+ * A relaxed load of a flag the LVGL thread publishes; it reads no LVGL object
+ * and takes no lock, so it is safe to call from the controller pump and the
+ * evdev feeder and costs nothing on the per-report path. The one imprecision is
+ * timing: a report may be forwarded against a gate state one publish old. It
+ * used to be worse than that — the gate was recomputed per read by chasing the
+ * live streaming fragment, which LVGL frees underneath the worker threads. */
 extern bool ui_should_block_input(void);
 
 /* --- owner services --------------------------------------------------------

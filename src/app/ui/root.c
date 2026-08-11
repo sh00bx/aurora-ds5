@@ -21,6 +21,7 @@
 
 #include <SDL.h>
 #include <SDL_image.h>
+#include <stdatomic.h>
 
 #include "logging_ext_lvgl.h"
 #include "fatal_error.h"
@@ -288,12 +289,31 @@ bool ui_dispatch_userevent(app_t *app, int which, void *data1, void *data2) {
     return handled;
 }
 
+/* The input gate as a VALUE, not a question.
+ *
+ * It used to be recomputed per read, from `overlay_showing` and from two
+ * pointer chases through the live streaming fragment. Two of the readers are
+ * worker threads (the HID passthrough controller pump and the evdev feeder),
+ * and the fragment they were chasing is freed by LVGL on the LVGL thread the
+ * moment the stream tears down — so a read that had already passed the NULL
+ * test could load `->soft_kbd` out of freed memory. The gate is now published
+ * by the LVGL thread whenever any of the three surfaces opens or closes
+ * (streaming/streaming.controller.c is the only writer — see
+ * streaming_publish_input_gate there) and readers only ever see a bool.
+ *
+ * Relaxed ordering on purpose: the flag carries no other data with it, nothing
+ * is published alongside it, and the load sits on the per-report input path
+ * where a barrier would cost something and buy nothing. The worst case is
+ * unchanged from before — one report forwarded with a gate state one publish
+ * old — but it is now the only failure mode instead of a use-after-free. */
+static _Atomic bool ui_input_gate = false;
+
+void ui_input_gate_publish(bool blocked) {
+    atomic_store_explicit(&ui_input_gate, blocked, memory_order_relaxed);
+}
+
 bool ui_should_block_input() {
-#if defined(TARGET_WEBOS)
-    return streaming_overlay_shown() || streaming_soft_keyboard_shown() || streaming_hid_panel_shown();
-#else
-    return streaming_overlay_shown() || streaming_soft_keyboard_shown();
-#endif
+    return atomic_load_explicit(&ui_input_gate, memory_order_relaxed);
 }
 
 void ui_display_size(app_ui_t *ui, int width, int height) {

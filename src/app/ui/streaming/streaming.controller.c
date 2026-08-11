@@ -201,6 +201,26 @@ bool streaming_stats_shown() {
     return overlay_showing || overlay_pinned;
 }
 
+/* Publish "a UI surface owns input" for the threads that cannot ask.
+ *
+ * The three predicates above answer the same question, but two of them chase
+ * `current_controller` into fragment storage that LVGL frees on this thread —
+ * fine here, but a use-after-free from the HID passthrough worker threads.
+ * Those read ui_should_block_input() instead, which is a plain flag; this file
+ * is its only writer, and writes happen on the LVGL thread only. Every mutation of
+ * `overlay_showing`, `->soft_kbd`, `->hid_panel` or `current_controller` below
+ * is therefore followed by a call to it. */
+static void streaming_publish_input_gate(void) {
+    bool blocked = overlay_showing;
+    if (current_controller != NULL) {
+        blocked = blocked || current_controller->soft_kbd != NULL;
+#if defined(TARGET_WEBOS)
+        blocked = blocked || current_controller->hid_panel != NULL;
+#endif
+    }
+    ui_input_gate_publish(blocked);
+}
+
 /* Quality colour for a total latency, matching the compact bar's thresholds. */
 static lv_color_t streaming_latency_color(float total_ms) {
     return total_ms <= 25.0f ? lv_palette_main(LV_PALETTE_GREEN)
@@ -477,6 +497,7 @@ static void constructor(lv_fragment_t *self, void *args) {
     current_controller = controller;
 
     overlay_showing = false;
+    streaming_publish_input_gate();
 
     streaming_styles_init(controller);
 
@@ -504,6 +525,11 @@ static void controller_dtor(lv_fragment_t *self) {
 #endif
     streaming_styles_reset(fragment);
     if (current_controller == fragment) {
+        /* Publish before the pointer goes, so the gate is a settled value for
+         * the whole teardown window rather than something a reader derives from
+         * a half-destroyed fragment. LVGL frees this storage right after we
+         * return. */
+        ui_input_gate_publish(false);
         current_controller = NULL;
     }
     fragment->soft_kbd = NULL; /* Will be deleted with parent */
@@ -608,6 +634,7 @@ static bool on_event(lv_fragment_t *self, int code, void *userdata) {
                 controller->global->session,
                 soft_keyboard_close_cb,
                 controller);
+            streaming_publish_input_gate();
             lv_group_t *kbd_group = soft_keyboard_get_group(controller->soft_kbd);
             if (kbd_group) {
                 app_input_set_group(&controller->global->ui.input, kbd_group);
@@ -710,6 +737,7 @@ static void soft_keyboard_close_cb(void *userdata) {
     }
     lv_obj_t *kbd_obj = controller->soft_kbd;
     controller->soft_kbd = NULL;
+    streaming_publish_input_gate();
     app_input_set_group(&controller->global->ui.input, controller->group);
     app_set_mouse_grab(&controller->global->input, true);
     if (controller->global->session) {
@@ -730,6 +758,7 @@ static void open_keyboard(lv_event_t *event) {
         controller->global->session,
         soft_keyboard_close_cb,
         controller);
+    streaming_publish_input_gate();
     lv_group_t *kbd_group = soft_keyboard_get_group(controller->soft_kbd);
     if (kbd_group) {
         app_input_set_group(&controller->global->ui.input, kbd_group);
@@ -763,6 +792,7 @@ static void hid_panel_close_cb(void *userdata) {
     }
     lv_obj_t *panel = controller->hid_panel;
     controller->hid_panel = NULL;
+    streaming_publish_input_gate();
     lv_obj_del(panel);
     lv_indev_reset(NULL, NULL);
     if (controller->group) {
@@ -781,6 +811,7 @@ static void open_hid_devices(lv_event_t *event) {
             controller->global->session,
             hid_panel_close_cb,
             controller);
+    streaming_publish_input_gate();
     if (!controller->hid_panel) {
         return;
     }
@@ -797,6 +828,7 @@ bool show_overlay(streaming_controller_t *controller) {
         return false;
     }
     overlay_showing = true;
+    streaming_publish_input_gate();
     lv_obj_clear_flag(controller->base.obj, LV_OBJ_FLAG_HIDDEN);
 
     lv_area_t coords = controller->video->coords;
@@ -832,6 +864,7 @@ static void hide_overlay_impl(streaming_controller_t *controller) {
         return;
     }
     overlay_showing = false;
+    streaming_publish_input_gate();
     app_set_mouse_grab(&controller->global->input, true);
     streaming_enter_fullscreen(controller->global->session);
 }

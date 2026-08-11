@@ -2,7 +2,8 @@
 #define CTM_STATE_H
 
 /* Headless shared state, types and core API for the CTM bridge (no LVGL / SDL).
- * Split out of ui_common.h so the enumeration/classification (ui_devices.c), the
+ * Split out of ui_common.h so the enumeration/classification (ctm_enumerate.c,
+ * ctm_classify.c, ctm_dev_composite.c, ctm_model.c — all once ui_devices.c), the
  * agent/session/plug logic (ui_bridge.c) and the helpers below can compile and
  * link into a host app (e.g. moonlight-tv) that owns its own LVGL/SDL. The UI
  * half (display, widgets, per-controller detail windows) stays in ui_common.h,
@@ -160,8 +161,8 @@ typedef struct {
  * descriptors to the host as another's.
  *
  * Entries live in fixed tables whose first member must be this struct; the
- * helpers in ui_devices.c enforce that with a _Static_assert rather than a
- * comment. */
+ * helpers in ctm_dev_composite.c enforce that with a _Static_assert rather than
+ * a comment. */
 typedef struct {
     int valid;
     char key[64];                 /* usb_busid, or the usbdir basename when the
@@ -244,7 +245,9 @@ bool contains_ci(const char *text, const char *needle);
 bool valid_bt_address(const char *s);
 void append_unique(char *dst, size_t dst_len, const char *value);
 
-/* ---- ui_devices.c: enumeration + classification + logical model ---- */
+/* ---- enumeration + classification + logical model ----
+ * Defined across ctm_enumerate.c (scan), ctm_classify.c (what is this pad),
+ * ctm_dev_composite.c (composite-USB node picking) and ctm_model.c. */
 device_info_t *find_or_add_device(scan_result_t *result, const char *hidraw);
 device_info_t *find_or_add_input_device(scan_result_t *result, const char *input_name,
                                         const char *usb_busid);
