@@ -10,7 +10,9 @@
  * runtime reader for a bridged controller's sibling hidraw nodes. The two share
  * no state and no naming.
  *
- * Split out of ui_devices.c; the code is unchanged. */
+ * Split out of ui_devices.c. Two things were deduplicated afterwards and are
+ * the only edits since: flydigi_busid_for_item() (one copy of a rule that had
+ * six) and flydigi_pick() (one loop where two near-identical ones stood). */
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -595,7 +597,21 @@ static void flydigi_busid_for_item(const logical_device_t *item, char *out, size
     }
 }
 
-static int flydigi_hidraw_pick(const char *usb_busid, const logical_device_t *only_item)
+/* Which scan row is this Flydigi's hidraw node — the one loop both pickers used
+ * to spell out separately.
+ *
+ * @p reject drops rows the caller cannot use (NULL: keep every hidraw row).
+ * @p score_fn ranks the survivors and the highest wins; NULL means the caller
+ * wants the first match in scan order rather than the best one, which is the
+ * difference between the node we bridge and the node we handshake on.
+ *
+ * @p only_item restricts the walk to one logical device's rows, and when that
+ * yields nothing the whole scan is walked instead — a Flydigi whose interfaces
+ * were grouped under some other key is still found that way. Returns a g_scan
+ * index, or -1. */
+static int flydigi_pick(const char *usb_busid, const logical_device_t *only_item,
+                        bool (*reject)(const device_info_t *dev),
+                        int (*score_fn)(const device_info_t *dev))
 {
     int best_idx = -1;
     int best_score = -1;
@@ -606,6 +622,7 @@ static int flydigi_hidraw_pick(const char *usb_busid, const logical_device_t *on
         if (i < 0 || i >= g_scan.count) continue;
         const device_info_t *dev = &g_scan.devices[i];
         if (!dev->hidraw[0]) continue;
+        if (reject && reject(dev)) continue;
 
         char peer_busid[64] = {0};
         snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
@@ -621,14 +638,16 @@ static int flydigi_hidraw_pick(const char *usb_busid, const logical_device_t *on
         }
 
         if (first_idx < 0) first_idx = i;
-        int score = gamepad_iface_score_for_device(dev);
-        if (score > best_score) {
-            best_score = score;
-            best_idx = i;
+        if (score_fn) {
+            int score = score_fn(dev);
+            if (score > best_score) {
+                best_score = score;
+                best_idx = i;
+            }
         }
     }
     if (first_idx < 0 && only_item) {
-        return flydigi_hidraw_pick(usb_busid, NULL);
+        return flydigi_pick(usb_busid, NULL, reject, score_fn);
     }
     return best_idx >= 0 ? best_idx : first_idx;
 }
@@ -759,41 +778,10 @@ int flydigi_xpad_scan_index_for_item(const logical_device_t *item)
     return -1;
 }
 
-static int flydigi_handshake_hidraw_pick(const char *usb_busid, const logical_device_t *only_item)
-{
-    int first_idx = -1;
-    const int loops = only_item ? only_item->device_count : g_scan.count;
-    for (int p = 0; p < loops; ++p) {
-        int i = only_item ? only_item->device_indices[p] : p;
-        if (i < 0 || i >= g_scan.count) continue;
-        const device_info_t *dev = &g_scan.devices[i];
-        if (!dev->hidraw[0] || flydigi_hidraw_is_mouse(dev)) continue;
-
-        char peer_busid[64] = {0};
-        snprintf(peer_busid, sizeof(peer_busid), "%s", dev->usb_busid);
-        if (!peer_busid[0]) {
-            usb_busid_for_scan_device(dev, peer_busid, sizeof(peer_busid));
-        }
-        if (usb_busid && usb_busid[0]) {
-            if (!peer_busid[0] || strcmp(peer_busid, usb_busid) != 0) continue;
-        } else if (peer_busid[0]) {
-            if (!is_flydigi_usb_busid(peer_busid)) continue;
-        } else if (!is_flydigi_composite_device(dev)) {
-            continue;
-        }
-
-        if (first_idx < 0) first_idx = i;
-    }
-    if (first_idx < 0 && only_item) {
-        return flydigi_handshake_hidraw_pick(usb_busid, NULL);
-    }
-    return first_idx;
-}
-
 int flydigi_handshake_hidraw_path_for_busid(const char *usb_busid, char *out, size_t out_len)
 {
     if (!out || out_len == 0) return -1;
-    int pick = flydigi_handshake_hidraw_pick(usb_busid, NULL);
+    int pick = flydigi_pick(usb_busid, NULL, flydigi_hidraw_is_mouse, NULL);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
     return 0;
@@ -804,7 +792,7 @@ int flydigi_handshake_hidraw_path_for_item(const logical_device_t *item, char *o
     if (!item || !out || out_len == 0) return -1;
     char busid[64];
     flydigi_busid_for_item(item, busid, sizeof(busid));
-    int pick = flydigi_handshake_hidraw_pick(busid[0] ? busid : NULL, item);
+    int pick = flydigi_pick(busid[0] ? busid : NULL, item, flydigi_hidraw_is_mouse, NULL);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
     return 0;
@@ -813,7 +801,7 @@ int flydigi_handshake_hidraw_path_for_item(const logical_device_t *item, char *o
 int flydigi_hidraw_path_for_busid(const char *usb_busid, char *out, size_t out_len)
 {
     if (!out || out_len == 0) return -1;
-    int pick = flydigi_hidraw_pick(usb_busid, NULL);
+    int pick = flydigi_pick(usb_busid, NULL, NULL, gamepad_iface_score_for_device);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
     return 0;
@@ -824,7 +812,8 @@ int flydigi_hidraw_path_for_item(const logical_device_t *item, char *out, size_t
     if (!item || !out || out_len == 0) return -1;
     char busid[64];
     flydigi_busid_for_item(item, busid, sizeof(busid));
-    int pick = flydigi_hidraw_pick(busid[0] ? busid : NULL, item);
+    int pick = flydigi_pick(busid[0] ? busid : NULL, item, NULL,
+                            gamepad_iface_score_for_device);
     if (pick < 0) return -1;
     snprintf(out, out_len, "%s", g_scan.devices[pick].node);
     return 0;
