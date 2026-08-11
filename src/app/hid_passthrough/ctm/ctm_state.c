@@ -16,7 +16,6 @@
 /* ---- headless global state (was defined in ui_common.c) ----------------- */
 composite_enum_t g_composite_enums[COMPOSITE_ENUM_MAX_CACHE];
 int g_composite_enum_count;
-puck_enum_t g_puck_enum;
 scan_result_t g_scan;
 logical_result_t g_devices;
 int g_selected_index = -1;

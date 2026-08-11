@@ -971,11 +971,6 @@ int composite_enumerate_ifaces(const char *usbdir, composite_if_t *out, int max)
     return n;
 }
 
-int puck_enumerate_ifaces(const char *usbdir, puck_if_t *out, int max)
-{
-    return composite_enumerate_ifaces(usbdir, out, max);
-}
-
 /* Raw (binary) sysfs read — for `descriptors` and `report_descriptor` blobs
  * (read_text_file would trim/stop at NULs). Returns bytes read. */
 static int read_binary_file(const char *path, uint8_t *out, int max)
@@ -1037,17 +1032,6 @@ static composite_enum_t *composite_enum_slot(const char *key)
     return slot;
 }
 
-static void sync_legacy_puck_enum(void)
-{
-    memset(&g_puck_enum, 0, sizeof(g_puck_enum));
-    for (int i = 0; i < g_composite_enum_count; ++i) {
-        if (g_composite_enums[i].valid) {
-            g_puck_enum = g_composite_enums[i];
-            return;
-        }
-    }
-}
-
 const composite_enum_t *composite_enum_lookup(const char *key)
 {
     if (!key || !key[0]) return NULL;
@@ -1080,7 +1064,6 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
     } else if (vid && pid && puck_usb_device_dir(vid, pid, usbdir, sizeof(usbdir)) == 0) {
         /* resolved by VID/PID (Steam Puck, native Flydigi) */
     } else {
-        sync_legacy_puck_enum();
         return -1;
     }
 
@@ -1088,7 +1071,6 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
     composite_enum_t *cache = composite_enum_slot(key);
     if (!cache) return -1;
     if (cache->valid && strcmp(cache->usbdir, usbdir) == 0) {
-        sync_legacy_puck_enum();
         return 0;
     }
 
@@ -1157,7 +1139,6 @@ int composite_enum_capture(const char *usb_busid, const char *vid, const char *p
                    cache->ifs[i].cls, cache->ifs[i].rdesc_len,
                    cache->ifs[i].node[0] ? cache->ifs[i].node : "-");
     }
-    sync_legacy_puck_enum();
     return 0;
 }
 

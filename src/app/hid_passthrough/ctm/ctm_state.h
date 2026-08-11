@@ -124,7 +124,6 @@ typedef struct {
 
 /* One USB interface of a composite device (from the device-dir sysfs walk). */
 typedef struct { int num; char cls[8]; char node[64]; char dir[32]; } composite_if_t;
-typedef composite_if_t puck_if_t;
 
 /* Cached composite USB enumeration — captured once per usb_busid and forwarded
  * verbatim to Windows at bridge plug (CTMB_MSG_ENUM). */
@@ -132,9 +131,6 @@ typedef composite_if_t puck_if_t;
 #define COMPOSITE_ENUM_MAX_DESC  4096
 #define COMPOSITE_ENUM_MAX_RDESC 1024
 #define COMPOSITE_ENUM_MAX_CACHE 8
-#define PUCK_ENUM_MAX_IF    COMPOSITE_ENUM_MAX_IF
-#define PUCK_ENUM_MAX_DESC  COMPOSITE_ENUM_MAX_DESC
-#define PUCK_ENUM_MAX_RDESC COMPOSITE_ENUM_MAX_RDESC
 
 typedef struct {
     int num;
@@ -143,7 +139,6 @@ typedef struct {
     int rdesc_len;
     uint8_t rdesc[COMPOSITE_ENUM_MAX_RDESC];
 } composite_enum_if_t;
-typedef composite_enum_if_t puck_enum_if_t;
 
 typedef struct {
     int valid;
@@ -156,11 +151,9 @@ typedef struct {
     composite_enum_if_t ifs[COMPOSITE_ENUM_MAX_IF];
     uint8_t full_speed;                        /* 1 = USB full-speed (12 Mbps) */
 } composite_enum_t;
-typedef composite_enum_t puck_enum_t;
 
 extern composite_enum_t g_composite_enums[COMPOSITE_ENUM_MAX_CACHE];
 extern int g_composite_enum_count;
-extern puck_enum_t g_puck_enum;                /* legacy alias: first valid cache entry */
 
 /* ---- headless global state (defined in ctm_state.c) --------------------- */
 extern scan_result_t g_scan;
@@ -280,7 +273,6 @@ void enumerate_devices(scan_result_t *result);
 int puck_usb_device_dir(const char *vid, const char *pid, char *out, size_t out_len);
 int composite_usb_device_dir_by_busid(const char *usb_busid, char *out, size_t out_len);
 int composite_enumerate_ifaces(const char *usbdir, composite_if_t *out, int max);
-int puck_enumerate_ifaces(const char *usbdir, puck_if_t *out, int max);
 int composite_enum_capture(const char *usb_busid, const char *vid, const char *pid);
 int puck_enum_capture(const char *vid, const char *pid);
 const composite_enum_t *composite_enum_lookup(const char *key);
