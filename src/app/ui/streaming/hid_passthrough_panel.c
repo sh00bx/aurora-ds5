@@ -1,11 +1,9 @@
 #if defined(TARGET_WEBOS)
 
 #include "hid_passthrough_panel.h"
+#include "hid_pt_panel_model.h"
 
-#include "ctm/ctm_state.h"
-#include "ctm/ctm_settings.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
-#include "hid_passthrough/hid_pt_gamepad_match.h"
 #include "stream/session.h"
 
 #include "util/bus.h"
@@ -55,17 +53,17 @@ typedef struct {
     lv_obj_t *plug_buttons[HID_PT_MAX_ROWS];
     lv_obj_t *plug_labels[HID_PT_MAX_ROWS];
     /* The device key each rendered row is LABELLED with, stamped by
-     * render_device_list(). g_devices is rebuilt from scratch on the manager's
-     * 1 Hz poll (and synchronously from the SDL hotplug handlers) while this
-     * panel re-renders on its own 2 s timer, so between the two a g_devices
-     * index no longer names the device the user is looking at. Every click and
-     * every settings write resolves this key instead. */
-    char row_keys[HID_PT_MAX_ROWS][96];
+     * render_device_list(). The device model is rebuilt from scratch on the
+     * manager's 1 Hz poll (and synchronously from the SDL hotplug handlers)
+     * while this panel re-renders on its own 2 s timer, so between the two a
+     * model index no longer names the device the user is looking at. Every
+     * click and every settings write resolves this key instead. */
+    char row_keys[HID_PT_MAX_ROWS][HID_PT_PANEL_KEY_LEN];
     lv_obj_t *active_dropdown;
     /* A ROW index into row_buttons/plug_buttons/plug_labels/row_keys — never an
-     * index into g_devices. The selected DEVICE is selected_key. */
+     * index into the device model. The selected DEVICE is the model's key. */
     int selected_index;
-    char selected_key[96];
+    hid_pt_model_t model;
     int list_width;
     uint64_t last_sig;
     bool have_rendered;
@@ -79,21 +77,6 @@ typedef struct {
 #define DS_LATENCY_MAX 200
 #define DS_VOLUME_MAX 100
 #define DS_HAPTICS_MAX 200
-
-static logical_device_t *panel_selected_item(const hid_pt_panel_t *panel)
-{
-    return panel ? logical_device_by_key(panel->selected_key) : NULL;
-}
-
-/* The device a rendered row stands for, or NULL if it has left the model since
- * the row was drawn. `row` is a row index, i.e. what the widgets carry. */
-static logical_device_t *panel_device_at_row(const hid_pt_panel_t *panel, int row)
-{
-    if (!panel || row < 0 || row >= HID_PT_MAX_ROWS) {
-        return NULL;
-    }
-    return logical_device_by_key(panel->row_keys[row]);
-}
 
 /* The row currently showing @p key, or -1. */
 static int panel_row_for_key(const hid_pt_panel_t *panel, const char *key)
@@ -109,42 +92,6 @@ static int panel_row_for_key(const hid_pt_panel_t *panel, const char *key)
     return -1;
 }
 
-static bool item_is_playstation_audio(const logical_device_t *item)
-{
-    if (!item) {
-        return false;
-    }
-    const char *kind = bridge_kind_for_item(item);
-    return strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0;
-}
-
-static bool item_is_bridgeable(const logical_device_t *item)
-{
-    if (!item) {
-        return false;
-    }
-    return strcmp(bridge_kind_for_item(item), "hid") != 0;
-}
-
-static bool selected_item_is_ds5(const hid_pt_panel_t *panel)
-{
-    logical_device_t *item = panel_selected_item(panel);
-    return item && strcmp(bridge_kind_for_item(item), "ds5") == 0;
-}
-
-static bool selected_item_is_flydigi(const hid_pt_panel_t *panel)
-{
-    const logical_device_t *item = panel_selected_item(panel);
-    if (!item) {
-        return false;
-    }
-    return is_flydigi_logical_device(item) ||
-           (item->usb_busid[0] && is_flydigi_usb_busid(item->usb_busid)) ||
-           (strcmp(item->vid, "04b4") == 0 && strcmp(item->pid, "2412") == 0) ||
-           contains_ci(item->name, "flydigi") || contains_ci(item->name, "vader") ||
-           contains_ci(item->name, "apex");
-}
-
 static void style_row(lv_obj_t *row, bool selected) {
     lv_obj_set_style_radius(row, LV_DPX(8), 0);
     lv_obj_set_style_border_width(row, selected ? 2 : 1, 0);
@@ -158,11 +105,10 @@ static void style_row(lv_obj_t *row, bool selected) {
 /* Styled by key, not by index: this also runs on refreshes that did NOT
  * re-render, where the rows still show the previous rebuild's order. */
 static void update_row_styles(hid_pt_panel_t *panel) {
+    const char *sel = hid_pt_model_selected_key(&panel->model);
     for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (panel->row_buttons[i]) {
-            style_row(panel->row_buttons[i],
-                      panel->selected_key[0] &&
-                          strcmp(panel->row_keys[i], panel->selected_key) == 0);
+            style_row(panel->row_buttons[i], sel[0] && strcmp(panel->row_keys[i], sel) == 0);
         }
     }
 }
@@ -212,14 +158,15 @@ static void panel_close_dropdown(hid_pt_panel_t *panel, lv_obj_t *dropdown)
 }
 
 /* @p row is a ROW index. The selection is stored as the key that row shows, so
- * it keeps naming the same controller after g_devices is rebuilt underneath. */
+ * it keeps naming the same controller after the device model is rebuilt
+ * underneath. */
 static void panel_select_device(hid_pt_panel_t *panel, int row)
 {
     if (!panel || row < 0 || row >= HID_PT_MAX_ROWS || !panel->row_buttons[row]) {
         return;
     }
     panel->selected_index = row;
-    snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", panel->row_keys[row]);
+    hid_pt_model_set_selected_key(&panel->model, panel->row_keys[row]);
     update_row_styles(panel);
     update_device_options(panel);
 }
@@ -229,7 +176,7 @@ static lv_obj_t *panel_first_option_target(hid_pt_panel_t *panel)
     if (!panel) {
         return NULL;
     }
-    if (selected_item_is_flydigi(panel) && panel->composite_row &&
+    if (hid_pt_model_selected_is_flydigi(&panel->model) && panel->composite_row &&
         !lv_obj_has_flag(panel->composite_row, LV_OBJ_FLAG_HIDDEN) && panel->composite_cb) {
         return panel->composite_cb;
     }
@@ -519,7 +466,7 @@ static void control_key_cb(lv_event_t *event)
             }
             if (panel_is_plug_button(panel, target)) {
                 int idx = panel_plug_button_index(panel, target);
-                for (int j = idx + 1; j < g_devices.count && j < HID_PT_MAX_ROWS; ++j) {
+                for (int j = idx + 1; j < hid_pt_model_device_count() && j < HID_PT_MAX_ROWS; ++j) {
                     if (panel->plug_buttons[j]) {
                         panel_focus_plug_at(panel, j);
                         break;
@@ -549,25 +496,21 @@ static void panel_key_cb(lv_event_t *event) {
 
 static void composite_toggle_cb(lv_event_t *event) {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!item || !settings) {
+    if (!panel || !panel->composite_cb) {
         return;
     }
-    settings->composite_passthrough = lv_obj_has_state(panel->composite_cb, LV_STATE_CHECKED);
-    apply_settings_to_session(item);
+    hid_pt_model_set_composite(&panel->model,
+                               lv_obj_has_state(panel->composite_cb, LV_STATE_CHECKED));
 }
 
 static void auto_plugin_toggle_cb(lv_event_t *event)
 {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!item || !settings || !panel->auto_plugin_cb) {
+    if (!panel || !panel->auto_plugin_cb) {
         return;
     }
-    settings->auto_plugin = lv_obj_has_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
-    hid_pt_sync_auto_plugin_pref(item);
+    hid_pt_model_set_auto_plugin(&panel->model,
+                                 lv_obj_has_state(panel->auto_plugin_cb, LV_STATE_CHECKED));
 }
 
 static void update_latency_label(hid_pt_panel_t *panel)
@@ -578,10 +521,9 @@ static void update_latency_label(hid_pt_panel_t *panel)
     int ms = (int) lv_slider_get_value(panel->latency_slider);
     /* Read the default back from the same place Reset uses instead of naming a
      * number here. A literal in this string has already gone stale once — the
-     * pt-BR translation still carries a msgid claiming 48 ms — and
-     * default_settings_for_item() is free to vary the value per controller. */
-    const logical_device_t *item = panel_selected_item(panel);
-    int def_ms = item ? (int) default_settings_for_item(item).latency_ms : 60;
+     * pt-BR translation still carries a msgid claiming 48 ms — and the model's
+     * per-device default is free to vary the value per controller. */
+    int def_ms = hid_pt_model_default_latency_ms(&panel->model);
     lv_label_set_text_fmt(panel->latency_label,
                           locstr("Audio/haptics latency — %d ms (default: %d ms)"), ms, def_ms);
 }
@@ -613,14 +555,14 @@ static void update_haptics_label(hid_pt_panel_t *panel)
     lv_label_set_text_fmt(panel->haptics_label, locstr("Haptics strength — %d%% (default: 100%%)"), pct);
 }
 
-static void update_audio_warning(hid_pt_panel_t *panel)
+/* @p controls is NULL when the selection has no settings record, which is the
+ * same case the hand-written version treated as "nothing to warn about". */
+static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t *controls)
 {
     if (!panel || !panel->audio_warning_label) {
         return;
     }
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!settings || settings->audio_mode == TV_BRIDGE_AUDIO_AUTO) {
+    if (!controls || controls->audio_mode == HID_PT_AUDIO_MODE_AUTO) {
         lv_obj_add_flag(panel->audio_warning_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_label_set_text(panel->audio_warning_label,
@@ -632,33 +574,15 @@ static void update_audio_warning(hid_pt_panel_t *panel)
 
 static void update_battery_label(hid_pt_panel_t *panel)
 {
-    if (!panel || !panel->battery_label || !selected_item_is_ds5(panel)) {
-        if (panel && panel->battery_label) {
-            lv_obj_add_flag(panel->battery_label, LV_OBJ_FLAG_HIDDEN);
-        }
+    if (!panel || !panel->battery_label) {
         return;
     }
-    logical_device_t *item = panel_selected_item(panel);
-    if (!item) {
+    char text[64];
+    if (!hid_pt_model_battery_text(&panel->model, text, sizeof(text))) {
+        lv_obj_add_flag(panel->battery_label, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    int session_index = session_index_for_key(item->key);
-    ctm_controller_status_t st;
-    memset(&st, 0, sizeof(st));
-    if (session_index >= 0 && g_sessions[session_index].controller) {
-        ctm_controller_get_status(g_sessions[session_index].controller, &st);
-    }
-    if (st.battery_valid) {
-        int pct = (int)(st.battery_level * 10);
-        if (st.battery_status == 2) {
-            pct = 100;
-        }
-        const char *stat = st.battery_status == 2 ? locstr(" (full)") :
-                           st.battery_status == 1 ? locstr(" (charging)") : "";
-        lv_label_set_text_fmt(panel->battery_label, locstr("Battery: %d%%%s"), pct, stat);
-    } else {
-        lv_label_set_text(panel->battery_label, locstr("Battery: --"));
-    }
+    lv_label_set_text(panel->battery_label, text);
     lv_obj_clear_flag(panel->battery_label, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -677,11 +601,11 @@ static void update_battery_label(hid_pt_panel_t *panel)
  */
 static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
 {
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!panel || !settings) {
+    hid_pt_controls_t c;
+    if (!panel || !hid_pt_model_read_controls(&panel->model, &c)) {
         return;
     }
+    const hid_pt_controls_t *settings = &c;
     if (panel->latency_slider) {
         int latency = (int) settings->latency_ms;
         if (latency < DS_LATENCY_MIN) {
@@ -723,7 +647,7 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         update_haptics_label(panel);
     }
     if (panel->haptics_row) {
-        if (selected_item_is_ds5(panel)) {
+        if (hid_pt_model_selected_is_ds5(&panel->model)) {
             lv_obj_clear_flag(panel->haptics_row, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(panel->haptics_row, LV_OBJ_FLAG_HIDDEN);
@@ -736,33 +660,42 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
             lv_obj_clear_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
         }
     }
-    update_audio_warning(panel);
+    update_audio_warning(panel, settings);
 }
 
+/**
+ * Push what the widgets hold back into the model.
+ *
+ * Only ever called from a widget's LV_EVENT_VALUE_CHANGED, i.e. from a change
+ * the user just made. The reverse direction lives in
+ * sync_customize_ui_from_settings().
+ */
 static void customize_setting_changed(hid_pt_panel_t *panel)
 {
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!panel || !item || !settings) {
+    hid_pt_controls_t c;
+    if (!panel || !hid_pt_model_read_controls(&panel->model, &c)) {
         return;
     }
     if (panel->latency_slider) {
-        settings->latency_ms = (unsigned) lv_slider_get_value(panel->latency_slider);
+        c.latency_ms = (unsigned) lv_slider_get_value(panel->latency_slider);
     }
     if (panel->audio_dropdown) {
-        settings->audio_mode = (tv_bridge_audio_mode_t) lv_dropdown_get_selected(panel->audio_dropdown);
+        c.audio_mode = lv_dropdown_get_selected(panel->audio_dropdown);
     }
     if (panel->speaker_slider) {
-        settings->speaker_volume_percent = (unsigned) lv_slider_get_value(panel->speaker_slider);
+        c.speaker_volume_percent = (unsigned) lv_slider_get_value(panel->speaker_slider);
     }
     if (panel->headset_slider) {
-        settings->headset_volume_percent = (unsigned) lv_slider_get_value(panel->headset_slider);
+        c.headset_volume_percent = (unsigned) lv_slider_get_value(panel->headset_slider);
     }
-    if (panel->haptics_slider && selected_item_is_ds5(panel)) {
-        settings->haptics_gain_centi = (unsigned) lv_slider_get_value(panel->haptics_slider);
+    if (panel->haptics_slider) {
+        /* The model drops this again unless the selection is a DualSense. */
+        c.haptics_gain_centi = (unsigned) lv_slider_get_value(panel->haptics_slider);
     }
-    apply_settings_to_session(item);
-    update_audio_warning(panel);
+    if (!hid_pt_model_write_controls(&panel->model, &c)) {
+        return;
+    }
+    update_audio_warning(panel, &c);
 }
 
 static void latency_slider_cb(lv_event_t *event)
@@ -801,15 +734,13 @@ static void audio_dropdown_cb(lv_event_t *event)
 static void reset_settings_cb(lv_event_t *event)
 {
     hid_pt_panel_t *panel = lv_event_get_user_data(event);
-    logical_device_t *item = panel_selected_item(panel);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!panel || !item || !settings) {
+    /* Defaults into the model, then into the widgets, then out to the bridge and
+     * the pref store — the order the panel has always used. */
+    if (!panel || !hid_pt_model_reset_selected(&panel->model)) {
         return;
     }
-    *settings = default_settings_for_item(item);
     sync_customize_ui_from_settings(panel);
-    apply_settings_to_session(item);
-    hid_pt_sync_auto_plugin_pref(item);
+    hid_pt_model_commit_selected(&panel->model);
 }
 
 static void update_auto_plugin_row(hid_pt_panel_t *panel)
@@ -817,22 +748,19 @@ static void update_auto_plugin_row(hid_pt_panel_t *panel)
     if (!panel || !panel->auto_plugin_row || !panel->auto_plugin_cb) {
         return;
     }
-    logical_device_t *item = panel_selected_item(panel);
-    bool show = item_is_bridgeable(item);
-    if (show) {
-        ui_record_for_item(item);
-        tv_bridge_worker_settings_t *settings = settings_for_item(item);
-        if (settings) {
-            if (settings->auto_plugin) {
-                lv_obj_add_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
-            } else {
-                lv_obj_clear_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
-            }
-        }
-        lv_obj_clear_flag(panel->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    if (!hid_pt_model_selected_is_bridgeable(&panel->model)) {
         lv_obj_add_flag(panel->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
+        return;
     }
+    hid_pt_controls_t c;
+    if (hid_pt_model_read_controls(&panel->model, &c)) {
+        if (c.auto_plugin) {
+            lv_obj_add_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(panel->auto_plugin_cb, LV_STATE_CHECKED);
+        }
+    }
+    lv_obj_clear_flag(panel->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void update_customize_panel(hid_pt_panel_t *panel)
@@ -840,13 +768,11 @@ static void update_customize_panel(hid_pt_panel_t *panel)
     if (!panel || !panel->customize_panel) {
         return;
     }
-    logical_device_t *item = panel_selected_item(panel);
-    bool show = item_is_playstation_audio(item);
-    if (show) {
-        ui_record_for_item(item);
+    if (hid_pt_model_selected_has_audio(&panel->model)) {
         sync_customize_ui_from_settings(panel);
-        if (panel->customize_title) {
-            lv_label_set_text_fmt(panel->customize_title, "%s", item->name);
+        char name[HID_PT_PANEL_NAME_LEN];
+        if (panel->customize_title && hid_pt_model_selected_name(&panel->model, name, sizeof(name))) {
+            lv_label_set_text_fmt(panel->customize_title, "%s", name);
         }
         lv_obj_clear_flag(panel->customize_panel, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -859,12 +785,11 @@ static void update_composite_row(hid_pt_panel_t *panel) {
     if (!panel || !panel->composite_row || !panel->composite_cb) {
         return;
     }
-    bool show = selected_item_is_flydigi(panel);
+    bool show = hid_pt_model_selected_is_flydigi(&panel->model);
     if (show) {
-        logical_device_t *item = panel_selected_item(panel);
-        tv_bridge_worker_settings_t *settings = settings_for_item(item);
-        if (settings) {
-            if (settings->composite_passthrough) {
+        hid_pt_controls_t c;
+        if (hid_pt_model_read_controls(&panel->model, &c)) {
+            if (c.composite_passthrough) {
                 lv_obj_add_state(panel->composite_cb, LV_STATE_CHECKED);
             } else {
                 lv_obj_clear_state(panel->composite_cb, LV_STATE_CHECKED);
@@ -904,70 +829,22 @@ static void plug_button_cb(lv_event_t *event) {
         return;
     }
 
-    /* Resolve the key the row is LABELLED with. The bare index this button used
-     * to carry addressed g_devices, which the manager's poll rebuilds in
-     * readdir order on a different cadence than this panel re-renders on, so a
-     * press could bridge the pad in the next row instead. NULL means the device
-     * left between the last render and the press: do nothing, and say so. */
-    logical_device_t *item = panel_device_at_row(panel, row);
-    if (!item) {
-        ctm_set_plug_error("%s is no longer connected", panel->row_keys[row]);
+    /* Act on the key the row is LABELLED with, not on its index: the model is
+     * rebuilt in readdir order on a different cadence than this panel
+     * re-renders on, so an index could bridge the pad in the next row instead.
+     * The model also owns the failure cases -- the device having left since the
+     * row was drawn, and plug_in_item() refusing -- and leaves the reason in the
+     * plug error the status line shows. */
+    bool plugged = false;
+    if (hid_pt_model_toggle_plug(&panel->model, panel->row_keys[row], panel->session, &plugged) !=
+        HID_PT_PLUG_DONE) {
         panel_update_status(panel);
         return;
     }
-    bool requested_state = !item->plugged;
-    if (requested_state) {
-        ctm_clear_plug_error();
-        if (!plug_in_item(item)) {
-            panel_update_status(panel);
-            return;
-        }
-        if (panel->session) {
-            stream_input_t *input = session_get_input(panel->session);
-            if (input) {
-                hid_pt_moonlight_exclude(input, item);
-                /* Keep the resolved slot in the session record too: it is the only
-                 * copy that survives the device disappearing from g_devices, and
-                 * the reconcile's reap path needs it to give the slot back. */
-                int session_index = session_index_for_key(item->key);
-                if (session_index >= 0) {
-                    g_sessions[session_index].moonlight_gs_id = item->moonlight_gs_id;
-                }
-            }
-        }
-    } else {
-        /* Third teardown path, alongside the reconcile's vanish-reap and
-         * zombie-session branches, and it needs the same care. Take the slot out
-         * of the session record before stop_session destroys it: matching the pad
-         * again afterwards only works while it is still enumerated in SDL, and a
-         * bridged pad usually is not — the exclusion bit would then stay set for
-         * the rest of the stream and kill whichever controller next inherits that
-         * gs_id. Clear item->plugged before the restore, or the owner guard
-         * refuses to release the slot this very device still claims. */
-        int session_index = session_index_for_key(item->key);
-        int gs_id = (session_index >= 0) ? g_sessions[session_index].moonlight_gs_id : -1;
-        stop_session(item->key);
-        ctm_clear_plug_error();
-        item->plugged = false;
-        if (panel->session) {
-            stream_input_t *input = session_get_input(panel->session);
-            if (input) {
-                hid_pt_moonlight_restore_slot(input, gs_id);
-            }
-        }
-    }
-
-    item->plugged = requested_state;
-    set_plug_key(item->key, item->plugged);
-    /* The user took manual control of this device: stop auto-managing it (so a
-     * deliberate plug-out is not re-plugged by the reconcile poll) until it
-     * physically reconnects. */
-    autoplug_mark_done(item->key);
     panel->selected_index = row;
-    snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", item->key);
 
     if (panel->plug_labels[row]) {
-        lv_label_set_text(panel->plug_labels[row], item->plugged ? locstr("Plug out") : locstr("Plug in"));
+        lv_label_set_text(panel->plug_labels[row], plugged ? locstr("Plug out") : locstr("Plug in"));
     }
     update_row_styles(panel);
     update_device_options(panel);
@@ -981,7 +858,8 @@ static void render_device_list(hid_pt_panel_t *panel) {
     memset(panel->plug_labels, 0, sizeof(panel->plug_labels));
     memset(panel->row_keys, 0, sizeof(panel->row_keys));
 
-    if (g_devices.count == 0) {
+    const int device_count = hid_pt_model_device_count();
+    if (device_count == 0) {
         lv_obj_t *empty = lv_label_create(panel->list);
         lv_label_set_text(empty, locstr("No HID devices visible to the native app"));
         lv_obj_set_style_text_color(empty, lv_color_hex(0xb6c5cf), 0);
@@ -996,40 +874,32 @@ static void render_device_list(hid_pt_panel_t *panel) {
     lv_obj_set_flex_flow(panel->list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(panel->list, gap, 0);
 
-    for (int i = 0; i < g_devices.count && i < HID_PT_MAX_ROWS; ++i) {
-        const logical_device_t *item = &g_devices.items[i];
+    const char *sel = hid_pt_model_selected_key(&panel->model);
+    for (int i = 0; i < device_count && i < HID_PT_MAX_ROWS; ++i) {
+        hid_pt_row_info_t info;
+        if (!hid_pt_model_row_info(i, &info)) {
+            /* Only out-of-range fails, and the loop bound is the count the model
+             * validates against; stop rather than leave a hole in the arrays. */
+            break;
+        }
         lv_obj_t *row = lv_obj_create(panel->list);
         panel->row_buttons[i] = row;
         /* What this row stands for, for as long as it exists. */
-        snprintf(panel->row_keys[i], sizeof(panel->row_keys[0]), "%s", item->key);
+        snprintf(panel->row_keys[i], sizeof(panel->row_keys[0]), "%s", info.key);
         lv_obj_set_width(row, LV_PCT(100));
         lv_obj_set_height(row, row_h);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
         lv_obj_add_event_cb(row, row_clicked_cb, LV_EVENT_CLICKED, panel);
         lv_obj_set_user_data(row, (void *) (intptr_t) i);
-        style_row(row, panel->selected_key[0] && strcmp(item->key, panel->selected_key) == 0);
+        style_row(row, sel[0] && strcmp(info.key, sel) == 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_hor(row, LV_DPX(14), 0);
         lv_obj_set_style_pad_gap(row, LV_DPX(8), 0);
 
         lv_obj_t *name = lv_label_create(row);
-        char display_name[128];
-        snprintf(display_name, sizeof(display_name), "%s", item->name);
-        if (is_flydigi_logical_device(item)) {
-            snprintf(display_name, sizeof(display_name), "%s (%s)", item->name,
-                     flydigi_is_xinput_evdev_only(item) ? "XInput" :
-                     flydigi_is_xinput_mode(item) ? "XInput" : "D-Input");
-        }
-        {
-            tv_bridge_worker_settings_t *dev_settings = settings_for_item(&g_devices.items[i]);
-            if (dev_settings && dev_settings->auto_plugin) {
-                size_t len = strlen(display_name);
-                snprintf(display_name + len, sizeof(display_name) - len, " [A]");
-            }
-        }
-        lv_label_set_text(name, display_name);
+        lv_label_set_text(name, info.label);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_flex_grow(name, 1);
 
@@ -1037,8 +907,8 @@ static void render_device_list(hid_pt_panel_t *panel) {
         panel->plug_buttons[i] = plug_btn;
         lv_obj_set_size(plug_btn, button_w, LV_DPX(38));
         lv_obj_set_style_radius(plug_btn, LV_DPX(6), 0);
-        lv_obj_set_style_bg_color(plug_btn, item->plugged ? lv_color_hex(0x7f1d1d) : lv_color_hex(0x0f766e), 0);
-        lv_obj_set_style_bg_color(plug_btn, item->plugged ? lv_color_hex(0x991b1b) : lv_color_hex(0x0d9488),
+        lv_obj_set_style_bg_color(plug_btn, info.plugged ? lv_color_hex(0x7f1d1d) : lv_color_hex(0x0f766e), 0);
+        lv_obj_set_style_bg_color(plug_btn, info.plugged ? lv_color_hex(0x991b1b) : lv_color_hex(0x0d9488),
                                   LV_STATE_PRESSED);
         lv_obj_add_event_cb(plug_btn, plug_button_cb, LV_EVENT_CLICKED, panel);
         lv_obj_add_event_cb(plug_btn, plug_focus_cb, LV_EVENT_FOCUSED, panel);
@@ -1046,7 +916,7 @@ static void render_device_list(hid_pt_panel_t *panel) {
         lv_obj_set_user_data(plug_btn, (void *) (intptr_t) i);
 
         panel->plug_labels[i] = lv_label_create(plug_btn);
-        lv_label_set_text(panel->plug_labels[i], item->plugged ? locstr("Plug out") : locstr("Plug in"));
+        lv_label_set_text(panel->plug_labels[i], info.plugged ? locstr("Plug out") : locstr("Plug in"));
         lv_obj_center(panel->plug_labels[i]);
     }
     panel_setup_focus_order(panel);
@@ -1057,7 +927,7 @@ static void panel_update_status(hid_pt_panel_t *panel) {
         return;
     }
     if (panel->error_label) {
-        const char *err = ctm_last_plug_error();
+        const char *err = hid_pt_model_plug_error();
         if (err) {
             lv_label_set_text(panel->error_label, err);
             lv_obj_clear_flag(panel->error_label, LV_OBJ_FLAG_HIDDEN);
@@ -1066,44 +936,12 @@ static void panel_update_status(hid_pt_panel_t *panel) {
         }
     }
     char status[128];
-    snprintf(status, sizeof(status), "%d device%s | Windows %s",
-             g_devices.count,
-             g_devices.count == 1 ? "" : "s",
-             ctm_agent_reachable() ? g_agent_host : "not found");
+    hid_pt_model_status_text(status, sizeof(status));
     lv_label_set_text(panel->status_label, status);
 }
 
 static void update_status_label(hid_pt_panel_t *panel) {
     panel_update_status(panel);
-}
-
-static uint64_t device_list_signature(void) {
-    uint64_t sig = 1469598103934665603ULL;
-#define SIG_MIX(p, n) do {                                              \
-        const unsigned char *_b = (const unsigned char *) (p);           \
-        for (size_t _i = 0; _i < (size_t) (n); ++_i) {                  \
-            sig ^= _b[_i];                                              \
-            sig *= 1099511628211ULL;                                    \
-        }                                                               \
-    } while (0)
-    SIG_MIX(&g_devices.count, sizeof(g_devices.count));
-    for (int i = 0; i < g_devices.count; ++i) {
-        const logical_device_t *item = &g_devices.items[i];
-        unsigned char st = (unsigned char) (item->plugged ? 1 : 0);
-        /* The row label carries the " [A]" marker, so auto_plugin belongs in the
-         * signature: without it, ticking the checkbox left the marker stale until
-         * some unrelated device event happened to change the hash.
-         * settings_for_item() materialises the record for a device that has none
-         * yet -- render_device_list() does the same for every row it draws, so
-         * this adds no entry the renderer would not have added anyway. */
-        const tv_bridge_worker_settings_t *settings = settings_for_item(item);
-        unsigned char ap = (unsigned char) ((settings && settings->auto_plugin) ? 1 : 0);
-        SIG_MIX(item->key, strlen(item->key));
-        SIG_MIX(&st, 1);
-        SIG_MIX(&ap, 1);
-    }
-#undef SIG_MIX
-    return sig;
 }
 
 static void focus_initial_target(hid_pt_panel_t *panel) {
@@ -1171,16 +1009,14 @@ static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
      * silently re-point the selection at row 0. The focus restore further down
      * compares against it: a control kept across a *device* change would hand the
      * user's arrow keys to a different controller's settings. */
-    char prev_key[sizeof(panel->selected_key)];
-    snprintf(prev_key, sizeof(prev_key), "%s", panel->selected_key);
+    char prev_key[HID_PT_PANEL_KEY_LEN];
+    snprintf(prev_key, sizeof(prev_key), "%s", hid_pt_model_selected_key(&panel->model));
 
     /* The selection is a key; only its presence in the current model is decided
      * here. Its ROW is resolved after the render decision below, because on a
      * refresh that does not re-render the rows still carry the previous
-     * rebuild's order and a g_devices index would point at the wrong widget. */
-    if (!logical_device_by_key(panel->selected_key) && g_devices.count > 0) {
-        snprintf(panel->selected_key, sizeof(panel->selected_key), "%s", g_devices.items[0].key);
-    }
+     * rebuild's order and a model index would point at the wrong widget. */
+    hid_pt_model_resolve_selection(&panel->model);
     update_status_label(panel);
 
     /* Where the cursor was before the re-render. render_device_list() empties and
@@ -1197,11 +1033,11 @@ static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
      * settings. When the device changed, fall through to focus_initial_target(),
      * which moves the cursor visibly back to the list. */
     lv_obj_t *prev_focus = lv_group_get_focused(panel->group);
-    bool same_device = strcmp(prev_key, panel->selected_key) == 0;
+    bool same_device = strcmp(prev_key, hid_pt_model_selected_key(&panel->model)) == 0;
     bool keep_focus = panel->have_rendered && same_device && panel_is_option_control(panel, prev_focus);
     bool prev_editing = keep_focus && lv_group_get_editing(panel->group);
 
-    uint64_t sig = device_list_signature();
+    uint64_t sig = hid_pt_model_signature();
     bool rerendered = false;
     if (!panel->have_rendered || sig != panel->last_sig) {
         panel->last_sig = sig;
@@ -1212,7 +1048,7 @@ static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
         update_row_styles(panel);
     }
     /* Rows exist and are current as of here, so the selected key has a row. */
-    panel->selected_index = panel_row_for_key(panel, panel->selected_key);
+    panel->selected_index = panel_row_for_key(panel, hid_pt_model_selected_key(&panel->model));
     /* Before restoring focus, not after: this is what decides whether the control
      * the user was on is still on screen for the selected device (the hidden test
      * below reads the flags it sets). */
