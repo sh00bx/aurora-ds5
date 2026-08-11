@@ -191,8 +191,6 @@ extern composite_enum_t g_composite_enums[COMPOSITE_ENUM_MAX_CACHE];
 /* ---- headless global state (defined in ctm_state.c) --------------------- */
 extern scan_result_t g_scan;
 extern logical_result_t g_devices;
-extern int g_selected_index;
-extern char g_selected_key[96];
 extern char g_plugged_keys[MAX_DEVICES][96];
 extern int g_plugged_key_count;
 extern char g_expanded_keys[MAX_DEVICES][96];

@@ -911,10 +911,15 @@ bool logical_device_can_expand(const logical_device_t *item)
             item->device_count > 1);
 }
 
-/* The one sanctioned way to get a logical device from outside the model: by the
- * key it is identified by, resolved against the CURRENT g_devices. Returns NULL
- * when the device is gone — callers must handle that rather than fall back to a
- * remembered index, which after a rebuild names a different device. */
+/* Resolve a device by the key it is identified by, against the CURRENT
+ * g_devices. Returns NULL when the device is gone, and callers must handle that
+ * rather than fall back to a remembered index.
+ *
+ * Use this for any index that OUTLIVES the call that took it — widget user
+ * data, a remembered selection, anything crossing a rebuild. Walking
+ * g_devices.items by index within one call is fine and several callers do it
+ * (hid_pt_gamepad_match.c, the panel's render loop); nothing enforces the
+ * distinction, it is about lifetime. */
 logical_device_t *logical_device_by_key(const char *key)
 {
     if (!key || !key[0]) {

@@ -127,9 +127,12 @@ int hid_passthrough_manager_get_device(hid_passthrough_manager_t *manager, int i
 }
 
 /* Re-enumerate sysfs, rebuild the logical model (which bumps
- * g_devices.generation) and refresh the derived caches. Private on purpose:
- * hid_passthrough_manager_request_rescan() is the only way in from outside, so
- * there is exactly one component deciding when enumeration happens. */
+ * g_devices.generation) and refresh the derived caches. Static on purpose: this
+ * module is the only caller of enumerate_devices()/build_logical_devices() in
+ * the tree, and hid_passthrough_manager_request_rescan() is the only entry
+ * point it offers, so one component decides when enumeration happens. The
+ * primitives are still declared in ctm_state.h; keep it that way by adding
+ * callers here rather than there. */
 static void hid_pt_rescan_model(void) {
     enumerate_devices(&g_scan);
     build_logical_devices(&g_scan, &g_devices);
