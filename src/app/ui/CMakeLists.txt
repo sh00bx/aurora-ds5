@@ -23,6 +23,7 @@ if (TARGET_WEBOS)
     target_sources(moonlight-lib PRIVATE
             streaming/hid_passthrough_panel.c
             streaming/hid_pt_panel_model.c
+            streaming/hid_pt_panel_view.c
             )
 endif()
 add_subdirectory(settings)
