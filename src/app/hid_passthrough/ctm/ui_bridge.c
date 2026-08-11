@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,8 +201,20 @@ void stop_sniff_once(const char *mac)
 /* ds5_txd pins the bound DS5 link out of sniff at HCI level (re-asserts every
  * 5 s), so the 2 Hz luna churn buys nothing while a DS5 session runs; keep
  * 500 ms only when another (unpinned) session needs it, or nothing is bridged
- * yet (menu-nav pads). Advisory read; a stale answer shifts one tick. */
-static unsigned stop_sniff_interval_ms(void)
+ * yet (menu-nav pads).
+ *
+ * Published by the main thread, read by the worker. The worker used to walk
+ * g_sessions itself with no synchronisation at all, while stop_session()'s
+ * memmove shifted that array underneath it — it could read a half-shifted
+ * busid and pick the wrong cadence for a cycle. The BT MAC list this same
+ * worker consumes has always been handed over under g_bt_mac_mutex, so the
+ * omission was inconsistent rather than deliberate. Relaxed ordering is
+ * enough: the value stands alone and one stale read shifts one tick, which is
+ * what the previous comment claimed and is now actually true. */
+static _Atomic unsigned g_sniff_interval_ms = 500u;
+
+/* Call on the main thread after any change to g_sessions. */
+static void publish_sniff_interval(void)
 {
     bool ds5 = false, other = false;
     for (int i = 0; i < g_session_count; ++i) {
@@ -209,7 +222,8 @@ static unsigned stop_sniff_interval_ms(void)
         if (starts_with(g_sessions[i].busid, "ctm-ds5-")) ds5 = true;
         else other = true;
     }
-    return (ds5 && !other) ? 5000u : 500u;
+    atomic_store_explicit(&g_sniff_interval_ms, (ds5 && !other) ? 5000u : 500u,
+                          memory_order_relaxed);
 }
 
 void *stop_sniff_worker(void *arg)
@@ -230,7 +244,7 @@ void *stop_sniff_worker(void *arg)
             stop_sniff_once(macs[i]);
         }
         /* Sliced sleep so manager_stop's join returns promptly. */
-        unsigned interval_ms = stop_sniff_interval_ms();
+        unsigned interval_ms = atomic_load_explicit(&g_sniff_interval_ms, memory_order_relaxed);
         for (unsigned slept = 0; slept < interval_ms && g_running; slept += 100) {
             usleep(100000);
         }
@@ -542,6 +556,7 @@ static void session_teardown(int index)
     memmove(&g_sessions[index], &g_sessions[index + 1],
             (size_t)(g_session_count - index - 1) * sizeof(g_sessions[0]));
     g_session_count--;
+    publish_sniff_interval();
 }
 
 bool add_session(const char *key, const char *busid, ctm_controller_t *controller, int port)
@@ -565,6 +580,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
         g_sessions[index].controller = controller;
         g_sessions[index].plug_ms = mono_ms();
         g_sessions[index].moonlight_gs_id = -1;   /* recorded by the plug caller */
+        publish_sniff_interval();
         return true;
     }
     if (g_session_count >= MAX_SESSIONS) {
@@ -577,6 +593,7 @@ bool add_session(const char *key, const char *busid, ctm_controller_t *controlle
     g_sessions[g_session_count].plug_ms = mono_ms();
     g_sessions[g_session_count].moonlight_gs_id = -1;   /* recorded by the plug caller */
     g_session_count++;
+    publish_sniff_interval();
     return true;
 }
 
