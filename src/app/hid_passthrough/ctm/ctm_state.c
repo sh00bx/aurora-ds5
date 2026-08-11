@@ -29,7 +29,6 @@ ui_device_settings_t g_settings[MAX_DEVICES];
 int g_settings_count;
 char g_agent_host[64];
 int g_agent_port = CTM_AGENT_PORT;
-bool g_agent_online;
 bool g_running = true;
 pthread_t g_stop_sniff_thread;
 bool g_stop_sniff_thread_started;

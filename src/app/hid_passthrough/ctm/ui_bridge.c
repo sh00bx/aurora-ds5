@@ -267,6 +267,55 @@ void publish_bt_macs(void)
     pthread_mutex_unlock(&g_bt_mac_mutex);
 }
 
+/* ---- agent reachability -------------------------------------------------
+ *
+ * A backoff window, not a latch. The old `g_agent_online` was cleared by any
+ * connect failure and set back to true by nothing at all while g_agent_host was
+ * populated — and the manager pins it to the stream address at every stream
+ * start, so it always is. One Wi-Fi hiccup therefore disabled every later
+ * BRIDGE_STOP for the rest of the app run, leaving an orphan virtual controller
+ * on the host for every plug-out and every vanish-reap. In the other direction
+ * it never noticed a recv timeout, so an agent that accepts TCP but does not
+ * answer cost a full 1 s SO_RCVTIMEO per vanished pad, one after another on the
+ * LVGL thread.
+ *
+ * A round trip that does not complete stamps the failure time; any round trip
+ * that does complete clears it, including one answering "ERR ..." — that is the
+ * agent talking, so it is plainly reachable, and reachability is the only thing
+ * this tracks. Optional round trips are skipped only inside the window, so
+ * recovery is automatic and a wedged host costs one stall per window rather
+ * than one per device.
+ *
+ * Deliberately NOT consulted by send_agent_command() itself: BRIDGE_START was
+ * never gated on the old flag either, and a plug the user just asked for should
+ * make its attempt and report what happened. */
+#define AGENT_BACKOFF_MS 3000u
+
+static uint64_t mono_ms(void);
+static uint64_t g_agent_fail_ms;   /* 0 = nothing has failed since the last success */
+
+static void agent_note_unreachable(void)
+{
+    uint64_t now = mono_ms();
+    g_agent_fail_ms = now ? now : 1;   /* keep 0 unambiguous */
+}
+
+static void agent_note_reachable(void)
+{
+    g_agent_fail_ms = 0;
+}
+
+bool ctm_agent_reachable(void)
+{
+    if (!g_agent_host[0]) {
+        return false;
+    }
+    if (!g_agent_fail_ms) {
+        return true;
+    }
+    return mono_ms() - g_agent_fail_ms >= AGENT_BACKOFF_MS;
+}
+
 void ctm_bridge_set_agent_host(const char *host, int port)
 {
     if (host && host[0]) {
@@ -275,13 +324,12 @@ void ctm_bridge_set_agent_host(const char *host, int port)
         g_agent_host[0] = '\0';
     }
     g_agent_port = port > 0 ? port : CTM_AGENT_PORT;
-    g_agent_online = g_agent_host[0] != '\0';
+    agent_note_reachable();   /* a freshly pinned host has not failed anything yet */
 }
 
 bool discover_agent_once(void)
 {
     if (g_agent_host[0]) {
-        g_agent_online = true;
         return true;
     }
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -322,8 +370,11 @@ bool discover_agent_once(void)
     }
     const char *ip = inet_ntoa(from.sin_addr);
     snprintf(g_agent_host, sizeof(g_agent_host), "%s", ip ? ip : "");
-    g_agent_online = g_agent_host[0] != '\0';
-    return g_agent_online;
+    if (!g_agent_host[0]) {
+        return false;
+    }
+    agent_note_reachable();
+    return true;
 }
 
 int send_agent_command(const char *command, char *response, size_t response_len)
@@ -347,7 +398,7 @@ int send_agent_command(const char *command, char *response, size_t response_len)
     addr.sin_port = htons((uint16_t)g_agent_port);
     if (inet_aton(g_agent_host, &addr.sin_addr) == 0) {
         close(fd);
-        g_agent_online = false;
+        agent_note_unreachable();
         return -1;
     }
     /* Non-blocking connect with a bounded timeout: SO_SNDTIMEO does NOT cap the
@@ -360,7 +411,7 @@ int send_agent_command(const char *command, char *response, size_t response_len)
     if (crc != 0) {
         if (errno != EINPROGRESS) {
             close(fd);
-            g_agent_online = false;
+            agent_note_unreachable();
             return -1;
         }
         fd_set wfds;
@@ -374,14 +425,14 @@ int send_agent_command(const char *command, char *response, size_t response_len)
         ctv.tv_usec = 300000;
         if (select(fd + 1, NULL, &wfds, NULL, &ctv) <= 0) {
             close(fd);
-            g_agent_online = false;
+            agent_note_unreachable();
             return -1;
         }
         int soerr = 0;
         socklen_t soerr_len = sizeof(soerr);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) != 0 || soerr != 0) {
             close(fd);
-            g_agent_online = false;
+            agent_note_unreachable();
             return -1;
         }
     }
@@ -391,12 +442,22 @@ int send_agent_command(const char *command, char *response, size_t response_len)
     snprintf(line, sizeof(line), "%s\n", command);
     if (send(fd, line, strlen(line), 0) < 0) {
         close(fd);
+        agent_note_unreachable();
         return -1;
     }
     ssize_t n = recv(fd, response, response_len > 0 ? response_len - 1 : 0, 0);
     close(fd);
     if (response_len > 0) {
         response[n > 0 ? n : 0] = '\0';
+    }
+    /* An answer of any kind means the agent is there; only a round trip that
+     * did not complete (this recv timing out, or returning an error) counts
+     * against reachability. A well-formed "ERR ..." is an application failure
+     * for the caller and a success for the backoff. */
+    if (n > 0) {
+        agent_note_reachable();
+    } else {
+        agent_note_unreachable();
     }
     return n > 0 && response && starts_with(response, "OK") ? 0 : -1;
 }
@@ -468,10 +529,11 @@ static void session_teardown(int index)
     }
     /* Tell the host to drop the bridge — but skip the (blocking) round-trip when
      * the agent is already known unreachable: it would only time out, and the
-     * first failure flips g_agent_online, so a mass-disconnect against a dead host
-     * costs at most one connect timeout on the UI thread (not one per device). The
-     * host GCs orphan virtual controllers when it comes back anyway. */
-    if (g_sessions[index].port > 0 && g_agent_online) {
+     * first failure opens the backoff window, so a mass-disconnect against a dead
+     * host costs at most one connect timeout on the UI thread (not one per
+     * device). The host GCs orphan virtual controllers when it comes back
+     * anyway. */
+    if (g_sessions[index].port > 0 && ctm_agent_reachable()) {
         char cmd[160];
         char response[256];
         snprintf(cmd, sizeof(cmd), "BRIDGE_STOP %s", g_sessions[index].busid);
@@ -616,7 +678,7 @@ static bool plug_in_scan_index(logical_device_t *item, int scan_index, const cha
     }
     /* No separate agent_tcp_reachable() probe here: the BRIDGE_START
      * send_agent_command below does its own bounded non-blocking connect and
-     * flips g_agent_online on failure, so a probe just costs an extra LAN RTT +
+     * opens the backoff window on failure, so a probe just costs an extra RTT +
      * socket on every hot-plug. The BRIDGE_START failure path reports the
      * unreachable host. */
     const device_info_t *dev = &g_scan.devices[scan_index];

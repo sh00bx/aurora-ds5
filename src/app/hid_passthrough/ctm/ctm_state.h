@@ -201,7 +201,6 @@ extern ui_device_settings_t g_settings[MAX_DEVICES];
 extern int g_settings_count;
 extern char g_agent_host[64];
 extern int g_agent_port;
-extern bool g_agent_online;
 extern bool g_running;
 extern pthread_t g_stop_sniff_thread;
 extern bool g_stop_sniff_thread_started;
@@ -329,6 +328,10 @@ void stop_sniff_once(const char *mac);
 void *stop_sniff_worker(void *arg);
 void publish_bt_macs(void);
 bool discover_agent_once(void);
+/* Is the Windows agent worth a (blocking) round trip right now? False while a
+ * recent failure's backoff window is open, and while no host is known. Callers
+ * that MUST try anyway — a plug the user asked for — do not consult it. */
+bool ctm_agent_reachable(void);
 int send_agent_command(const char *command, char *response, size_t response_len);
 int session_index_for_key(const char *key);
 int next_bridge_port(void);

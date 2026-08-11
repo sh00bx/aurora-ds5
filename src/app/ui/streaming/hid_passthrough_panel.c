@@ -1069,7 +1069,7 @@ static void panel_update_status(hid_pt_panel_t *panel) {
     snprintf(status, sizeof(status), "%d device%s | Windows %s",
              g_devices.count,
              g_devices.count == 1 ? "" : "s",
-             g_agent_online ? g_agent_host : "not found");
+             ctm_agent_reachable() ? g_agent_host : "not found");
     lv_label_set_text(panel->status_label, status);
 }
 
