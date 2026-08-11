@@ -39,7 +39,13 @@ struct ctm_hid_io {
     uint64_t audio_last_us;            /* last 0x36/0x39 write: gates rumble slotting */
 
     /* Per-report-id output histogram + hidraw outcome counters (what actually
-     * flows out). Read and zeroed once per telemetry window. */
+     * flows out), read and zeroed once per telemetry window.
+     *
+     * Relaxed atomics like the controller's ctm_stats_t, for the same reason:
+     * they are pure statistics that order nothing, and the alternative is a
+     * comment claiming a single writer that nothing enforces. The window reset
+     * is an atomic exchange, so a count landing between the read and the zero
+     * is carried into the next window instead of lost. */
     unsigned long st_out_36, st_out_31, st_out_32, st_out_other;
     unsigned long st_out_39;           /* batched audio/haptic report: counted
                                         * separately so the telemetry line shows
@@ -161,38 +167,42 @@ void ctm_hid_io_session_reset(ctm_hid_io_t *io)
     io->last31_len = 0;
     io->last31_ts_us = 0;
     io->audio_last_us = 0;
-    io->st_out_36 = io->st_out_39 = io->st_out_31 = io->st_out_32 = io->st_out_other = 0;
-    io->st_hid_ok = io->st_hid_eagain = io->st_hid_recovered = io->st_hid_dropped = 0;
-    io->st_dedup_skipped = 0;
+    /* Same read-and-zero the telemetry window uses; the values are discarded
+     * because a new session starts a new window. */
+    ctm_hid_io_stats_t discard;
+    ctm_hid_io_stats_take(io, &discard);
 }
 
 void ctm_hid_io_stats_take(ctm_hid_io_t *io, ctm_hid_io_stats_t *out)
 {
     if (!io || !out) return;
-    out->out36 = io->st_out_36;
-    out->out39 = io->st_out_39;
-    out->out31 = io->st_out_31;
-    out->out32 = io->st_out_32;
-    out->out_other = io->st_out_other;
-    out->hid_ok = io->st_hid_ok;
-    out->hid_eagain = io->st_hid_eagain;
-    out->hid_recovered = io->st_hid_recovered;
-    out->hid_dropped = io->st_hid_dropped;
-    out->dedup_skipped = io->st_dedup_skipped;
-    io->st_out_36 = io->st_out_39 = io->st_out_31 = io->st_out_32 = io->st_out_other = 0;
-    io->st_hid_ok = io->st_hid_eagain = io->st_hid_recovered = io->st_hid_dropped = 0;
-    io->st_dedup_skipped = 0;
+    out->out36 = __atomic_exchange_n(&io->st_out_36, 0ul, __ATOMIC_RELAXED);
+    out->out39 = __atomic_exchange_n(&io->st_out_39, 0ul, __ATOMIC_RELAXED);
+    out->out31 = __atomic_exchange_n(&io->st_out_31, 0ul, __ATOMIC_RELAXED);
+    out->out32 = __atomic_exchange_n(&io->st_out_32, 0ul, __ATOMIC_RELAXED);
+    out->out_other = __atomic_exchange_n(&io->st_out_other, 0ul, __ATOMIC_RELAXED);
+    out->hid_ok = __atomic_exchange_n(&io->st_hid_ok, 0ul, __ATOMIC_RELAXED);
+    out->hid_eagain = __atomic_exchange_n(&io->st_hid_eagain, 0ul, __ATOMIC_RELAXED);
+    out->hid_recovered = __atomic_exchange_n(&io->st_hid_recovered, 0ul, __ATOMIC_RELAXED);
+    out->hid_dropped = __atomic_exchange_n(&io->st_hid_dropped, 0ul, __ATOMIC_RELAXED);
+    out->dedup_skipped = __atomic_exchange_n(&io->st_dedup_skipped, 0ul, __ATOMIC_RELAXED);
 }
 
 int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
 {
     if (!io || io->fd < 0 || !data || len == 0) return -1;
     switch (data[0]) {
-        case 0x36: io->st_out_36++; io->audio_last_us = ctm_now_us(); break;
-        case 0x39: io->st_out_39++; io->audio_last_us = ctm_now_us(); break;
-        case 0x31: io->st_out_31++; break;
-        case 0x32: io->st_out_32++; break;
-        default:   io->st_out_other++; break;
+        case 0x36:
+            __atomic_fetch_add(&io->st_out_36, 1ul, __ATOMIC_RELAXED);
+            io->audio_last_us = ctm_now_us();
+            break;
+        case 0x39:
+            __atomic_fetch_add(&io->st_out_39, 1ul, __ATOMIC_RELAXED);
+            io->audio_last_us = ctm_now_us();
+            break;
+        case 0x31: __atomic_fetch_add(&io->st_out_31, 1ul, __ATOMIC_RELAXED); break;
+        case 0x32: __atomic_fetch_add(&io->st_out_32, 1ul, __ATOMIC_RELAXED); break;
+        default:   __atomic_fetch_add(&io->st_out_other, 1ul, __ATOMIC_RELAXED); break;
     }
     uint8_t patched[CTM_MAX_REPORT];
     if (len > sizeof(patched)) return -1;
@@ -222,7 +232,7 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
         if (patched_len == io->last31_len &&
             memcmp(patched + 2, io->last31 + 2, cmp - 2) == 0 &&
             ctm_now_us() - io->last31_ts_us < DEDUP31_TTL_US) {
-            io->st_dedup_skipped++;
+            __atomic_fetch_add(&io->st_dedup_skipped, 1ul, __ATOMIC_RELAXED);
             return 0;
         }
         if (patched_len <= sizeof(io->last31)) {
@@ -250,7 +260,7 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
              * rumble state — clearing on it would defeat dedup exactly under
              * congestion. */
             if (io->dedup_report_id && patched[0] == io->dedup_report_id) io->last31_len = 0;
-            io->st_hid_dropped++;
+            __atomic_fetch_add(&io->st_hid_dropped, 1ul, __ATOMIC_RELAXED);
             return -1;
         }
         /* DS5_ACL_TX_HIDRAW: injector not ready/disabled — fall through to the
@@ -259,7 +269,7 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
     pthread_mutex_lock(&io->mutex);
     ssize_t n = write(io->fd, patched, patched_len);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        io->st_hid_eagain++;
+        __atomic_fetch_add(&io->st_hid_eagain, 1ul, __ATOMIC_RELAXED);
         if (io->eagain_wait_ms > 0) {
             struct pollfd pf;
             pf.fd = io->fd;
@@ -268,21 +278,21 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
             if (poll(&pf, 1, io->eagain_wait_ms) > 0 && (pf.revents & POLLOUT)) {
                 n = write(io->fd, patched, patched_len);
                 if (n == (ssize_t)patched_len) {
-                    io->st_hid_recovered++;
+                    __atomic_fetch_add(&io->st_hid_recovered, 1ul, __ATOMIC_RELAXED);
                 }
             }
         }
     }
     pthread_mutex_unlock(&io->mutex);
     if (n == (ssize_t)patched_len) {
-        io->st_hid_ok++;
+        __atomic_fetch_add(&io->st_hid_ok, 1ul, __ATOMIC_RELAXED);
         ctm_ctl_note_output_report(io->owner);
         return 0;
     }
     /* frame not delivered: never let it satisfy future dedup (scoped to the
      * deduped id, the only report the cache ever holds) */
     if (io->dedup_report_id && patched[0] == io->dedup_report_id) io->last31_len = 0;
-    io->st_hid_dropped++;
+    __atomic_fetch_add(&io->st_hid_dropped, 1ul, __ATOMIC_RELAXED);
     return -1;
 }
 

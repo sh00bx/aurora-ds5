@@ -72,6 +72,33 @@ struct hidraw_devinfo { unsigned int bustype; short vendor; short product; };
 
 typedef struct { int fd; char path[64]; } evdev_grab_t;
 
+/* The bridging counters the UI status panel shows.
+ *
+ * reports_in is incremented by every reader the controller runs: the primary
+ * input thread, one thread per composite sibling interface (up to 15 for a
+ * Steam puck) and the xpad evdev feeder — so on ARM32 a plain `x++` is a
+ * load-add-store that interleaves and silently loses counts, which is exactly
+ * the number an operator reads to decide whether a pad is feeding the host at
+ * all. All four go through relaxed atomics: no ordering is implied or wanted,
+ * they are pure statistics, and a relaxed fetch-add is a single ldrex/strex
+ * pair with no barrier, no syscall and no lock on the input path. */
+typedef struct {
+    unsigned long reports_in;       /* input reports forwarded to the host */
+    unsigned long reports_out;      /* output reports written to the device */
+    unsigned long coalesced;        /* input reports dropped by per-burst coalescing */
+    unsigned long ui_neutralized;   /* input reports blanked by the overlay gate */
+} ctm_stats_t;
+
+static inline void ctm_stat_add(unsigned long *v, unsigned long n)
+{
+    __atomic_fetch_add(v, n, __ATOMIC_RELAXED);
+}
+
+static inline unsigned long ctm_stat_get(unsigned long *v)
+{
+    return __atomic_load_n(v, __ATOMIC_RELAXED);
+}
+
 
 struct ctm_controller {
     const ctm_controller_ops_t *ops;
@@ -115,7 +142,8 @@ struct ctm_controller {
      * (fill bridging stalls). Slewed in the pump loop, applied per report by
      * ds5_patch_output via ctm_controller_adapt_latency_ms(). */
     int adapt_enabled;
-    volatile uint32_t adapt_lat_add_ms;
+    uint32_t adapt_lat_add_ms;   /* relaxed-atomic: read by the exported
+                                  * ctm_controller_adapt_latency_ms() */
     uint64_t adapt_hot_until_us;
     uint64_t adapt_slew_next_us;
     /* Diagnostic: host->TV OUTPUT_REPORT arrival pattern (HOL-blocking probe).
@@ -148,11 +176,17 @@ struct ctm_controller {
 
     pthread_t session_thread;
     int session_started;
-    volatile int session_finished;  /* session thread exited; reconcile re-plugs */
+    _Atomic(int) session_finished;  /* session thread exited; reconcile re-plugs */
     pthread_t input_thread;
     int input_thread_started;
-    volatile int stop;
-    volatile int link_down;         /* input thread saw a send failure; run_session
+    /* Session flags, written by one thread and read by several others.
+     * _Atomic rather than volatile so that a plain access anywhere in this file
+     * is still an atomic one (C11 gives it sequential consistency), and the
+     * three reads that sit on a per-report or per-poll path use an explicit
+     * relaxed load below — none of these flags orders any data, each IS the
+     * whole message, so relaxed is the correct strength and costs no barrier. */
+    _Atomic(int) stop;
+    _Atomic(int) link_down;         /* input thread saw a send failure; run_session
                                      * exits so session_main retries the connect */
     /* Liveness ticket for the input watchdog. The two readers that do NOT own
      * last_rx_us — the composite sibling threads and the xpad evdev feeder —
@@ -168,7 +202,7 @@ struct ctm_controller {
      * needs to know "something arrived in the last 250 ms window", and a lost
      * race just defers the observation by one poll timeout, far inside the
      * multi-second timeout it feeds. */
-    volatile uint32_t rx_tick;
+    uint32_t rx_tick;
 
     pthread_mutex_t settings_mutex;
     tv_bridge_worker_settings_t settings;
@@ -178,17 +212,17 @@ struct ctm_controller {
 
     FILE *log;
 
-    /* Live status for the UI panel. Counters are single-writer (reports_in:
-     * reader thread; reports_out: session thread) and read advisorily;
-     * connected/transport/last_event are guarded by status_mutex. */
+    /* Live status for the UI panel. connected/transport/last_event are written
+     * and read under status_mutex; the counters are not, so they go through
+     * ctm_stat_* (see ctm_stats_t). */
     pthread_mutex_t status_mutex;
-    volatile int st_connected;
-    volatile int st_transport_enet;
-    volatile unsigned long st_reports_in;
-    volatile unsigned long st_reports_out;
-    volatile unsigned long st_coalesced;   /* input reports dropped by per-burst coalescing */
-    volatile unsigned long st_ui_neutralized; /* input reports neutralized while overlay owned input */
-    int ui_gated_logged;                   /* last logged overlay-gate state (input thread only) */
+    int st_connected;
+    int st_transport_enet;
+    ctm_stats_t stats;
+    int ui_gated_logged;                   /* last logged overlay-gate state; written
+                                            * by input_thread_main, zeroed by
+                                            * session_state_reset (which the pump
+                                            * runs before that thread is created) */
     char st_last_event[96];
 
     uint8_t battery_level;
@@ -199,7 +233,7 @@ struct ctm_controller {
 
     uint8_t *enum_payload;           /* composite: forwarded enumeration (CTMB_MSG_ENUM) */
     int enum_payload_len;
-    volatile int comp_run;           /* gates the composite sibling readers and the
+    _Atomic(int) comp_run;           /* gates the composite sibling readers and the
                                       * xpad feeder for the length of one session
                                       * (ctm_ctl_readers_run) */
     int flydigi_xinput_evdev_only;   /* gamepad via evdev only (no hidraw on bus) */
@@ -289,14 +323,14 @@ int ctm_ctl_send(ctm_controller_t *c, uint16_t type, uint32_t flags,
  * and hand the watchdog its liveness ticket. See rx_tick in the struct. */
 void ctm_ctl_note_input_report(ctm_controller_t *c)
 {
-    c->st_reports_in++;
+    ctm_stat_add(&c->stats.reports_in, 1);
     __atomic_store_n(&c->rx_tick, 1u, __ATOMIC_RELAXED);
 }
 
 /* Count one output report the device (or its injector) accepted. */
 void ctm_ctl_note_output_report(ctm_controller_t *c)
 {
-    c->st_reports_out++;
+    ctm_stat_add(&c->stats.reports_out, 1);
 }
 
 /* The session's non-primary readers keep looping while the session that started
@@ -304,12 +338,8 @@ void ctm_ctl_note_output_report(ctm_controller_t *c)
  * plug-out has not been requested. */
 bool ctm_ctl_readers_run(ctm_controller_t *c)
 {
-    return c->comp_run && !c->stop;
-}
-
-bool ctm_ctl_running(ctm_controller_t *c)
-{
-    return !c->stop;
+    return __atomic_load_n(&c->comp_run, __ATOMIC_RELAXED) &&
+           !__atomic_load_n(&c->stop, __ATOMIC_RELAXED);
 }
 
 /* Pop one received message (1=got / 0=none / -1=dropped). When: the session
@@ -754,7 +784,7 @@ static int audio_synth_write_cb(void *ctx, const uint8_t *data, size_t len)
  * latency slider right now. Read by ds5_patch_output per outbound report. */
 uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c)
 {
-    return c ? c->adapt_lat_add_ms : 0;
+    return c ? __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED) : 0;
 }
 
 /* Primary input thread: blocking-poll the bridged hidraw node and forward what
@@ -802,7 +832,8 @@ static void *input_thread_main(void *arg)
      * resolved before this thread starts. */
     const int hid_fd = ctm_hid_io_fd(c->io);
     const uint8_t in_ep = ctm_composite_primary_in_ep(c->comp);
-    while (!c->stop && !c->link_down) {
+    while (!__atomic_load_n(&c->stop, __ATOMIC_RELAXED) &&
+           !__atomic_load_n(&c->link_down, __ATOMIC_RELAXED)) {
         struct pollfd pfds[2];
         pfds[0].fd = hid_fd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = c->wake_pipe[0]; pfds[1].events = POLLIN; pfds[1].revents = 0;
@@ -867,10 +898,10 @@ static void *input_thread_main(void *arg)
             c->ui_gated_logged = ui_blocked ? 1 : 0;
             ctm_ctl_log(c, "input %s by overlay gate", ui_blocked ? "neutralized" : "released");
         }
-        for (int i = 0; i < coal_n && !c->stop; ++i) {
+        for (int i = 0; i < coal_n && !__atomic_load_n(&c->stop, __ATOMIC_RELAXED); ++i) {
             if (ui_blocked && c->ops->neutralize_input) {
                 c->ops->neutralize_input(c, coal_buf[i], coal_len[i]);
-                c->st_ui_neutralized++;
+                ctm_stat_add(&c->stats.ui_neutralized, 1);
             }
             if (ctm_ctl_send(c, CTMB_MSG_INPUT_REPORT, CTMB_FLAG_OK, in_ep,
                        coal_buf[i], coal_len[i]) != 0) {
@@ -884,9 +915,10 @@ static void *input_thread_main(void *arg)
             if (c->ops->on_input_report) {
                 c->ops->on_input_report(c, coal_buf[i], coal_len[i]);
             }
-            c->st_reports_in++;
+            ctm_stat_add(&c->stats.reports_in, 1);
         }
-        if (drained > coal_n) c->st_coalesced += (unsigned long)(drained - coal_n);
+        if (drained > coal_n)
+            ctm_stat_add(&c->stats.coalesced, (unsigned long)(drained - coal_n));
     }
     return NULL;
 }
@@ -1074,8 +1106,8 @@ static int handshake(ctm_controller_t *c, const ctmb_device_caps_t *caps,
  * guard at all, so the first tick of a reconnected session wrote the rumble
  * state the pad had when it fell off.
  *
- * Deliberately NOT reset: st_reports_in/out and st_coalesced/st_ui_neutralized
- * (lifetime counters the UI panel shows), and the adaptive-latency trio, which
+ * Deliberately NOT reset: the ctm_stats_t counters (lifetime totals the UI
+ * panel shows), and the adaptive-latency trio, which
  * is a controller with its own decay rather than leftover state — zeroing it
  * mid-stream would step the pad's jitter buffer, not clean anything up.
  * When: the top of run_session, before the handshake. */
@@ -1185,7 +1217,8 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     }
 
     int link_alive = 1;
-    while (!c->stop && !c->link_down && link_alive) {
+    while (!__atomic_load_n(&c->stop, __ATOMIC_RELAXED) &&
+           !__atomic_load_n(&c->link_down, __ATOMIC_RELAXED) && link_alive) {
         /* The ~10.6ms host pace (~94/s) was sized for the BT one-outstanding wall
          * on the hidraw write path. The raw-ACL injector bypasses that wall, but at
          * ~94/s the pace barely lags the ~100/s DS5 audio source, so the paced queue
@@ -1256,14 +1289,14 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             if (c->adapt_slew_next_us == 0 || anow >= c->adapt_slew_next_us) {
                 c->adapt_slew_next_us = anow + 250000ull;
                 uint32_t target = anow < c->adapt_hot_until_us ? 40u : 0u;
-                uint32_t cur = c->adapt_lat_add_ms;
+                uint32_t cur = __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED);
                 if (cur < target) {
                     cur = cur + 8 > target ? target : cur + 8;
                 } else if (cur > target) {
                     cur = cur >= 2 ? cur - 2 : 0;
                 }
-                if (cur != c->adapt_lat_add_ms) {
-                    c->adapt_lat_add_ms = cur;
+                if (cur != __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED)) {
+                    __atomic_store_n(&c->adapt_lat_add_ms, cur, __ATOMIC_RELAXED);
                 }
             }
         }
@@ -1349,8 +1382,11 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
                         c->audio.plc_have36,
                         rdy, inj, drp,
                         io_st.hid_ok, io_st.hid_eagain, io_st.hid_recovered, io_st.hid_dropped,
-                        io_st.dedup_skipped, c->st_reports_in, c->st_coalesced,
-                        c->st_rumble_coal, c->audio.st_stale_drop, (unsigned)c->adapt_lat_add_ms);
+                        io_st.dedup_skipped,
+                        ctm_stat_get(&c->stats.reports_in),
+                        ctm_stat_get(&c->stats.coalesced),
+                        c->st_rumble_coal, c->audio.st_stale_drop,
+                        (unsigned)__atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED));
                 c->audio.st_audio_omit = c->audio.st_audio_conceal = 0;
                 c->audio.st_audio_capdrop = c->audio.st_audio_fill = 0;
                 c->audio.st_fill_skip = 0;
@@ -1926,8 +1962,8 @@ void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out
     out->transport_enet = c->st_transport_enet ? true : false;
     snprintf(out->last_event, sizeof(out->last_event), "%s", c->st_last_event);
     pthread_mutex_unlock(&c->status_mutex);
-    out->reports_in = c->st_reports_in;
-    out->reports_out = c->st_reports_out;
+    out->reports_in = ctm_stat_get(&c->stats.reports_in);
+    out->reports_out = ctm_stat_get(&c->stats.reports_out);
     uint64_t now = ctm_now_us();
     uint64_t upd = __atomic_load_n(&c->battery_updated_us, __ATOMIC_ACQUIRE);
     out->battery_level  = __atomic_load_n(&c->battery_level,  __ATOMIC_ACQUIRE);

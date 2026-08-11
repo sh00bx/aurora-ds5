@@ -77,10 +77,6 @@ void ctm_ctl_note_output_report(ctm_controller_t *c);
  * plug-out nor a teardown has been requested yet. */
 bool ctm_ctl_readers_run(ctm_controller_t *c);
 
-/* True until plug-out (or a fatal open failure) asks the session thread to
- * exit. */
-bool ctm_ctl_running(ctm_controller_t *c);
-
 #ifdef __cplusplus
 }
 #endif
