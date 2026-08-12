@@ -34,3 +34,9 @@ void session_evkbd_interrupt(session_evkbd_t *kbd);
 void session_evkbd_disable(session_evkbd_t *kbd);
 
 void session_evkbd_enable(session_evkbd_t *kbd);
+
+/* True while a physical keyboard is open AND exclusively grabbed, i.e. while SDL
+ * cannot see that keyboard's keys at all. Callers use this to tell "webOS handed us
+ * a key the compositor folded onto a shared scancode" apart from "this key had its
+ * own route and cannot be the one that just arrived". */
+SDL_bool session_evkbd_is_grabbing(session_evkbd_t *kbd);

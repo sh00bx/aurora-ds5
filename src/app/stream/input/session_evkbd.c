@@ -240,6 +240,19 @@ void session_evkbd_enable(session_evkbd_t *kbd) {
     SDL_UnlockMutex(kbd->lock);
 }
 
+SDL_bool session_evkbd_is_grabbing(session_evkbd_t *kbd) {
+    if (kbd == NULL || !kbd->started) {
+        return SDL_FALSE;
+    }
+    /* Same lock the enable/disable pair takes. Safe from the key path: the worker
+     * dispatches into stream_input_handle_key() with kbd->lock released (see
+     * kbd_worker), so no caller of this reaches it already holding the lock. */
+    SDL_LockMutex(kbd->lock);
+    SDL_bool grabbing = (kbd->dev != NULL && !kbd->disabled) ? SDL_TRUE : SDL_FALSE;
+    SDL_UnlockMutex(kbd->lock);
+    return grabbing;
+}
+
 static void set_dev(session_evkbd_t *kbd, evkbd_t *dev) {
     SDL_LockMutex(kbd->lock);
     kbd->dev = dev;

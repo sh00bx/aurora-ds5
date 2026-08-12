@@ -36,8 +36,21 @@ bool stream_input_webos_intercept_remote_keys(stream_input_t *input, const SDL_K
              * So the two intents collide, and system-key capture is the switch
              * between them: with it on the user has asked for host system keys, and
              * a Windows key that arrives as VK_HOME opens nothing. With it off we
-             * keep forwarding Home (Reshade et al) and the ribbon behaviour. */
-            if (session != NULL && !input->view_only) {
+             * keep forwarding Home (Reshade et al) and the ribbon behaviour.
+             *
+             * The collision only exists while the keyboard has no route of its own.
+             * Once the evdev grab holds it, EVIOCGRAB takes it away from the
+             * compositor entirely -- SDL sees nothing from that device, which is why
+             * the worker has to rebuild the modifier state by hand -- so its Super
+             * arrives as KEY_LEFTMETA on the evdev path and can no longer reach this
+             * scancode. Anything landing here in that state is the remote's Home
+             * button, and forwarding it as a Windows key would cost webOS Home for
+             * no gain, because the keyboard's Super is already getting through. */
+            bool key_has_own_route = false;
+#if FEATURE_INPUT_EVKBD
+            key_has_own_route = session != NULL && session_evkbd_is_grabbing(&input->evkbd);
+#endif
+            if (session != NULL && !input->view_only && !key_has_own_route) {
                 *keyCode = app_configuration->syskey_capture ? VK_LWIN : VK_HOME;
                 return false;
             }
