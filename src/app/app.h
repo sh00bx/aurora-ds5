@@ -35,6 +35,12 @@ typedef int (app_settings_loader)(app_settings_t *settings);
 
 typedef struct app_t {
     bool running, focused;
+    /* webOS app lifecycle state, tracked from SDL_APP_WILLENTERBACKGROUND /
+     * SDL_APP_DIDENTERFOREGROUND. Distinct from `focused`: window focus is a
+     * desktop notion, this is the platform state that decides whether the media
+     * pipeline accepts frames at all. Platforms that never emit those events
+     * leave it at its initial true. */
+    bool foreground;
     SDL_threadID main_thread_id;
     os_info_t os_info;
     app_settings_t settings;

@@ -337,6 +337,10 @@ static void launcher_auto_resume_async(void *userdata) {
     launcher_fragment_t *controller = userdata;
     // The launcher may have been destroyed between scheduling and firing.
     if (current_instance != controller) { return; }
+    // Same window can swallow the app into the background; re-check it here rather
+    // than only at schedule time. Dropping the attempt is safe — auto_resume_done
+    // stays set, and the foreground handler clears it to re-arm.
+    if (!controller->global->foreground) { return; }
     const uuidstr_t *uuid = &controller->auto_resume_uuid;
     const pclist_t *node = pcmanager_node(pcmanager, uuid);
     if (node == NULL || node->state.code != SERVER_STATE_AVAILABLE) { return; }
@@ -351,6 +355,16 @@ static void launcher_auto_resume_async(void *userdata) {
 
 static void launcher_try_auto_resume(launcher_fragment_t *controller, const uuidstr_t *uuid) {
     if (!app_configuration->autoresume) { return; }
+    // Never resume into the background. Being pushed out of the foreground ends the
+    // stream (STREAMING_INTERRUPT_BACKGROUND) and unloads the media pipeline, and the
+    // host refresh that follows arrives with currentGame still set — which used to
+    // re-launch immediately, behind whatever app took the screen. The reconnect then
+    // fed frames into a pipeline the platform refuses to serve while backgrounded
+    // ("player is not loaded"), tripping VDEC_FEED_ERROR_LIMIT and surfacing as
+    // "Decoder reported error" before the next attempt finally succeeded.
+    // Dropping the attempt loses nothing: the guard below is untouched, so the
+    // USER_APP_FOREGROUND handler re-requests the host update and resumes then.
+    if (!controller->global->foreground) { return; }
     // Only fire once per app start; let an explicit CLI/deep-link launch take priority.
     if (controller->auto_resume_done || controller->def_app_requested) { return; }
     const pclist_t *node = pcmanager_node(pcmanager, uuid);

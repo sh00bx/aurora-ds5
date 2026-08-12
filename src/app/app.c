@@ -53,6 +53,10 @@ int app_init(app_t *app, app_settings_loader *settings_loader, int argc, char *a
     app->main_thread_id = SDL_ThreadID();
     app->running = true;
     app->focused = false;
+    // The launcher is created foregrounded; SDL_APP_DIDENTERFOREGROUND only fires on
+    // a later background->foreground transition, so false here would block the
+    // cold-start auto-resume until the user switched away and back.
+    app->foreground = true;
 #if FEATURE_EMBEDDED_SHELL
     app->embed_version.major = -1;
 #endif
@@ -182,6 +186,7 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
     app_t *app = userdata;
     switch (event->type) {
         case SDL_APP_WILLENTERBACKGROUND: {
+            app->foreground = false;
             // Interrupt streaming because app will go to background
             if (app_ui_is_opened(&app->ui) && app->session != NULL) {
                 session_interrupt(app->session, false, STREAMING_INTERRUPT_BACKGROUND);
@@ -189,6 +194,7 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
             break;
         }
         case SDL_APP_DIDENTERFOREGROUND: {
+            app->foreground = true;
             lv_obj_invalidate(lv_scr_act());
             /* Re-arm auto-resume on a genuine background->foreground transition. The
              * cold-start auto-resume is one-shot; switching away and back to Aurora on
