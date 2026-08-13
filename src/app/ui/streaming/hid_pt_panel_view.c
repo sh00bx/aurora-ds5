@@ -1,11 +1,32 @@
 #if defined(TARGET_WEBOS)
 
 #include "hid_pt_panel_view.h"
+#include "overlay_style.h"
 
 #include "util/i18n.h"
 
 #include <stdint.h>
 #include <string.h>
+
+/* The sheet's grid. Every actionable row is the same height and puts its control
+ * in the same gutter on the right, so from the couch the column of values reads
+ * as one vertical line instead of eight differently-shaped rows. */
+#define SHEET_W        LV_DPX(880)
+#define HEADER_H       LV_DPX(52)
+#define FOOTER_H       LV_DPX(38)
+#define BODY_PAD       LV_DPX(12)
+#define DEV_COL_W      LV_DPX(300)
+/* What the sheet's 92 % cap leaves for a body pane once the header, the footer
+ * and the body padding are taken off. Both panes stop growing here and scroll. */
+#define PANE_MAX_H     LV_DPX(390)
+#define DEV_ROW_H      LV_DPX(54)
+#define OPT_ROW_H      LV_DPX(36)
+#define ROW_GAP        LV_DPX(6)
+#define SLIDER_W       LV_DPX(220)
+#define VALUE_W        LV_DPX(80)
+/* The dropdown spans the track and the number together, so its left edge lands
+ * on the same axis every slider starts at. LV_DPX(6) is slab_body()'s gap. */
+#define GUTTER_W       (SLIDER_W + LV_DPX(6) + VALUE_W)
 
 /* ---- event trampolines --------------------------------------------------
  *
@@ -82,21 +103,13 @@ static void row_clicked_cb(lv_event_t *event)
     }
 }
 
-static void plug_clicked_cb(lv_event_t *event)
+static void row_focused_cb(lv_event_t *event)
 {
     hid_pt_view_t *view = lv_event_get_user_data(event);
-    if (view && view->cbs.plug_clicked) {
-        view->cbs.plug_clicked(view->cbs.userdata, row_of(lv_event_get_current_target(event)));
-    }
-}
-
-static void plug_focused_cb(lv_event_t *event)
-{
-    hid_pt_view_t *view = lv_event_get_user_data(event);
-    if (!view || lv_event_get_code(event) != LV_EVENT_FOCUSED || !view->cbs.plug_focused) {
+    if (!view || lv_event_get_code(event) != LV_EVENT_FOCUSED || !view->cbs.row_focused) {
         return;
     }
-    view->cbs.plug_focused(view->cbs.userdata, row_of(lv_event_get_target(event)));
+    view->cbs.row_focused(view->cbs.userdata, row_of(lv_event_get_target(event)));
 }
 
 static void deleted_cb(lv_event_t *event)
@@ -107,18 +120,123 @@ static void deleted_cb(lv_event_t *event)
     }
 }
 
-/* ---- the device list ---------------------------------------------------- */
+/* ---- the shared slab ----------------------------------------------------
+ *
+ * One shape for everything the cursor can land on, in the list and in the
+ * settings column alike: a dark plate, a hairline, and a rail down its leading
+ * edge. The rail carries state (teal once a device is bridged); focus is the
+ * plate lifting behind a chalk border. See overlay_style.h.
+ */
 
-static void style_row(lv_obj_t *row, bool selected)
+static lv_obj_t *slab_rail(lv_obj_t *slab)
 {
-    lv_obj_set_style_radius(row, LV_DPX(8), 0);
-    lv_obj_set_style_border_width(row, selected ? 2 : 1, 0);
-    lv_obj_set_style_border_color(row, selected ? lv_color_hex(0x38bdf8) : lv_color_hex(0x263540), 0);
-    lv_obj_set_style_bg_color(row, selected ? lv_color_hex(0x12384a) : lv_color_hex(0x18232c), 0);
-    lv_obj_set_style_bg_color(row, selected ? lv_color_hex(0x16455d) : lv_color_hex(0x202e38), LV_STATE_PRESSED);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *rail = lv_obj_create(slab);
+    lv_obj_remove_style_all(rail);
+    lv_obj_set_size(rail, OVERLAY_RAIL_W, LV_PCT(100));
+    lv_obj_set_style_bg_color(rail, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
+    return rail;
 }
+
+static void slab_style(lv_obj_t *slab, lv_coord_t height)
+{
+    lv_obj_remove_style_all(slab);
+    lv_obj_set_size(slab, LV_PCT(100), height);
+    lv_obj_set_style_bg_color(slab, lv_color_hex(OVERLAY_SLAB), 0);
+    lv_obj_set_style_bg_opa(slab, OVERLAY_OPA_SLAB, 0);
+    lv_obj_set_style_border_width(slab, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(slab, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_border_opa(slab, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(slab, OVERLAY_RADIUS, 0);
+    lv_obj_set_style_clip_corner(slab, true, 0);
+    lv_obj_set_style_pad_all(slab, 0, 0);
+    lv_obj_set_style_pad_gap(slab, 0, 0);
+    lv_obj_set_flex_flow(slab, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(slab, LV_OBJ_FLAG_SCROLLABLE);
+    /* Focus: the plate lifts and takes a white edge with a bloom behind it. No
+     * hue moves, because hue already means something else on this rail.
+     *
+     * Two states, one look. A device row is focusable itself and gets
+     * FOCUS_KEY; a settings row is a plate around a slider or a switch, and the
+     * focus is on that child — bind_slab_focus() below mirrors it here as
+     * USER_1, so both kinds of row light up the same way. */
+    for (int i = 0; i < 2; i++) {
+        lv_state_t state = i == 0 ? LV_STATE_FOCUS_KEY : LV_STATE_USER_1;
+        lv_obj_set_style_bg_color(slab, lv_color_hex(OVERLAY_SLAB_HI), state);
+        lv_obj_set_style_bg_opa(slab, OVERLAY_OPA_SLAB_FOCUS, state);
+        lv_obj_set_style_border_color(slab, lv_color_hex(OVERLAY_CHALK), state);
+        lv_obj_set_style_border_opa(slab, LV_OPA_COVER, state);
+        lv_obj_set_style_shadow_width(slab, LV_DPX(20), state);
+        lv_obj_set_style_shadow_color(slab, lv_color_hex(OVERLAY_CHALK), state);
+        lv_obj_set_style_shadow_opa(slab, 45, state);
+    }
+    lv_obj_set_style_bg_color(slab, lv_color_hex(OVERLAY_SLAB_HI), LV_STATE_PRESSED);
+}
+
+/** Light @p slab up while @p control has the cursor. */
+static void slab_focus_cb(lv_event_t *event)
+{
+    lv_obj_t *slab = lv_event_get_user_data(event);
+    if (slab == NULL) {
+        return;
+    }
+    if (lv_event_get_code(event) == LV_EVENT_FOCUSED) {
+        lv_obj_add_state(slab, LV_STATE_USER_1);
+    } else {
+        lv_obj_clear_state(slab, LV_STATE_USER_1);
+    }
+}
+
+static void bind_slab_focus(lv_obj_t *control, lv_obj_t *slab)
+{
+    lv_obj_add_event_cb(control, slab_focus_cb, LV_EVENT_FOCUSED, slab);
+    lv_obj_add_event_cb(control, slab_focus_cb, LV_EVENT_DEFOCUSED, slab);
+}
+
+/** The body of a slab: everything but the rail, inset and vertically centred. */
+static lv_obj_t *slab_body(lv_obj_t *slab)
+{
+    lv_obj_t *body = lv_obj_create(slab);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_pad_left(body, LV_DPX(13), 0);
+    lv_obj_set_style_pad_right(body, LV_DPX(15), 0);
+    lv_obj_set_style_pad_gap(body, LV_DPX(6), 0);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_CLICKABLE);
+    return body;
+}
+
+/** An all-caps, tracked line. The panel's only second voice. */
+static lv_obj_t *eyebrow(lv_obj_t *parent, const char *text, uint32_t colour, lv_opa_t opa)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_style_text_font(label, lv_theme_get_font_small(parent), 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(colour), 0);
+    lv_obj_set_style_text_opa(label, opa, 0);
+    lv_obj_set_style_text_letter_space(label, LV_DPX(2), 0);
+    if (text) {
+        lv_label_set_text(label, text);
+    }
+    return label;
+}
+
+static lv_obj_t *body_text(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_style_text_color(label, lv_color_hex(OVERLAY_CHALK), 0);
+    if (text) {
+        lv_label_set_text(label, text);
+    }
+    return label;
+}
+
+/* ---- the device list ---------------------------------------------------- */
 
 void hid_pt_view_list_clear(hid_pt_view_t *view)
 {
@@ -127,8 +245,8 @@ void hid_pt_view_list_clear(hid_pt_view_t *view)
     }
     lv_obj_clean(view->list);
     memset(view->row_buttons, 0, sizeof(view->row_buttons));
-    memset(view->plug_buttons, 0, sizeof(view->plug_buttons));
-    memset(view->plug_labels, 0, sizeof(view->plug_labels));
+    memset(view->row_state_labels, 0, sizeof(view->row_state_labels));
+    memset(view->row_rails, 0, sizeof(view->row_rails));
 }
 
 void hid_pt_view_list_show_empty(hid_pt_view_t *view)
@@ -138,8 +256,11 @@ void hid_pt_view_list_show_empty(hid_pt_view_t *view)
     }
     lv_obj_t *empty = lv_label_create(view->list);
     lv_label_set_text(empty, locstr("No HID devices visible to the native app"));
-    lv_obj_set_style_text_color(empty, lv_color_hex(0xb6c5cf), 0);
-    lv_obj_set_style_pad_all(empty, LV_DPX(18), 0);
+    lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(empty, LV_PCT(100));
+    lv_obj_set_style_text_color(empty, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(empty, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_style_pad_all(empty, LV_DPX(9), 0);
 }
 
 void hid_pt_view_list_prepare(hid_pt_view_t *view)
@@ -148,7 +269,22 @@ void hid_pt_view_list_prepare(hid_pt_view_t *view)
         return;
     }
     lv_obj_set_flex_flow(view->list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(view->list, LV_DPX(8), 0);
+    lv_obj_set_style_pad_gap(view->list, ROW_GAP, 0);
+}
+
+void hid_pt_view_set_row_state(hid_pt_view_t *view, int row, bool plugged)
+{
+    if (!view || row < 0 || row >= HID_PT_MAX_ROWS || !view->row_state_labels[row]) {
+        return;
+    }
+    lv_obj_t *state = view->row_state_labels[row];
+    lv_label_set_text(state, plugged ? locstr("BRIDGED") : locstr("IDLE"));
+    lv_obj_set_style_text_color(state, lv_color_hex(plugged ? OVERLAY_LIVE : OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(state, plugged ? LV_OPA_COVER : OVERLAY_OPA_FAINT, 0);
+    if (view->row_rails[row]) {
+        lv_obj_set_style_bg_color(view->row_rails[row],
+                                  lv_color_hex(plugged ? OVERLAY_LIVE : OVERLAY_SEAM), 0);
+    }
 }
 
 void hid_pt_view_add_row(hid_pt_view_t *view, int i, const char *label, bool plugged, bool selected)
@@ -156,43 +292,36 @@ void hid_pt_view_add_row(hid_pt_view_t *view, int i, const char *label, bool plu
     if (!view || !view->list || i < 0 || i >= HID_PT_MAX_ROWS) {
         return;
     }
-    const int row_h = LV_DPX(60);
-    const int button_w = LV_DPX(112);
-
-    lv_obj_t *row = lv_obj_create(view->list);
+    /* The row is the control. There is no separate plug button any more: one
+     * device, one focus stop, and OK on it does the one thing a device row is
+     * for. It halves the number of places the cursor can be. */
+    lv_obj_t *row = lv_btn_create(view->list);
     view->row_buttons[i] = row;
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, row_h);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    slab_style(row, DEV_ROW_H);
     lv_obj_add_event_cb(row, row_clicked_cb, LV_EVENT_CLICKED, view);
+    lv_obj_add_event_cb(row, row_focused_cb, LV_EVENT_FOCUSED, view);
+    lv_obj_add_event_cb(row, key_cb, LV_EVENT_KEY, view);
     lv_obj_set_user_data(row, (void *) (intptr_t) i);
-    style_row(row, selected);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_hor(row, LV_DPX(14), 0);
-    lv_obj_set_style_pad_gap(row, LV_DPX(8), 0);
 
-    lv_obj_t *name = lv_label_create(row);
-    lv_label_set_text(name, label);
+    view->row_rails[i] = slab_rail(row);
+
+    lv_obj_t *body = slab_body(row);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(body, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(body, LV_DPX(3), 0);
+
+    lv_obj_t *name = body_text(body, label);
+    /* One line, cut with an ellipsis. LONG_DOT wraps first and only dots once it
+     * runs out of HEIGHT, so a two-word-too-long name ("Logitech USB Receiver
+     * System Control") took a second line and shoved the state line out of the
+     * row. Pinning the height to one line is what makes it truncate instead. */
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_flex_grow(name, 1);
+    lv_obj_set_width(name, LV_PCT(100));
+    lv_obj_set_height(name, lv_font_get_line_height(lv_obj_get_style_text_font(name, LV_PART_MAIN)));
 
-    lv_obj_t *plug_btn = lv_btn_create(row);
-    view->plug_buttons[i] = plug_btn;
-    lv_obj_set_size(plug_btn, button_w, LV_DPX(38));
-    lv_obj_set_style_radius(plug_btn, LV_DPX(6), 0);
-    lv_obj_set_style_bg_color(plug_btn, plugged ? lv_color_hex(0x7f1d1d) : lv_color_hex(0x0f766e), 0);
-    lv_obj_set_style_bg_color(plug_btn, plugged ? lv_color_hex(0x991b1b) : lv_color_hex(0x0d9488),
-                              LV_STATE_PRESSED);
-    lv_obj_add_event_cb(plug_btn, plug_clicked_cb, LV_EVENT_CLICKED, view);
-    lv_obj_add_event_cb(plug_btn, plug_focused_cb, LV_EVENT_FOCUSED, view);
-    lv_obj_add_event_cb(plug_btn, key_cb, LV_EVENT_KEY, view);
-    lv_obj_set_user_data(plug_btn, (void *) (intptr_t) i);
-
-    view->plug_labels[i] = lv_label_create(plug_btn);
-    lv_label_set_text(view->plug_labels[i], plugged ? locstr("Plug out") : locstr("Plug in"));
-    lv_obj_center(view->plug_labels[i]);
+    view->row_state_labels[i] = eyebrow(body, NULL, OVERLAY_CHALK, OVERLAY_OPA_FAINT);
+    hid_pt_view_set_row_state(view, i, plugged);
+    hid_pt_view_set_row_selected(view, i, selected);
 }
 
 bool hid_pt_view_has_row(const hid_pt_view_t *view, int row)
@@ -200,20 +329,21 @@ bool hid_pt_view_has_row(const hid_pt_view_t *view, int row)
     return view && row >= 0 && row < HID_PT_MAX_ROWS && view->row_buttons[row] != NULL;
 }
 
+/**
+ * Mark @p row as the device the settings column is showing.
+ *
+ * Distinct from focus on purpose: the cursor can be off in the settings column
+ * while this row stays the one being edited, and then it is the only thing on
+ * the left saying which device that is.
+ */
 void hid_pt_view_set_row_selected(hid_pt_view_t *view, int row, bool selected)
 {
     if (!hid_pt_view_has_row(view, row)) {
         return;
     }
-    style_row(view->row_buttons[row], selected);
-}
-
-void hid_pt_view_set_plug_label(hid_pt_view_t *view, int row, bool plugged)
-{
-    if (!view || row < 0 || row >= HID_PT_MAX_ROWS || !view->plug_labels[row]) {
-        return;
-    }
-    lv_label_set_text(view->plug_labels[row], plugged ? locstr("Plug out") : locstr("Plug in"));
+    lv_obj_t *slab = view->row_buttons[row];
+    lv_obj_set_style_bg_color(slab, lv_color_hex(selected ? OVERLAY_SLAB_SEL : OVERLAY_SLAB), 0);
+    lv_obj_set_style_border_opa(slab, selected ? LV_OPA_COVER : 160, 0);
 }
 
 /* ---- focus -------------------------------------------------------------- */
@@ -221,14 +351,11 @@ void hid_pt_view_set_plug_label(hid_pt_view_t *view, int row, bool plugged)
 /**
  * Bring the focused control into view.
  *
- * The settings column is taller than the sheet for a DualSense (battery,
- * latency, audio route + warning, two volume sliders, haptics, reset), so the
- * last entries -- "Reset to defaults" in particular -- sit below the fold. The
- * pane scrolls, but nothing was asking it to: LVGL only auto-scrolls to a
- * focused object that carries LV_OBJ_FLAG_SCROLL_ON_FOCUS, which these controls
- * don't, so arrowing down onto the button moved focus somewhere invisible.
- * Recursive, because both the right pane and the settings box can be the one
- * that has to move.
+ * The settings column is built to fit without scrolling — that is the point of
+ * the single-line rows — but a small display, a long translation or a device
+ * with more controls than a DualSense can still overflow it, and the device list
+ * scrolls by nature. One handler on one scroll container each: the old panel had
+ * a pane inside a pane, both scrollable, and the two took turns moving.
  */
 static void scroll_into_view_cb(lv_event_t *event)
 {
@@ -253,15 +380,38 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
 }
 
 /**
+ * The option column, top to bottom.
+ *
+ * One list, used for the focus group's order and for stepping the cursor, so the
+ * two can't disagree. Entries that are hidden for the selected device are
+ * skipped by the stepper, not removed from here.
+ */
+static void option_chain(const hid_pt_view_t *view, lv_obj_t *const **out, size_t *count)
+{
+    static lv_obj_t *chain[8];
+    size_t n = 0;
+    chain[n++] = view->auto_plugin_cb;
+    chain[n++] = view->composite_cb;
+    chain[n++] = view->audio_dropdown;
+    chain[n++] = view->speaker_slider;
+    chain[n++] = view->headset_slider;
+    chain[n++] = view->haptics_slider;
+    chain[n++] = view->latency_slider;
+    chain[n++] = view->reset_settings_btn;
+    *out = chain;
+    *count = n;
+}
+
+/**
  * Rebuild the focus group: device rows first, then the option column.
  *
  * lv_group_remove_all_objs() clears obj_focus, and the very next
  * lv_group_add_obj() sees head == tail and calls lv_group_refocus(), which sends
- * LV_EVENT_FOCUSED to plug button 0. Without the guard that reaches the panel's
- * plug-focus handler and overwrites the selection, so the key-based restore the
+ * LV_EVENT_FOCUSED to row 0. Without the guard that reaches the panel's
+ * row-focus handler and overwrites the selection, so the key-based restore the
  * panel does after a re-render has nothing left to restore. The flag only
- * suppresses that *bookkeeping*; LVGL still parks its focus on plug button 0,
- * which is why the panel puts focus back explicitly afterwards.
+ * suppresses that *bookkeeping*; LVGL still parks its focus on row 0, which is
+ * why the panel puts focus back explicitly afterwards.
  */
 void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
 {
@@ -271,20 +421,18 @@ void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
     view->rebuilding = true;
     lv_group_remove_all_objs(view->group);
     for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
-        if (view->plug_buttons[i]) {
-            /* Plug buttons scroll the device list from their own FOCUSED
-             * handler, so they do not get the generic one. */
-            lv_group_add_obj(view->group, view->plug_buttons[i]);
+        if (view->row_buttons[i]) {
+            /* Rows scroll the device list from their own FOCUSED handler, so
+             * they do not get the generic one. */
+            lv_group_add_obj(view->group, view->row_buttons[i]);
         }
     }
-    group_add(view, view->composite_cb);
-    group_add(view, view->auto_plugin_cb);
-    group_add(view, view->latency_slider);
-    group_add(view, view->audio_dropdown);
-    group_add(view, view->speaker_slider);
-    group_add(view, view->headset_slider);
-    group_add(view, view->haptics_slider);
-    group_add(view, view->reset_settings_btn);
+    lv_obj_t *const *chain;
+    size_t count;
+    option_chain(view, &chain, &count);
+    for (size_t i = 0; i < count; ++i) {
+        group_add(view, chain[i]);
+    }
     group_add(view, view->refresh_btn);
     group_add(view, view->close_btn);
     view->rebuilding = false;
@@ -300,15 +448,15 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
     if (!view || !obj) {
         return HID_PT_WK_NONE;
     }
-    if (hid_pt_view_plug_row_of(view, obj) >= 0) {
-        return HID_PT_WK_PLUG;
+    if (hid_pt_view_row_of(view, obj) >= 0) {
+        return HID_PT_WK_ROW;
     }
     const struct {
         lv_obj_t *const *slot;
         hid_pt_widget_kind_t kind;
     } table[] = {
-            {&view->composite_cb,       HID_PT_WK_CHECKBOX},
-            {&view->auto_plugin_cb,     HID_PT_WK_CHECKBOX},
+            {&view->composite_cb,       HID_PT_WK_SWITCH},
+            {&view->auto_plugin_cb,     HID_PT_WK_SWITCH},
             {&view->latency_slider,     HID_PT_WK_SLIDER},
             {&view->speaker_slider,     HID_PT_WK_SLIDER},
             {&view->headset_slider,     HID_PT_WK_SLIDER},
@@ -323,35 +471,40 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
             return table[i].kind;
         }
     }
-    /* The hand-written list this table replaced also accepted any child of the
-     * haptics row, and the haptics slider is the only one of those that is in
-     * the table above. Kept so the answer for the row's other child, the label,
-     * is the one it has always been. */
-    if (view->haptics_row && lv_obj_get_parent(obj) == view->haptics_row) {
-        return HID_PT_WK_OPTION_OTHER;
-    }
     return HID_PT_WK_NONE;
 }
 
-int hid_pt_view_plug_row_of(const hid_pt_view_t *view, lv_obj_t *obj)
+hid_pt_zone_t hid_pt_view_zone_of(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    hid_pt_widget_kind_t kind = hid_pt_view_kind_of(view, obj);
+    if (kind == HID_PT_WK_HEADER_BTN) {
+        return HID_PT_ZONE_HEADER;
+    }
+    if (hid_pt_view_kind_is_option(kind)) {
+        return HID_PT_ZONE_OPTIONS;
+    }
+    return HID_PT_ZONE_LIST;
+}
+
+int hid_pt_view_row_of(const hid_pt_view_t *view, lv_obj_t *obj)
 {
     if (!view || !obj) {
         return -1;
     }
     for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
-        if (view->plug_buttons[i] == obj) {
+        if (view->row_buttons[i] == obj) {
             return i;
         }
     }
     return -1;
 }
 
-void hid_pt_view_focus_plug(hid_pt_view_t *view, int row)
+void hid_pt_view_focus_row(hid_pt_view_t *view, int row)
 {
-    if (!view || row < 0 || row >= HID_PT_MAX_ROWS || !view->plug_buttons[row]) {
+    if (!view || row < 0 || row >= HID_PT_MAX_ROWS || !view->row_buttons[row]) {
         return;
     }
-    lv_group_focus_obj(view->plug_buttons[row]);
+    lv_group_focus_obj(view->row_buttons[row]);
 }
 
 void hid_pt_view_scroll_row_into_view(hid_pt_view_t *view, int row)
@@ -373,6 +526,48 @@ bool hid_pt_view_obj_is_hidden(const hid_pt_view_t *view, lv_obj_t *obj)
         }
     }
     return false;
+}
+
+lv_obj_t *hid_pt_view_first_option(const hid_pt_view_t *view)
+{
+    if (!view) {
+        return NULL;
+    }
+    lv_obj_t *const *chain;
+    size_t count;
+    option_chain(view, &chain, &count);
+    for (size_t i = 0; i < count; ++i) {
+        if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
+            return chain[i];
+        }
+    }
+    return NULL;
+}
+
+lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int step)
+{
+    if (!view || !from || step == 0) {
+        return NULL;
+    }
+    lv_obj_t *const *chain;
+    size_t count;
+    option_chain(view, &chain, &count);
+    int at = -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (chain[i] == from) {
+            at = (int) i;
+            break;
+        }
+    }
+    if (at < 0) {
+        return NULL;
+    }
+    for (int i = at + step; i >= 0 && i < (int) count; i += step) {
+        if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
+            return chain[i];
+        }
+    }
+    return NULL;
 }
 
 /* ---- the audio dropdown's list ------------------------------------------ */
@@ -412,42 +607,95 @@ void hid_pt_view_close_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown)
 
 void hid_pt_view_update_latency_label(hid_pt_view_t *view, int default_ms)
 {
-    if (!view || !view->latency_label) {
+    if (!view || !view->latency_value) {
         return;
     }
-    int ms = (int) lv_slider_get_value(view->latency_slider);
-    /* The default is passed in rather than named here. A literal in this string
-     * has already gone stale once -- the pt-BR translation still carries a msgid
-     * claiming 48 ms -- and the model's default is free to vary per controller. */
-    lv_label_set_text_fmt(view->latency_label,
-                          locstr("Audio/haptics latency — %d ms (default: %d ms)"), ms, default_ms);
+    lv_label_set_text_fmt(view->latency_value, locstr("%d ms"),
+                          (int) lv_slider_get_value(view->latency_slider));
+    /* The default is named in the row's label rather than hardcoded in the
+     * string: a literal here has already gone stale once — the pt-BR catalogue
+     * still carries a msgid claiming 48 ms — and the model's default is free to
+     * vary per controller. */
+    if (view->latency_label) {
+        lv_label_set_text_fmt(view->latency_label, locstr("Latency · default %d ms"), default_ms);
+    }
 }
 
 void hid_pt_view_update_speaker_label(hid_pt_view_t *view)
 {
-    if (!view || !view->speaker_label) {
+    if (!view || !view->speaker_value) {
         return;
     }
-    int pct = (int) lv_slider_get_value(view->speaker_slider);
-    lv_label_set_text_fmt(view->speaker_label, locstr("Speaker volume — %d%%"), pct);
+    lv_label_set_text_fmt(view->speaker_value, "%d %%", (int) lv_slider_get_value(view->speaker_slider));
 }
 
 void hid_pt_view_update_headset_label(hid_pt_view_t *view)
 {
-    if (!view || !view->headset_label) {
+    if (!view || !view->headset_value) {
         return;
     }
-    int pct = (int) lv_slider_get_value(view->headset_slider);
-    lv_label_set_text_fmt(view->headset_label, locstr("Headphone jack volume — %d%%"), pct);
+    lv_label_set_text_fmt(view->headset_value, "%d %%", (int) lv_slider_get_value(view->headset_slider));
 }
 
 void hid_pt_view_update_haptics_label(hid_pt_view_t *view)
 {
-    if (!view || !view->haptics_label) {
+    if (!view || !view->haptics_value) {
         return;
     }
-    int pct = (int) lv_slider_get_value(view->haptics_slider);
-    lv_label_set_text_fmt(view->haptics_label, locstr("Haptics strength — %d%% (default: 100%%)"), pct);
+    lv_label_set_text_fmt(view->haptics_value, "%d %%", (int) lv_slider_get_value(view->haptics_slider));
+}
+
+bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir)
+{
+    if (!view || hid_pt_view_kind_of(view, obj) != HID_PT_WK_SLIDER) {
+        return false;
+    }
+    /* One press moves a fortieth of the range: five points on a percentage, five
+     * milliseconds on the latency. Held down, LVGL's key repeat walks the whole
+     * range in about a second. */
+    int32_t min = lv_slider_get_min_value(obj);
+    int32_t max = lv_slider_get_max_value(obj);
+    int32_t step = (max - min) / 40;
+    if (step < 1) {
+        step = 1;
+    }
+    int32_t next = lv_slider_get_value(obj) + (int32_t) dir * step;
+    if (next < min) {
+        next = min;
+    } else if (next > max) {
+        next = max;
+    }
+    if (next == lv_slider_get_value(obj)) {
+        return true;
+    }
+    lv_slider_set_value(obj, next, LV_ANIM_OFF);
+    lv_event_send(obj, LV_EVENT_VALUE_CHANGED, NULL);
+    return true;
+}
+
+void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged)
+{
+    if (!view || !view->hint_label) {
+        return;
+    }
+    /* One whole sentence per case rather than assembled fragments: a translator
+     * gets to see the line they are translating. */
+    const char *text;
+    switch (zone) {
+        case HID_PT_ZONE_OPTIONS:
+            text = locstr("UP/DOWN  setting        LEFT/RIGHT  adjust        BACK  devices");
+            break;
+        case HID_PT_ZONE_HEADER:
+            text = locstr("LEFT/RIGHT  choose        OK  run        BACK  close");
+            break;
+        case HID_PT_ZONE_LIST:
+        default:
+            text = plugged
+                   ? locstr("UP/DOWN  device        OK  unplug        RIGHT  settings        BACK  close")
+                   : locstr("UP/DOWN  device        OK  plug in        RIGHT  settings        BACK  close");
+            break;
+    }
+    lv_label_set_text(view->hint_label, text);
 }
 
 /* ---- construction ------------------------------------------------------- */
@@ -458,6 +706,91 @@ static void bind_control(hid_pt_view_t *view, lv_obj_t *obj, hid_pt_ctl_t id)
     lv_obj_set_user_data(obj, (void *) (intptr_t) id);
     lv_obj_add_event_cb(obj, value_changed_cb, LV_EVENT_VALUE_CHANGED, view);
     lv_obj_add_event_cb(obj, key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
+}
+
+/** A quiet outlined button, for the header and for Reset. */
+static lv_obj_t *ghost_button(hid_pt_view_t *view, lv_obj_t *parent, const char *text, hid_pt_ctl_t id)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_size(btn, LV_SIZE_CONTENT, LV_DPX(30));
+    lv_obj_set_style_radius(btn, LV_DPX(5), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(btn, LV_DPX(13), 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(OVERLAY_SLAB_HI), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, lv_color_hex(OVERLAY_CHALK), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_20, LV_STATE_PRESSED);
+    lv_obj_set_user_data(btn, (void *) (intptr_t) id);
+    lv_obj_add_event_cb(btn, clicked_cb, LV_EVENT_CLICKED, view);
+    lv_obj_add_event_cb(btn, key_cb, LV_EVENT_KEY, view);
+
+    lv_obj_t *label = eyebrow(btn, text, OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_center(label);
+    return btn;
+}
+
+/** A settings row: label on the left, its control in the shared right gutter. */
+static lv_obj_t *option_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label, lv_obj_t **label_out)
+{
+    (void) view;
+    lv_obj_t *row = lv_obj_create(parent);
+    slab_style(row, OPT_ROW_H);
+    slab_rail(row);
+    lv_obj_t *body = slab_body(row);
+
+    lv_obj_t *name = body_text(body, label);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(name, 1);
+    if (label_out) {
+        *label_out = name;
+    }
+    return body;
+}
+
+/** A slider row: label, then the track and the number, both on the gutter. */
+static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label, int32_t min,
+                            int32_t max, hid_pt_ctl_t id, lv_obj_t **slider_out, lv_obj_t **value_out,
+                            lv_obj_t **label_out)
+{
+    lv_obj_t *body = option_row(view, parent, label, label_out);
+
+    lv_obj_t *slider = lv_slider_create(body);
+    lv_slider_set_range(slider, min, max);
+    lv_obj_set_size(slider, SLIDER_W, LV_DPX(6));
+    lv_obj_set_style_bg_color(slider, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(slider, 40, 0);
+    lv_obj_set_style_radius(slider, LV_DPX(3), 0);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(slider, LV_DPX(3), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(slider, 190, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, LV_DPX(5), LV_PART_KNOB);
+    lv_obj_set_style_border_width(slider, 0, LV_PART_KNOB);
+    /* The knob only grows once the row owns the arrow keys, so the row that is
+     * being adjusted is obvious even out of the corner of the eye. */
+    lv_obj_set_style_bg_opa(slider, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_pad_all(slider, LV_DPX(8), LV_PART_KNOB | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_width(slider, LV_DPX(12), LV_PART_KNOB | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_color(slider, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_opa(slider, 120, LV_PART_KNOB | LV_STATE_FOCUS_KEY);
+    bind_slab_focus(slider, lv_obj_get_parent(body));
+    bind_control(view, slider, id);
+    if (slider_out) {
+        *slider_out = slider;
+    }
+
+    lv_obj_t *value = body_text(body, "-");
+    lv_obj_set_width(value, VALUE_W);
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+    if (value_out) {
+        *value_out = value;
+    }
+    return body;
 }
 
 lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt_view_cbs_t *cbs)
@@ -472,219 +805,246 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_t *cont = lv_obj_create(parent);
     lv_obj_remove_style_all(cont);
     lv_obj_set_size(cont, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(cont, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(cont, LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(OVERLAY_INK), 0);
+    lv_obj_set_style_bg_opa(cont, OVERLAY_OPA_VEIL, 0);
     lv_obj_add_flag(cont, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *sheet = lv_obj_create(cont);
     view->sheet = sheet;
-    /* A DualSense fills the settings column (battery, latency, audio route,
-     * speaker, headset, haptics, reset); a couple more percent of height keeps
-     * that off the scrollbar in the common case. */
-    lv_obj_set_size(sheet, LV_DPX(760), LV_PCT(90));
-    lv_obj_set_style_min_height(sheet, LV_DPX(400), 0);
+    /* As tall as it needs to be, not as tall as it is allowed to be. A fixed 92 %
+     * left a third of the sheet empty under the last setting, which is most of
+     * what made a five-row panel feel like a takeover of the screen. */
+    lv_obj_set_size(sheet, SHEET_W, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(sheet, LV_DPX(300), 0);
     lv_obj_center(sheet);
-    lv_obj_set_style_max_width(sheet, LV_PCT(92), 0);
+    lv_obj_set_style_max_width(sheet, LV_PCT(96), 0);
     lv_obj_set_style_max_height(sheet, LV_PCT(92), 0);
-    lv_obj_set_style_bg_color(sheet, lv_color_hex(0x121a20), 0);
-    lv_obj_set_style_bg_opa(sheet, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(sheet, LV_DPX(12), 0);
-    lv_obj_set_style_border_width(sheet, 1, 0);
-    lv_obj_set_style_border_color(sheet, lv_color_hex(0x2c3d49), 0);
-    lv_obj_set_style_shadow_width(sheet, LV_DPX(24), 0);
-    lv_obj_set_style_shadow_opa(sheet, LV_OPA_40, 0);
+    lv_obj_set_style_bg_color(sheet, lv_color_hex(OVERLAY_INK), 0);
+    lv_obj_set_style_bg_opa(sheet, OVERLAY_OPA_SHEET, 0);
+    lv_obj_set_style_radius(sheet, LV_DPX(10), 0);
+    lv_obj_set_style_clip_corner(sheet, true, 0);
+    lv_obj_set_style_border_width(sheet, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(sheet, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_shadow_width(sheet, LV_DPX(30), 0);
+    lv_obj_set_style_shadow_opa(sheet, LV_OPA_60, 0);
+    lv_obj_set_style_shadow_color(sheet, lv_color_black(), 0);
     lv_obj_set_style_pad_all(sheet, 0, 0);
+    lv_obj_set_style_pad_gap(sheet, 0, 0);
     lv_obj_set_flex_flow(sheet, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(sheet, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(sheet, LV_OBJ_FLAG_CLICK_FOCUSABLE);
     lv_obj_add_event_cb(sheet, sheet_key_cb, LV_EVENT_KEY, view);
 
+    /* ---- header ---- */
     lv_obj_t *header = lv_obj_create(sheet);
     lv_obj_remove_style_all(header);
-    lv_obj_set_width(header, LV_PCT(100));
-    lv_obj_set_height(header, LV_DPX(56));
-    lv_obj_set_style_bg_color(header, lv_color_hex(0x18232c), 0);
-    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(header, LV_DPX(12), 0);
-    lv_obj_set_style_pad_hor(header, LV_DPX(14), 0);
+    lv_obj_set_size(header, LV_PCT(100), HEADER_H);
+    lv_obj_set_style_bg_color(header, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(header, OVERLAY_OPA_BAR, 0);
+    lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(header, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(header, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_border_opa(header, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(header, LV_DPX(16), 0);
+    lv_obj_set_style_pad_gap(header, LV_DPX(10), 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, locstr("HID Devices"));
-    lv_obj_set_style_text_color(title, lv_color_hex(0xf5f8fa), 0);
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *title_block = lv_obj_create(header);
+    lv_obj_remove_style_all(title_block);
+    lv_obj_set_size(title_block, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(title_block, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(title_block, LV_DPX(2), 0);
+    lv_obj_clear_flag(title_block, LV_OBJ_FLAG_SCROLLABLE);
+    eyebrow(title_block, locstr("HID PASSTHROUGH"), OVERLAY_CHALK, OVERLAY_OPA_FAINT);
+    lv_obj_t *title = body_text(title_block, locstr("Controllers"));
+    lv_obj_set_style_text_font(title, lv_theme_get_font_large(title_block), 0);
 
-    lv_obj_t *refresh_btn = lv_btn_create(header);
-    view->refresh_btn = refresh_btn;
-    lv_obj_set_size(refresh_btn, LV_DPX(88), LV_DPX(36));
-    lv_obj_align(refresh_btn, LV_ALIGN_RIGHT_MID, LV_DPX(-98), 0);
-    lv_obj_set_user_data(refresh_btn, (void *) (intptr_t) HID_PT_CTL_REFRESH);
-    lv_obj_add_event_cb(refresh_btn, clicked_cb, LV_EVENT_CLICKED, view);
-    lv_obj_add_event_cb(refresh_btn, key_cb, LV_EVENT_KEY, view);
-    lv_obj_t *refresh_lbl = lv_label_create(refresh_btn);
-    lv_label_set_text(refresh_lbl, locstr("Refresh"));
-    lv_obj_center(refresh_lbl);
-
-    lv_obj_t *close_btn = lv_btn_create(header);
-    view->close_btn = close_btn;
-    lv_obj_set_size(close_btn, LV_DPX(88), LV_DPX(36));
-    lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_set_user_data(close_btn, (void *) (intptr_t) HID_PT_CTL_CLOSE);
-    lv_obj_add_event_cb(close_btn, clicked_cb, LV_EVENT_CLICKED, view);
-    lv_obj_add_event_cb(close_btn, key_cb, LV_EVENT_KEY, view);
-    lv_obj_t *close_lbl = lv_label_create(close_btn);
-    lv_label_set_text(close_lbl, locstr("Close"));
-    lv_obj_center(close_lbl);
-
-    lv_obj_t *status_row = lv_obj_create(sheet);
-    lv_obj_remove_style_all(status_row);
-    lv_obj_set_width(status_row, LV_PCT(100));
-    lv_obj_set_height(status_row, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_hor(status_row, LV_DPX(14), 0);
-    lv_obj_set_style_pad_bottom(status_row, LV_DPX(4), 0);
-    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(status_row, LV_DPX(2), 0);
-
-    view->status_label = lv_label_create(status_row);
+    /* The bridge's own words, kept where they belong to the sheet as a whole
+     * rather than to any one device. */
+    view->status_label = lv_label_create(header);
     lv_label_set_text(view->status_label, locstr("starting"));
-    lv_obj_set_style_text_color(view->status_label, lv_color_hex(0xaab6bf), 0);
-    lv_obj_set_style_text_font(view->status_label, lv_theme_get_font_small(view->status_label), 0);
+    lv_obj_set_style_text_color(view->status_label, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(view->status_label, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_style_text_font(view->status_label, lv_theme_get_font_small(header), 0);
+    lv_obj_set_style_text_align(view->status_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(view->status_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(view->status_label, 1);
 
-    view->error_label = lv_label_create(status_row);
+    view->refresh_btn = ghost_button(view, header, locstr("RESCAN"), HID_PT_CTL_REFRESH);
+    view->close_btn = ghost_button(view, header, locstr("CLOSE"), HID_PT_CTL_CLOSE);
+
+    /* ---- error bar: only there when the bridge has something to say ---- */
+    view->error_row = lv_obj_create(sheet);
+    lv_obj_remove_style_all(view->error_row);
+    lv_obj_set_size(view->error_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(view->error_row, LV_DPX(16), 0);
+    lv_obj_set_style_pad_ver(view->error_row, LV_DPX(6), 0);
+    lv_obj_set_style_bg_color(view->error_row, lv_color_hex(OVERLAY_ALERT), 0);
+    lv_obj_set_style_bg_opa(view->error_row, 30, 0);
+    lv_obj_add_flag(view->error_row, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(view->error_row, LV_OBJ_FLAG_SCROLLABLE);
+    view->error_label = lv_label_create(view->error_row);
     lv_label_set_text(view->error_label, "");
-    lv_obj_set_style_text_color(view->error_label, lv_color_hex(0xf87171), 0);
-    lv_obj_set_style_text_font(view->error_label, lv_theme_get_font_small(view->error_label), 0);
+    lv_obj_set_style_text_color(view->error_label, lv_color_hex(OVERLAY_ALERT), 0);
+    lv_obj_set_style_text_font(view->error_label, lv_theme_get_font_small(view->error_row), 0);
     lv_obj_set_width(view->error_label, LV_PCT(100));
     lv_label_set_long_mode(view->error_label, LV_LABEL_LONG_WRAP);
-    lv_obj_add_flag(view->error_label, LV_OBJ_FLAG_HIDDEN);
 
+    /* ---- body: devices left, the selected device's settings right ---- */
     lv_obj_t *body_row = lv_obj_create(sheet);
     lv_obj_remove_style_all(body_row);
-    lv_obj_set_width(body_row, LV_PCT(100));
-    lv_obj_set_flex_grow(body_row, 1);
-    lv_obj_set_style_bg_opa(body_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(body_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(body_row, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(body_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_all(body_row, LV_DPX(8), 0);
-    lv_obj_set_style_pad_gap(body_row, LV_DPX(8), 0);
+    lv_obj_set_style_pad_all(body_row, BODY_PAD, 0);
+    lv_obj_set_style_pad_gap(body_row, LV_DPX(12), 0);
     lv_obj_clear_flag(body_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *left_pane = lv_obj_create(body_row);
     lv_obj_remove_style_all(left_pane);
-    lv_obj_set_height(left_pane, LV_PCT(100));
-    lv_obj_set_flex_grow(left_pane, 4);
-    lv_obj_set_style_bg_opa(left_pane, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(left_pane, DEV_COL_W, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(left_pane, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(left_pane, 0, 0);
+    lv_obj_set_style_pad_gap(left_pane, LV_DPX(8), 0);
+    lv_obj_clear_flag(left_pane, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *devices_title = lv_label_create(left_pane);
-    lv_label_set_text(devices_title, locstr("Devices"));
-    lv_obj_set_style_text_color(devices_title, lv_color_hex(0xf5f8fa), 0);
-    lv_obj_set_style_pad_left(devices_title, LV_DPX(10), 0);
-    lv_obj_set_style_pad_top(devices_title, LV_DPX(4), 0);
+    lv_obj_t *devices_title = eyebrow(left_pane, locstr("DEVICES"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_set_style_pad_left(devices_title, LV_DPX(3), 0);
 
     view->list = lv_obj_create(left_pane);
-    lv_obj_set_width(view->list, LV_PCT(100));
-    lv_obj_set_flex_grow(view->list, 1);
-    lv_obj_set_style_bg_opa(view->list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_opa(view->list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_all(view->list, LV_DPX(6), 0);
+    lv_obj_remove_style_all(view->list);
+    lv_obj_set_size(view->list, LV_PCT(100), LV_SIZE_CONTENT);
+    /* The cap the sheet's own 92 % works out to, minus its bars. Past it the list
+     * scrolls instead of pushing the sheet off the screen. */
+    lv_obj_set_style_max_height(view->list, PANE_MAX_H, 0);
+    lv_obj_set_style_pad_right(view->list, LV_DPX(4), 0);
     lv_obj_add_flag(view->list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(view->list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(view->list, lv_color_hex(OVERLAY_CHALK), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(view->list, 60, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(view->list, LV_DPX(2), LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(view->list, LV_DPX(1), LV_PART_SCROLLBAR);
 
     lv_obj_t *right_pane = lv_obj_create(body_row);
     lv_obj_remove_style_all(right_pane);
-    lv_obj_set_height(right_pane, LV_PCT(100));
-    lv_obj_set_flex_grow(right_pane, 6);
-    lv_obj_set_style_bg_color(right_pane, lv_color_hex(0x0e1820), 0);
-    lv_obj_set_style_bg_opa(right_pane, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(right_pane, LV_DPX(8), 0);
-    lv_obj_set_style_border_width(right_pane, 1, 0);
-    lv_obj_set_style_border_color(right_pane, lv_color_hex(0x2c3d49), 0);
+    lv_obj_set_height(right_pane, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(right_pane, PANE_MAX_H, 0);
+    lv_obj_set_flex_grow(right_pane, 1);
     lv_obj_set_flex_flow(right_pane, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(right_pane, LV_DPX(12), 0);
+    lv_obj_set_style_pad_gap(right_pane, ROW_GAP, 0);
+    /* Sized to fit at 1080p — that is what the single-line rows buy. The scroll
+     * is the fallback for a smaller panel or a longer translation, and it is the
+     * only scroll container on this side now. */
     lv_obj_add_flag(right_pane, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(right_pane, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_style_bg_color(right_pane, lv_color_hex(0x64748b), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(right_pane, LV_OPA_60, LV_PART_SCROLLBAR);
-    lv_obj_set_style_width(right_pane, LV_DPX(4), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(right_pane, lv_color_hex(OVERLAY_CHALK), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(right_pane, 60, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(right_pane, LV_DPX(2), LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(right_pane, LV_DPX(1), LV_PART_SCROLLBAR);
+    view->customize_panel = right_pane;
 
-    view->composite_row = lv_obj_create(right_pane);
-    lv_obj_remove_style_all(view->composite_row);
-    lv_obj_set_width(view->composite_row, LV_PCT(100));
-    lv_obj_set_height(view->composite_row, LV_DPX(44));
+    /* Device header: who is being edited, and how it is doing. */
+    lv_obj_t *head_row = lv_obj_create(right_pane);
+    lv_obj_remove_style_all(head_row);
+    lv_obj_set_size(head_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(head_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(head_row, LV_DPX(3), 0);
+    lv_obj_set_style_pad_bottom(head_row, LV_DPX(2), 0);
+    lv_obj_clear_flag(head_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    view->customize_title = body_text(head_row, locstr("Controller settings"));
+    lv_obj_set_style_text_font(view->customize_title, lv_theme_get_font_large(head_row), 0);
+    lv_label_set_long_mode(view->customize_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(view->customize_title, 1);
+    view->reset_settings_btn = ghost_button(view, head_row, locstr("RESET"), HID_PT_CTL_RESET);
+
+    /* State and battery on one line: recoloured so "BRIDGED" carries the same
+     * teal as the rail on the device's row. */
+    view->customize_state = eyebrow(right_pane, "", OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_label_set_recolor(view->customize_state, true);
+    lv_obj_set_style_pad_left(view->customize_state, LV_DPX(3), 0);
+    lv_obj_set_style_pad_bottom(view->customize_state, LV_DPX(4), 0);
+
+    /* Auto-plug: a switch, not a checkbox — it lands in the same right-hand
+     * gutter as every other control, and it is a bigger target from the couch. */
+    lv_obj_t *auto_body = option_row(view, right_pane,
+                                     locstr("Auto-plug on next stream"), NULL);
+    view->auto_plugin_row = lv_obj_get_parent(auto_body);
+    view->auto_plugin_cb = lv_switch_create(auto_body);
+    lv_obj_set_size(view->auto_plugin_cb, LV_DPX(44), LV_DPX(22));
+    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 40, 0);
+    /* The filled half of a switch is its INDICATOR, not its background — leaving
+     * that part unstyled is why the toggle came out in the theme's blue while
+     * every other "this is on" mark in the sheet is teal. */
+    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(view->auto_plugin_cb, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 110, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 190, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_LIVE),
+                              LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(view->auto_plugin_cb, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_add_flag(view->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
+    bind_slab_focus(view->auto_plugin_cb, view->auto_plugin_row);
+    bind_control(view, view->auto_plugin_cb, HID_PT_CTL_AUTO_PLUGIN);
+
+    lv_obj_t *composite_body = option_row(view, right_pane,
+                                          locstr("Recognize as native Flydigi on PC"), NULL);
+    view->composite_row = lv_obj_get_parent(composite_body);
+    view->composite_cb = lv_switch_create(composite_body);
+    lv_obj_set_size(view->composite_cb, LV_DPX(44), LV_DPX(22));
+    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(view->composite_cb, 40, 0);
+    /* The filled half of a switch is its INDICATOR, not its background — leaving
+     * that part unstyled is why the toggle came out in the theme's blue while
+     * every other "this is on" mark in the sheet is teal. */
+    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(view->composite_cb, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(view->composite_cb, 110, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(view->composite_cb, 190, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_LIVE),
+                              LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(view->composite_cb, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
     lv_obj_add_flag(view->composite_row, LV_OBJ_FLAG_HIDDEN);
-    view->composite_cb = lv_checkbox_create(view->composite_row);
-    lv_checkbox_set_text(view->composite_cb, locstr("Recognize as native Flydigi on PC"));
-    lv_obj_set_style_text_color(view->composite_cb, lv_color_hex(0xdbe4ea), 0);
-    lv_obj_align(view->composite_cb, LV_ALIGN_LEFT_MID, 0, 0);
+    bind_slab_focus(view->composite_cb, view->composite_row);
     bind_control(view, view->composite_cb, HID_PT_CTL_COMPOSITE);
 
-    view->auto_plugin_row = lv_obj_create(right_pane);
-    lv_obj_remove_style_all(view->auto_plugin_row);
-    lv_obj_set_width(view->auto_plugin_row, LV_PCT(100));
-    lv_obj_set_height(view->auto_plugin_row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(view->auto_plugin_row, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(view->auto_plugin_row, LV_DPX(4), 0);
-    lv_obj_add_flag(view->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
-    view->auto_plugin_cb = lv_checkbox_create(view->auto_plugin_row);
-    lv_checkbox_set_text(view->auto_plugin_cb,
-                         locstr("Auto-Plugin (connect via HID Passthrough on next stream)"));
-    lv_obj_set_style_text_color(view->auto_plugin_cb, lv_color_hex(0xdbe4ea), 0);
-    lv_obj_set_width(view->auto_plugin_cb, LV_PCT(100));
-    bind_control(view, view->auto_plugin_cb, HID_PT_CTL_AUTO_PLUGIN);
-    lv_obj_t *auto_plugin_hint = lv_label_create(view->auto_plugin_row);
-    lv_label_set_text(auto_plugin_hint,
-                      locstr("When unchecked, the controller uses normal Moonlight emulation until you Plug in."));
-    lv_label_set_long_mode(auto_plugin_hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(auto_plugin_hint, LV_PCT(100));
-    lv_obj_set_style_text_color(auto_plugin_hint, lv_color_hex(0x94a3b8), 0);
+    view->audio_heading = eyebrow(right_pane, locstr("AUDIO & HAPTICS"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_set_style_pad_left(view->audio_heading, LV_DPX(3), 0);
+    lv_obj_set_style_pad_top(view->audio_heading, LV_DPX(4), 0);
 
-    view->customize_panel = lv_obj_create(right_pane);
-    lv_obj_remove_style_all(view->customize_panel);
-    lv_obj_set_width(view->customize_panel, LV_PCT(100));
-    lv_obj_set_flex_grow(view->customize_panel, 1);
-    lv_obj_set_style_bg_color(view->customize_panel, lv_color_hex(0x152028), 0);
-    lv_obj_set_style_bg_opa(view->customize_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(view->customize_panel, 1, 0);
-    lv_obj_set_style_border_color(view->customize_panel, lv_color_hex(0x2c3d49), 0);
-    lv_obj_set_style_radius(view->customize_panel, LV_DPX(6), 0);
-    lv_obj_set_style_pad_all(view->customize_panel, LV_DPX(12), 0);
-    lv_obj_set_flex_flow(view->customize_panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(view->customize_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_add_flag(view->customize_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(view->customize_panel, LV_OBJ_FLAG_HIDDEN);
-    /* lv_obj_remove_style_all() above took the scrollbar with it, so a pane that
-     * had more below the fold gave no hint of it. Put a slim one back. */
-    lv_obj_set_scrollbar_mode(view->customize_panel, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_style_bg_color(view->customize_panel, lv_color_hex(0x64748b), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(view->customize_panel, LV_OPA_60, LV_PART_SCROLLBAR);
-    lv_obj_set_style_width(view->customize_panel, LV_DPX(4), LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(view->customize_panel, LV_DPX(2), LV_PART_SCROLLBAR);
-    /* Room under the last control so it doesn't sit flush against the border. */
-    lv_obj_set_style_pad_bottom(view->customize_panel, LV_DPX(16), 0);
-
-    view->customize_title = lv_label_create(view->customize_panel);
-    lv_label_set_text(view->customize_title, locstr("Controller settings"));
-    lv_obj_set_style_text_color(view->customize_title, lv_color_hex(0xf5f8fa), 0);
-
-    view->battery_label = lv_label_create(view->customize_panel);
-    lv_obj_set_style_text_color(view->battery_label, lv_color_hex(0x7dd3fc), 0);
-    lv_obj_add_flag(view->battery_label, LV_OBJ_FLAG_HIDDEN);
-
-    view->latency_label = lv_label_create(view->customize_panel);
-    lv_obj_set_style_text_color(view->latency_label, lv_color_hex(0xdbe4ea), 0);
-    view->latency_slider = lv_slider_create(view->customize_panel);
-    lv_slider_set_range(view->latency_slider, DS_LATENCY_MIN, DS_LATENCY_MAX);
-    lv_obj_set_width(view->latency_slider, LV_PCT(100));
-    bind_control(view, view->latency_slider, HID_PT_CTL_LATENCY);
-
-    lv_obj_t *audio_lbl = lv_label_create(view->customize_panel);
-    lv_label_set_text(audio_lbl, locstr("Audio output"));
-    lv_obj_set_style_text_color(audio_lbl, lv_color_hex(0xdbe4ea), 0);
-    view->audio_dropdown = lv_dropdown_create(view->customize_panel);
+    lv_obj_t *audio_body = option_row(view, right_pane, locstr("Audio output"), NULL);
+    view->audio_row = lv_obj_get_parent(audio_body);
+    view->audio_dropdown = lv_dropdown_create(audio_body);
     lv_dropdown_set_options(view->audio_dropdown,
                             locstr("Auto (game decides)\nOff\nController speaker\nHeadphone jack\nSpeaker + jack"));
-    lv_obj_set_width(view->audio_dropdown, LV_PCT(100));
+    /* No box of its own: the row already is the box. The theme gives a dropdown a
+     * filled plate, a border and a blue focus outline, which next to four bare
+     * slider rows made this one row look like a different design — and the plate
+     * clipped its own text, because the theme's vertical padding is written for a
+     * content-sized dropdown, not one that has to fit a fixed row.
+     *
+     * So: transparent, borderless, its own padding, and the value right-aligned
+     * on the same axis every slider's number sits on. */
+    lv_obj_set_size(view->audio_dropdown, GUTTER_W, LV_DPX(26));
+    lv_obj_set_style_bg_opa(view->audio_dropdown, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(view->audio_dropdown, 0, 0);
+    lv_obj_set_style_outline_width(view->audio_dropdown, 0, 0);
+    lv_obj_set_style_outline_width(view->audio_dropdown, 0, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_width(view->audio_dropdown, 0, 0);
+    lv_obj_set_style_text_color(view->audio_dropdown, lv_color_hex(OVERLAY_CHALK), 0);
+    /* lv_dropdown draws its text at pad_top and its symbol against the right
+     * edge, and ignores text_align entirely — so the padding IS the layout: the
+     * value starts where every slider's track starts, the chevron ends where
+     * every number ends. */
+    lv_obj_set_style_pad_hor(view->audio_dropdown, 0, 0);
+    lv_obj_set_style_pad_ver(view->audio_dropdown, LV_DPX(5), 0);
+    lv_obj_set_style_text_color(view->audio_dropdown, lv_color_hex(OVERLAY_CHALK), LV_PART_INDICATOR);
+    lv_obj_set_style_text_opa(view->audio_dropdown, OVERLAY_OPA_MUTED, LV_PART_INDICATOR);
+    bind_slab_focus(view->audio_dropdown, view->audio_row);
     /* Not bind_control(): the dropdown wants its KEY handler WITHOUT
      * LV_EVENT_PREPROCESS, so LVGL's own list handling runs first, plus a second
      * preprocess handler that turns the arrow keys into panel navigation while
@@ -694,47 +1054,49 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_add_event_cb(view->audio_dropdown, key_cb, LV_EVENT_KEY, view);
     lv_obj_add_event_cb(view->audio_dropdown, dropdown_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
 
-    view->audio_warning_label = lv_label_create(view->customize_panel);
+    lv_obj_t *spk = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
+                               HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);
+    view->speaker_row = lv_obj_get_parent(spk);
+    lv_obj_t *hs = slider_row(view, right_pane, locstr("Headphone volume"), 0, DS_VOLUME_MAX,
+                              HID_PT_CTL_HEADSET, &view->headset_slider, &view->headset_value, NULL);
+    view->headset_row = lv_obj_get_parent(hs);
+    lv_obj_t *hap = slider_row(view, right_pane, locstr("Haptics strength"), 0, DS_HAPTICS_MAX,
+                               HID_PT_CTL_HAPTICS, &view->haptics_slider, &view->haptics_value,
+                               &view->haptics_label);
+    view->haptics_row = lv_obj_get_parent(hap);
+    lv_obj_t *lat = slider_row(view, right_pane, locstr("Latency"), DS_LATENCY_MIN, DS_LATENCY_MAX,
+                               HID_PT_CTL_LATENCY, &view->latency_slider, &view->latency_value,
+                               &view->latency_label);
+    view->latency_row = lv_obj_get_parent(lat);
+
+    /* The advisory sits under the settings it is about, one quiet line rather
+     * than a coloured block: it is a consequence to know, not an error. */
+    view->audio_warning_label = lv_label_create(right_pane);
     lv_label_set_long_mode(view->audio_warning_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(view->audio_warning_label, LV_PCT(100));
-    lv_obj_set_style_text_color(view->audio_warning_label, lv_color_hex(0xfbbf24), 0);
+    lv_obj_set_style_text_font(view->audio_warning_label, lv_theme_get_font_small(right_pane), 0);
+    lv_obj_set_style_text_color(view->audio_warning_label, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(view->audio_warning_label, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_style_pad_left(view->audio_warning_label, LV_DPX(3), 0);
+    lv_obj_set_style_pad_top(view->audio_warning_label, LV_DPX(4), 0);
+    lv_label_set_recolor(view->audio_warning_label, true);
     lv_obj_add_flag(view->audio_warning_label, LV_OBJ_FLAG_HIDDEN);
 
-    view->speaker_label = lv_label_create(view->customize_panel);
-    lv_obj_set_style_text_color(view->speaker_label, lv_color_hex(0xdbe4ea), 0);
-    view->speaker_slider = lv_slider_create(view->customize_panel);
-    lv_slider_set_range(view->speaker_slider, 0, DS_VOLUME_MAX);
-    lv_obj_set_width(view->speaker_slider, LV_PCT(100));
-    bind_control(view, view->speaker_slider, HID_PT_CTL_SPEAKER);
-
-    view->headset_label = lv_label_create(view->customize_panel);
-    lv_obj_set_style_text_color(view->headset_label, lv_color_hex(0xdbe4ea), 0);
-    view->headset_slider = lv_slider_create(view->customize_panel);
-    lv_slider_set_range(view->headset_slider, 0, DS_VOLUME_MAX);
-    lv_obj_set_width(view->headset_slider, LV_PCT(100));
-    bind_control(view, view->headset_slider, HID_PT_CTL_HEADSET);
-
-    view->haptics_row = lv_obj_create(view->customize_panel);
-    lv_obj_remove_style_all(view->haptics_row);
-    lv_obj_set_width(view->haptics_row, LV_PCT(100));
-    lv_obj_set_height(view->haptics_row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(view->haptics_row, LV_FLEX_FLOW_COLUMN);
-    lv_obj_clear_flag(view->haptics_row, LV_OBJ_FLAG_SCROLLABLE);
-    view->haptics_label = lv_label_create(view->haptics_row);
-    lv_obj_set_style_text_color(view->haptics_label, lv_color_hex(0xdbe4ea), 0);
-    view->haptics_slider = lv_slider_create(view->haptics_row);
-    lv_slider_set_range(view->haptics_slider, 0, DS_HAPTICS_MAX);
-    lv_obj_set_width(view->haptics_slider, LV_PCT(100));
-    bind_control(view, view->haptics_slider, HID_PT_CTL_HAPTICS);
-
-    view->reset_settings_btn = lv_btn_create(view->customize_panel);
-    lv_obj_set_size(view->reset_settings_btn, LV_DPX(180), LV_DPX(40));
-    lv_obj_set_user_data(view->reset_settings_btn, (void *) (intptr_t) HID_PT_CTL_RESET);
-    lv_obj_add_event_cb(view->reset_settings_btn, clicked_cb, LV_EVENT_CLICKED, view);
-    lv_obj_add_event_cb(view->reset_settings_btn, key_cb, LV_EVENT_KEY, view);
-    lv_obj_t *reset_lbl = lv_label_create(view->reset_settings_btn);
-    lv_label_set_text(reset_lbl, locstr("Reset to defaults"));
-    lv_obj_center(reset_lbl);
+    /* ---- footer: what the four keys do, right here, right now ---- */
+    lv_obj_t *footer = lv_obj_create(sheet);
+    lv_obj_remove_style_all(footer);
+    lv_obj_set_size(footer, LV_PCT(100), FOOTER_H);
+    lv_obj_set_style_bg_color(footer, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(footer, OVERLAY_OPA_BAR, 0);
+    lv_obj_set_style_border_side(footer, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(footer, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(footer, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_border_opa(footer, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(footer, LV_DPX(16), 0);
+    lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
+    view->hint_label = eyebrow(footer, NULL, OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_center(view->hint_label);
+    hid_pt_view_set_hints(view, HID_PT_ZONE_LIST, false);
 
     hid_pt_view_rebuild_focus_order(view);
 

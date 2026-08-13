@@ -4,6 +4,7 @@
 #include "soft_keyboard.h"
 #include "hid_passthrough_panel.h"
 #include "controller_info.h"
+#include "overlay_style.h"
 #include "input/input_gamepad.h"
 
 #include <SDL.h>
@@ -326,11 +327,12 @@ static void streaming_refresh_controllers(streaming_controller_t *controller) {
         lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(controller->stats_items.pads[i].name, pad->name);
 
-        /* Purple is what this overlay already uses for HID passthrough, on the
-         * "HID Devices" button right below. */
+        /* Teal is "this pad is bridged" everywhere in the overlay — the rail on
+         * its row in the HID sheet, and this badge. It used to be purple, after
+         * the colour the "HID Devices" button had before the redesign. */
         lv_obj_t *badge = controller->stats_items.pads[i].badge;
         lv_label_set_text(badge, pad->bridged ? "BRIDGED" : "SDL");
-        lv_obj_set_style_bg_color(badge, pad->bridged ? lv_palette_main(LV_PALETTE_PURPLE)
+        lv_obj_set_style_bg_color(badge, pad->bridged ? lv_color_hex(OVERLAY_LIVE)
                                                       : lv_color_white(), 0);
         lv_obj_set_style_bg_opa(badge, pad->bridged ? LV_OPA_60 : LV_OPA_20, 0);
         lv_obj_set_style_text_opa(badge, pad->bridged ? LV_OPA_COVER : LV_OPA_70, 0);
@@ -888,8 +890,22 @@ static void overlay_key_cb(lv_event_t *e) {
     }
 }
 
+/**
+ * Point the remote's four colour keys at the commands that wear their colour.
+ *
+ * The button indev indexes this array by btn_id, and lv_sdl_drv_button_input.c
+ * only ever produces 1..4 — red, green, yellow, blue. Green used to land on a
+ * point nobody wrote (a click at the top-left corner) while HID Devices sat on
+ * index 5, which no key can reach; it now has the key its rail advertises.
+ * Indices with no command behind them are parked off-screen, where a click
+ * finds no object at all.
+ */
 static void update_buttons_layout(streaming_controller_t *controller) {
     lv_area_t coords;
+    for (size_t i = 0; i < sizeof(controller->button_points) / sizeof(controller->button_points[0]); i++) {
+        controller->button_points[i].x = -1;
+        controller->button_points[i].y = -1;
+    }
     lv_obj_get_coords(controller->quit_btn, &coords);
     lv_area_center(&coords, &controller->button_points[1]);
     lv_obj_get_coords(controller->suspend_btn, &coords);
@@ -899,7 +915,7 @@ static void update_buttons_layout(streaming_controller_t *controller) {
 #if defined(TARGET_WEBOS)
     if (controller->hid_devices_btn) {
         lv_obj_get_coords(controller->hid_devices_btn, &coords);
-        lv_area_center(&coords, &controller->button_points[5]);
+        lv_area_center(&coords, &controller->button_points[2]);
     }
 #endif
     app_input_set_button_points(&controller->global->ui.input, controller->button_points);

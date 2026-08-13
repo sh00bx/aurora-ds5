@@ -10,6 +10,18 @@
 
 #include "lvgl/ext/lv_child_group.h"
 #include "lvgl/theme/lv_theme_moonlight.h"
+#include "overlay_style.h"
+
+/**
+ * One command in the bottom bar.
+ *
+ * @p key_colour is the LG remote colour key that also triggers it, drawn as the
+ * slab's leading rail; OVERLAY_SEAM means the command has no key. @p key_name is
+ * the same fact in words for anyone not holding that remote, and is NULL when
+ * there is no key to name.
+ */
+static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *parent, const char *label,
+                                uint32_t key_colour, const char *key_name);
 
 static lv_obj_t *stat_label(streaming_controller_t *controller, lv_obj_t *parent, const char *title,
                             lv_coord_t pad_hor);
@@ -40,6 +52,9 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_t *hint = lv_label_create(obj);
     lv_obj_set_style_pad_all(hint, LV_DPX(20), 0);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(hint), 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(hint, OVERLAY_OPA_FAINT, 0);
     lv_label_set_text_fmt(hint, locstr("Hint: %s"), hints_obtain());
     controller->hint = hint;
 
@@ -64,69 +79,61 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     int video_top = app_configuration->show_stats_compact ? LV_DPX(36) : LV_DPX(20);
     lv_obj_align(video, LV_ALIGN_TOP_LEFT, LV_DPX(20), video_top);
     lv_obj_clear_flag(video, LV_OBJ_FLAG_CLICKABLE);
+    /* The game shrinks into this rectangle while the overlay is up. A hairline
+     * around it says the crop is deliberate rather than the picture having lost
+     * its bottom half. */
+    lv_obj_set_style_border_width(video, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(video, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_border_opa(video, LV_OPA_COVER, 0);
 
     lv_obj_t *bottom_stack = lv_obj_create(overlay);
     lv_obj_remove_style_all(bottom_stack);
     lv_obj_set_width(bottom_stack, LV_PCT(100));
-    lv_obj_set_height(bottom_stack, LV_DPX(260));
+    lv_obj_set_height(bottom_stack, LV_DPX(210));
     lv_obj_align(bottom_stack, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_layout(bottom_stack, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(bottom_stack, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(bottom_stack, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bottom_stack, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(bottom_stack, LV_OBJ_FLAG_EVENT_BUBBLE);
-
-    lv_obj_t *actions = lv_obj_create(bottom_stack);
-    lv_obj_remove_style_all(actions);
-    lv_obj_set_size(actions, LV_PCT(100), LV_DPX(200));
-    lv_obj_clear_flag(actions, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_layout(actions, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    lv_obj_set_style_pad_gap(actions, LV_DPX(15), 0);
-    lv_obj_set_style_pad_all(actions, LV_DPX(20), 0);
-    static const lv_grad_dsc_t actions_grad = {
+    /* The commands sit on the empty screen the shrunken video leaves behind, so
+     * this only has to settle whatever the game still draws at the very bottom.
+     * It fades into the ink the sheet is made of rather than to pure black, and
+     * stops short of full opacity so the frame stays visible underneath. */
+    static const lv_grad_dsc_t scrim_grad = {
             .dir = LV_GRAD_DIR_VER,
             .stops = {
-                    {.color = {.ch ={0, 0, 0, 0}}, .frac = 0},
-                    {.color = {.ch ={0, 0, 0, 255}}, .frac = 255},
+                    {.color = {.ch = {0x0A, 0x07, 0x04, 0}}, .frac = 0},
+                    {.color = {.ch = {0x0A, 0x07, 0x04, 235}}, .frac = 255},
             },
             .stops_count = 2
     };
-    lv_obj_set_style_bg_grad(actions, &actions_grad, 0);
-    // We need a non-opaque opacity to properly render the elements
-    lv_obj_set_style_bg_opa(actions, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_grad(bottom_stack, &scrim_grad, 0);
+    lv_obj_set_style_bg_opa(bottom_stack, LV_OPA_COVER, 0);
+
+    lv_obj_t *actions = lv_obj_create(bottom_stack);
+    lv_obj_remove_style_all(actions);
+    lv_obj_set_size(actions, LV_PCT(100), LV_DPX(150));
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_layout(actions, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_gap(actions, LV_DPX(10), 0);
+    lv_obj_set_style_pad_all(actions, LV_DPX(20), 0);
     lv_obj_add_flag(actions, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(actions, cb_child_group_add, LV_EVENT_CHILD_CREATED, controller->group);
 
-    lv_obj_t *kbd_btn = lv_btn_create(actions);
-    lv_obj_add_flag(kbd_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_style(kbd_btn, &controller->overlay_button_style, 0);
-    lv_obj_add_style(kbd_btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_bg_color(kbd_btn, lv_palette_main(LV_PALETTE_BLUE), 0);
-    lv_obj_t *kbd_label = lv_label_create(kbd_btn);
-    lv_obj_add_style(kbd_label, &controller->overlay_button_label_style, 0);
-    lv_label_set_text(kbd_label, locstr("Full keyboard"));
-
-    lv_obj_t *vmouse_btn = lv_btn_create(actions);
-    lv_obj_add_flag(vmouse_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_style(vmouse_btn, &controller->overlay_button_style, 0);
-    lv_obj_add_style(vmouse_btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_bg_color(vmouse_btn, lv_palette_main(LV_PALETTE_GREEN), 0);
-    lv_obj_t *vmouse_label = lv_label_create(vmouse_btn);
-    lv_obj_add_style(vmouse_label, &controller->overlay_button_label_style, 0);
-    lv_label_set_text(vmouse_label, locstr("Virtual Mouse"));
+    /* Blue, green, yellow and red are the four colour keys on the LG remote, and
+     * each command below wears the one that presses it. Virtual Mouse has no key,
+     * so its rail stays seam-grey — the absence is the information. */
+    lv_obj_t *kbd_btn = command_button(controller, actions, locstr("Full keyboard"),
+                                       OVERLAY_KEY_BLUE, locstr("Blue key"));
+    lv_obj_t *vmouse_btn = command_button(controller, actions, locstr("Virtual Mouse"),
+                                          OVERLAY_SEAM, NULL);
 
 #if defined(TARGET_WEBOS)
     if (app_configuration->hid_passthrough) {
-        lv_obj_t *hid_btn = lv_btn_create(actions);
-        lv_obj_add_flag(hid_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-        lv_obj_add_style(hid_btn, &controller->overlay_button_style, 0);
-        lv_obj_add_style(hid_btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
-        lv_obj_set_style_bg_color(hid_btn, lv_palette_main(LV_PALETTE_PURPLE), 0);
-        lv_obj_t *hid_label = lv_label_create(hid_btn);
-        lv_obj_add_style(hid_label, &controller->overlay_button_label_style, 0);
-        lv_label_set_text(hid_label, locstr("HID Devices"));
-        controller->hid_devices_btn = hid_btn;
+        controller->hid_devices_btn = command_button(controller, actions, locstr("HID Devices"),
+                                                     OVERLAY_KEY_GREEN, locstr("Green key"));
     }
 #endif
 
@@ -134,23 +141,10 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_remove_style_all(actions_spacing);
     lv_obj_set_flex_grow(actions_spacing, 1);
 
-    lv_obj_t *suspend_btn = lv_btn_create(actions);
-    lv_obj_add_flag(suspend_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_style(suspend_btn, &controller->overlay_button_style, 0);
-    lv_obj_add_style(suspend_btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_bg_color(suspend_btn, lv_palette_main(LV_PALETTE_AMBER), 0);
-    lv_obj_t *suspend_lbl = lv_label_create(suspend_btn);
-    lv_obj_add_style(suspend_lbl, &controller->overlay_button_label_style, 0);
-    lv_label_set_text(suspend_lbl, locstr("Disconnect"));
-
-    lv_obj_t *exit_btn = lv_btn_create(actions);
-    lv_obj_add_flag(exit_btn, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_style(exit_btn, &controller->overlay_button_style, 0);
-    lv_obj_add_style(exit_btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_bg_color(exit_btn, lv_palette_main(LV_PALETTE_RED), 0);
-    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_obj_add_style(exit_lbl, &controller->overlay_button_label_style, 0);
-    lv_label_set_text(exit_lbl, locstr("Quit game"));
+    lv_obj_t *suspend_btn = command_button(controller, actions, locstr("Disconnect"),
+                                           OVERLAY_KEY_YELLOW, locstr("Yellow key"));
+    lv_obj_t *exit_btn = command_button(controller, actions, locstr("Quit game"),
+                                        OVERLAY_KEY_RED, locstr("Red key"));
 
     lv_obj_t *stats = lv_obj_create(overlay);
     lv_obj_remove_style_all(stats);
@@ -210,6 +204,12 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
         lv_obj_set_style_pad_bottom(stats, LV_DPX(14), 0);
         lv_obj_set_style_radius(stats, LV_DPX(8), 0);
         lv_obj_set_style_clip_corner(stats, true, 0);
+        /* Same hairline the command slabs and the HID sheet wear, so the three
+         * surfaces read as one overlay. Nothing inside the panel changes. */
+        lv_obj_set_style_border_width(stats, LV_DPX(1), 0);
+        lv_obj_set_style_border_color(stats, lv_color_hex(OVERLAY_SEAM), 0);
+        lv_obj_set_style_border_opa(stats, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_opa(stats, LV_OPA_40, LV_STATE_USER_1);
         lv_obj_align(stats, LV_ALIGN_TOP_RIGHT, -LV_DPX(20), LV_DPX(20));
         controller->stats_compact_label = NULL;
         controller->stats_quality_indicator = NULL;
@@ -252,22 +252,94 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     return overlay;
 }
 
+/**
+ * The command slab, and what happens to it when the cursor arrives.
+ *
+ * Idle it is a dark slab on a dark scrim, held together by a seam-coloured
+ * hairline; focused it lifts a shade, takes a chalk border and a bloom of the
+ * same white. No hue moves, because hue here already means the colour key.
+ */
 void streaming_styles_init(streaming_controller_t *controller) {
     lv_theme_t *theme = lv_disp_get_default()->theme;
 
     lv_style_init(&controller->overlay_button_style);
-    lv_style_set_shadow_ofs_y(&controller->overlay_button_style, LV_DPX(3));
-    lv_style_set_shadow_width(&controller->overlay_button_style, LV_DPX(4));
+    lv_style_set_bg_color(&controller->overlay_button_style, lv_color_hex(OVERLAY_SLAB));
+    lv_style_set_bg_opa(&controller->overlay_button_style, OVERLAY_OPA_SLAB);
+    lv_style_set_border_width(&controller->overlay_button_style, LV_DPX(1));
+    lv_style_set_border_color(&controller->overlay_button_style, lv_color_hex(OVERLAY_SEAM));
+    lv_style_set_border_opa(&controller->overlay_button_style, LV_OPA_COVER);
+    lv_style_set_shadow_width(&controller->overlay_button_style, LV_DPX(10));
+    lv_style_set_shadow_ofs_y(&controller->overlay_button_style, LV_DPX(4));
     lv_style_set_shadow_color(&controller->overlay_button_style, lv_color_black());
-    lv_style_set_shadow_opa(&controller->overlay_button_style, LV_OPA_30);
-    lv_style_set_radius(&controller->overlay_button_style, LV_DPX(8));
-    lv_style_set_pad_hor(&controller->overlay_button_style, LV_DPX(15));
-    lv_style_set_pad_ver(&controller->overlay_button_style, LV_DPX(10));
+    lv_style_set_shadow_opa(&controller->overlay_button_style, LV_OPA_40);
+    lv_style_set_radius(&controller->overlay_button_style, OVERLAY_RADIUS);
+    lv_style_set_clip_corner(&controller->overlay_button_style, true);
+    /* No padding of its own: the rail has to reach both edges, so the slab is a
+     * plain row of [rail][text block] and the text block carries the insets. */
+    lv_style_set_pad_all(&controller->overlay_button_style, 0);
+    lv_style_set_pad_gap(&controller->overlay_button_style, 0);
+    lv_style_set_min_width(&controller->overlay_button_style, LV_DPX(125));
+
     lv_style_init(&controller->overlay_button_style_focused);
-    lv_style_set_outline_color(&controller->overlay_button_style_focused, lv_palette_lighten(LV_PALETTE_BLUE, 3));
+    lv_style_set_bg_color(&controller->overlay_button_style_focused, lv_color_hex(OVERLAY_SLAB_HI));
+    lv_style_set_bg_opa(&controller->overlay_button_style_focused, OVERLAY_OPA_SLAB_FOCUS);
+    lv_style_set_border_color(&controller->overlay_button_style_focused, lv_color_hex(OVERLAY_CHALK));
+    lv_style_set_shadow_width(&controller->overlay_button_style_focused, LV_DPX(24));
+    lv_style_set_shadow_ofs_y(&controller->overlay_button_style_focused, 0);
+    lv_style_set_shadow_color(&controller->overlay_button_style_focused, lv_color_hex(OVERLAY_CHALK));
+    lv_style_set_shadow_opa(&controller->overlay_button_style_focused, 45);
+    lv_style_set_outline_width(&controller->overlay_button_style_focused, 0);
 
     lv_style_init(&controller->overlay_button_label_style);
-    lv_style_set_text_font(&controller->overlay_button_label_style, theme->font_small);
+    lv_style_set_text_font(&controller->overlay_button_label_style, theme->font_normal);
+    lv_style_set_text_color(&controller->overlay_button_label_style, lv_color_hex(OVERLAY_CHALK));
+}
+
+static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *parent, const char *label,
+                                uint32_t key_colour, const char *key_name) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_remove_style_all(btn);
+    lv_obj_add_style(btn, &controller->overlay_button_style, 0);
+    lv_obj_add_style(btn, &controller->overlay_button_style_focused, LV_STATE_FOCUS_KEY);
+    /* Fixed height, so the rail below can ask for all of it in percent — a
+     * content-sized parent would resolve that to nothing. */
+    lv_obj_set_size(btn, LV_SIZE_CONTENT, LV_DPX(62));
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* The rail. Its own object rather than a left border, because the slab still
+     * needs a border of its own all the way round to say where it ends. */
+    lv_obj_t *rail = lv_obj_create(btn);
+    lv_obj_remove_style_all(rail);
+    lv_obj_set_size(rail, OVERLAY_RAIL_W, LV_PCT(100));
+    lv_obj_set_style_bg_color(rail, lv_color_hex(key_colour), 0);
+    lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *text = lv_obj_create(btn);
+    lv_obj_remove_style_all(text);
+    lv_obj_set_size(text, LV_SIZE_CONTENT, LV_PCT(100));
+    lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_hor(text, LV_DPX(15), 0);
+    lv_obj_set_style_pad_gap(text, LV_DPX(4), 0);
+    lv_obj_clear_flag(text, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(text, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *name = lv_label_create(text);
+    lv_obj_add_style(name, &controller->overlay_button_label_style, 0);
+    lv_label_set_text(name, label);
+
+    /* Kept even when there is no key, so every command's name sits on the same
+     * line whether or not the one next to it has a second one. */
+    lv_obj_t *key = lv_label_create(text);
+    lv_obj_set_style_text_font(key, lv_theme_get_font_small(text), 0);
+    lv_obj_set_style_text_color(key, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(key, OVERLAY_OPA_FAINT, 0);
+    lv_obj_set_style_text_letter_space(key, LV_DPX(2), 0);
+    lv_label_set_text(key, key_name != NULL ? key_name : "");
+    return btn;
 }
 
 void streaming_styles_reset(streaming_controller_t *controller) {

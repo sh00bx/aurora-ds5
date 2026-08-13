@@ -89,8 +89,9 @@ static void update_row_styles(hid_pt_panel_t *panel) {
 static void panel_update_status(hid_pt_panel_t *panel);
 static void update_device_options(hid_pt_panel_t *panel);
 static void panel_select_device(hid_pt_panel_t *panel, int row);
-static lv_obj_t *panel_first_option_target(hid_pt_panel_t *panel);
-static void panel_focus_current_plug(hid_pt_panel_t *panel);
+static void panel_focus_selected_row(hid_pt_panel_t *panel);
+static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused);
+static bool panel_selected_is_plugged(hid_pt_panel_t *panel);
 
 static void panel_request_close(hid_pt_panel_t *panel) {
     (void) panel;
@@ -111,70 +112,45 @@ static void panel_select_device(hid_pt_panel_t *panel, int row)
     update_device_options(panel);
 }
 
-static lv_obj_t *panel_first_option_target(hid_pt_panel_t *panel)
-{
-    if (!panel) {
-        return NULL;
-    }
-    if (hid_pt_model_selected_is_flydigi(&panel->model) && panel->view.composite_row &&
-        !lv_obj_has_flag(panel->view.composite_row, LV_OBJ_FLAG_HIDDEN) && panel->view.composite_cb) {
-        return panel->view.composite_cb;
-    }
-    if (panel->view.customize_panel && !lv_obj_has_flag(panel->view.customize_panel, LV_OBJ_FLAG_HIDDEN)) {
-        if (panel->view.latency_slider) {
-            return panel->view.latency_slider;
-        }
-    }
-    return NULL;
-}
-
-static void panel_focus_current_plug(hid_pt_panel_t *panel)
+static void panel_focus_selected_row(hid_pt_panel_t *panel)
 {
     if (!panel) {
         return;
     }
-    hid_pt_view_focus_plug(&panel->view, panel->selected_index);
-}
-
-static void panel_focus_plug_at(hid_pt_panel_t *panel, int index)
-{
-    if (!panel || index < 0 || index >= HID_PT_MAX_ROWS ||
-        !hid_pt_view_has_row(&panel->view, index)) {
-        return;
-    }
-    panel_select_device(panel, index);
-    hid_pt_view_focus_plug(&panel->view, index);
+    hid_pt_view_focus_row(&panel->view, panel->selected_index);
 }
 
 /**
- * Move the cursor to the nearest plug row in direction @p step.
+ * Move the cursor to the nearest row in direction @p step, or nowhere.
  *
  * The downward bound is the model's *current* device count, not the number of
  * rows on screen. Those differ when the model changed after the last render, and
  * then the trailing rows are not reachable with DOWN until the next re-render.
- * Carried over unchanged: this pass reshapes the key handling and decides
- * nothing new.
+ * Carried over unchanged from the previous key handling.
  */
-static void panel_step_plug(hid_pt_panel_t *panel, int from, int step)
+static bool panel_step_row(hid_pt_panel_t *panel, int from, int step)
 {
     if (step < 0) {
         for (int j = from - 1; j >= 0; --j) {
             if (hid_pt_view_has_row(&panel->view, j)) {
-                panel_focus_plug_at(panel, j);
-                return;
+                hid_pt_view_focus_row(&panel->view, j);
+                return true;
             }
         }
-        return;
+        return false;
     }
     for (int j = from + 1; j < hid_pt_model_device_count() && j < HID_PT_MAX_ROWS; ++j) {
         if (hid_pt_view_has_row(&panel->view, j)) {
-            panel_focus_plug_at(panel, j);
-            return;
+            hid_pt_view_focus_row(&panel->view, j);
+            return true;
         }
     }
+    return false;
 }
 
-static void panel_plug_focused(void *userdata, int row)
+/* Arriving on a row IS selecting the device: the settings column follows the
+ * cursor, so there is nothing extra to press to see a controller's settings. */
+static void panel_row_focused(void *userdata, int row)
 {
     hid_pt_panel_t *panel = userdata;
     if (!panel || hid_pt_view_is_rebuilding(&panel->view) ||
@@ -183,6 +159,34 @@ static void panel_plug_focused(void *userdata, int row)
     }
     panel_select_device(panel, row);
     hid_pt_view_scroll_row_into_view(&panel->view, row);
+    panel_update_hints(panel, panel->view.row_buttons[row]);
+}
+
+static bool panel_selected_is_plugged(hid_pt_panel_t *panel)
+{
+    if (!panel || panel->selected_index < 0) {
+        return false;
+    }
+    hid_pt_row_info_t info;
+    for (int i = 0; i < hid_pt_model_device_count() && i < HID_PT_MAX_ROWS; ++i) {
+        if (hid_pt_model_row_info(i, &info) &&
+            strcmp(info.key, panel->row_keys[panel->selected_index]) == 0) {
+            return info.plugged;
+        }
+    }
+    return false;
+}
+
+/* The footer names the keys for where the cursor actually is — OK plugs a
+ * device in and does nothing at all to a slider, and saying so once at the
+ * bottom is cheaper than a legend on every row. */
+static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused)
+{
+    if (!panel) {
+        return;
+    }
+    hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, focused);
+    hid_pt_view_set_hints(&panel->view, zone, panel_selected_is_plugged(panel));
 }
 
 static void panel_dropdown_key(void *userdata, lv_event_t *event)
@@ -199,33 +203,62 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
     const uint32_t key = lv_event_get_key(event);
     switch (key) {
         case LV_KEY_UP:
-            lv_group_focus_prev(panel->view.group);
+        case LV_KEY_DOWN: {
+            lv_obj_t *next = hid_pt_view_step_option(&panel->view, target, key == LV_KEY_UP ? -1 : 1);
+            if (next) {
+                lv_group_focus_obj(next);
+                panel_update_hints(panel, next);
+            }
             lv_event_stop_processing(event);
             return;
-        case LV_KEY_DOWN:
-            lv_group_focus_next(panel->view.group);
-            lv_event_stop_processing(event);
-            return;
+        }
         case LV_KEY_LEFT:
-            panel_focus_current_plug(panel);
+        case LV_KEY_RIGHT: {
+            /* LEFT/RIGHT steps the audio mode where it steps a slider's value, so
+             * the whole settings column answers to one pair of keys. OK still
+             * opens the full list for anyone who wants to see all five at once. */
+            uint16_t count = lv_dropdown_get_option_cnt(target);
+            int32_t sel = (int32_t) lv_dropdown_get_selected(target) + (key == LV_KEY_RIGHT ? 1 : -1);
+            if (count > 0 && sel >= 0 && sel < (int32_t) count) {
+                lv_dropdown_set_selected(target, (uint16_t) sel);
+                lv_event_send(target, LV_EVENT_VALUE_CHANGED, NULL);
+            }
             lv_event_stop_processing(event);
             return;
-        case LV_KEY_RIGHT:
-            lv_group_focus_next(panel->view.group);
-            lv_event_stop_processing(event);
-            return;
+        }
         default:
             break;
     }
 }
 
+/** Move the cursor and tell the footer about it. */
+static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj)
+{
+    if (!obj) {
+        return;
+    }
+    lv_group_focus_obj(obj);
+    panel_update_hints(panel, obj);
+}
+
 /**
  * The panel's key handling, for every control and for the sheet itself.
  *
- * Which control the key came from is one lookup -- hid_pt_view_kind_of() -- and
- * every branch below asks about that kind instead of testing the target against
- * a widget pointer or an LVGL class. The four navigation keys share their two
- * preconditions rather than repeating them.
+ * The sheet is three zones laid out the way the eye sees them — the header
+ * above, the devices left, that device's settings right — and the arrows move
+ * within a zone rather than along one flat chain of every widget on screen:
+ *
+ *   UP/DOWN     the next thing in this column, and no further
+ *   RIGHT       from a device, into its settings
+ *   LEFT        from a setting, back to the device — or, on a slider, DOWN a
+ *               step, because a slider owns both horizontal keys outright
+ *   OK          plugs the focused device in or out; opens the dropdown
+ *   BACK        from the settings, back to the devices; from there, closes
+ *
+ * The sliders take LEFT/RIGHT with nothing in between. They used to want OK to
+ * enter an edit mode, arrows to move, then OK or BACK to leave — three keys and
+ * a mode to remember for what is one continuous gesture, and the mode was
+ * invisible except for LVGL's own focus tint.
  */
 static void panel_control_key(void *userdata, lv_event_t *event)
 {
@@ -236,69 +269,86 @@ static void panel_control_key(void *userdata, lv_event_t *event)
     lv_obj_t *target = lv_event_get_target(event);
     const uint32_t key = lv_event_get_key(event);
     const hid_pt_widget_kind_t kind = hid_pt_view_kind_of(&panel->view, target);
-    const bool editing = lv_group_get_editing(panel->view.group);
+    const hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, target);
 
     switch (key) {
         case LV_KEY_ESC:
-            if (editing && kind == HID_PT_WK_SLIDER) {
-                lv_group_set_editing(panel->view.group, false);
-                break;
-            }
             if (kind == HID_PT_WK_DROPDOWN && hid_pt_view_dropdown_is_open(&panel->view, target)) {
                 hid_pt_view_close_dropdown(&panel->view, target);
+                break;
+            }
+            /* One step back out of the settings, then out of the sheet. Without
+             * this the only way off a slider would be UP or DOWN, since it has
+             * taken LEFT for its own. */
+            if (zone == HID_PT_ZONE_OPTIONS && hid_pt_view_has_row(&panel->view, panel->selected_index)) {
+                panel_focus_selected_row(panel);
                 break;
             }
             panel_request_close(panel);
             break;
         case LV_KEY_ENTER:
             if (kind == HID_PT_WK_SLIDER) {
-                /* Toggle edit mode: first OK enters (LEFT/RIGHT adjust value),
-                 * a second OK leaves it again (like ESC). */
-                lv_group_set_editing(panel->view.group, !editing);
+                /* Nothing to confirm: the value is already what it looks like. */
                 break;
             }
             if (kind == HID_PT_WK_DROPDOWN && !hid_pt_view_dropdown_is_open(&panel->view, target)) {
                 hid_pt_view_open_dropdown(&panel->view, target);
                 break;
             }
-            /* Anything else: let the widget have its own OK. */
+            /* Anything else -- a device row, a switch, a button -- has its own
+             * OK, and LVGL turns the key into a click on it. */
             return;
         case LV_KEY_LEFT:
         case LV_KEY_RIGHT:
         case LV_KEY_UP:
-        case LV_KEY_DOWN:
-            /* An open dropdown list owns all four arrows, and so does a slider
-             * in edit mode -- there they change the value, not the focus. */
+        case LV_KEY_DOWN: {
+            /* An open dropdown list owns all four arrows: there they pick an
+             * entry rather than move the cursor. */
             if (hid_pt_view_dropdown_is_open(&panel->view, target)) {
                 return;
             }
-            if (kind == HID_PT_WK_SLIDER && editing) {
-                return;
+            const int dir = (key == LV_KEY_RIGHT || key == LV_KEY_DOWN) ? 1 : -1;
+            if ((key == LV_KEY_LEFT || key == LV_KEY_RIGHT) &&
+                hid_pt_view_nudge_slider(&panel->view, target, dir)) {
+                break;
             }
-            if (key == LV_KEY_LEFT) {
-                if (hid_pt_view_kind_is_option(kind)) {
-                    panel_focus_current_plug(panel);
-                } else {
-                    lv_group_focus_prev(panel->view.group);
-                }
-            } else if (key == LV_KEY_RIGHT) {
-                if (kind == HID_PT_WK_PLUG) {
-                    lv_obj_t *opt = panel_first_option_target(panel);
-                    if (opt) {
-                        lv_group_focus_obj(opt);
+            if (zone == HID_PT_ZONE_LIST) {
+                if (key == LV_KEY_RIGHT) {
+                    panel_focus(panel, hid_pt_view_first_option(&panel->view));
+                } else if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
+                    int from = hid_pt_view_row_of(&panel->view, target);
+                    if (!panel_step_row(panel, from, dir) && key == LV_KEY_UP) {
+                        /* Off the top of the list is the header, which is where
+                         * it sits on screen. */
+                        panel_focus(panel, panel->view.refresh_btn);
                     }
-                } else {
-                    lv_group_focus_next(panel->view.group);
                 }
-            } else if (kind == HID_PT_WK_PLUG) {
-                panel_step_plug(panel, hid_pt_view_plug_row_of(&panel->view, target),
-                                key == LV_KEY_UP ? -1 : 1);
-            } else if (key == LV_KEY_UP) {
-                lv_group_focus_prev(panel->view.group);
-            } else {
-                lv_group_focus_next(panel->view.group);
+            } else if (zone == HID_PT_ZONE_OPTIONS) {
+                if (key == LV_KEY_LEFT) {
+                    panel_focus_selected_row(panel);
+                } else if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
+                    lv_obj_t *next = hid_pt_view_step_option(&panel->view, target, dir);
+                    if (next) {
+                        panel_focus(panel, next);
+                    } else if (key == LV_KEY_UP) {
+                        panel_focus(panel, panel->view.close_btn);
+                    }
+                }
+            } else { /* the header */
+                if (key == LV_KEY_LEFT) {
+                    panel_focus(panel, panel->view.refresh_btn);
+                } else if (key == LV_KEY_RIGHT) {
+                    panel_focus(panel, panel->view.close_btn);
+                } else if (key == LV_KEY_DOWN) {
+                    if (hid_pt_view_has_row(&panel->view, panel->selected_index)) {
+                        panel_focus_selected_row(panel);
+                    } else {
+                        panel_focus(panel, hid_pt_view_first_option(&panel->view));
+                    }
+                }
             }
             break;
+        }
         default:
             return;
     }
@@ -322,18 +372,27 @@ static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t 
     }
 }
 
-static void update_battery_label(hid_pt_panel_t *panel)
+/**
+ * The one line under the device's name: whether it is bridged, and how it is
+ * doing. "BRIDGED" is tinted with the same teal the device's rail wears in the
+ * list, so the two say the same thing in the same colour.
+ */
+static void update_state_line(hid_pt_panel_t *panel)
 {
-    if (!panel || !panel->view.battery_label) {
+    if (!panel || !panel->view.customize_state) {
         return;
     }
-    char text[64];
-    if (!hid_pt_model_battery_text(&panel->model, text, sizeof(text))) {
-        lv_obj_add_flag(panel->view.battery_label, LV_OBJ_FLAG_HIDDEN);
-        return;
+    char battery[64];
+    const bool has_battery = hid_pt_model_battery_text(&panel->model, battery, sizeof(battery));
+    const bool plugged = panel_selected_is_plugged(panel);
+    const char *state = plugged ? locstr("BRIDGED") : locstr("IDLE");
+    if (plugged) {
+        /* LVGL's inline recolour: #rrggbb marks the run, # ends it. */
+        lv_label_set_text_fmt(panel->view.customize_state, has_battery ? "#17d9b4 %s#   %s" : "#17d9b4 %s#",
+                              state, battery);
+    } else {
+        lv_label_set_text_fmt(panel->view.customize_state, has_battery ? "%s   %s" : "%s", state, battery);
     }
-    lv_label_set_text(panel->view.battery_label, text);
-    lv_obj_clear_flag(panel->view.battery_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 /**
@@ -469,23 +528,57 @@ static void update_auto_plugin_row(hid_pt_panel_t *panel)
     lv_obj_clear_flag(panel->view.auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void show_row(lv_obj_t *row, bool show)
+{
+    if (!row) {
+        return;
+    }
+    if (show) {
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/**
+ * Show the settings the selected device actually has.
+ *
+ * The whole column used to be hidden at once for anything that is not a
+ * PlayStation pad, which meant a bridgeable device with an auto-plug setting had
+ * nowhere to show it. Rows are hidden one group at a time now, and the flex
+ * layout closes the gap.
+ */
 static void update_customize_panel(hid_pt_panel_t *panel)
 {
     if (!panel || !panel->view.customize_panel) {
         return;
     }
-    if (hid_pt_model_selected_has_audio(&panel->model)) {
-        sync_customize_ui_from_settings(panel);
-        char name[HID_PT_PANEL_NAME_LEN];
-        if (panel->view.customize_title &&
-            hid_pt_model_selected_name(&panel->model, name, sizeof(name))) {
-            lv_label_set_text_fmt(panel->view.customize_title, "%s", name);
-        }
-        lv_obj_clear_flag(panel->view.customize_panel, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(panel->view.customize_panel, LV_OBJ_FLAG_HIDDEN);
+    hid_pt_view_t *v = &panel->view;
+    char name[HID_PT_PANEL_NAME_LEN];
+    const bool have_device = hid_pt_model_selected_name(&panel->model, name, sizeof(name));
+    const bool has_audio = have_device && hid_pt_model_selected_has_audio(&panel->model);
+
+    if (v->customize_title) {
+        lv_label_set_text_fmt(v->customize_title, "%s",
+                              have_device ? name : locstr("No device selected"));
     }
-    update_battery_label(panel);
+    if (has_audio) {
+        sync_customize_ui_from_settings(panel);
+    }
+    show_row(v->audio_heading, has_audio);
+    show_row(v->audio_row, has_audio);
+    show_row(v->speaker_row, has_audio);
+    show_row(v->headset_row, has_audio);
+    show_row(v->latency_row, has_audio);
+    show_row(v->reset_settings_btn, has_audio);
+    /* The haptics row is hidden from inside sync_...(), which only runs for a
+     * device that has the settings record to read it from. */
+    if (!has_audio) {
+        show_row(v->haptics_row, false);
+        show_row(v->audio_warning_label, false);
+    }
+    show_row(v->customize_state, have_device);
+    update_state_line(panel);
 }
 
 static void update_composite_row(hid_pt_panel_t *panel) {
@@ -517,16 +610,9 @@ static void update_device_options(hid_pt_panel_t *panel)
     update_customize_panel(panel);
 }
 
+/* The row is the button now: OK on a device, or a click anywhere on it, is the
+ * plug. There is no second control to aim at. */
 static void panel_row_clicked(void *userdata, int row) {
-    hid_pt_panel_t *panel = userdata;
-    if (!panel || !hid_pt_view_has_row(&panel->view, row)) {
-        return;
-    }
-    panel_select_device(panel, row);
-    hid_pt_view_focus_plug(&panel->view, row);
-}
-
-static void panel_plug_clicked(void *userdata, int row) {
     hid_pt_panel_t *panel = userdata;
     if (!panel || !hid_pt_view_has_row(&panel->view, row)) {
         return;
@@ -546,10 +632,11 @@ static void panel_plug_clicked(void *userdata, int row) {
     }
     panel->selected_index = row;
 
-    hid_pt_view_set_plug_label(&panel->view, row, plugged);
+    hid_pt_view_set_row_state(&panel->view, row, plugged);
     update_row_styles(panel);
     update_device_options(panel);
     panel_update_status(panel);
+    panel_update_hints(panel, panel->view.row_buttons[row]);
 }
 
 static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
@@ -651,13 +738,13 @@ static void panel_update_status(hid_pt_panel_t *panel) {
     if (!panel || !panel->view.status_label) {
         return;
     }
-    if (panel->view.error_label) {
+    if (panel->view.error_label && panel->view.error_row) {
         const char *err = hid_pt_model_plug_error();
         if (err) {
             lv_label_set_text(panel->view.error_label, err);
-            lv_obj_clear_flag(panel->view.error_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(panel->view.error_row, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(panel->view.error_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(panel->view.error_row, LV_OBJ_FLAG_HIDDEN);
         }
     }
     char status[128];
@@ -671,18 +758,18 @@ static void focus_initial_target(hid_pt_panel_t *panel) {
     }
     if (panel->selected_index >= 0 && panel->selected_index < HID_PT_MAX_ROWS &&
         hid_pt_view_has_row(&panel->view, panel->selected_index)) {
-        hid_pt_view_focus_plug(&panel->view, panel->selected_index);
+        panel_focus(panel, panel->view.row_buttons[panel->selected_index]);
         return;
     }
     for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (hid_pt_view_has_row(&panel->view, i)) {
             panel_select_device(panel, i);
-            hid_pt_view_focus_plug(&panel->view, i);
+            panel_focus(panel, panel->view.row_buttons[i]);
             return;
         }
     }
     if (panel->view.close_btn) {
-        lv_group_focus_obj(panel->view.close_btn);
+        panel_focus(panel, panel->view.close_btn);
     }
 }
 
@@ -826,8 +913,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
             .value_changed = panel_value_changed,
             .clicked = panel_clicked,
             .row_clicked = panel_row_clicked,
-            .plug_clicked = panel_plug_clicked,
-            .plug_focused = panel_plug_focused,
+            .row_focused = panel_row_focused,
             .key = panel_control_key,
             .dropdown_key = panel_dropdown_key,
             .deleted = panel_deleted,
