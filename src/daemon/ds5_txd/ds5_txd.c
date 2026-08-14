@@ -89,6 +89,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/resource.h>   /* RLIMIT_RTPRIO + setpriority: RT scheduling in main() */
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -2032,8 +2033,41 @@ int main(int argc,char**argv){
      * identify the daemon with `pkill -x ds5_txd`, which matches the comm — renaming
      * main would silently break every one of them. Only the worker threads are named
      * (ds5-cap/ds5-brk, per audit O3) so the respawner can still target them by TID. */
+    /* Real-time scheduling, and say out loud whether we got it. This daemon is the
+     * last hop before the air: it services the pad's NOCP credits and injects at
+     * ~94/s, so every stretch it is descheduled for shows up as a hole in the
+     * controller's audio. It has asked for SCHED_FIFO 14 since the first commit —
+     * and, measured 2026-08-15, has been running SCHED_OTHER the whole time: ls-hubd
+     * starts us with RLIMIT_RTPRIO 0, the call fails, and nobody noticed because the
+     * result was thrown away. The gap histogram below was reporting the consequence
+     * (190 of 193 stall episodes classified TX-scheduling, not RF) with nothing to
+     * connect it to.
+     *
+     * Raise the limit first — CAP_SYS_NICE alone should be enough, but if the
+     * capability is not effective in our start context the setrlimit is what makes
+     * the difference — then fall back to the deepest niceness we can get, which is
+     * what the app does when its own attempt is refused. */
+    struct rlimit rl_rt;
+    if(getrlimit(RLIMIT_RTPRIO,&rl_rt)==0 && rl_rt.rlim_max<14){
+        struct rlimit want={.rlim_cur=14,.rlim_max=14};
+        if(setrlimit(RLIMIT_RTPRIO,&want)!=0)
+            fprintf(stderr,"[txd] RLIMIT_RTPRIO stays %llu (%s)\n",
+                    (unsigned long long)rl_rt.rlim_max,strerror(errno));
+    }
     struct sched_param sp; memset(&sp,0,sizeof sp); sp.sched_priority=14;
-    sched_setscheduler(0,SCHED_FIFO,&sp);
+    if(sched_setscheduler(0,SCHED_FIFO,&sp)==0){
+        fprintf(stderr,"[txd] sched: SCHED_FIFO prio 14\n");
+    }else{
+        int e=errno;
+        errno=0;
+        int nice_rc=setpriority(PRIO_PROCESS,0,-20);
+        int nice_now=getpriority(PRIO_PROCESS,0);
+        fprintf(stderr,"[txd] sched: SCHED_FIFO DENIED (%s) -> SCHED_OTHER nice %d%s"
+                       " — audio gaps below are expected to be scheduling, not RF;"
+                       " boost us from the game-mode guard\n",
+                strerror(e), (nice_rc==0||errno==0)?nice_now:0,
+                nice_rc==0?"":" (renice also refused)");
+    }
 
     /* Pin the file-creation mask: the readiness/telemetry records now take their
      * mode from open(...,0644) alone (write_record_atomic no longer fchmod()s —
