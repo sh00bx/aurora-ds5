@@ -268,6 +268,32 @@ static int ds5_on_plug_init(ctm_controller_t *c, ctm_transport_t *t)
     return ctm_controller_write_feature(c, feature, sizeof(feature));
 }
 
+/* Byte 1 of a BT 0x31 says what the rest of it holds: high nibble a rolling
+ * sequence, low nibble the flags — bit 0 that gamepad state is present, bit 1
+ * that audio is. With the microphone armed the pad emits audio-only reports,
+ * which carry encoded sound in the bytes where the sticks and buttons live. We
+ * forward reports verbatim to the host, which repacks the payload into a USB
+ * 0x01 without re-validating it (ds5_reports.h bt_input_to_usb), so one of
+ * those arriving unfiltered is not noise in the pad state — it IS the pad
+ * state, and the game reads audio samples as full stick deflection. Measured
+ * elsewhere (CTM-USBIP 9bdbf81f) as a cursor that crosses the desktop and stays
+ * crossing until the controller is switched off.
+ *
+ * Nothing in this app arms the microphone today. The guard is here because
+ * something else can: a state left behind by another host, or the PTT path in
+ * the voice work. It costs one load and one test per report.
+ *
+ * These offsets are the hidraw ones, which is what this reader gets. The
+ * raw-ACL side (ds5_txd) sits a byte further in — do not reuse this index
+ * there. */
+static bool ds5_input_carries_state(const uint8_t *data, size_t len)
+{
+    if (!data || len < 2 || data[0] != 0x31) {
+        return true; /* not the report this rule is about */
+    }
+    return (data[1] & 0x01) != 0;
+}
+
 static void ds5_on_input_report(ctm_controller_t *c, const uint8_t *data, size_t len)
 {
     /* DS5 BT input 0x31: payload starts at byte 2; status[0] (battery) is at
@@ -362,5 +388,6 @@ const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .patch_output = ds5_patch_output,
     .set_settings = NULL,   /* live values read via get_settings in patch_output */
     .on_input_report = ds5_on_input_report,
+    .input_carries_state = ds5_input_carries_state,
     .neutralize_input = ds5_neutralize_input,
 };

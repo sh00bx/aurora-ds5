@@ -124,6 +124,13 @@ typedef struct {
     /* Optional per-input-report hook (DS5 battery, etc.). NULL => none. */
     void (*on_input_report)(ctm_controller_t *c, const uint8_t *data, size_t len);
 
+    /* Does this report carry gamepad state at all? Some devices reuse one
+     * report id for state and for other payloads, and the reader must not hand
+     * the latter to the host, which has no way left to tell them apart. Return
+     * false to drop the report (it still counts as proof the link is alive).
+     * NULL => every report carries state, which is today's behavior. */
+    bool (*input_carries_state)(const uint8_t *data, size_t len);
+
     /* Neutralize the gamepad state of an input report IN PLACE (sticks
      * centered, buttons/triggers/touch released, gyro zeroed) — used while the
      * streaming overlay owns the controller so UI navigation stops leaking

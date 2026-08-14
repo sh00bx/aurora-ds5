@@ -86,6 +86,7 @@ typedef struct {
     unsigned long reports_out;      /* output reports written to the device */
     unsigned long coalesced;        /* input reports dropped by per-burst coalescing */
     unsigned long ui_neutralized;   /* input reports blanked by the overlay gate */
+    unsigned long stateless_in;     /* input reports dropped: no gamepad state in them */
 } ctm_stats_t;
 
 static inline void ctm_stat_add(unsigned long *v, unsigned long n)
@@ -872,6 +873,23 @@ static void *input_thread_main(void *arg)
             if (n <= 0) {
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
                 break;
+            }
+            if (c->ops->input_carries_state && !c->ops->input_carries_state(buf, (size_t) n)) {
+                /* Not gamepad state. Dropped here rather than forwarded, because
+                 * the coalescing below keys on the report id alone: a report
+                 * that shares an id with the state reports would not sit beside
+                 * the last real one, it would REPLACE it in the slot, and the
+                 * host would repack whatever it carries as sticks and buttons.
+                 * Still counts as traffic — the pad is plainly alive — so the
+                 * liveness timeout below does not fire on a device that has gone
+                 * quiet only in the sense this reader cares about. */
+                unsigned long seen = ctm_stat_get(&c->stats.stateless_in) + 1;
+                ctm_stat_add(&c->stats.stateless_in, 1);
+                if (seen == 1 || seen % 500 == 0) {
+                    ctm_ctl_log(c, "dropped %lu input report(s) carrying no pad state", seen);
+                }
+                drained++;
+                continue;
             }
             uint8_t id = buf[0];
             int slot = -1;
