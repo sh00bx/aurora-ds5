@@ -23,6 +23,7 @@
 #include "hid_passthrough_panel.h"
 #include "hid_pt_panel_model.h"
 #include "hid_pt_panel_view.h"
+#include "overlay_style.h"
 
 #include "hid_passthrough/hid_passthrough_manager.h"
 #include "stream/session.h"
@@ -91,7 +92,7 @@ static void update_device_options(hid_pt_panel_t *panel);
 static void panel_select_device(hid_pt_panel_t *panel, int row);
 static void panel_focus_selected_row(hid_pt_panel_t *panel);
 static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused);
-static bool panel_selected_is_plugged(hid_pt_panel_t *panel);
+static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj);
 
 static void panel_request_close(hid_pt_panel_t *panel) {
     (void) panel;
@@ -162,21 +163,6 @@ static void panel_row_focused(void *userdata, int row)
     panel_update_hints(panel, panel->view.row_buttons[row]);
 }
 
-static bool panel_selected_is_plugged(hid_pt_panel_t *panel)
-{
-    if (!panel || panel->selected_index < 0) {
-        return false;
-    }
-    hid_pt_row_info_t info;
-    for (int i = 0; i < hid_pt_model_device_count() && i < HID_PT_MAX_ROWS; ++i) {
-        if (hid_pt_model_row_info(i, &info) &&
-            strcmp(info.key, panel->row_keys[panel->selected_index]) == 0) {
-            return info.plugged;
-        }
-    }
-    return false;
-}
-
 /* The footer names the keys for where the cursor actually is — OK plugs a
  * device in and does nothing at all to a slider, and saying so once at the
  * bottom is cheaper than a legend on every row. */
@@ -186,7 +172,7 @@ static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused)
         return;
     }
     hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, focused);
-    hid_pt_view_set_hints(&panel->view, zone, panel_selected_is_plugged(panel));
+    hid_pt_view_set_hints(&panel->view, zone, hid_pt_model_selected_is_plugged(&panel->model));
 }
 
 static void panel_dropdown_key(void *userdata, lv_event_t *event)
@@ -204,11 +190,7 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
     switch (key) {
         case LV_KEY_UP:
         case LV_KEY_DOWN: {
-            lv_obj_t *next = hid_pt_view_step_option(&panel->view, target, key == LV_KEY_UP ? -1 : 1);
-            if (next) {
-                lv_group_focus_obj(next);
-                panel_update_hints(panel, next);
-            }
+            panel_focus(panel, hid_pt_view_step_option(&panel->view, target, key == LV_KEY_UP ? -1 : 1));
             lv_event_stop_processing(event);
             return;
         }
@@ -355,6 +337,32 @@ static void panel_control_key(void *userdata, lv_event_t *event)
     lv_event_stop_processing(event);
 }
 
+/* Every one of these is rewritten on the 2 s refresh with the value it already
+ * has. LVGL treats a flag write as a change regardless: it invalidates the row
+ * and marks both it and its parent's layout dirty, which costs a full-screen
+ * layout walk and a repaint of the sheet — over a decoding game — for nothing.
+ * So the no-op case stops here. */
+static void show_row(lv_obj_t *row, bool show)
+{
+    if (!row || show != lv_obj_has_flag(row, LV_OBJ_FLAG_HIDDEN)) {
+        return; /* already in the state being asked for */
+    }
+    if (show) {
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void set_switch(lv_obj_t *sw, bool on)
+{
+    if (on) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(sw, LV_STATE_CHECKED);
+    }
+}
+
 /* @p controls is NULL when the selection has no settings record, which is the
  * same case the hand-written version treated as "nothing to warn about". */
 static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t *controls)
@@ -362,14 +370,15 @@ static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t 
     if (!panel || !panel->view.audio_warning_label) {
         return;
     }
-    if (!controls || controls->audio_mode == HID_PT_AUDIO_MODE_AUTO) {
-        lv_obj_add_flag(panel->view.audio_warning_label, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    const bool warn = controls && controls->audio_mode != HID_PT_AUDIO_MODE_AUTO;
+    /* The wording never varies, so it is written once, when the label comes up —
+     * not again on every one of the 2 s refreshes it stays up for. */
+    if (warn && lv_obj_has_flag(panel->view.audio_warning_label, LV_OBJ_FLAG_HIDDEN)) {
         lv_label_set_text(panel->view.audio_warning_label,
                           locstr("Enabling the controller speaker may route game audio over Bluetooth (SBC). "
                                  "Use Auto to keep game audio on HDMI."));
-        lv_obj_clear_flag(panel->view.audio_warning_label, LV_OBJ_FLAG_HIDDEN);
     }
+    show_row(panel->view.audio_warning_label, warn);
 }
 
 /**
@@ -384,14 +393,22 @@ static void update_state_line(hid_pt_panel_t *panel)
     }
     char battery[64];
     const bool has_battery = hid_pt_model_battery_text(&panel->model, battery, sizeof(battery));
-    const bool plugged = panel_selected_is_plugged(panel);
+    const bool plugged = hid_pt_model_selected_is_plugged(&panel->model);
     const char *state = plugged ? locstr("BRIDGED") : locstr("IDLE");
+    char line[128];
     if (plugged) {
-        /* LVGL's inline recolour: #rrggbb marks the run, # ends it. */
-        lv_label_set_text_fmt(panel->view.customize_state, has_battery ? "#17d9b4 %s#   %s" : "#17d9b4 %s#",
-                              state, battery);
+        /* LVGL's inline recolour: #rrggbb marks the run, # ends it. The teal is
+         * the palette's, so it cannot drift from the rail it is matching. */
+        snprintf(line, sizeof(line), has_battery ? "#%06x %s#   %s" : "#%06x %s#", OVERLAY_LIVE, state,
+                 has_battery ? battery : "");
     } else {
-        lv_label_set_text_fmt(panel->view.customize_state, has_battery ? "%s   %s" : "%s", state, battery);
+        snprintf(line, sizeof(line), has_battery ? "%s   %s" : "%s", state, has_battery ? battery : "");
+    }
+    /* This runs on the 2 s refresh and on every focus move, almost always with
+     * the line already on screen; setting it again would re-measure the whole
+     * recoloured string and dirty the sheet's layout for nothing. */
+    if (strcmp(lv_label_get_text(panel->view.customize_state), line) != 0) {
+        lv_label_set_text(panel->view.customize_state, line);
     }
 }
 
@@ -455,19 +472,9 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         lv_slider_set_value(v->haptics_slider, hap, LV_ANIM_OFF);
         hid_pt_view_update_haptics_label(v);
     }
-    if (v->haptics_row) {
-        if (hid_pt_model_selected_is_ds5(&panel->model)) {
-            lv_obj_clear_flag(v->haptics_row, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(v->haptics_row, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    show_row(v->haptics_row, hid_pt_model_selected_is_ds5(&panel->model));
     if (v->auto_plugin_cb) {
-        if (c.auto_plugin) {
-            lv_obj_add_state(v->auto_plugin_cb, LV_STATE_CHECKED);
-        } else {
-            lv_obj_clear_state(v->auto_plugin_cb, LV_STATE_CHECKED);
-        }
+        set_switch(v->auto_plugin_cb, c.auto_plugin);
     }
     update_audio_warning(panel, &c);
 }
@@ -508,36 +515,21 @@ static void customize_setting_changed(hid_pt_panel_t *panel)
     update_audio_warning(panel, &c);
 }
 
+/* Both switch rows do the same two things: show themselves only for a device the
+ * setting applies to, and mirror that device's stored value while they do. The
+ * value is written only when the settings record could be read, so a device
+ * without one leaves the switch where it was rather than clearing it. */
 static void update_auto_plugin_row(hid_pt_panel_t *panel)
 {
     if (!panel || !panel->view.auto_plugin_row || !panel->view.auto_plugin_cb) {
         return;
     }
-    if (!hid_pt_model_selected_is_bridgeable(&panel->model)) {
-        lv_obj_add_flag(panel->view.auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
+    const bool show = hid_pt_model_selected_is_bridgeable(&panel->model);
     hid_pt_controls_t c;
-    if (hid_pt_model_read_controls(&panel->model, &c)) {
-        if (c.auto_plugin) {
-            lv_obj_add_state(panel->view.auto_plugin_cb, LV_STATE_CHECKED);
-        } else {
-            lv_obj_clear_state(panel->view.auto_plugin_cb, LV_STATE_CHECKED);
-        }
+    if (show && hid_pt_model_read_controls(&panel->model, &c)) {
+        set_switch(panel->view.auto_plugin_cb, c.auto_plugin);
     }
-    lv_obj_clear_flag(panel->view.auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void show_row(lv_obj_t *row, bool show)
-{
-    if (!row) {
-        return;
-    }
-    if (show) {
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
-    }
+    show_row(panel->view.auto_plugin_row, show);
 }
 
 /**
@@ -559,8 +551,12 @@ static void update_customize_panel(hid_pt_panel_t *panel)
     const bool has_audio = have_device && hid_pt_model_selected_has_audio(&panel->model);
 
     if (v->customize_title) {
-        lv_label_set_text_fmt(v->customize_title, "%s",
-                              have_device ? name : locstr("No device selected"));
+        /* Only moves when the selection does, while this runs on every refresh —
+         * and a content-sized label re-measures its whole string on every write. */
+        const char *title = have_device ? name : locstr("No device selected");
+        if (strcmp(lv_label_get_text(v->customize_title), title) != 0) {
+            lv_label_set_text(v->customize_title, title);
+        }
     }
     if (has_audio) {
         sync_customize_ui_from_settings(panel);
@@ -585,22 +581,12 @@ static void update_composite_row(hid_pt_panel_t *panel) {
     if (!panel || !panel->view.composite_row || !panel->view.composite_cb) {
         return;
     }
-    bool show = hid_pt_model_selected_is_flydigi(&panel->model);
-    if (show) {
-        hid_pt_controls_t c;
-        if (hid_pt_model_read_controls(&panel->model, &c)) {
-            if (c.composite_passthrough) {
-                lv_obj_add_state(panel->view.composite_cb, LV_STATE_CHECKED);
-            } else {
-                lv_obj_clear_state(panel->view.composite_cb, LV_STATE_CHECKED);
-            }
-        }
+    const bool show = hid_pt_model_selected_is_flydigi(&panel->model);
+    hid_pt_controls_t c;
+    if (show && hid_pt_model_read_controls(&panel->model, &c)) {
+        set_switch(panel->view.composite_cb, c.composite_passthrough);
     }
-    if (show) {
-        lv_obj_clear_flag(panel->view.composite_row, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(panel->view.composite_row, LV_OBJ_FLAG_HIDDEN);
-    }
+    show_row(panel->view.composite_row, show);
 }
 
 static void update_device_options(hid_pt_panel_t *panel)

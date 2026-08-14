@@ -100,14 +100,22 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
      * this only has to settle whatever the game still draws at the very bottom.
      * It fades into the ink the sheet is made of rather than to pure black, and
      * stops short of full opacity so the frame stays visible underneath. */
+    /* lv_color_t's channels at LV_COLOR_DEPTH 32, in memory order, so the stops
+     * carry OVERLAY_INK itself rather than a hand-transcribed copy of it. */
+#define SCRIM_STOP(alpha)                                                                          \
+    {                                                                                              \
+        .ch = {(OVERLAY_INK) & 0xFF, ((OVERLAY_INK) >> 8) & 0xFF, ((OVERLAY_INK) >> 16) & 0xFF,    \
+               (alpha)}                                                                            \
+    }
     static const lv_grad_dsc_t scrim_grad = {
             .dir = LV_GRAD_DIR_VER,
             .stops = {
-                    {.color = {.ch = {0x0A, 0x07, 0x04, 0}}, .frac = 0},
-                    {.color = {.ch = {0x0A, 0x07, 0x04, 235}}, .frac = 255},
+                    {.color = SCRIM_STOP(0), .frac = 0},
+                    {.color = SCRIM_STOP(OVERLAY_OPA_SCRIM), .frac = 255},
             },
             .stops_count = 2
     };
+#undef SCRIM_STOP
     lv_obj_set_style_bg_grad(bottom_stack, &scrim_grad, 0);
     lv_obj_set_style_bg_opa(bottom_stack, LV_OPA_COVER, 0);
 
@@ -287,7 +295,7 @@ void streaming_styles_init(streaming_controller_t *controller) {
     lv_style_set_shadow_width(&controller->overlay_button_style_focused, LV_DPX(24));
     lv_style_set_shadow_ofs_y(&controller->overlay_button_style_focused, 0);
     lv_style_set_shadow_color(&controller->overlay_button_style_focused, lv_color_hex(OVERLAY_CHALK));
-    lv_style_set_shadow_opa(&controller->overlay_button_style_focused, 45);
+    lv_style_set_shadow_opa(&controller->overlay_button_style_focused, OVERLAY_OPA_BLOOM);
     lv_style_set_outline_width(&controller->overlay_button_style_focused, 0);
 
     lv_style_init(&controller->overlay_button_label_style);

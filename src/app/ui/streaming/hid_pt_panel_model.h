@@ -111,6 +111,8 @@ bool hid_pt_model_battery_text(const hid_pt_model_t *model, char *buf, size_t le
 
 bool hid_pt_model_selected_is_ds5(const hid_pt_model_t *model);
 bool hid_pt_model_selected_is_flydigi(const hid_pt_model_t *model);
+/** Bridged right now, i.e. the state the device's rail and the footer report. */
+bool hid_pt_model_selected_is_plugged(const hid_pt_model_t *model);
 /** Bridgeable at all, i.e. not the plain "hid" fallback kind. */
 bool hid_pt_model_selected_is_bridgeable(const hid_pt_model_t *model);
 /** A PlayStation pad, i.e. the one that has the audio/haptics column. */

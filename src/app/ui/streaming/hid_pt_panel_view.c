@@ -170,7 +170,7 @@ static void slab_style(lv_obj_t *slab, lv_coord_t height)
         lv_obj_set_style_border_opa(slab, LV_OPA_COVER, state);
         lv_obj_set_style_shadow_width(slab, LV_DPX(20), state);
         lv_obj_set_style_shadow_color(slab, lv_color_hex(OVERLAY_CHALK), state);
-        lv_obj_set_style_shadow_opa(slab, 45, state);
+        lv_obj_set_style_shadow_opa(slab, OVERLAY_OPA_BLOOM, state);
     }
     lv_obj_set_style_bg_color(slab, lv_color_hex(OVERLAY_SLAB_HI), LV_STATE_PRESSED);
 }
@@ -379,27 +379,25 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
+#define OPTION_CHAIN_LEN 8
+
 /**
- * The option column, top to bottom.
+ * The option column, top to bottom, into @p out.
  *
  * One list, used for the focus group's order and for stepping the cursor, so the
  * two can't disagree. Entries that are hidden for the selected device are
  * skipped by the stepper, not removed from here.
  */
-static void option_chain(const hid_pt_view_t *view, lv_obj_t *const **out, size_t *count)
+static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_LEN])
 {
-    static lv_obj_t *chain[8];
-    size_t n = 0;
-    chain[n++] = view->auto_plugin_cb;
-    chain[n++] = view->composite_cb;
-    chain[n++] = view->audio_dropdown;
-    chain[n++] = view->speaker_slider;
-    chain[n++] = view->headset_slider;
-    chain[n++] = view->haptics_slider;
-    chain[n++] = view->latency_slider;
-    chain[n++] = view->reset_settings_btn;
-    *out = chain;
-    *count = n;
+    out[0] = view->auto_plugin_cb;
+    out[1] = view->composite_cb;
+    out[2] = view->audio_dropdown;
+    out[3] = view->speaker_slider;
+    out[4] = view->headset_slider;
+    out[5] = view->haptics_slider;
+    out[6] = view->latency_slider;
+    out[7] = view->reset_settings_btn;
 }
 
 /**
@@ -427,10 +425,9 @@ void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
             lv_group_add_obj(view->group, view->row_buttons[i]);
         }
     }
-    lv_obj_t *const *chain;
-    size_t count;
-    option_chain(view, &chain, &count);
-    for (size_t i = 0; i < count; ++i) {
+    lv_obj_t *chain[OPTION_CHAIN_LEN];
+    option_chain(view, chain);
+    for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
         group_add(view, chain[i]);
     }
     group_add(view, view->refresh_btn);
@@ -533,10 +530,9 @@ lv_obj_t *hid_pt_view_first_option(const hid_pt_view_t *view)
     if (!view) {
         return NULL;
     }
-    lv_obj_t *const *chain;
-    size_t count;
-    option_chain(view, &chain, &count);
-    for (size_t i = 0; i < count; ++i) {
+    lv_obj_t *chain[OPTION_CHAIN_LEN];
+    option_chain(view, chain);
+    for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
         if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
             return chain[i];
         }
@@ -549,11 +545,10 @@ lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int
     if (!view || !from || step == 0) {
         return NULL;
     }
-    lv_obj_t *const *chain;
-    size_t count;
-    option_chain(view, &chain, &count);
+    lv_obj_t *chain[OPTION_CHAIN_LEN];
+    option_chain(view, chain);
     int at = -1;
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
         if (chain[i] == from) {
             at = (int) i;
             break;
@@ -562,7 +557,7 @@ lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int
     if (at < 0) {
         return NULL;
     }
-    for (int i = at + step; i >= 0 && i < (int) count; i += step) {
+    for (int i = at + step; i >= 0 && i < OPTION_CHAIN_LEN; i += step) {
         if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
             return chain[i];
         }
@@ -605,6 +600,15 @@ void hid_pt_view_close_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown)
 
 /* ---- the option column's labels ----------------------------------------- */
 
+/** The number in a percentage row's gutter. */
+static void set_percent(lv_obj_t *value, lv_obj_t *slider)
+{
+    if (!value || !slider) {
+        return;
+    }
+    lv_label_set_text_fmt(value, "%d %%", (int) lv_slider_get_value(slider));
+}
+
 void hid_pt_view_update_latency_label(hid_pt_view_t *view, int default_ms)
 {
     if (!view || !view->latency_value) {
@@ -615,34 +619,38 @@ void hid_pt_view_update_latency_label(hid_pt_view_t *view, int default_ms)
     /* The default is named in the row's label rather than hardcoded in the
      * string: a literal here has already gone stale once — the pt-BR catalogue
      * still carries a msgid claiming 48 ms — and the model's default is free to
-     * vary per controller. */
-    if (view->latency_label) {
+     * vary per controller.
+     *
+     * It only moves with the selected device, while this runs on every step of
+     * the slider and on the panel's 2 s refresh, so the caption is written only
+     * when it actually changes. */
+    if (view->latency_label &&
+        (!view->latency_default_valid || view->latency_default_ms != default_ms)) {
         lv_label_set_text_fmt(view->latency_label, locstr("Latency · default %d ms"), default_ms);
+        view->latency_default_ms = default_ms;
+        view->latency_default_valid = true;
     }
 }
 
 void hid_pt_view_update_speaker_label(hid_pt_view_t *view)
 {
-    if (!view || !view->speaker_value) {
-        return;
+    if (view) {
+        set_percent(view->speaker_value, view->speaker_slider);
     }
-    lv_label_set_text_fmt(view->speaker_value, "%d %%", (int) lv_slider_get_value(view->speaker_slider));
 }
 
 void hid_pt_view_update_headset_label(hid_pt_view_t *view)
 {
-    if (!view || !view->headset_value) {
-        return;
+    if (view) {
+        set_percent(view->headset_value, view->headset_slider);
     }
-    lv_label_set_text_fmt(view->headset_value, "%d %%", (int) lv_slider_get_value(view->headset_slider));
 }
 
 void hid_pt_view_update_haptics_label(hid_pt_view_t *view)
 {
-    if (!view || !view->haptics_value) {
-        return;
+    if (view) {
+        set_percent(view->haptics_value, view->haptics_slider);
     }
-    lv_label_set_text_fmt(view->haptics_value, "%d %%", (int) lv_slider_get_value(view->haptics_slider));
 }
 
 bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir)
@@ -678,6 +686,16 @@ void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged
     if (!view || !view->hint_label) {
         return;
     }
+    /* Every arrow key asks for the hints again, but only a move between zones —
+     * or plugging the selected device in or out — can change them. Rewriting the
+     * label re-measures the whole line and dirties the layout, so the common case
+     * (stepping to the next row, the next slider) stops here. */
+    if (view->hint_valid && view->hint_zone == zone && view->hint_plugged == plugged) {
+        return;
+    }
+    view->hint_zone = zone;
+    view->hint_plugged = plugged;
+    view->hint_valid = true;
     /* One whole sentence per case rather than assembled fragments: a translator
      * gets to see the line they are translating. */
     const char *text;
@@ -733,10 +751,15 @@ static lv_obj_t *ghost_button(hid_pt_view_t *view, lv_obj_t *parent, const char 
     return btn;
 }
 
-/** A settings row: label on the left, its control in the shared right gutter. */
-static lv_obj_t *option_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label, lv_obj_t **label_out)
+/**
+ * A settings row: label on the left, its control in the shared right gutter.
+ *
+ * Returns the slab, which is what the view stores and what focus lights up;
+ * @p body_out takes the inset strip inside it that the control is added to.
+ */
+static lv_obj_t *option_row(lv_obj_t *parent, const char *label, lv_obj_t **body_out,
+                            lv_obj_t **label_out)
 {
-    (void) view;
     lv_obj_t *row = lv_obj_create(parent);
     slab_style(row, OPT_ROW_H);
     slab_rail(row);
@@ -748,7 +771,44 @@ static lv_obj_t *option_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     if (label_out) {
         *label_out = name;
     }
-    return body;
+    if (body_out) {
+        *body_out = body;
+    }
+    return row;
+}
+
+/**
+ * A settings row whose control is a switch, not a checkbox — it lands in the
+ * same right-hand gutter as every other control, and it is a bigger target from
+ * the couch. Starts hidden; the panel shows it for a device that has the setting.
+ */
+static lv_obj_t *switch_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label,
+                            hid_pt_ctl_t id, lv_obj_t **switch_out)
+{
+    lv_obj_t *body;
+    lv_obj_t *row = option_row(parent, label, &body, NULL);
+
+    lv_obj_t *sw = lv_switch_create(body);
+    lv_obj_set_size(sw, LV_DPX(44), LV_DPX(22));
+    lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(sw, 40, 0);
+    /* The filled half of a switch is its INDICATOR, not its background — leaving
+     * that part unstyled is why the toggle came out in the theme's blue while
+     * every other "this is on" mark in the sheet is teal. */
+    lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(sw, 110, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw, 190, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_LIVE), LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    bind_slab_focus(sw, row);
+    bind_control(view, sw, id);
+    if (switch_out) {
+        *switch_out = sw;
+    }
+    return row;
 }
 
 /** A slider row: label, then the track and the number, both on the gutter. */
@@ -756,7 +816,8 @@ static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
                             int32_t max, hid_pt_ctl_t id, lv_obj_t **slider_out, lv_obj_t **value_out,
                             lv_obj_t **label_out)
 {
-    lv_obj_t *body = option_row(view, parent, label, label_out);
+    lv_obj_t *body;
+    lv_obj_t *row = option_row(parent, label, &body, label_out);
 
     lv_obj_t *slider = lv_slider_create(body);
     lv_slider_set_range(slider, min, max);
@@ -778,7 +839,7 @@ static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     lv_obj_set_style_shadow_width(slider, LV_DPX(12), LV_PART_KNOB | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_shadow_color(slider, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_shadow_opa(slider, 120, LV_PART_KNOB | LV_STATE_FOCUS_KEY);
-    bind_slab_focus(slider, lv_obj_get_parent(body));
+    bind_slab_focus(slider, row);
     bind_control(view, slider, id);
     if (slider_out) {
         *slider_out = slider;
@@ -790,7 +851,7 @@ static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     if (value_out) {
         *value_out = value;
     }
-    return body;
+    return row;
 }
 
 lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt_view_cbs_t *cbs)
@@ -966,58 +1027,17 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_left(view->customize_state, LV_DPX(3), 0);
     lv_obj_set_style_pad_bottom(view->customize_state, LV_DPX(4), 0);
 
-    /* Auto-plug: a switch, not a checkbox — it lands in the same right-hand
-     * gutter as every other control, and it is a bigger target from the couch. */
-    lv_obj_t *auto_body = option_row(view, right_pane,
-                                     locstr("Auto-plug on next stream"), NULL);
-    view->auto_plugin_row = lv_obj_get_parent(auto_body);
-    view->auto_plugin_cb = lv_switch_create(auto_body);
-    lv_obj_set_size(view->auto_plugin_cb, LV_DPX(44), LV_DPX(22));
-    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_CHALK), 0);
-    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 40, 0);
-    /* The filled half of a switch is its INDICATOR, not its background — leaving
-     * that part unstyled is why the toggle came out in the theme's blue while
-     * every other "this is on" mark in the sheet is teal. */
-    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(view->auto_plugin_cb, LV_OPA_TRANSP, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 110, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(view->auto_plugin_cb, 190, LV_PART_KNOB);
-    lv_obj_set_style_bg_color(view->auto_plugin_cb, lv_color_hex(OVERLAY_LIVE),
-                              LV_PART_KNOB | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_opa(view->auto_plugin_cb, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
-    lv_obj_add_flag(view->auto_plugin_row, LV_OBJ_FLAG_HIDDEN);
-    bind_slab_focus(view->auto_plugin_cb, view->auto_plugin_row);
-    bind_control(view, view->auto_plugin_cb, HID_PT_CTL_AUTO_PLUGIN);
-
-    lv_obj_t *composite_body = option_row(view, right_pane,
-                                          locstr("Recognize as native Flydigi on PC"), NULL);
-    view->composite_row = lv_obj_get_parent(composite_body);
-    view->composite_cb = lv_switch_create(composite_body);
-    lv_obj_set_size(view->composite_cb, LV_DPX(44), LV_DPX(22));
-    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_CHALK), 0);
-    lv_obj_set_style_bg_opa(view->composite_cb, 40, 0);
-    /* The filled half of a switch is its INDICATOR, not its background — leaving
-     * that part unstyled is why the toggle came out in the theme's blue while
-     * every other "this is on" mark in the sheet is teal. */
-    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_LIVE), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(view->composite_cb, LV_OPA_TRANSP, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(view->composite_cb, 110, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_CHALK), LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(view->composite_cb, 190, LV_PART_KNOB);
-    lv_obj_set_style_bg_color(view->composite_cb, lv_color_hex(OVERLAY_LIVE),
-                              LV_PART_KNOB | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_opa(view->composite_cb, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
-    lv_obj_add_flag(view->composite_row, LV_OBJ_FLAG_HIDDEN);
-    bind_slab_focus(view->composite_cb, view->composite_row);
-    bind_control(view, view->composite_cb, HID_PT_CTL_COMPOSITE);
+    view->auto_plugin_row = switch_row(view, right_pane, locstr("Auto-plug on next stream"),
+                                       HID_PT_CTL_AUTO_PLUGIN, &view->auto_plugin_cb);
+    view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
+                                     HID_PT_CTL_COMPOSITE, &view->composite_cb);
 
     view->audio_heading = eyebrow(right_pane, locstr("AUDIO & HAPTICS"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
     lv_obj_set_style_pad_left(view->audio_heading, LV_DPX(3), 0);
     lv_obj_set_style_pad_top(view->audio_heading, LV_DPX(4), 0);
 
-    lv_obj_t *audio_body = option_row(view, right_pane, locstr("Audio output"), NULL);
-    view->audio_row = lv_obj_get_parent(audio_body);
+    lv_obj_t *audio_body;
+    view->audio_row = option_row(right_pane, locstr("Audio output"), &audio_body, NULL);
     view->audio_dropdown = lv_dropdown_create(audio_body);
     lv_dropdown_set_options(view->audio_dropdown,
                             locstr("Auto (game decides)\nOff\nController speaker\nHeadphone jack\nSpeaker + jack"));
@@ -1054,20 +1074,15 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_add_event_cb(view->audio_dropdown, key_cb, LV_EVENT_KEY, view);
     lv_obj_add_event_cb(view->audio_dropdown, dropdown_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
 
-    lv_obj_t *spk = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
-                               HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);
-    view->speaker_row = lv_obj_get_parent(spk);
-    lv_obj_t *hs = slider_row(view, right_pane, locstr("Headphone volume"), 0, DS_VOLUME_MAX,
-                              HID_PT_CTL_HEADSET, &view->headset_slider, &view->headset_value, NULL);
-    view->headset_row = lv_obj_get_parent(hs);
-    lv_obj_t *hap = slider_row(view, right_pane, locstr("Haptics strength"), 0, DS_HAPTICS_MAX,
-                               HID_PT_CTL_HAPTICS, &view->haptics_slider, &view->haptics_value,
-                               &view->haptics_label);
-    view->haptics_row = lv_obj_get_parent(hap);
-    lv_obj_t *lat = slider_row(view, right_pane, locstr("Latency"), DS_LATENCY_MIN, DS_LATENCY_MAX,
-                               HID_PT_CTL_LATENCY, &view->latency_slider, &view->latency_value,
-                               &view->latency_label);
-    view->latency_row = lv_obj_get_parent(lat);
+    view->speaker_row = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
+                                   HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);
+    view->headset_row = slider_row(view, right_pane, locstr("Headphone volume"), 0, DS_VOLUME_MAX,
+                                   HID_PT_CTL_HEADSET, &view->headset_slider, &view->headset_value, NULL);
+    view->haptics_row = slider_row(view, right_pane, locstr("Haptics strength"), 0, DS_HAPTICS_MAX,
+                                   HID_PT_CTL_HAPTICS, &view->haptics_slider, &view->haptics_value, NULL);
+    view->latency_row = slider_row(view, right_pane, locstr("Latency"), DS_LATENCY_MIN, DS_LATENCY_MAX,
+                                   HID_PT_CTL_LATENCY, &view->latency_slider, &view->latency_value,
+                                   &view->latency_label);
 
     /* The advisory sits under the settings it is about, one quiet line rather
      * than a coloured block: it is a consequence to know, not an error. */

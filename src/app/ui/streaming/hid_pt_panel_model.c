@@ -173,6 +173,12 @@ bool hid_pt_model_selected_has_audio(const hid_pt_model_t *model)
     return kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0);
 }
 
+bool hid_pt_model_selected_is_plugged(const hid_pt_model_t *model)
+{
+    const logical_device_t *item = selected_item(model);
+    return item && item->plugged;
+}
+
 bool hid_pt_model_selected_is_bridgeable(const hid_pt_model_t *model)
 {
     const char *kind = selected_kind(model);

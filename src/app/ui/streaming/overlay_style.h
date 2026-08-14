@@ -16,10 +16,11 @@
  * tinted one collides with whatever the tint already means here.
  */
 
-/* Surfaces, dark to light. INK is the sheet, GRAPHITE its header and footer,
- * SLAB every actionable row, SLAB_HI that row once the cursor is on it. */
+/* Surfaces, dark to light. INK is the sheet and the scrim under the command bar,
+ * SLAB every actionable row, SLAB_HI that row once the cursor is on it. The
+ * header and the footer are not surfaces of their own: they are a wash of CHALK
+ * at OVERLAY_OPA_BAR over the ink, so the whole sheet keeps one transparency. */
 #define OVERLAY_INK        0x04070A
-#define OVERLAY_GRAPHITE   0x10161C
 #define OVERLAY_SLAB       0x0B1117
 /** The device the settings column is showing, while the cursor is elsewhere. */
 #define OVERLAY_SLAB_SEL   0x131C24
@@ -41,7 +42,6 @@
 
 /* Text weights. The family is whatever the platform has (Museo Sans on webOS),
  * so hierarchy is carried by size, case, tracking and these opacities. */
-#define OVERLAY_OPA_TEXT   LV_OPA_COVER
 #define OVERLAY_OPA_MUTED  ((lv_opa_t) 140)
 #define OVERLAY_OPA_FAINT  ((lv_opa_t) 105)
 
@@ -58,8 +58,13 @@
 /* Header and footer are a wash of light over the sheet rather than a lighter
  * solid, so the whole sheet keeps one transparency. */
 #define OVERLAY_OPA_BAR    ((lv_opa_t) 14)
+/* Where the scrim under the command bar settles. Short of full opacity so the
+ * frame stays visible under it. */
+#define OVERLAY_OPA_SCRIM  ((lv_opa_t) 235)
+/* The white glow behind a focused slab. Faint on purpose: it has to read against
+ * an arbitrary game frame without becoming a second border. */
+#define OVERLAY_OPA_BLOOM  ((lv_opa_t) 45)
 
 /* Geometry, in DPX so it scales with the panel size the display asks for. */
 #define OVERLAY_RAIL_W     LV_DPX(4)
 #define OVERLAY_RADIUS     LV_DPX(6)
-#define OVERLAY_SLAB_PAD   LV_DPX(17)

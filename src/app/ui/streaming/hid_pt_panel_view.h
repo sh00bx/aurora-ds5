@@ -119,7 +119,6 @@ typedef struct {
     lv_obj_t *headset_value;
     lv_obj_t *headset_slider;
     lv_obj_t *haptics_row;
-    lv_obj_t *haptics_label;
     lv_obj_t *haptics_value;
     lv_obj_t *haptics_slider;
     lv_obj_t *audio_warning_label;
@@ -138,6 +137,16 @@ typedef struct {
      * which fires the plug-focus callback on row 0; the panel reads this flag
      * there and skips the selection bookkeeping. */
     bool rebuilding;
+    /* What the footer currently says. Every arrow key asks for hints again, but
+     * moving between two rows of the same zone asks for the line already up --
+     * and rewriting a label re-measures every glyph and dirties the layout. */
+    hid_pt_zone_t hint_zone;
+    bool hint_plugged;
+    bool hint_valid;
+    /* The default named in the latency row's caption, which only moves when the
+     * selected device does; its value label changes on every step. */
+    int latency_default_ms;
+    bool latency_default_valid;
     hid_pt_view_cbs_t cbs;
 } hid_pt_view_t;
 
