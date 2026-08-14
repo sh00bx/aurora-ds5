@@ -270,28 +270,45 @@ static int ds5_on_plug_init(ctm_controller_t *c, ctm_transport_t *t)
 
 /* Byte 1 of a BT 0x31 says what the rest of it holds: high nibble a rolling
  * sequence, low nibble the flags — bit 0 that gamepad state is present, bit 1
- * that audio is. With the microphone armed the pad emits audio-only reports,
- * which carry encoded sound in the bytes where the sticks and buttons live. We
- * forward reports verbatim to the host, which repacks the payload into a USB
- * 0x01 without re-validating it (ds5_reports.h bt_input_to_usb), so one of
- * those arriving unfiltered is not noise in the pad state — it IS the pad
- * state, and the game reads audio samples as full stick deflection. Measured
- * elsewhere (CTM-USBIP 9bdbf81f) as a cursor that crosses the desktop and stays
- * crossing until the controller is switched off.
+ * that microphone audio is. With the microphone armed the pad keeps sending
+ * 0x31 at the same rate, but the payload is Opus instead of pad state: the mic
+ * frame REPLACES it (measured here 2026-07-22 with txd_armtest.py — Opus at
+ * payload[4], 71 B, TOC constant 0xd4, ~100/s, l2cap length unchanged at 79).
+ * Those are the same bytes the sticks, buttons and triggers live in.
  *
- * Nothing in this app arms the microphone today. The guard is here because
- * something else can: a state left behind by another host, or the PTT path in
- * the voice work. It costs one load and one test per report.
+ * We forward input reports verbatim, and the host repacks the payload into a
+ * USB 0x01 without re-validating it (ds5_reports.h bt_input_to_usb). So an
+ * unfiltered mic frame is not noise mixed into the pad state — it IS the pad
+ * state for that frame, and the game reads Opus samples as full stick
+ * deflection.
  *
- * These offsets are the hidraw ones, which is what this reader gets. The
- * raw-ACL side (ds5_txd) sits a byte further in — do not reuse this index
- * there. */
+ * We know that failure from the inside, and worse than the desktop-cursor
+ * version CTM-USBIP later measured (9bdbf81f): arming the mic while
+ * hid-playstation is still bound makes the KERNEL parse those same frames, an
+ * Opus byte lands on the mute bit, and the resulting output storm walks the TV
+ * into a watchdog reboot (2026-07-22). That is why the PTT path arms only
+ * while the pad is unbound, where no hidraw node exists and this reader sees
+ * nothing at all.
+ *
+ * This guard is the backstop for when that invariant slips: a crash between
+ * arm and disarm, or a rebind that beats the disarm, leaves an ARMED pad bound
+ * to the driver again — and the arming survives it (kernel 0x31 output carries
+ * no mic-valid bits, so it never disarms the pad). In that state the frames
+ * reach us, and dropping them is the difference between a dead stick and a
+ * game being played by the sound of the room.
+ *
+ * Both bits are tested rather than just one. The two are mutually exclusive on
+ * this pad, so either test alone would do today; requiring state AND no audio
+ * costs the same and fails safe if that ever stops being true.
+ *
+ * These are hidraw offsets, which is what this reader gets. The raw-ACL side
+ * (ds5_txd) sits one byte further in — payload[2] there is this byte 1. */
 static bool ds5_input_carries_state(const uint8_t *data, size_t len)
 {
     if (!data || len < 2 || data[0] != 0x31) {
         return true; /* not the report this rule is about */
     }
-    return (data[1] & 0x01) != 0;
+    return (data[1] & 0x03) == 0x01;
 }
 
 static void ds5_on_input_report(ctm_controller_t *c, const uint8_t *data, size_t len)

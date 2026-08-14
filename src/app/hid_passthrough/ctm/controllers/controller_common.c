@@ -886,7 +886,12 @@ static void *input_thread_main(void *arg)
                 unsigned long seen = ctm_stat_get(&c->stats.stateless_in) + 1;
                 ctm_stat_add(&c->stats.stateless_in, 1);
                 if (seen == 1 || seen % 500 == 0) {
-                    ctm_ctl_log(c, "dropped %lu input report(s) carrying no pad state", seen);
+                    /* Not routine noise: reaching this at all means the device is
+                     * in a mode nothing here asked it to be in, and for the DS5
+                     * that mode is the one that walks the TV into a watchdog
+                     * reboot. Worth reading as a diagnosis, not a statistic. */
+                    ctm_ctl_log(c, "dropped %lu input report(s) with no pad state in them "
+                                   "— device is streaming something else", seen);
                 }
                 drained++;
                 continue;
