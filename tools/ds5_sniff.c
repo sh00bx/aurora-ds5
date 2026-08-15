@@ -267,6 +267,11 @@ static void handle_event(const uint8_t *e, int el){
                 uint64_t gap=t-H->last_nocp;
                 if(gap>=GAP_MIN_MS) close_gap(H,hh,gap,pre);
             }
+            /* Clamped at zero: attaching mid-session credits back packets we
+             * never saw sent, so outstanding starts too LOW and a few early gaps
+             * go unrecorded until the window turns over (<1s). That is the safe
+             * direction — the ledger under-reports rather than inventing
+             * starvation it did not witness. */
             H->outstanding = pre>(long)cnt ? pre-(long)cnt : 0;
             H->last_nocp=t;
             snap(H);
