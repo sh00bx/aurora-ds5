@@ -692,6 +692,9 @@ struct ds5_link {
     uint16_t policy_handle;  /* handle the last link-policy write was for */
     uint64_t last_policy;
     uint64_t last_unsniff;   /* last Exit_Sniff send (>=3s throttle, cap-only) */
+    uint16_t flush_handle;   /* handle the last Write_Automatic_Flush_Timeout was for */
+    int      flush_sent_ms;  /* value we last wrote (0 = infinite/off); -1 = nothing written */
+    uint64_t last_flush_cmd; /* send throttle, shares the >=3s command budget */
     /* per-link gap telemetry (g_lock) — the A/B acceptance signal.
      *
      * MOVED TO THE CAPTURE THREAD 2026-08-15. The histogram used to be derived in
@@ -915,6 +918,23 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
     L->session_seen=now_ms();   /* a bind only happens off on-air HID-output = a session */
 }
 
+/* L1 auto-flush state, declared here because inject_one's PB class split reads
+ * it (definition and rationale live with the command senders further down).
+ * Capture-thread-written, main-thread-read — same discipline as g_cmd_dead.
+ *   g_lmp_nonflush      -1 unanswered / 0 controller lacks LMP bit 54 / 1 has it
+ *   g_flush_confirmed_ms the timeout the controller CONFIRMED on read-back.
+ *                        The split keys off THIS, never off the write, so a
+ *                        controller that accepted-and-ignored the command leaves
+ *                        the packet boundary flags exactly as they were. */
+static volatile int g_lmp_nonflush = -1;
+static volatile int g_flush_confirmed_ms = 0;
+static volatile int g_flush_readback_pending = 0;
+/* Published copy of the operator toggle. flush_ms_want() keeps function-static
+ * cache state and is therefore CAPTURE-THREAD-ONLY; the inject thread's 10s
+ * ledger line reads this snapshot instead of calling it, so the two threads
+ * never race on those statics. */
+static volatile int g_flush_want = 0;
+
 /* Inject one output report as a raw-ACL frame onto link L under g_lock, honoring
  * the credit window. Critical section identical in scope to the legacy inline path
  * (one bounded, non-blocking write; TOCTOU handle re-check under the same lock).
@@ -1005,6 +1025,18 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
                 frame[0]=HCI_ACLDATA_PKT; memcpy(frame+1,L->hdr,8);
                 frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
                 frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
+                /* L1 PB class split. Only once the controller has CONFIRMED a
+                 * finite flush timeout by read-back, and only then, do the
+                 * packet boundary flags start meaning anything: audio stays
+                 * PB=2 (automatically flushable — stale audio is worthless,
+                 * dropping it beats replaying it late), while 0x31/0x32 control
+                 * go out PB=0 (non-flushable) because a flushed SetState can
+                 * leave the pad routing audio to the wrong sink for ~1s.
+                 * Untouched while disarmed: the template's own flags survive
+                 * byte-for-byte, so the off state is the pre-L1 behaviour and
+                 * not merely a similar one. */
+                if(g_flush_confirmed_ms>0)
+                    frame[2] = (uint8_t)((frame[2]&0xCF) | (is_audio_report(rep[0]) ? (2<<4) : (0<<4)));
                 frame[9]=0xA2; memcpy(frame+10,rep,n);
                 ssize_t wr=write(rawfd,frame,10+n);
                 if(wr==(ssize_t)(10+n)){ r=1; L->outstanding++; txwin_push(L,is_rumble); }
@@ -1191,6 +1223,97 @@ static int send_exit_sniff(uint16_t handle){
         OP_EXIT_SNIFF&0xff, OP_EXIT_SNIFF>>8, 2,
         (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f) };
     return cmd_send(cmd,sizeof cmd,OP_EXIT_SNIFF,handle,0);
+}
+
+/* ---- L1: let the CONTROLLER discard stale audio -----------------------------
+ *
+ * We already mark audio ACL frames PB=2 ("first fragment, automatically
+ * flushable"), but that flag is inert: the default Automatic Flush Timeout is
+ * infinite, so nothing is ever flushed. A frame queued in the controller behind
+ * a blackout is therefore delivered LATE no matter how stale it has become —
+ * and by the depth conservation law that late delivery is not a lost frame, it
+ * is a permanent addition to the pad's standing buffer depth.
+ *
+ * Setting a finite timeout changes what a blackout costs. Stale audio is
+ * dropped by the controller instead of replayed late, and — this is the part
+ * that makes it worth a command — the spec requires flushed packets to be
+ * credited back via Number_Of_Completed_Packets. Credits therefore return
+ * DURING the blackout rather than after it, which also removes the
+ * over-injection that follows a txwin_reset.
+ *
+ * Value 80ms, not the 30-40 the research suggested: at 30 the ~300/min benign
+ * 30-49ms gaps would start flushing normal audio and collapse the buffer inside
+ * a minute. 80 only reaches frames that were going to underrun anyway at B=60
+ * (a gap must exceed B + one frame period).
+ *
+ * TWO HARD PRECONDITIONS, both enforced below rather than assumed:
+ *
+ *  1. The PB class split must be possible. A flush timeout is per-CONNECTION,
+ *     not per-packet, so it would also eat the ~1/s 0x31 SetState — and a
+ *     dropped SetState can leave the pad routing audio to the wrong sink for up
+ *     to a second. The split (audio flushable, control non-flushable) needs the
+ *     controller to support the non-flushable packet boundary flag, LMP feature
+ *     bit 54. If it does not, we do NOT fall back to "flush everything": we
+ *     refuse to arm at all.
+ *
+ *  2. The write must actually take. MediaTek controllers are known in this
+ *     project to accept-and-ignore commands they do not implement (QoS_Setup
+ *     did exactly that), so every write is followed by a read-back and the
+ *     armed state is set from the READ, never from the write's status.
+ *
+ * Default OFF. Arm with `echo 80 > /tmp/ds5_flush_ms` (root-owned), disarm by
+ * removing the file or writing 0 — which writes the infinite timeout back, so
+ * an A/B can be reversed without restarting the daemon.
+ */
+#define OP_WRITE_AUTO_FLUSH    0x0c28
+#define OP_READ_AUTO_FLUSH     0x0c27
+#define OP_READ_LOCAL_FEATURES 0x1003
+#define FLUSH_MS_MIN  50     /* below this the benign 30-49ms gap population starts
+                              * flushing healthy audio -> buffer collapse (see above) */
+#define FLUSH_MS_MAX 1000
+#define FLUSH_SLOTS(ms) ((uint16_t)(((long)(ms)*8)/5))   /* 0.625ms units */
+
+/* Operator toggle, cached ~1/s like every other live tunable. Out-of-range
+ * values are refused loudly rather than clamped: silently flushing at a
+ * different timeout than the operator asked for would corrupt an A/B.
+ * CAPTURE-THREAD-ONLY (function-static cache); readers elsewhere use
+ * g_flush_want. */
+static int flush_ms_want(void){
+    static int v=0; static uint64_t last=0; static int warned=0, badwarn=0;
+    uint64_t n=now_us();
+    if(last==0 || n-last>1000000ull){
+        last=n;
+        int r=read_root_int("/tmp/ds5_flush_ms",&warned);
+        if(r<0)                    v=0;                      /* absent = off */
+        else if(r==0)              v=0;                      /* explicit off */
+        else if(r>=FLUSH_MS_MIN && r<=FLUSH_MS_MAX){ v=r; badwarn=0; }
+        else if(!badwarn){
+            badwarn=1;
+            fprintf(stderr,"[txd] ignoring /tmp/ds5_flush_ms=%d: outside %d..%d ms "
+                           "(below the floor a flush eats healthy audio)\n",
+                    r,FLUSH_MS_MIN,FLUSH_MS_MAX);
+        }
+    }
+    return v;
+}
+
+static int send_auto_flush(uint16_t handle, int ms){
+    uint16_t slots = ms>0 ? FLUSH_SLOTS(ms) : 0;   /* 0 = no automatic flush */
+    uint8_t cmd[8]={ 0x01,
+        OP_WRITE_AUTO_FLUSH&0xff, OP_WRITE_AUTO_FLUSH>>8, 4,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f),
+        (uint8_t)(slots&0xff), (uint8_t)(slots>>8) };
+    return cmd_send(cmd,sizeof cmd,OP_WRITE_AUTO_FLUSH,handle,0);
+}
+static int send_read_auto_flush(uint16_t handle){
+    uint8_t cmd[6]={ 0x01,
+        OP_READ_AUTO_FLUSH&0xff, OP_READ_AUTO_FLUSH>>8, 2,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f) };
+    return cmd_send(cmd,sizeof cmd,OP_READ_AUTO_FLUSH,handle,0);
+}
+static int send_read_local_features(void){
+    uint8_t cmd[4]={ 0x01, OP_READ_LOCAL_FEATURES&0xff, OP_READ_LOCAL_FEATURES>>8, 0 };
+    return cmd_send(cmd,sizeof cmd,OP_READ_LOCAL_FEATURES,0,0);
 }
 
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
@@ -1613,6 +1736,47 @@ static void handle_hci_event(const uint8_t *e, int el){
     const char *reason=NULL; int none_bound=0;
     if(code==HCI_EV_CMD_COMPLETE && pl>=3){                 /* ncmd,opcode(2),status... */
         uint16_t op=(uint16_t)(p[1]|(p[2]<<8));
+        /* L1 answers. Both are read from the RESPONSE, never inferred from the
+         * fact that we sent something — that distinction is the whole reason
+         * these two commands exist (a controller that ignores the write still
+         * returns success for it). */
+        if(op==OP_READ_LOCAL_FEATURES && pl>=12){           /* ncmd,op(2),status,features(8) */
+            if(p[3]==0x00){
+                /* LMP feature bit 54 = Non-flushable Packet Boundary Flag. */
+                int have=(p[4+6]&0x40)?1:0;
+                if(g_lmp_nonflush!=have){
+                    g_lmp_nonflush=have;
+                    fprintf(stderr,"[txd] flush: local LMP bit54 (non-flushable PB) = %s%s\n",
+                            have?"SUPPORTED":"ABSENT",
+                            have?"" : " -> auto-flush stays DISARMED (a flush would eat 0x31 SetState)");
+                }
+            } else {
+                g_lmp_nonflush=0;
+                fprintf(stderr,"[txd] flush: Read_Local_Supported_Features failed status=0x%02x "
+                               "-> auto-flush stays DISARMED\n",p[3]);
+            }
+        } else if(op==OP_READ_AUTO_FLUSH && pl>=8){         /* ncmd,op(2),status,handle(2),timeout(2) */
+            g_flush_readback_pending=0;
+            if(p[3]==0x00){
+                uint16_t slots=(uint16_t)(p[6]|(p[7]<<8));
+                int ms=(int)(((long)slots*5)/8);
+                int was=g_flush_confirmed_ms;
+                g_flush_confirmed_ms=ms;
+                if(was!=ms)
+                    fprintf(stderr,"[txd] flush: read-back handle=0x%03x -> %u slots = %d ms%s\n",
+                            (unsigned)((p[4]|(p[5]<<8))&0x0fff),slots,ms,
+                            ms? " (ARMED: audio PB=2 flushable, 0x31/0x32 PB=0 protected)"
+                              : " (infinite: disarmed)");
+            } else {
+                g_flush_confirmed_ms=0;
+                fprintf(stderr,"[txd] flush: read-back failed status=0x%02x -> treating as DISARMED\n",p[3]);
+            }
+        } else if(op==OP_WRITE_AUTO_FLUSH && pl>=4 && p[3]!=0x00){
+            /* Accepted-and-ignored is the case we fear, but an outright reject
+             * must not leave a stale "armed" belief behind either. */
+            g_flush_confirmed_ms=0;
+            fprintf(stderr,"[txd] flush: Write_Automatic_Flush_Timeout rejected status=0x%02x\n",p[3]);
+        }
         for(int i=0;i<g_pend_n;i++)                         /* pop the oldest matching pend */
             if(g_pend[i].op==op){
                 g_pend_n--;
@@ -1946,7 +2110,40 @@ static void *capture_thread(void *arg){
                     L->last_unsniff=t;
                     fprintf(stderr,"[txd] L%d handle=0x%03x in sniff while pinned -> Exit_Sniff sent\n",i,lh[i]);
                 }
-            } else L->policy_handle=0xffff;
+                /* L1 reconcile: one Write + one Read per bind (or per toggle
+                 * change), sharing the same >=3s throttle as everything else on
+                 * this budget. The feature probe is asked once and only when
+                 * somebody actually wants the lever — an unused daemon sends
+                 * nothing it did not send before this change. */
+                int want=flush_ms_want();
+                if(want && g_lmp_nonflush<0 && t-L->last_flush_cmd>3000 &&
+                   send_read_local_features()==0)
+                    L->last_flush_cmd=t;
+                else if(g_lmp_nonflush==1 || (!want && L->flush_sent_ms>0)){
+                    /* Disarming does not need the feature bit: writing the
+                     * infinite timeout back must work even on a controller we
+                     * later decided we cannot trust, or an A/B could not be
+                     * reversed without a restart. */
+                    int target = g_lmp_nonflush==1 ? want : 0;
+                    /* What this HANDLE is believed to carry right now. A handle
+                     * we have not written to is infinite by definition (that is
+                     * the spec default for a fresh connection), so a disarmed
+                     * lever costs zero commands per bind instead of one
+                     * redundant "set infinite" on every reconnect. */
+                    int believed = (L->flush_handle==lh[i]) ? L->flush_sent_ms : 0;
+                    if(target!=believed &&
+                       t-L->last_flush_cmd>3000 && send_auto_flush(lh[i],target)==0){
+                        L->last_flush_cmd=t; L->flush_handle=lh[i]; L->flush_sent_ms=target;
+                        g_flush_readback_pending=1;
+                        fprintf(stderr,"[txd] L%d flush: Write_Automatic_Flush_Timeout handle=0x%03x "
+                                       "-> %d ms (%u slots), verifying by read-back\n",
+                                i,lh[i],target,(unsigned)(target?FLUSH_SLOTS(target):0));
+                    } else if(g_flush_readback_pending && t-L->last_flush_cmd>3000 &&
+                              send_read_auto_flush(lh[i])==0){
+                        L->last_flush_cmd=t;
+                    }
+                }
+            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1; }
         }
         /* Scan follows the SESSION, not electrical liveness. The three restores above
          * are edge-triggered on a link INVALIDATION, and since RX liveness (v11) a pad
@@ -2760,10 +2957,15 @@ int main(int argc,char**argv){
             /* Measured too: this is the LONGEST single write the inject thread
              * makes, so if stderr can block at all it shows here first. */
             uint64_t t0=now_us();
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld%s%s\n",
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
+                /* want / confirmed-by-read-back / LMP bit54. The middle number is
+                 * the only one that means the lever is live; want>0 with
+                 * confirmed=0 is precisely the accept-and-ignore case. */
+                g_flush_want, g_flush_confirmed_ms,
+                g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"),
                 g_cmd_dead?" CMDDEAD":"", links);
             logw_note(t0);
             last_log=now_ms();
