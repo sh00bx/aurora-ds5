@@ -1293,6 +1293,7 @@ static int flush_ms_want(void){
                            "(below the floor a flush eats healthy audio)\n",
                     r,FLUSH_MS_MIN,FLUSH_MS_MAX);
         }
+        g_flush_want=v;   /* publish for the inject thread's ledger line */
     }
     return v;
 }
