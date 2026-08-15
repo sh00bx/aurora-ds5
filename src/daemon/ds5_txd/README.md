@@ -102,6 +102,57 @@ load-bearing; re-check all five against any re-vendored source.
   — and the refusal is logged once per call site rather than silently disabling
   the operator's tuning.
 
+## Measurement phase (2026-08-15)
+
+Everything here exists to make the *next* experiment trustworthy; none of it
+changes how audio is delivered.
+
+* **NOCP gaps are binned in the capture thread**, not sampled from the main poll
+  loop. The loop is datagram-clocked, and batched `0x39` halved its rate to
+  ~47/s — so the old `gaps=` histogram was quantized to ~21 ms and undercounted
+  the 30-49 bin. Each NOCP arrival ends exactly one gap, so the handler bins
+  `now - last_nocp` directly. **`gaps=` counts are therefore not comparable
+  across this build boundary** — it is a resolution change, not a format change.
+* **`drop_total` is split** into `drop_age` (intended staleness age-out),
+  `drop_ovf` (FIFO overflow) and the remainder (template loss), reported as
+  `drops=age/ovf/other`. `drop_total` is still their sum, so old readers are
+  unaffected. Without this a maxq ladder has no usable abort criterion —
+  "drop_total must stay 0" self-aborts on the first normal 150-400 ms episode,
+  which ages a frame out *by design*.
+* **A freed credit now wakes the main loop** (eventfd, `g_kickfd`). `drain_fifo`
+  stays main-thread-owned; the capture thread only posts the fd. Previously a
+  held frame waited for the next app datagram — a systematic 0..21.33 ms
+  (mean ~10.7) on every congestion recovery. The datagram-clocked drain remains
+  as belt-and-braces, so a lost kick costs latency, never a stranded frame.
+* **`DS5Q` telemetry record is v2, 36 B.** First 24 bytes byte-identical to v1.
+  Appended: `gap50`, `gap80`, `flush_events`, `nocp_age_ms`, `drop_age`,
+  `drop_ovf` — all **wrapping u16**, compare with wrapping deltas. Daemon and app
+  ship from different trees, so the reader accepts v1 *and* v2; rejecting an
+  unknown version would silently stop `PACE_FEEDBACK` and drop the host rate
+  servo to its blind fallback with nothing showing why.
+* **`logw=max_us/slow/n`** on the stats line measures how long the inject
+  thread's own `fprintf`s take. The EPISODE lines are written *during* the stall
+  they describe; whether that write can actually block here was never measured.
+  Probe first — if `slow` stays 0 the item is closed, if it does not, log I/O is
+  perturbing the very gaps it records and must move off the inject path (to a
+  dedicated low-priority writer — **not** the capture thread, which owns credit
+  accounting and would turn log backpressure into apparent NOCP gaps).
+* **Deterministic gap injector**: write a millisecond count to
+  `/tmp/ds5_gap_inject` (root-owned) and every ACL write is held for that long.
+  One-shot (unlinked on read), refused if the file is >5 s old or outside
+  20..2000 ms, bracketed by `GAPINJECT start`/`end` lines, and its gaps are
+  counted in a **separate** `synth=` counter so they never enter the production
+  bins. The `.st` record is frozen for the hold plus 2 s so the injected backlog
+  cannot leave the host rate servo stretched for the next ~12 s.
+
+  🚨 **Scope limit — this rig cannot test everything.** A write-hold emulates TX
+  *absence*, not credit starvation: the controller's TX queue drains and then
+  sits empty. It validates pad-side physics (how the pad's jitter buffer reacts
+  to a hole) and nothing else. It can never exercise the stall-resync path and,
+  once `Write_Automatic_Flush_Timeout` exists, can never fire a flush — there is
+  nothing queued to flush. Flush semantics are observable **only on real coex
+  episodes**.
+
 Still open from that phase and deliberately not done here: hardening
 `ds5-tmpld.sh`'s `>>"$LOG"` append against a symlink plant on the predictable
 `/tmp/ds5_txd.log` path. It is only a real primitive if `/tmp` is `1777` on the
@@ -111,6 +162,7 @@ logging is what makes the rest of this observable.
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 b61d95378ccdb30a51fb8866bb9e33d3, 79160 bytes   (measurement phase, 1.4.23)
     # md5 a5524813257d2b8a0e67cadfc170da62, 78676 bytes   (+ daemon hardening phase)
     # md5 0939f76761c39ebe702f3aae6eb624fc, 78504 bytes   (d1557da + jail-uid patch)
     # md5 8056dddf23813cc4c6e975e7f89ea6f6, 78476 bytes   (d1557da, unpatched)

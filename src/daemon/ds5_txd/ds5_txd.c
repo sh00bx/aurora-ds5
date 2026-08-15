@@ -94,6 +94,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/eventfd.h>    /* NOCP->main-loop kick: drain held audio the moment credits free */
 #include <time.h>
 #include <dirent.h>
 
@@ -342,6 +343,26 @@ static int is_audio_report(uint8_t id){ return id==0x36 || id==0x39; }
 static uint64_t now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull; }
 static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000ull+ts.tv_nsec/1000ull; }
 
+/* stderr write-cost probe (2026-08-15). The EPISODE lines are written from the
+ * INJECT thread and they land DURING the stall they describe. glibc leaves
+ * stderr unbuffered, so each one is a write(2): if stderr is a pipe into
+ * pmlog/console rather than the tmpfs log file, a blocked write adds jitter to
+ * injection at the worst possible moment AND perturbs the very gap it records.
+ * Nobody has ever measured whether it actually blocks here, so the first move is
+ * a probe, not a rewrite — the cost of guessing wrong in either direction is a
+ * rebuild of the primary instrument. Reported on the 10s status line as
+ * logw=max_us/slow, slow = writes >=1ms. A p99 far under 1ms (the tmpfs-backed
+ * expectation) closes the item; multi-ms blocks correlated with episodes promote
+ * it ahead of every other A/B, because it then contaminates their measurement. */
+static uint64_t g_logw_max_us=0;
+static long     g_logw_n=0, g_logw_slow=0;
+static inline void logw_note(uint64_t t0){
+    uint64_t d=now_us()-t0;
+    g_logw_n++;
+    if(d>g_logw_max_us) g_logw_max_us=d;
+    if(d>=1000) g_logw_slow++;
+}
+
 /* Read a small non-negative integer out of a ROOT-OWNED regular file; -1 if the
  * file is absent, a symlink, not root-owned, or unparsable (both callers range-
  * check, and -1 fails every range, so it needs no separate error path).
@@ -464,6 +485,104 @@ static int inject_fifo(void){
     return d;
 }
 
+/* ---- deterministic gap injector (bench instrument, 2026-08-15) ------------- *
+ * Real coex episodes arrive ~5.3/min and CLUSTER, so every pad-side experiment
+ * (underrun rule, re-prime depth, buffer-byte semantics) costs hours per data
+ * point and is confounded by which cluster it landed in. This holds every ACL
+ * write for exactly G ms on command, so the same questions take a 10-minute
+ * sweep with real repetitions.
+ *
+ * 🚨 SCOPE — READ BEFORE TRUSTING A RESULT. A write-hold emulates TX ABSENCE,
+ * not credit starvation: the controller's own TX queue drains normally and then
+ * sits EMPTY for the rest of the hold. So this rig validates PAD physics (how
+ * the pad's jitter buffer reacts to a hole) and nothing else. It can never
+ * exercise the stall-resync path, and — once the auto-flush lever exists — it
+ * can never fire a flush or produce a Flush_Occurred, because there is nothing
+ * queued to flush. Flush semantics are only observable on REAL episodes.
+ *
+ * Ingest, FIFO accounting and credit accounting all stay live, so the backlog
+ * behaviour on release is the real one.
+ *
+ * Safety (a stray trigger during a user session is a self-inflicted dropout that
+ * would be blamed on coex and would poison the ledger): root-owned file only,
+ * ONE-SHOT via unlink-on-read, refused if older than 5 s, G clamped, and both
+ * ends logged with their own marker so the ledger can select or exclude them. */
+#define GAP_INJECT_PATH     "/tmp/ds5_gap_inject"
+#define GAP_INJECT_MIN_MS   20
+#define GAP_INJECT_MAX_MS   2000
+#define GAP_INJECT_FRESH_S  5
+/* Telemetry quiet time AFTER the hold. The host rate servo up-steps on fifo
+ * depth and drops and decays at only 3us per feedback sample (~12s to shed a
+ * full stretch), so publishing the injected backlog would bias every
+ * measurement for minutes afterwards. Freezing the .st record freezes the app's
+ * PACE_FEEDBACK with it — the app already treats a non-advancing seq as
+ * "nothing new", so no app change is needed. */
+#define GAP_INJECT_QUIET_MS 2000
+static uint64_t g_gap_hold_until_us=0;   /* written by main only (inject path reads it) */
+/* Read by the CAPTURE thread too (it tags synthetic gaps), so both ends use
+ * relaxed atomics — same reasoning as ds5_link.last_demand. */
+static uint64_t g_gap_quiet_until_us=0;
+static long     g_gap_injections=0;
+
+/* Arm from the control file. Called on a ~250ms tick from the main loop (a
+ * bench trigger does not need report-rate latency, and this keeps the syscall
+ * off the inject path). */
+static void gap_inject_poll(void){
+    static uint64_t last=0; static int warned=0;
+    uint64_t n=now_us();
+    if(last && n-last<250000ull) return;
+    last=n;
+    int fd=open(GAP_INJECT_PATH,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if(fd<0) return;                     /* ENOENT is the normal state */
+    struct stat st; char b[32]; ssize_t rd=-1;
+    if(fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==0)
+        rd=read(fd,b,sizeof b-1);
+    close(fd);
+    unlink(GAP_INJECT_PATH);             /* ONE-SHOT: consumed even if malformed */
+    if(rd<=0){
+        if(!warned){ warned=1; fprintf(stderr,"[txd] GAPINJECT ignored: not a readable root-owned file\n"); }
+        return;
+    }
+    b[rd]='\0';
+    /* Freshness against the WALL clock (the file carries an mtime, not a
+     * monotonic stamp): a trigger left over from a previous bench session must
+     * never fire into a user session hours later. */
+    time_t age=time(NULL)-st.st_mtim.tv_sec;
+    char *end=NULL; long g=strtol(b,&end,10);
+    if(end==b || g<GAP_INJECT_MIN_MS || g>GAP_INJECT_MAX_MS){
+        fprintf(stderr,"[txd] GAPINJECT refused: G=%ld outside %d..%d ms\n",g,GAP_INJECT_MIN_MS,GAP_INJECT_MAX_MS);
+        return;
+    }
+    if(age<0 || age>GAP_INJECT_FRESH_S){
+        fprintf(stderr,"[txd] GAPINJECT refused: trigger is %llds old (max %d)\n",
+                (long long)age,GAP_INJECT_FRESH_S);
+        return;
+    }
+    g_gap_hold_until_us=now_us()+(uint64_t)g*1000ull;
+    __atomic_store_n(&g_gap_quiet_until_us,g_gap_hold_until_us+GAP_INJECT_QUIET_MS*1000ull,__ATOMIC_RELAXED);
+    g_gap_injections++;
+    fprintf(stderr,"[txd] GAPINJECT start G=%ldms n=%ld (SYNTHETIC — telemetry frozen for G+%dms)\n",
+            g,g_gap_injections,GAP_INJECT_QUIET_MS);
+}
+
+/* True while a synthetic hold is in force. PURE predicate: it is called from the
+ * inject path with g_lock held, so it must not log or do anything blocking —
+ * the end marker is emitted by gap_inject_tick() instead. */
+static int gap_hold_active(void){
+    return g_gap_hold_until_us && now_us()<g_gap_hold_until_us;
+}
+
+/* Once per main-loop wakeup, outside every lock: close out a finished hold (the
+ * ledger marker wants the real end time, not the next 250ms poll) and then let
+ * the throttled file poll arm the next one. */
+static void gap_inject_tick(void){
+    if(g_gap_hold_until_us && now_us()>=g_gap_hold_until_us){
+        g_gap_hold_until_us=0;
+        fprintf(stderr,"[txd] GAPINJECT end n=%ld\n",g_gap_injections);
+    }
+    gap_inject_poll();
+}
+
 /* g_lock guards the per-link template/identity state below (the g_links[] fields
  * noted "g_lock"). It is held only for short, NON-BLOCKING work — never across
  * filesystem I/O. Publishing the template record (which does open/write/rename and
@@ -517,8 +636,12 @@ struct ds5_link {
                                 confirmed on-air (via HCI Number_Of_Completed_Packets) */
     uint64_t last_nocp;      /* last NOCP time; stall backstop if credits stop returning */
     uint64_t last_wr_err_log;/* rate limit for the structural-write-error line (inject) */
-    uint64_t last_demand;    /* last report the APP handed us for this link (inject thread
-                                writes, same thread snapshots -> no lock). Telemetry only:
+    uint64_t last_demand;    /* last report the APP handed us for this link. Written by the
+                                inject thread; since the gap histogram moved into the NOCP
+                                handler the CAPTURE thread reads it too, so both sides go
+                                through __atomic_*_n RELAXED — a torn 64-bit read on this
+                                32-bit ARM would only mis-gate a single gap, but the race is
+                                free to remove. Telemetry only:
                                 separates "idle with residue" from a real TX stall. Must be
                                 DEMAND, not last successful inject — a credit stall blocks
                                 injection, so keying on success would mute exactly the
@@ -543,6 +666,19 @@ struct ds5_link {
      * so with two pads the host rate servo attributed one pad's drop storm to
      * BOTH links and throttled the healthy pad too. */
     long     inj_total, drop_total;
+    /* drop_total BY REASON (main thread; drop_total stays their sum so every
+     * historical reader keeps working). The host rate servo up-steps its stretch
+     * by 20us per drop it sees — but an AGE-OUT is an intentional staleness shed
+     * (the frame was already past the pad's buffer), while an OVERFLOW eviction is
+     * the real "we could not keep up" signature. Feeding both into one counter
+     * makes the servo punish our own correct sheds, slowing production further and
+     * eroding pad depth (which nothing in the stack ever refills). Splitting them
+     * is also what lets a maxq ladder have an abort criterion at all: "drop_total
+     * must stay 0" self-aborts the moment a normal 150-400ms episode ages a frame
+     * out, which is by design and not a failure. */
+    long     drop_age;       /* FIFO age-out (> FIFO_MAX_AGE_MS): intended shed */
+    long     drop_ovf;       /* FIFO overflow evict-to-fit: could not keep up */
+    long     flush_events;   /* controller-side auto-flush (0 until 0x0C28 ships) */
     /* previous identity pending an invalid-publish (g_lock). When a slot is
      * re-bound to a DIFFERENT pad before the old pad's invalidation was
      * published (main-thread invalidate racing a capture rebind), the old
@@ -556,9 +692,29 @@ struct ds5_link {
     uint16_t policy_handle;  /* handle the last link-policy write was for */
     uint64_t last_policy;
     uint64_t last_unsniff;   /* last Exit_Sniff send (>=3s throttle, cap-only) */
-    /* per-link gap telemetry (inject) — the A/B acceptance signal */
-    long     gap30, gap50, gap80; /* NOCP-gap histogram 30-50/50-80/>=80ms */
-    uint64_t ep_start, gap_hi;    /* episode + sub-episode high-watermark state */
+    /* per-link gap telemetry (g_lock) — the A/B acceptance signal.
+     *
+     * MOVED TO THE CAPTURE THREAD 2026-08-15. The histogram used to be derived in
+     * the main poll loop as a high-watermark of (now - last_nocp), sampled once per
+     * wakeup. That loop is DATAGRAM-clocked, and since the switch to batched 0x39
+     * the app feeds it ~47/s — so every gap was quantized to ~21ms and the 30-49
+     * bin systematically undercounted (the bins are absolute, while the underrun
+     * rule itself moved from B+10.67 to B+21.33ms). The NOCP handler sees every
+     * credit return at native rate and each arrival ENDS exactly one gap, so
+     * binning (now - last_nocp) there needs no watermark and carries no
+     * quantization. Written under the lock the NOCP handler already holds; the
+     * main loop snapshots them in its existing locked block. */
+    long     gap30, gap50, gap80; /* NOCP-gap histogram 30-49/50-79/>=80ms */
+    uint64_t gap_max;             /* largest single gap this binding (ms) */
+    /* Gaps we caused ourselves with the bench injector are counted SEPARATELY.
+     * They must not enter the production bins — the histogram is the primary
+     * instrument for every experiment in this area, and a rig that quietly
+     * inflates the band it is meant to measure is worse than no rig. Keeping the
+     * measured length is what makes the injector self-validating: commanded G
+     * should come back out here within a few ms. */
+    long     gap_synth;           /* synthetic gaps observed */
+    uint64_t gap_synth_ms;        /* length of the most recent one */
+    uint64_t ep_start;            /* episode start (main thread; the >80ms detector) */
     uint16_t tele_gen;            /* nonce the histogram counts; reset on rebind */
     /* RX-continuity forensics (stall RCA): inbound ACL packets from THIS link
      * (capture thread, g_lock) and episode-start snapshots (inject thread).
@@ -830,8 +986,14 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
         if(g_htab[hh].known && memcmp(g_htab[hh].addr,L->bound_addr,6)!=0){
             L->have=0; *reason="bound handle now foreign -> template INVALID"; r=-1;
         } else {
-            int blocked = L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap);
-            if(blocked && L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
+            /* Synthetic hold (bench instrument): present exactly as a full credit
+             * window so everything downstream — FIFO hold, evict-to-fit, rumble
+             * latest-wins — runs its REAL path. But skip the stall backstop: the
+             * credits are not actually lost, and resyncing `outstanding` mid-hold
+             * would corrupt the very accounting the rig measures against. */
+            int held = gap_hold_active();
+            int blocked = held || L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap);
+            if(!held && blocked && L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
                 L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
                 L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
                 blocked=0;
@@ -897,7 +1059,10 @@ static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval,
         int idx=L->fifo_head;
         if(now_ms()-L->fifo[idx].ts>FIFO_MAX_AGE_MS){
             L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--;
-            L->drop_total++;                        /* age-out is a real loss: keep it visible to the host servo */
+            L->drop_total++; L->drop_age++;         /* a real loss (host servo must see it) but an
+                                                     * INTENDED one — split so the servo, and any
+                                                     * maxq ladder's abort criterion, can tell it
+                                                     * apart from overflow (see drop_age/drop_ovf) */
             continue;                               /* stale pre-pause audio: drop */
         }
         int r=inject_one(L,rawfd,L->fifo[idx].buf,L->fifo[idx].len,maxq,reason,expect,1 /* FIFO holds app audio */);
@@ -909,6 +1074,19 @@ static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval,
     return inj;
 }
 static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
+
+/* NOCP -> main-loop wakeup (2026-08-15). drain_fifo() is main-thread-only by
+ * design (it owns the FIFO and the fifo_gen rebind check), and it used to run
+ * ONLY from process_report — i.e. on the next datagram from the app. So a credit
+ * freed by the controller mid-period left a held frame sitting until the next
+ * report arrived: a systematic 0..21.33ms (mean ~10.7) tax on every congestion
+ * recovery, paid exactly at the B+21.33ms underrun boundary where it decides
+ * whether the recovery is audible. The capture thread only WRITES this eventfd
+ * (never touches the FIFO), the main loop drains as before, so the ownership
+ * rules and the rebind guard are unchanged. The datagram-clocked drain stays in
+ * place as belt-and-braces: a lost kick can only cost the old latency, never
+ * strand a frame. */
+static int      g_kickfd = -1;
 
 /* HCI command health guard + rate discipline (2026-07-05, reworked 07-06).
  * PROVEN on-air (raw-write + monitor-listen probe): the LG vendor stack holds
@@ -1535,19 +1713,59 @@ static void handle_hci_event(const uint8_t *e, int el){
     } else if(code==HCI_EV_NUM_COMP_PKTS && pl>=1){        /* TX credits returned: free the outstanding window */
         int nh=p[0];
         if(pl < 1+nh*4) return;
+        int kick=0;
+        uint64_t nowm=now_ms();
         pthread_mutex_lock(&g_lock);
         for(int i=0;i<nh;i++){
             uint16_t hh=(uint16_t)((p[1+i*4]|(p[2+i*4]<<8))&0x0fff);
             struct ds5_link *L=link_by_handle(hh);   /* credits are PER HANDLE -> per link */
             if(!L) continue;
             int cnt=(int)(p[3+i*4]|(p[4+i*4]<<8));
+            /* Sub-episode gap histogram, at native NOCP resolution. THIS credit
+             * return ends exactly one credit-starved stretch, so its length is
+             * (now - last_nocp) — no high-watermark, no sampling, no ~21ms
+             * quantization from the datagram-clocked main loop.
+             *
+             * Gated exactly as before: only while the window was actually
+             * occupied (outstanding>0, read BEFORE the decrement below) and only
+             * while the app is really feeding us. On stream teardown the
+             * controller discards its queued packets without emitting the
+             * matching NOCPs, so an ungated histogram counts idle as starvation —
+             * that is the DEMAND_IDLE_MS gate, keyed on demand and never on
+             * successful inject (a credit stall is precisely when injection
+             * stops). */
+            if(L->have && L->outstanding>0 && L->last_nocp && nowm>L->last_nocp){
+                uint64_t ld=__atomic_load_n(&L->last_demand,__ATOMIC_RELAXED);
+                if(ld && nowm>=ld && nowm-ld<DEMAND_IDLE_MS){
+                    uint64_t g=nowm-L->last_nocp;
+                    /* Was this OUR hole? The first NOCP after a synthetic hold
+                     * necessarily lands after the hold has been released, so the
+                     * test is the quiet window (hold + settle), not the hold
+                     * itself. Everything measured in that window is bench data
+                     * and is kept out of the production bins. */
+                    if(now_us()<__atomic_load_n(&g_gap_quiet_until_us,__ATOMIC_RELAXED)){
+                        L->gap_synth++; L->gap_synth_ms=g;
+                    } else {
+                        if(g>=80)      L->gap80++;
+                        else if(g>=50) L->gap50++;
+                        else if(g>=30) L->gap30++;
+                        if(g>L->gap_max) L->gap_max=g;
+                    }
+                }
+            }
             L->outstanding-=cnt; if(L->outstanding<0) L->outstanding=0;
             txwin_pop(L,cnt);   /* FIFO-approximate the per-type in-flight counts */
+            /* Credits just freed: if this link is holding audio, wake the main
+             * loop NOW instead of letting the backlog wait for the next app
+             * datagram. Relaxed read of a main-thread-owned int — this is a HINT
+             * (the main loop re-checks under its own ownership), so a stale value
+             * can only cost a spurious wakeup or fall back to the old behaviour. */
+            if(__atomic_load_n(&L->fifo_count,__ATOMIC_RELAXED)>0) kick=1;
             /* Refresh the stall timestamp ONLY for OUR handle's completions:
              * a global refresh would let any other device's NOCP chatter
              * (Magic Remote etc.) suppress the 150ms backstop exactly when
              * our credits are the ones wedged. */
-            L->last_nocp=now_ms();
+            L->last_nocp=nowm;
             /* NOCP for the bound handle also proves the LINK is alive:
              * the controller is completing OUR injections. Without this,
              * last_seen is only refreshed by kernel-path HID writes
@@ -1570,9 +1788,16 @@ static void handle_hci_event(const uint8_t *e, int el){
              * NOCPs) stops on its own. Closing it fully needs an on-air identity
              * re-check, but HCIGETCONNLIST is empty on webOS and our own injects
              * aren't mirrored on MONITOR -> no cheap in-session identity signal. */
-            L->last_seen=now_ms();
+            L->last_seen=nowm;
         }
         pthread_mutex_unlock(&g_lock);
+        /* Outside the lock on purpose: g_lock is held only for short non-blocking
+         * work, and the eventfd write is the one syscall in this path. */
+        if(kick && g_kickfd>=0){
+            uint64_t one=1;
+            ssize_t w=write(g_kickfd,&one,sizeof one);
+            (void)w;   /* EAGAIN = counter saturated = a wakeup is already pending */
+        }
         return;   /* NOCP never affects template validity */
     } else return;
     if(reason){
@@ -1968,7 +2193,8 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
                     /* Evict-to-fit: fdepth can be LOWERED at runtime; a single-evict
                      * would balance every insert and keep the count at the old
                      * high-water forever under congestion, voiding the latency bound. */
-                    while(L->fifo_count>=fdepth){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--; (*dropped)++; L->drop_total++; }
+                    while(L->fifo_count>=fdepth){ L->fifo_head=(L->fifo_head+1)%FIFO_MAX; L->fifo_count--;
+                                                  (*dropped)++; L->drop_total++; L->drop_ovf++; }
                     int tail=(L->fifo_head+L->fifo_count)%FIFO_MAX;
                     memcpy(L->fifo[tail].buf,report,(size_t)n); L->fifo[tail].len=n;
                     L->fifo[tail].ts=now_ms(); L->fifo_count++;
@@ -2100,6 +2326,13 @@ int main(int argc,char**argv){
     int ufd=bind_unix_dgram(sock_path);
     if(ufd<0) perror("[txd] bind unix (retrying every 500ms)");
 
+    /* Before the capture thread starts, so it never sees a half-set fd. On
+     * failure g_kickfd stays -1: poll() ignores a negative fd, the capture side
+     * skips the write, and the drain falls back to the datagram-clocked path —
+     * i.e. exactly the old behaviour, never a broken one. */
+    g_kickfd=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+    if(g_kickfd<0) fprintf(stderr,"[txd] eventfd failed errno=%d -> credit drain stays datagram-clocked\n",errno);
+
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
     {   /* Idle lightbar BOOT colour: DS5_IDLE_LIGHTBAR=RRGGBB (hex), "0"/"off"
@@ -2138,10 +2371,18 @@ int main(int argc,char**argv){
     uint64_t last_cred_log=0;   /* 1/s rate limit for the cred-rejection line */
     uint64_t last_stat=now_ms(); uint32_t stat_seq=0;   /* queue-telemetry publish (v9) */
     for(;;){
-        struct pollfd pfd[2]={{ufd,POLLIN,0},{minfo,POLLPRI,0}};
+        /* pfd[2] is the NOCP kick (g_kickfd): the capture thread posts it when a
+         * credit frees on a link that is holding audio, so the backlog drains on
+         * the credit instead of waiting for the next app datagram. */
+        struct pollfd pfd[3]={{ufd,POLLIN,0},{minfo,POLLPRI,0},{g_kickfd,POLLIN,0}};
         int to=500;
-        int pr=poll(pfd,2,to);
+        int pr=poll(pfd,3,to);
         if(pr<0){ if(errno==EINTR) continue; usleep(2000); continue; }
+        if(g_kickfd>=0 && (pfd[2].revents&POLLIN)){
+            uint64_t kv; ssize_t kr=read(g_kickfd,&kv,sizeof kv);
+            (void)kr;   /* level-triggered counter: one read clears it */
+        }
+        gap_inject_tick();   /* bench instrument: close/arm synthetic TX holds */
 
         /* Mount table changed (or retry tick while rebinding / watch down): if our
          * node's path stopped resolving to a socket, Aurora remounted its tmp under
@@ -2173,7 +2414,8 @@ int main(int argc,char**argv){
          * tracked independently so a 2-pad session shows which pad is starved. */
         uint16_t link_nonce[MAX_LINKS];
         {
-            struct { int have, qd; uint64_t ln, ld, ss; uint16_t nonce; uint64_t rx; uint8_t addr[6]; } sn[MAX_LINKS];
+            struct { int have, qd; uint64_t ln, ld, ss; uint16_t nonce; uint64_t rx; uint8_t addr[6];
+                     int rst; long r30,r50,r80; } sn[MAX_LINKS];
             uint64_t nowm=now_ms(), other_now;
             pthread_mutex_lock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
@@ -2182,30 +2424,64 @@ int main(int argc,char**argv){
                 sn[i].rx=g_links[i].rx_pkts; sn[i].ld=g_links[i].last_demand;
                 sn[i].ss=g_links[i].session_seen;   /* painter hidraw-quiet gate */
                 memcpy(sn[i].addr,g_links[i].bound_addr,6);
+                /* Per-binding telemetry: a rebind (nonce bump) starts a FRESH gap
+                 * histogram so the 10s status line measures THIS binding, not the
+                 * slot's whole lifetime — cumulative counts across rebinds/address
+                 * swaps were useless for A/B deltas. The outgoing counts ride out in
+                 * the snapshot and are logged after the unlock, so nothing is lost.
+                 * The reset moved INSIDE the lock when the histogram became
+                 * capture-thread-owned: doing it out here would race a NOCP that
+                 * lands between the snapshot and the clear (silently dropping a bin,
+                 * or worse resurrecting a previous binding's count). */
+                sn[i].rst=0; sn[i].r30=sn[i].r50=sn[i].r80=0;
+                if(g_links[i].tele_gen!=g_links[i].nonce){
+                    sn[i].rst=1;
+                    sn[i].r30=g_links[i].gap30; sn[i].r50=g_links[i].gap50; sn[i].r80=g_links[i].gap80;
+                    g_links[i].gap30=g_links[i].gap50=g_links[i].gap80=0;
+                    g_links[i].gap_max=0;
+                    g_links[i].gap_synth=0; g_links[i].gap_synth_ms=0;
+                    g_links[i].tele_gen=g_links[i].nonce;
+                }
             }
             other_now=g_other_rx;
             pthread_mutex_unlock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
                 struct ds5_link *L=&g_links[i];
                 link_nonce[i]=sn[i].nonce;
-                /* Per-binding telemetry: a rebind (nonce bump) starts a FRESH gap
-                 * histogram so the 10s status line measures THIS binding, not the
-                 * slot's whole lifetime — cumulative counts across rebinds/address
-                 * swaps were useless for A/B deltas. The outgoing counts are
-                 * logged, so nothing is lost. Reset here (inject thread owns the
-                 * histogram), not in link_bind (capture thread — would race). */
-                if(L->tele_gen!=sn[i].nonce){
-                    if(L->gap30||L->gap50||L->gap80)
+                /* The counters themselves were already cleared under the lock above;
+                 * only the logging and the main-thread-owned episode state happen
+                 * here. */
+                if(sn[i].rst){
+                    if(sn[i].r30||sn[i].r50||sn[i].r80)
                         fprintf(stderr,"[txd] L%d gap histogram reset on rebind (was %ld/%ld/%ld)\n",
-                                i,L->gap30,L->gap50,L->gap80);
-                    L->gap30=L->gap50=L->gap80=0; L->ep_start=0; L->gap_hi=0;
-                    L->tele_gen=sn[i].nonce;
+                                i,sn[i].r30,sn[i].r50,sn[i].r80);
+                    L->ep_start=0;
                 }
                 /* Stale-backlog gate: a rebind bumps the nonce, so audio still held
                  * from the previous binding must be dropped, not played into the new
                  * session (drain_fifo also clears on the no-template path, but that
                  * never runs when the invalidate->rebind happens between wakeups). */
                 if(L->fifo_count>0 && L->fifo_gen!=sn[i].nonce) fifo_clear(L);
+                /* Credit-freed drain. The NOCP that returned a credit is what woke
+                 * us (g_kickfd), so put the held frame on the air NOW instead of at
+                 * the next app datagram — that wait was a systematic 0..21.33ms
+                 * (mean ~10.7) added to every congestion recovery, right at the
+                 * B+21.33ms underrun boundary. Unconditional rather than gated on
+                 * the kick: once we are awake the drain is the same work the
+                 * datagram path would do, and this way the 500ms tick also bounds
+                 * how long a backlog can sit if a kick is ever missed.
+                 * `expect` = this link's snapshotted address, so inject_one's
+                 * re-check still skips a pad that the capture thread rebound
+                 * between the snapshot and here. */
+                if(L->fifo_count>0){
+                    int kneed=0; const char *kreason=NULL;
+                    injected+=drain_fifo(L,rawfd,inject_maxq(),&kneed,&kreason,sn[i].addr);
+                    if(kneed){
+                        publish_all();
+                        fprintf(stderr,"[txd] %s\n",kreason?kreason:"template invalid (credit drain)");
+                        g_scan_restore=1;
+                    }
+                }
                 /* DEMAND GATE (2026-08-02). "queue non-empty + no NOCP" is only a STALL
                  * while the app is actually feeding us. On stream teardown the controller
                  * DISCARDS its queued packets without ever emitting the matching NOCPs, so
@@ -2270,7 +2546,9 @@ int main(int argc,char**argv){
                 if(sn[i].have && sn[i].qd>0 && sn[i].ln && tx_demand && nowm-sn[i].ln>80){
                     if(!L->ep_start){
                         L->ep_start=nowm; L->ep_rx0=sn[i].rx; L->ep_other0=other_now;
+                        uint64_t t0=now_us();
                         fprintf(stderr,"[txd] L%d EPISODE start t=%llu q=%d\n",i,(unsigned long long)nowm,sn[i].qd);
+                        logw_note(t0);   /* this write lands mid-stall — see g_logw_* */
                     }
                 } else if(L->ep_start){
                     /* RX-continuity verdict for the stall window: rx = this pad's
@@ -2279,27 +2557,24 @@ int main(int argc,char**argv){
                      * alive = this link's RF; both dead = radio-global.
                      * "(idle)" = the demand gate ended it, i.e. the app stopped feeding
                      * mid-episode. Reported, never hidden, but NOT a link verdict. */
-                    fprintf(stderr,"[txd] L%d EPISODE end t=%llu dur=%dms rx=%llu orx=%llu%s\n",
+                    uint64_t t0=now_us();
+                    fprintf(stderr,"[txd] L%d EPISODE end t=%llu dur=%dms rx=%llu orx=%llu%s%s\n",
                             i,(unsigned long long)nowm,(int)(nowm-L->ep_start),
                             (unsigned long long)(sn[i].rx-L->ep_rx0),
                             (unsigned long long)(other_now-L->ep_other0),
-                            tx_demand?"":" (idle)");
+                            tx_demand?"":" (idle)",
+                            /* An injected episode ends only AFTER the hold is
+                             * released, so test the quiet window, not the hold. */
+                            now_us()<g_gap_quiet_until_us?" SYNTH":"");
+                    logw_note(t0);
                     L->ep_start=0;
                 }
-                /* Sub-episode gap histogram: the EPISODE lines only show >80ms, but a
-                 * 56ms DS5 buffer already underruns on 50-80ms NOCP gaps. Track the
-                 * high-watermark of each credit-starved stretch and bucket it when a
-                 * NOCP resets the gap. Loop wakes ~94/s in-session -> ~10ms res.
-                 * Same demand gate: an idle stretch would otherwise pile its whole
-                 * duration into gap80 the moment traffic resumes. */
-                uint64_t cur=(sn[i].have && sn[i].qd>0 && sn[i].ln && tx_demand)?(nowm-sn[i].ln):0;
-                if(cur>L->gap_hi) L->gap_hi=cur;
-                else if(L->gap_hi){
-                    if(L->gap_hi>=80) L->gap80++;
-                    else if(L->gap_hi>=50) L->gap50++;
-                    else if(L->gap_hi>=30) L->gap30++;
-                    L->gap_hi=0;
-                }
+                /* (The sub-episode gap histogram used to be derived HERE, as a
+                 * high-watermark of (nowm - last_nocp) sampled once per wakeup. It
+                 * now lives in the capture thread's NOCP handler at native rate —
+                 * see the gap30/50/80 field comment. Sampling it from this loop was
+                 * quantized to the datagram cadence, which the batched 0x39 halved
+                 * to ~47/s = ~21ms per bucket.) */
             }
         }
         if(ufd>=0 && (pfd[0].revents&POLLIN)){
@@ -2445,27 +2720,52 @@ int main(int argc,char**argv){
                 }
 
                 int idx=(int)(L-g_links);
-                L->last_demand=now_ms();   /* stamp BEFORE process_report: demand exists even
-                                              when the report is then paced away or blocked */
+                /* stamp BEFORE process_report: demand exists even when the report is
+                 * then paced away or blocked. Relaxed atomic because the capture
+                 * thread's NOCP gap gate reads it (see the field comment). */
+                __atomic_store_n(&L->last_demand,now_ms(),__ATOMIC_RELAXED);
                 process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);
             }
         }
         if(now_ms()-last_log>10000){
-            char links[MAX_LINKS*160]; int lo=0; links[0]='\0';
+            /* LEDGER FORMAT RULE: everything that existed here keeps its exact
+             * spelling and position — `gaps=g30/g50/g80` above all. Every A/B
+             * baseline in this project is a re-parse of these lines, so new
+             * numbers are APPENDED, never substituted. (`gaps=` now counts at
+             * native NOCP resolution instead of the old ~21ms-quantized sampling,
+             * so it is not comparable across this build boundary — that is a
+             * measurement change to note in the ledger, not a format change.) */
+            char links[MAX_LINKS*224]; int lo=0; links[0]='\0';
             for(int i=0;i<MAX_LINKS;i++){
                 struct ds5_link *L=&g_links[i];
                 if(!L->ever_bound) continue;
                 const uint8_t*a=L->bound_addr;
+                /* Only present once the bench injector has actually been used, so
+                 * an ordinary session's line is byte-for-byte the old one plus the
+                 * new always-on fields. */
+                char synth[48]; synth[0]='\0';
+                if(L->gap_synth)
+                    snprintf(synth,sizeof synth," synth=%ld/%llums",
+                             L->gap_synth,(unsigned long long)L->gap_synth_ms);
                 lo+=snprintf(links+lo,sizeof links-lo,
-                    " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld",
+                    " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld"
+                    " gmax=%llu drops=%ld/%ld/%ld%s",
                     i,a[5],a[4],a[3],a[2],a[1],a[0],L->have,L->outstanding,L->rumble_fly,
-                    L->fifo_count,L->gap30,L->gap50,L->gap80);
+                    L->fifo_count,L->gap30,L->gap50,L->gap80,
+                    (unsigned long long)L->gap_max,
+                    L->drop_age,L->drop_ovf,L->drop_total-L->drop_age-L->drop_ovf,
+                    synth);
                 if(lo>=(int)sizeof links) break;
             }
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d%s%s\n",
+            /* Measured too: this is the LONGEST single write the inject thread
+             * makes, so if stderr can block at all it shows here first. */
+            uint64_t t0=now_us();
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
+                (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
                 g_cmd_dead?" CMDDEAD":"", links);
+            logw_note(t0);
             last_log=now_ms();
         }
         /* Queue-telemetry publish (v9): every ~200ms of TRAFFIC (this loop only
@@ -2479,9 +2779,16 @@ int main(int argc,char**argv){
          * symlink planted in the jail tmp, and the reader never sees a half
          * record. A stale file after unbind stops advancing seq, which the app
          * treats as "nothing new". */
-        if(now_ms()-last_stat>200){
+        /* Freeze the record across a synthetic hold (+settle): the injected
+         * backlog would otherwise ride out as PACE_FEEDBACK and leave the host
+         * rate servo stretched for ~12s, biasing everything measured after it.
+         * A non-advancing seq is already the app's "nothing new" signal, so this
+         * needs no app-side change. */
+        if(now_ms()-last_stat>200 && now_us()>=g_gap_quiet_until_us){
             last_stat=now_ms();
-            struct { int eb; uint8_t valid,q,fifo; uint8_t addr[6]; uint32_t inj,drop; } st[MAX_LINKS];
+            struct { int eb; uint8_t valid,q,fifo; uint8_t addr[6]; uint32_t inj,drop;
+                     uint16_t g50,g80,flush,nage,dage,dovf; } st[MAX_LINKS];
+            uint64_t stnow=now_ms();
             pthread_mutex_lock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
                 struct ds5_link *L=&g_links[i];
@@ -2495,15 +2802,36 @@ int main(int argc,char**argv){
                  * host servo treats drop_total deltas as THIS pad's losses. */
                 st[i].inj=(uint32_t)L->inj_total;
                 st[i].drop=(uint32_t)L->drop_total;
+                /* v2 fields. All are WRAPPING u16 counters — readers must use
+                 * wrapping deltas, exactly like the u32s above. The gap bins are
+                 * what finally lets the app arm on the stalls it cannot see
+                 * itself: they happen BELOW the app, so its own PLC/fill counters
+                 * stay at zero through every episode. */
+                st[i].g50=(uint16_t)L->gap50; st[i].g80=(uint16_t)L->gap80;
+                st[i].flush=(uint16_t)L->flush_events;
+                st[i].dage=(uint16_t)L->drop_age; st[i].dovf=(uint16_t)L->drop_ovf;
+                /* Age of the credit window's silence, right now: the one field
+                 * that reports a stall IN PROGRESS rather than after it ended. */
+                uint64_t na=(L->last_nocp && stnow>L->last_nocp)?(stnow-L->last_nocp):0;
+                st[i].nage=(uint16_t)(na>65535?65535:na);
             }
             pthread_mutex_unlock(&g_lock);
             stat_seq++;
             int mq=inject_maxq(), fc_cap=inject_fifo();
             for(int i=0;i<MAX_LINKS;i++){
                 if(!st[i].eb || !st[i].valid) continue;   /* publish only live links */
-                uint8_t rec[24];
+                /* DS5Q v2 (36 B). The first 24 bytes are BYTE-IDENTICAL to v1 and
+                 * keep their meaning: a v1 reader that checks `rec[4]==1` simply
+                 * stops parsing (it sees v2 and skips the tick), and a v2 reader
+                 * accepts both. That matters more than usual here — daemon and app
+                 * ship in separate trees and can be deployed out of step, and a
+                 * silently mis-parsed record would take PACE_FEEDBACK down with it,
+                 * dropping the host servo to its blind fallback with no counter
+                 * anywhere showing why. */
+                uint8_t rec[36];
+                memset(rec,0,sizeof rec);
                 rec[0]='D';rec[1]='S';rec[2]='5';rec[3]='Q';
-                rec[4]=1; rec[5]=st[i].valid; rec[6]=st[i].q; rec[7]=st[i].fifo;
+                rec[4]=2; rec[5]=st[i].valid; rec[6]=st[i].q; rec[7]=st[i].fifo;
                 rec[8]=(uint8_t)(mq&0xff); rec[9]=(uint8_t)((mq>>8)&0xff);
                 rec[10]=(uint8_t)(fc_cap&0xff); rec[11]=(uint8_t)((fc_cap>>8)&0xff);
                 uint32_t v=st[i].inj;
@@ -2512,10 +2840,17 @@ int main(int argc,char**argv){
                 rec[16]=v&0xff; rec[17]=(v>>8)&0xff; rec[18]=(v>>16)&0xff; rec[19]=(v>>24)&0xff;
                 v=stat_seq;
                 rec[20]=v&0xff; rec[21]=(v>>8)&0xff; rec[22]=(v>>16)&0xff; rec[23]=(v>>24)&0xff;
+                /* --- v2 tail --- */
+                rec[24]=st[i].g50&0xff;   rec[25]=(st[i].g50>>8)&0xff;    /* NOCP gaps 50-79ms */
+                rec[26]=st[i].g80&0xff;   rec[27]=(st[i].g80>>8)&0xff;    /* NOCP gaps >=80ms  */
+                rec[28]=st[i].flush&0xff; rec[29]=(st[i].flush>>8)&0xff;  /* controller flushes */
+                rec[30]=st[i].nage&0xff;  rec[31]=(st[i].nage>>8)&0xff;   /* current NOCP silence, ms */
+                rec[32]=st[i].dage&0xff;  rec[33]=(st[i].dage>>8)&0xff;   /* drops: intended age-out */
+                rec[34]=st[i].dovf&0xff;  rec[35]=(st[i].dovf>>8)&0xff;   /* drops: FIFO overflow */
                 char p[600], p2[620];
                 per_addr_path(p,sizeof p,st[i].addr);
                 snprintf(p2,sizeof p2,"%s.st",p);
-                write_record_atomic(p2,rec,24);
+                write_record_atomic(p2,rec,sizeof rec);
             }
         }
     }

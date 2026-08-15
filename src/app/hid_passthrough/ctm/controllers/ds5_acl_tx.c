@@ -345,13 +345,22 @@ int ds5_acl_tx_qstats(ds5_acl_tx_t *t, ds5_acl_qstats_t *out)
     if (fd < 0) {
         return 0;
     }
-    uint8_t rec[24];
+    /* Version-TOLERANT parse. The daemon and this app live in separate trees and
+     * are deployed separately, so they WILL run out of step across an upgrade.
+     * The v2 record keeps its first 24 bytes byte-identical to v1 for exactly
+     * that reason: accept any version we know, parse the common prefix, and take
+     * the tail only when it is really there. Rejecting an unknown version here
+     * would silently stop PACE_FEEDBACK and drop the host rate servo to its blind
+     * fallback with no counter anywhere showing why. */
+    uint8_t rec[36];
+    memset(rec, 0, sizeof rec);
     ssize_t n = read(fd, rec, sizeof rec);
     close(fd);
-    if (n != 24 || rec[0] != 'D' || rec[1] != 'S' || rec[2] != '5' || rec[3] != 'Q' ||
-        rec[4] != 1) {
+    if (n < 24 || rec[0] != 'D' || rec[1] != 'S' || rec[2] != '5' || rec[3] != 'Q' ||
+        rec[4] < 1 || rec[4] > 2) {
         return 0;
     }
+    out->ver         = rec[4];
     out->valid       = rec[5];
     out->outstanding = rec[6];
     out->fifo_count  = rec[7];
@@ -363,6 +372,20 @@ int ds5_acl_tx_qstats(ds5_acl_tx_t *t, ds5_acl_qstats_t *out)
                        ((uint32_t)rec[18] << 16) | ((uint32_t)rec[19] << 24);
     out->seq         = (uint32_t)rec[20] | ((uint32_t)rec[21] << 8) |
                        ((uint32_t)rec[22] << 16) | ((uint32_t)rec[23] << 24);
+    out->gap50_events = 0;
+    out->gap80_events = 0;
+    out->flush_events = 0;
+    out->nocp_age_ms  = 0;
+    out->drop_age     = 0;
+    out->drop_ovf     = 0;
+    if (out->ver >= 2 && n >= 36) {
+        out->gap50_events = (uint16_t)(rec[24] | (rec[25] << 8));
+        out->gap80_events = (uint16_t)(rec[26] | (rec[27] << 8));
+        out->flush_events = (uint16_t)(rec[28] | (rec[29] << 8));
+        out->nocp_age_ms  = (uint16_t)(rec[30] | (rec[31] << 8));
+        out->drop_age     = (uint16_t)(rec[32] | (rec[33] << 8));
+        out->drop_ovf     = (uint16_t)(rec[34] | (rec[35] << 8));
+    }
     return out->valid ? 1 : 0;
 }
 

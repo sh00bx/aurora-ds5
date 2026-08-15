@@ -146,6 +146,10 @@ struct ctm_controller {
                                   * ctm_controller_adapt_latency_ms() */
     uint64_t adapt_hot_until_us;
     uint64_t adapt_slew_next_us;
+    /* Last effective pad-buffer value we stamped into an outbound report
+     * (slider + adapt add, after the 1..255 clamp). Logged on CHANGE only —
+     * see ctm_controller_note_b_eff. Pump-thread only. */
+    unsigned b_eff_last;
     /* Diagnostic: host->TV OUTPUT_REPORT arrival pattern (HOL-blocking probe).
      * The agent sends ALL its output (0x36 haptics, 0x31 rumble, feature
      * replies) RELIABLE on ONE ENet channel, so a WiFi loss stalls every later
@@ -785,6 +789,30 @@ static int audio_synth_write_cb(void *ctx, const uint8_t *data, size_t len)
 uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c)
 {
     return c ? __atomic_load_n(&c->adapt_lat_add_ms, __ATOMIC_RELAXED) : 0;
+}
+
+/* Record the EFFECTIVE pad-buffer value (B_eff) whenever it moves.
+ *
+ * This closes a plain instrumentation hole: the value the pad is actually told
+ * to buffer lives only in memory (settings.latency_ms plus the adaptive add) and
+ * is patched into the 0x91 block of every outbound report — so after the fact
+ * NOTHING in any log said what B the session had actually run at. Every A/B in
+ * this area is a comparison against the underrun rule "gap > B + 21.33ms", which
+ * is unusable without a B timeline: a slider nudged mid-session silently
+ * invalidates the whole slice, and an adaptive add would do the same
+ * automatically. One line per change is enough — the value is otherwise stamped
+ * ~47 times a second.
+ *
+ * Called from the patch hook on the pump thread, which is the only writer of
+ * b_eff_last, so no locking is needed. */
+void ctm_controller_note_b_eff(ctm_controller_t *c, unsigned b_eff,
+                               unsigned slider, unsigned adapt_add)
+{
+    if (!c || c->b_eff_last == b_eff) return;
+    unsigned prev = c->b_eff_last;
+    c->b_eff_last = b_eff;
+    ctm_ctl_log(c, "B_eff %u -> %u ms (slider %u + adapt %u)",
+                prev, b_eff, slider, adapt_add);
 }
 
 /* Primary input thread: blocking-poll the bridged hidraw node and forward what

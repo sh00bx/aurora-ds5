@@ -168,6 +168,12 @@ void ctm_controller_get_settings(ctm_controller_t *c, tv_bridge_worker_settings_
  * latency slider right now (0 when the link is clean or the feature is off).
  * Read by the DS5 patch_output hook per outbound report. */
 uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c);
+/* Log the effective pad-buffer value (slider + adapt, post-clamp) when it moves.
+ * Without this timeline no A/B against the "gap > B_eff + 21.33ms" underrun rule
+ * is reconstructable after the fact. Call from the patch hook; logs on change
+ * only. Pump thread only. */
+void ctm_controller_note_b_eff(ctm_controller_t *c, unsigned b_eff,
+                               unsigned slider, unsigned adapt_add);
 void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out);
 /* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
 bool ctm_controller_finished(ctm_controller_t *c);

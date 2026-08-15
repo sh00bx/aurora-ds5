@@ -68,6 +68,30 @@ typedef struct {
     uint32_t inj_total;    /* daemon lifetime counters (monotonic) */
     uint32_t drop_total;
     uint32_t seq;          /* advances per daemon write; stale file = frozen seq */
+    /* ---- v2 (daemon >= 2026-08-15). All zero when the daemon still writes v1,
+     * so a caller may read them unconditionally; check `ver >= 2` before giving
+     * a zero any meaning.
+     *
+     * These exist because the app is STRUCTURALLY BLIND to the stalls that
+     * matter: they happen below it, on the controller's credit window, after the
+     * report has already left ctm_hid_io_write. Its own PLC/fill counters stay at
+     * zero through every episode (measured 2026-08-15), so nothing app-side can
+     * arm on them. The gap bins are the daemon telling us what it alone can see.
+     *
+     * The u16 counters WRAP — always compare with wrapping deltas, never with >.
+     *
+     * 🚨 There is NO zero-daemon-change substitute for these: a frozen `seq` does
+     * NOT mean "credits stalled". The daemon bumps seq every ~200ms of TRAFFIC on
+     * a datagram-clocked loop, and during a NOCP stall the app keeps sending, so
+     * the loop keeps waking and seq keeps advancing. Frozen seq means "the app
+     * stopped sending, or the daemon died" — a different signal entirely. */
+    uint8_t  ver;            /* record version actually parsed (1 or 2) */
+    uint16_t gap50_events;   /* NOCP gaps 50-79ms, native resolution */
+    uint16_t gap80_events;   /* NOCP gaps >=80ms — the audible band at B=60 */
+    uint16_t flush_events;   /* controller auto-flushes (0 until 0x0C28 ships) */
+    uint16_t nocp_age_ms;    /* credit silence RIGHT NOW: a stall in progress */
+    uint16_t drop_age;       /* of drop_total: intended staleness age-out */
+    uint16_t drop_ovf;       /* of drop_total: FIFO overflow (could not keep up) */
 } ds5_acl_qstats_t;
 
 /* Read the daemon's queue-stats record. 1 = valid record read, 0 = none/invalid
