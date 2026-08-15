@@ -657,6 +657,13 @@ struct ds5_link {
     uint8_t  txtype[TXRING]; /* 1 = rumble (0x31/0x32), 0 = audio (0x36/0x39) */
     int      tx_head, tx_cnt;
     int      rumble_fly;     /* believed-in-flight rumble packets */
+    /* L4 ghost accounting: packets the stall backstop WROTE OFF while the
+     * controller may still have been holding them. Their NOCPs arrive later and
+     * would otherwise free credits for packets we already stopped counting. */
+    int      ghost;          /* written-off packets still awaiting their late NOCPs */
+    uint64_t ghost_ts;       /* when the write-off happened (TTL base) */
+    long     ghost_absorbed; /* lifetime: late credits correctly consumed by ghosts */
+    long     ghost_expired;  /* lifetime: ghosts that never came back (genuinely lost) */
     /* audio elastic FIFO (inject) — see inject_fifo() */
     struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; uint64_t ts; } fifo[FIFO_MAX];
     int      fifo_head, fifo_count;
@@ -914,6 +921,7 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
                                                  * from an assert-sourced htab entry stays
                                                  * assert_learned even across idle-flaps */
     L->outstanding=0; L->last_nocp=now_ms(); txwin_reset(L);
+    L->ghost=0;                 /* a fresh connection cannot owe credits for the old one */
     L->last_seen=now_ms();
     L->session_seen=now_ms();   /* a bind only happens off on-air HID-output = a session */
 }
@@ -929,6 +937,39 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
 static volatile int g_lmp_nonflush = -1;
 static volatile int g_flush_confirmed_ms = 0;
 static volatile int g_flush_readback_pending = 0;
+
+/* ---- L4: ghost in-flight accounting ---------------------------------------
+ *
+ * The stall backstop presumes a link's outstanding packets lost once credits
+ * have stopped for STALL_RESET_MS, zeroes `outstanding` and resumes injecting.
+ * That is right when the link really flapped and wrong when the controller was
+ * merely slow: it still holds those packets, and their NOCPs arrive later. Each
+ * such late credit then decrements an `outstanding` that no longer counts them
+ * and pops a ring entry belonging to a NEWER packet — so right after every
+ * blackout we believe we have more credit than we do and over-inject into a
+ * controller that is still draining. That transient burst is the mechanism that
+ * seeds the follower stalls in a cluster.
+ *
+ * Ghost accounting closes it: the written-off count is remembered, and the
+ * credits that arrive afterwards pay the ghosts down FIRST. Only what is left
+ * over frees real credit.
+ *
+ * The TTL is not a tuning knob, it is a safety bound, and both directions are
+ * failure modes. Too short and late credits go back to freeing new packets —
+ * the bug we are fixing. Unbounded and a ghost that genuinely never returns
+ * absorbs credits forever, permanently shrinking the window of a daemon that
+ * never restarts, until injection stops entirely: session-fatal. So ghosts
+ * expire, comfortably above STALL_RESET_MS (the window that justified writing
+ * them off) and comfortably above the observed blackout tail (p90 ~500ms,
+ * longest real episode seen 2.2s).
+ *
+ * Default OFF: this changes injection behaviour after every blackout, and it
+ * ships untested. Arm with `echo 1000 > /tmp/ds5_ghost_ttl_ms` (root-owned).
+ * Refreshed by the capture thread only (function-static cache); inject_one and
+ * the NOCP handler read the published snapshot. */
+#define GHOST_TTL_MIN_MS  200    /* must exceed STALL_RESET_MS to be worth anything */
+#define GHOST_TTL_MAX_MS 5000
+static volatile int g_ghost_ttl_ms = 0;
 /* Published copy of the operator toggle. flush_ms_want() keeps function-static
  * cache state and is therefore CAPTURE-THREAD-ONLY; the inject thread's 10s
  * ledger line reads this snapshot instead of calling it, so the two threads
@@ -1014,6 +1055,16 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
             int held = gap_hold_active();
             int blocked = held || L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap);
             if(!held && blocked && L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
+                /* Remember what we are abandoning, so the credits for these
+                 * packets cannot later be spent on newer ones. Capped at the
+                 * ring size: more cannot physically be in flight, and an
+                 * uncapped accumulation across repeated write-offs during one
+                 * long blackout would absorb credits well past the real debt. */
+                if(g_ghost_ttl_ms>0 && L->outstanding>0){
+                    int g=L->ghost+L->outstanding;
+                    L->ghost = g>TXRING ? TXRING : g;
+                    L->ghost_ts=now_ms();
+                }
                 L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
                 L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
                 blocked=0;
@@ -1296,6 +1347,23 @@ static int flush_ms_want(void){
         g_flush_want=v;   /* publish for the inject thread's ledger line */
     }
     return v;
+}
+
+/* CAPTURE-THREAD-ONLY (function-static cache), publishes g_ghost_ttl_ms. */
+static void ghost_ttl_refresh(void){
+    static uint64_t last=0; static int warned=0, badwarn=0;
+    uint64_t n=now_us();
+    if(last && n-last<=1000000ull) return;
+    last=n;
+    int r=read_root_int("/tmp/ds5_ghost_ttl_ms",&warned);
+    if(r<0 || r==0) g_ghost_ttl_ms=0;                     /* absent/0 = off */
+    else if(r>=GHOST_TTL_MIN_MS && r<=GHOST_TTL_MAX_MS){ g_ghost_ttl_ms=r; badwarn=0; }
+    else if(!badwarn){
+        badwarn=1;
+        fprintf(stderr,"[txd] ignoring /tmp/ds5_ghost_ttl_ms=%d: outside %d..%d ms "
+                       "(below the floor it cannot outlive the write-off it corrects)\n",
+                r,GHOST_TTL_MIN_MS,GHOST_TTL_MAX_MS);
+    }
 }
 
 static int send_auto_flush(uint16_t handle, int ms){
@@ -1918,6 +1986,25 @@ static void handle_hci_event(const uint8_t *e, int el){
                     }
                 }
             }
+            /* Late credits settle the written-off debt before they free
+             * anything new. Expiry is evaluated here rather than on a timer:
+             * this is the only place ghosts can be observed, and an expired
+             * ghost must not silently keep absorbing. */
+            int ttl=g_ghost_ttl_ms;
+            if(L->ghost>0){
+                /* ghost_ts is stamped by the INJECT thread, nowm read by this
+                 * one; if that ordering ever put ghost_ts marginally ahead, an
+                 * unsigned subtraction would wrap to "ancient" and expire the
+                 * ghosts. Compare explicitly — and note the wrap direction was
+                 * already the safe one (fall back to old behaviour), so this is
+                 * about not lying in the counters. */
+                if(ttl<=0 || (nowm>L->ghost_ts && nowm-L->ghost_ts>(uint64_t)ttl)){
+                    L->ghost_expired+=L->ghost; L->ghost=0;   /* genuinely lost after all */
+                } else {
+                    int use = cnt<L->ghost ? cnt : L->ghost;
+                    L->ghost-=use; cnt-=use; L->ghost_absorbed+=use;
+                }
+            }
             L->outstanding-=cnt; if(L->outstanding<0) L->outstanding=0;
             txwin_pop(L,cnt);   /* FIFO-approximate the per-type in-flight counts */
             /* Credits just freed: if this link is holding audio, wake the main
@@ -2042,6 +2129,18 @@ static void *capture_thread(void *arg){
         int lb[MAX_LINKS], pin[MAX_LINKS]; uint16_t lh[MAX_LINKS]; uint8_t md[MAX_LINKS];
         pthread_mutex_lock(&g_lock);
         for(int i=0;i<MAX_LINKS;i++){
+            /* Ghosts also expire without traffic. The NOCP path can only retire
+             * them when a credit actually arrives, so a link that goes quiet
+             * after a write-off would keep showing a stale live count — and
+             * "ghost back to 0 after every episode" is the acceptance criterion
+             * for this whole mechanism. A counter that cannot be trusted to
+             * drain cannot serve as that check. */
+            {   int gttl=g_ghost_ttl_ms; uint64_t tnow=now_ms();
+                struct ds5_link *G=&g_links[i];
+                if(G->ghost>0 && (gttl<=0 || (tnow>G->ghost_ts && tnow-G->ghost_ts>(uint64_t)gttl))){
+                    G->ghost_expired+=G->ghost; G->ghost=0;
+                }
+            }
             if(g_links[i].have && now_ms()-g_links[i].last_seen>IDLE_INVALIDATE_MS){
                 g_links[i].have=0; idle_inval=1;
             }
@@ -2091,6 +2190,7 @@ static void *capture_thread(void *arg){
          * bind (handle change) and refresh every 10s while bound; never more often
          * than every 3s so a flap storm cannot flood the 0.5/s kernel drain (bursts
          * beyond that are additionally absorbed by cmd_send's unacked-queue cap). */
+        ghost_ttl_refresh();   /* capture-thread-only reader; publishes g_ghost_ttl_ms */
         for(int i=0;i<MAX_LINKS;i++){
             struct ds5_link *L=&g_links[i];
             if(pin[i]){
@@ -2947,11 +3047,16 @@ int main(int argc,char**argv){
                              L->gap_synth,(unsigned long long)L->gap_synth_ms);
                 lo+=snprintf(links+lo,sizeof links-lo,
                     " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld"
-                    " gmax=%llu drops=%ld/%ld/%ld%s",
+                    " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s",
                     i,a[5],a[4],a[3],a[2],a[1],a[0],L->have,L->outstanding,L->rumble_fly,
                     L->fifo_count,L->gap30,L->gap50,L->gap80,
                     (unsigned long long)L->gap_max,
                     L->drop_age,L->drop_ovf,L->drop_total-L->drop_age-L->drop_ovf,
+                    /* live / absorbed / expired. `live` must return to 0 after
+                     * every episode — a live count that never drains is the
+                     * session-fatal leak the TTL exists to prevent, and this is
+                     * where it would show. */
+                    L->ghost,L->ghost_absorbed,L->ghost_expired,
                     synth);
                 if(lo>=(int)sizeof links) break;
             }
