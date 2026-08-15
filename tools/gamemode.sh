@@ -144,44 +144,6 @@ boost_game() {
 	[ "$rrok" -eq 0 ] && log "  (kernel refused SCHED_RR - relying on renice -10)"
 }
 
-# ds5_txd's inject loop is the last hop before the air: it services the pad's
-# NOCP credits at ~94/s, and any stretch it is descheduled for underruns the
-# controller's audio buffer. Measured 2026-08-15 over a 48min session: 4.2
-# stalls/min of >=80ms and 41.3/min of 50-79ms, and the daemon's own classifier
-# called 190 of 193 of them TX-scheduling rather than RF.
-#
-# The daemon asks for SCHED_FIFO 14 at startup and gets it -- and then ds5-tmpld.sh
-# deliberately takes it away again ("so neither thread hurts the CTM usbip input
-# thread ... normal policy so it never preempts the input thread"). That was
-# correct when it was written: the client's in-app SCHED_RR patch failed EPERM, so
-# the input thread really was SCHED_OTHER and an RT daemon would have preempted it.
-# It stopped being correct the day boost_game started putting every aurora thread
-# on RR 20 from here -- FIFO 14 cannot preempt RR 20. So we restore the daemon's
-# own intent, but only inside a game session and only while we also hold the client
-# above it. Outside a session the supervisor's conservative setting stands.
-#
-# ONLY the main thread. ds5-cap wakes ~420/s on the HCI monitor and the supervisor
-# parks it at nice 19 on purpose; putting that on RT is the very thing its comment
-# warns about. Same for the LG library threads (tLibSystrim/tFragmentation).
-boost_txd() {
-	tp=$(pidof ds5_txd 2>/dev/null | tr ' ' '\n' | sort -n | head -1)
-	[ -z "$tp" ] && { log "ds5_txd not running - skip boost"; return; }
-	if chrt -f -p 14 "$tp" >/dev/null 2>&1; then
-		log "ds5_txd pid=$tp: main thread SCHED_FIFO 14 (workers left at the supervisor's nice)"
-	else
-		log "ds5_txd pid=$tp: kernel refused SCHED_FIFO - staying on the supervisor's nice -5"
-	fi
-}
-
-# Hand the main thread back to the supervisor's setting (SCHED_OTHER nice -5).
-restore_txd() {
-	tp=$(pidof ds5_txd 2>/dev/null | tr ' ' '\n' | sort -n | head -1)
-	[ -z "$tp" ] && return
-	chrt -o -p 0 "$tp" >/dev/null 2>&1
-	renice -n -5 -p "$tp" >/dev/null 2>&1
-	log "ds5_txd pid=$tp: restored SCHED_OTHER nice -5"
-}
-
 restore_game() {
 	mp=$(game_pid)
 	[ -z "$mp" ] && return
@@ -282,7 +244,6 @@ on)
 	# restarted. The RAM it reclaimed is cold/parked swap that wasn't hurting
 	# latency anyway. Not worth the risk. (Function kept below, unused.)
 	boost_game
-	boost_txd
 	tame_quickset
 	free -m | awk '/Mem:/{print "[gamemode] mem: "$4"MB free, "$7"MB avail"} /Swap:/{print "[gamemode] swap: "$3"MB used"}'
 	log "on: done"
@@ -293,13 +254,11 @@ enforce)
 	quiet_p2p >/dev/null 2>&1
 	pin_cpus >/dev/null 2>&1
 	boost_game >/dev/null 2>&1
-	boost_txd >/dev/null 2>&1
 	tame_quickset >/dev/null 2>&1
 	;;
 off)
 	log "=== GAME MODE OFF ==="
 	restore_game
-	restore_txd
 	restore_quickset
 	start_services
 	unpin_cpus
