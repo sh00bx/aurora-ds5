@@ -170,6 +170,24 @@ class Run:
         act = self.active_seconds
         return [g for g in self.gaps if int(g["t"]) in act or int(g["t"]) - 1 in act]
 
+    @staticmethod
+    def split_audio(gaps):
+        """Separate gaps that starved AUDIO from gaps with nothing to send.
+
+        Measured 2026-08-15: a third of the >=80ms events, and TWO THIRDS of the
+        >=80ms time, were ~5s windows carrying no audio at all — one 0x31
+        heartbeat out, pad input flowing normally, outstanding stuck at 1-2. The
+        credit clock keeps running while the link is audio-idle, so the gate
+        "outstanding > 0" alone counts silence as starvation. Nothing can
+        underrun when nothing is being sent.
+
+        This is safe to gate on precisely because the window is never full
+        (observed outstanding 0-4 against maxq=12, daemon fifo=0 in 71/71
+        samples): audio that existed WOULD have gone out, so no audio on the
+        wire means no audio to send, not audio blocked behind credits."""
+        return ([g for g in gaps if g["tx36"] + g["tx39"] > 0],
+                [g for g in gaps if g["tx36"] + g["tx39"] == 0])
+
     def baseline_rates(self):
         a = self.active
         if not a:
@@ -218,12 +236,24 @@ def report_run(r, verbose):
     # ---- gap ledger, activity-filtered, as rates ------------------------
     per_min = 60.0 / max(1.0, float(len(act)))
     counts = Counter(band(g["gap"]) for g in ag)
+    aud, silent = r.split_audio(ag)
+    ca, cs = Counter(band(g["gap"]) for g in aud), Counter(band(g["gap"]) for g in silent)
     print(f"\n   ── gaps (monitor ground truth, active-filtered) ──")
+    print(f"      {'band':>6}  {'AUDIO starved':>14}   {'silent (nothing to send)':>26}")
     for b in BANDS:
-        print(f"      {b:>6}  {counts[b] * per_min:7.1f}/min   (n={counts[b]})")
-    if ag:
-        mx = max(g["gap"] for g in ag)
-        print(f"      max     {mx} ms")
+        st = sum(g["gap"] for g in silent if band(g["gap"]) == b) / 1000.0
+        print(f"      {b:>6}  {ca[b] * per_min:7.1f}/min n={ca[b]:<5d}"
+              f"{cs[b] * per_min:9.1f}/min n={cs[b]:<5d} ({st:.0f}s)")
+    if aud:
+        print(f"      max (audio-starved) {max(g['gap'] for g in aud)} ms"
+              + (f" · max silent {max(g['gap'] for g in silent)} ms" if silent else ""))
+    if cs["≥80"]:
+        share = 100.0 * sum(g["gap"] for g in silent if g["gap"] >= 80) / max(
+            1.0, sum(g["gap"] for g in ag if g["gap"] >= 80))
+        print(f"      ⚠ {cs['≥80']} of {counts['≥80']} ≥80ms events carried NO audio "
+              f"— {share:.0f}% of the ≥80 TIME. Nothing can underrun there;")
+        print(f"        the credit clock simply keeps running while the link is audio-idle."
+              f"\n        The daemon's own gaps= counter does NOT make this distinction either.")
 
     # ---- 2.4 role -------------------------------------------------------
     print(f"\n   ── 2.4 role ──")
@@ -244,8 +274,12 @@ def report_run(r, verbose):
         print("      Fix: start ds5_phase2_run.sh BEFORE switching the pad on.")
 
     # ---- 2.3 / 2.5 in-gap traffic --------------------------------------
-    ing, gsecs = r.in_gap_rates(ag)
-    print(f"\n   ── 2.3 / 2.5 in-gap airtime  ({gsecs:.1f}s pooled across {len(ag)} gaps) ──")
+    # Silent gaps are excluded here: they contain exactly one 0x31 heartbeat by
+    # construction, which would show up as "0x31 is elevated during starvation"
+    # — a pure artefact of the wrong denominator.
+    ing, gsecs = r.in_gap_rates(aud)
+    print(f"\n   ── 2.3 / 2.5 in-gap airtime  ({gsecs:.1f}s pooled across {len(aud)} "
+          f"AUDIO-starved gaps; {len(silent)} silent gaps excluded) ──")
     if ing:
         print(f"      0x31 out   {fmt_ratio(ing['tx31'], base['tx31'])}   ← 2.3 (X4)")
         print(f"      pad rx     {fmt_ratio(ing['rx'], base['rx'])}")
@@ -255,7 +289,7 @@ def report_run(r, verbose):
         # Per-band, because the tail is where the audible damage is
         print(f"      by band (0x31 out /s · LE+other /s):")
         for b in BANDS:
-            sub = [g for g in ag if band(g["gap"]) == b]
+            sub = [g for g in aud if band(g["gap"]) == b]
             sr, st = r.in_gap_rates(sub)
             if sr:
                 print(f"        {b:>6}  n={len(sub):4d}  {st:6.1f}s   "
@@ -264,11 +298,19 @@ def report_run(r, verbose):
         # (~300/min) and would drown any tail signal in a pooled ratio; the ≥80
         # band is the one that is actually audible, and it is where a real
         # mechanism has to show up. Pool only when the tail is too thin to read.
-        tail = [g for g in ag if g["gap"] >= 80]
+        tail = [g for g in aud if g["gap"] >= 80]
         tr, tsecs = r.in_gap_rates(tail)
         TAIL_MIN_N = 8
 
         def verdict(name, ing_pooled, ing_tail, base_rate, yes, no, maybe):
+            if base_rate <= 0.001 and ing_pooled <= 0.001:
+                # Absence of the thing is not evidence about its timing. Saying
+                # "flat" here would dress a vacuous question as an answer.
+                print(f"\n      ⇒ {name}: NOT APPLICABLE — zero such traffic anywhere in this "
+                      f"capture,\n         inside the gaps or outside. Exonerated by absence for "
+                      f"THIS session's conditions only;\n         a session where the source is "
+                      f"actually active is a different measurement.")
+                return
             pooled = ing_pooled / base_rate if base_rate > 0.001 else 0
             if ing_tail is not None and len(tail) >= TAIL_MIN_N:
                 v, src = (ing_tail / base_rate if base_rate > 0.001 else 0), f"≥80 band, n={len(tail)}"
@@ -312,11 +354,21 @@ def report_run(r, verbose):
                   f"{d80 * per_min:6.1f} per min   gmax={b['gmax']}ms  "
                   f"drops age/ovf/oth = {int(b['dage']) - int(a['dage'])}/"
                   f"{int(b['dovf']) - int(a['dovf'])}/{int(b['doth']) - int(a['doth'])}")
-            print(f"      L{slot} monitor {counts['30-49'] * per_min:7.1f} / "
-                  f"{counts['50-79'] * per_min:7.1f} / {counts['≥80'] * per_min:6.1f} per min")
-            print("           (the two ledgers gate starvation identically; a large "
-                  "divergence means the\n            daemon's capture thread is missing "
-                  "NOCPs — i.e. it is being starved of CPU itself.)")
+            # The daemon counter spans the whole window and is NOT activity-
+            # filtered, so it must be compared against the unfiltered monitor
+            # totals. Comparing it to the filtered rate manufactures a
+            # divergence that is only the filter.
+            allc = Counter(band(g["gap"]) for g in r.gaps)
+            print(f"      L{slot} daemon  counts {d30} / {d50} / {d80}   (whole window)")
+            print(f"      L{slot} monitor counts {allc['30-49']} / {allc['50-79']} / "
+                  f"{allc['≥80']}   (whole window, unfiltered)")
+            for lbl, dv, mv in (("30-49", d30, allc["30-49"]), ("50-79", d50, allc["50-79"]),
+                                ("≥80", d80, allc["≥80"])):
+                if mv or dv:
+                    print(f"           {lbl:>6} agreement {100.0 * min(dv, mv) / max(dv, mv, 1):5.1f}%")
+            print("           (independent readers of the same NOCP stream. A large divergence "
+                  "would mean the\n            daemon's capture thread is missing NOCPs — i.e. "
+                  "it is being starved of CPU itself.)")
         if r.episodes:
             ep = sorted(r.episodes)
             print(f"      EPISODEs n={len(ep)} median={ep[len(ep) // 2]}ms "
