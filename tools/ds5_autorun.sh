@@ -58,16 +58,23 @@ case "$LEVER" in
 esac
 
 MP=/proc/lg/pm/mp_enable
-cores_on(){
-    [ "$LEVER" = "cores" ] || return 0
+cores_pin(){
     [ -e "$MP" ] && echo 0 > "$MP" 2>/dev/null
     for c in 1 2 3; do echo 1 > "/sys/devices/system/cpu/cpu$c/online" 2>/dev/null; done
+    return 0
 }
-cores_off(){
+cores_unpin(){
     # The governor is handed back, not overridden the other way: hotplugging
     # cores down is this TV's own idle behaviour and is what the OFF arm is
     # supposed to measure.
     [ -e "$MP" ] && echo 1 > "$MP" 2>/dev/null
+    return 0
+}
+cores_on(){  [ "$LEVER" = "cores" ] && cores_pin; return 0; }
+cores_off(){
+    [ "$BG_PIN" = "1" ] && return 0          # parity condition outranks the arm
+    [ "$LEVER" = "cores" ] || return 0       # never touch a knob this run isn't using
+    cores_unpin
 }
 # How many cores are online right now: "0-1" -> 2, "0,2-3" -> 3.
 cores_now(){
@@ -75,8 +82,7 @@ cores_now(){
         /sys/devices/system/cpu/online 2>/dev/null
 }
 
-load_on(){
-    [ "$LEVER" = "wifi" ] || return 0
+load_start(){
     # Rate-limited to ~72 Mbit/s on purpose rather than saturating: that is the
     # order of the 4K60 + FEC stream the reference sessions carried on this same
     # radio, so the control reproduces production's load instead of inventing a
@@ -85,12 +91,14 @@ load_on(){
         >/dev/null 2>&1 </dev/null &
     echo $! > /tmp/ds5_autorun_load.pid
 }
-load_off(){
+load_stop(){
     [ -f /tmp/ds5_autorun_load.pid ] || return 0
     kill "$(cat /tmp/ds5_autorun_load.pid)" 2>/dev/null
     pkill -f "$LOAD_URL" 2>/dev/null
     rm -f /tmp/ds5_autorun_load.pid
 }
+load_on(){  [ "$LEVER" = "wifi" ] && load_start; return 0; }
+load_off(){ [ "$BG_LOAD" = "1" ] && return 0; load_stop; }
 
 # One lever at a time: the ledger cannot attribute a delta to two of them.
 # Lever state is DECLARED, never discovered: a knob left armed by a previous
@@ -112,9 +120,27 @@ if [ "$LEVER" = "cores" ] && ps ax 2>/dev/null | grep -q "[g]amemode.sh"; then
 fi
 pidof ds5_txd >/dev/null 2>&1 || { echo "REFUSING: ds5_txd is not running"; exit 1; }
 
+# Background conditions, held in BOTH arms for the whole run. Gameplay is never a
+# quiet TV: the guard pins the cores for the life of the client and the video
+# stream sits on the shared radio the whole time. A lever measured on an idle
+# machine is measured somewhere the game never goes.
+BG_LOAD="${BG_LOAD:-0}"     # hold the wlan0 load up in every block
+BG_PIN="${BG_PIN:-0}"       # hold cpu1-3 online in every block
+[ "$BG_LOAD" = "1" ] && [ "$LEVER" = "wifi" ] && \
+    { echo "REFUSING: BG_LOAD and lever=wifi are the same knob"; exit 1; }
+[ "$BG_PIN" = "1" ] && [ "$LEVER" = "cores" ] && \
+    { echo "REFUSING: BG_PIN and lever=cores are the same knob"; exit 1; }
+
 OUT="/tmp/autorun-$LEVER-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT" || exit 1
 say(){ echo "$(date '+%F %T') $*"; }
+
+# The conditions a run was taken under belong IN the run, not in whoever's memory
+# analyses it later. Two runs of "the same" lever an hour apart already differed
+# by a knob nobody wrote down.
+printf 'lever=%s blocks=%s block_s=%s b_ms=%s bg_load=%s bg_pin=%s\nstarted=%s\n' \
+    "$LEVER" "$BLOCKS" "$BLOCK" "$B_MS" "$BG_LOAD" "$BG_PIN" "$(date '+%F %T')" \
+    > "$OUT/conditions.txt"
 
 # Production parity: the supervisor's boot default is a SHALLOW audio FIFO (3);
 # the app deepens it to 10 against a rate-servo host, and every reference number
@@ -124,12 +150,15 @@ echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks ge
 
 cleanup(){
     [ -n "$TOG" ] && rm -f "$TOG"
-    load_off
-    cores_off
+    load_stop            # unconditional: background conditions end with the run
+    cores_unpin          # four hot cores on someone's TV is not a default
     kill "$RIG_PID" 2>/dev/null
-    say "cleanup: lever disarmed, load stopped, rig stopped"
+    say "cleanup: lever disarmed, load stopped, cores released, rig stopped"
 }
 trap 'cleanup; exit 130' INT TERM
+
+[ "$BG_LOAD" = "1" ] && { load_start; say "background: wlan0 load held up in BOTH arms"; }
+[ "$BG_PIN" = "1" ]  && { cores_pin;  say "background: cpu1-3 pinned online in BOTH arms"; }
 
 TOTAL=$(( BLOCKS * (BLOCK + GUARD) + 30 ))
 say "starting rig for ${TOTAL}s (B=$B_MS), $BLOCKS x ${BLOCK}s blocks, lever=$LEVER"
@@ -198,8 +227,8 @@ while [ "$i" -lt "$BLOCKS" ]; do
 done
 
 [ -n "$TOG" ] && rm -f "$TOG"
-load_off
-cores_off
+load_stop            # the background conditions end with the run, BG flags or not
+cores_unpin
 kill "$LEDGER_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
 cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
