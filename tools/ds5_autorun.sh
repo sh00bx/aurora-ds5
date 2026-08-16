@@ -103,9 +103,16 @@ while [ "$i" -lt "$BLOCKS" ]; do
     say "block $i/$BLOCKS arm=$ARM (guard ${GUARD}s, then ${BLOCK}s)"
     sleep "$GUARD"                      # the lever needs a reconcile pass to land
     S=$(date +%s)
+    RX0=$(awk '/wlan0/{print $2}' /proc/net/dev)
     sleep "$BLOCK"
     E=$(date +%s)
-    printf '%s\t%s\t%s\n' "$ARM" "$S" "$E" >> "$OUT/windows.tsv"
+    RX1=$(awk '/wlan0/{print $2}' /proc/net/dev)
+    # WiFi and bluetooth share the MT7921, so what else was on the air during a
+    # block belongs in the record rather than in hindsight: a run taken while the
+    # TV was streaming is not the same experiment as one taken on a quiet radio.
+    FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
+        "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" >> "$OUT/windows.tsv"
     kill -0 "$RIG_PID" 2>/dev/null || { say "rig died mid-run"; break; }
 done
 

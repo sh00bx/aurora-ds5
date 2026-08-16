@@ -43,8 +43,11 @@ def main(argv):
     for line in win_f.read_text().splitlines():
         if not line.strip():
             continue
-        arm, s, e = line.split("\t")
-        windows.append((arm, int(s) * 1000, int(e) * 1000))
+        f = line.split("\t")
+        arm, s, e = f[0], f[1], f[2]
+        wifi = int(f[3]) if len(f) > 3 else None
+        fg = f[4] if len(f) > 4 else None
+        windows.append((arm, int(s) * 1000, int(e) * 1000, wifi, fg))
     if not windows:
         print("no blocks recorded")
         return 1
@@ -77,8 +80,10 @@ def main(argv):
 
     EDGES = (60, 70, 80, 100)
     arms = {}
-    for arm, s, e in windows:
-        a = arms.setdefault(arm, {"secs": 0.0, **{k: 0 for k in EDGES}})
+    for arm, s, e, wifi, fg in windows:
+        a = arms.setdefault(arm, {"secs": 0.0, "wifi": [], **{k: 0 for k in EDGES}})
+        if wifi is not None:
+            a["wifi"].append(wifi)
         a["secs"] += (e - s) / 1000.0
         for ts, ms, _out in gaps:
             if s <= ts <= e:
@@ -86,8 +91,23 @@ def main(argv):
                     if ms >= k:
                         a[k] += 1
 
+    # A rebind zeroes the daemon's own histograms and starts a new binding; the
+    # gap log survives it, but a block that spans one was not one experiment.
+    ledger = d / "ledger.log"
+    if ledger.exists():
+        rebinds = sum(1 for l in ledger.read_text(errors="ignore").splitlines()
+                      if "template handle=" in l and "bound" in l)
+        if rebinds:
+            print(f"  !! {rebinds} rebind(s) during the run — the link flapped, "
+                  f"so blocks spanning one mix two bindings")
+
     print(f"\n{len(windows)} blocks: " + ", ".join(f"{a}={sum(1 for w in windows if w[0]==a)}"
                                                    for a in sorted(arms)))
+    for a in sorted(arms):
+        w = arms[a]["wifi"]
+        if w:
+            print(f"  {a}: wlan0 rx {min(w)}-{max(w)} kbit/s per block"
+                  + ("   (quiet radio)" if max(w) < 500 else "   (SHARED RADIO WAS BUSY)"))
     print(f"{'edge':>6} " + " ".join(f"{a:>18}" for a in sorted(arms)))
     for k in EDGES:
         row = f">={k:3d}ms "
