@@ -613,7 +613,7 @@ int main(int argc, char **argv) {
     uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0, last_app_check = t0;
     uint64_t sent = 0, send_err = 0, late = 0, late_us_max = 0;
     int      adj_us = 0;                    /* one-sided rate servo, see below   */
-    int      warned_drop = 0, warned_invalid = 0;
+    int      warned_drop = 0, warned_invalid = 0, warned_late = 0;
     uint32_t last_inj = s.inj;
     uint64_t last_sent_mark = 0;
     struct st s0 = s;
@@ -737,6 +737,18 @@ int main(int argc, char **argv) {
              * and resynchronise rather than sprinting to catch up. */
             late++;
             if (now - next > late_us_max) late_us_max = now - next;
+            /* 150 ms is not an arbitrary threshold: it is AUDIO_IDLE_MS in the
+             * daemon. A hiccup longer than that makes the daemon treat the pause
+             * as "the game stopped producing audio" and stop binning gaps
+             * entirely — so our own stall would erase itself from the record and
+             * read as a quiet stretch. Say it in the stream the harness keeps. */
+            if (now - next > 150000ull && !warned_late) {
+                warned_late = 1;
+                printf("[synth] WARNING a %llu ms scheduling gap exceeded the daemon's "
+                       "audio-idle window — gaps around it were not binned\n",
+                       (unsigned long long) ((now - next) / 1000));
+                fflush(stdout);
+            }
             next = now;
         } else {
             struct timespec ts = { (time_t) (next / 1000000ull), (long) ((next % 1000000ull) * 1000ull) };
