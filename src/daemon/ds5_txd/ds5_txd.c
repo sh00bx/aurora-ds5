@@ -1555,6 +1555,10 @@ static void linkq_refresh(void){
                               * multi-slot basic-rate types not enabled */
 static volatile int g_ptype_want = 0;    /* published toggle: 1 = clamp */
 static volatile int g_ptype_seen = -1;   /* last mask a 0x1D event reported; -1 = never */
+static volatile int g_ptype_ever = 0;    /* the toggle was armed at least once this run */
+static volatile int g_ptype_refused = 0; /* controller rejected 0x040F: stop reconciling
+                                          * (a 3s retry loop against a standing refusal
+                                          * would eat the command budget forever) */
 
 static int send_chg_ptype(uint16_t handle, uint16_t mask){
     uint8_t cmd[8]={ 0x01,
@@ -1573,7 +1577,7 @@ static void ptype_refresh(void){
     int r=read_root_int("/tmp/ds5_ptype",&warned);
     int was=g_ptype_want;
     if(r<0 || r==0)  g_ptype_want=0;
-    else if(r==1){   g_ptype_want=1; badwarn=0; }
+    else if(r==1){   g_ptype_want=1; g_ptype_ever=1; badwarn=0; }
     else if(!badwarn){
         badwarn=1;
         fprintf(stderr,"[txd] ignoring /tmp/ds5_ptype=%d: only 0/1 defined\n",r);
@@ -2192,7 +2196,13 @@ static void handle_hci_event(const uint8_t *e, int el){
                  * would compare two identical arms and read it as
                  * accept-and-ignore. */
                 if(op==OP_CHG_CONN_PTYPE && p[0]!=0x00){
-                    fprintf(stderr,"[txd] L18 ptype: rejected status=0x%02x handle=0x%03x\n",
+                    /* One refusal parks the lever for the whole run: with the
+                     * converge-on-unknown rule a mere sent=-1 reset would turn
+                     * into a 3s retry loop against a controller that will keep
+                     * refusing (pre-registered outcome E1 = lever closed). */
+                    g_ptype_refused=1;
+                    fprintf(stderr,"[txd] L18 ptype: rejected status=0x%02x handle=0x%03x "
+                                   "-> lever parked for this run (E1)\n",
                             p[0],arg&0x0fff);
                     /* ptype_* is capture-thread-owned, and so is this handler. */
                     for(int k=0;k<MAX_LINKS;k++)
@@ -2602,11 +2612,31 @@ static void *capture_thread(void *arg){
                 }
                 /* L18 reconcile: one Change_Connection_Packet_Type per bind or
                  * per toggle flip, same believed/sent pattern and the same >=3s
-                 * budget as the flush lever. A fresh handle is believed to carry
-                 * the stack default (full mask), so the disarmed lever costs
-                 * zero commands per bind. */
-                {   int ptarget = g_ptype_want ? PTYPE_CLAMP : PTYPE_ALL;
-                    int pbelieved = (L->ptype_handle==lh[i]) ? L->ptype_sent : PTYPE_ALL;
+                 * budget as the flush lever.
+                 *
+                 * Believed-state RULES (learned live 2026-08-16, first armed
+                 * night): the controller LATCHES the mask for the lifetime of
+                 * the ACL connection, and there is no read-back command for it
+                 * — so our ptype_sent is the only record of what the link
+                 * carries, and erasing it wrongly means a session can run
+                 * silently clamped (which poisons every OFF baseline).
+                 *   - ptype state survives pin flaps (the idle-invalidate reset
+                 *     used to erase it between the user's run and the disarm:
+                 *     the restore then compared ALL==ALL and never fired,
+                 *     while the link still carried the clamp).
+                 *   - Once the lever has been armed this run (g_ptype_ever), an
+                 *     UNKNOWN handle converges to the target with one command
+                 *     instead of being assumed default — cheap insurance, only
+                 *     paid by sessions that actually use the lever.
+                 *   - A run that never arms keeps the zero-commands-per-bind
+                 *     contract. Residual (accepted, documented): clamp armed in
+                 *     run N + daemon restart + the same ACL connection
+                 *     surviving into run N+1 which never arms — no record left
+                 *     anywhere to know the mask; a pad reconnect clears it. */
+                if(!g_ptype_refused){
+                    int ptarget = g_ptype_want ? PTYPE_CLAMP : PTYPE_ALL;
+                    int pbelieved = (L->ptype_handle==lh[i]) ? L->ptype_sent
+                                    : (g_ptype_ever ? -1 : PTYPE_ALL);
                     if(ptarget!=pbelieved && t-L->last_ptype_cmd>3000 &&
                        send_chg_ptype(lh[i],(uint16_t)ptarget)==0){
                         L->last_ptype_cmd=t; L->ptype_handle=lh[i]; L->ptype_sent=ptarget;
@@ -2643,8 +2673,12 @@ static void *capture_thread(void *arg){
                         break;
                     }
                 }
-            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1;
-                     L->ptype_handle=0xffff; L->ptype_sent=-1; }
+            /* ptype state deliberately NOT reset here: pin loss is routinely
+             * just idle-invalidate, the ACL connection (and its latched mask)
+             * outlives it, and this reset is exactly what ate the disarm on
+             * 08-16. A genuinely new handle is caught by the
+             * ptype_handle==lh[i] check in the reconcile above. */
+            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1; }
         }
         /* Scan follows the SESSION, not electrical liveness. The three restores above
          * are edge-triggered on a link INVALIDATION, and since RX liveness (v11) a pad
