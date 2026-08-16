@@ -74,10 +74,15 @@ esac
 CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu
 CPU_PIDS=/tmp/ds5_autorun_cpu.pids
 cpu_start(){
+    # NOT `i`: sh functions share one scope, and the block loop counts in `i`.
+    # Using it here reset the counter on every ON arm (4 -> 2), so the loop
+    # alternated 2,3,2,3 forever and only stopped when the rig's own budget ran
+    # out. The blocks themselves were fine — the arms still alternated and the
+    # witnesses were right — but the run would never have ended on its own.
     : > "$CPU_PIDS"
-    i=0
-    while [ "$i" -lt "$CPU_N" ]; do
-        i=$((i+1))
+    cpu_i=0
+    while [ "$cpu_i" -lt "$CPU_N" ]; do
+        cpu_i=$((cpu_i+1))
         nohup sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
         echo $! >> "$CPU_PIDS"
     done
@@ -234,7 +239,8 @@ RIG_PID=$!
 # bootstrap, the SetState prime and any sniff exit the daemon still has to do.
 sleep 20
 if ! kill -0 "$RIG_PID" 2>/dev/null; then
-    say "FATAL: the rig died during warm-up — see $OUT/synth.log"; exit 1
+    say "FATAL: the rig died during warm-up — see $OUT/synth.log"
+    cleanup; exit 1          # else the load keeps running and the cores stay pinned
 fi
 
 # Warm-up acceptance: if the transport is not carrying the offered load there is

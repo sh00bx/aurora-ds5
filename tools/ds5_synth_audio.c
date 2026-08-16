@@ -701,7 +701,16 @@ int main(int argc, char **argv) {
                  * stops changing, which is exactly what a dead link looks like
                  * from here. */
                 uint64_t d_sent = sent - last_sent_mark;
-                if (d_sent > 40) {
+                /* Not during bootstrap. The first seconds are the bind, the
+                 * template publish and the FIFO going 3 -> 10, and frames queued
+                 * before the link is ready age out by design — judging delivery
+                 * there condemns every run at its own startup (it did, on the
+                 * first run after this guard was repaired). Keep re-baselining
+                 * so the first real window starts clean. */
+                if (sent <= 200) {
+                    last_inj = cur.inj;
+                    last_sent_mark = sent;
+                } else if (d_sent > 40) {
                     uint32_t d_inj = cur.inj - last_inj;
                     if (d_inj * 100 < d_sent * 80) {
                         printf("[synth] STOPPING: the daemon injected %u of the %llu reports "

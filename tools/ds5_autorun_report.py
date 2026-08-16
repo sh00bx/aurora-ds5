@@ -115,26 +115,28 @@ def main(argv):
             print("     nothing survives — rerun with per-block snapshots")
             return 1
 
-    # Holes: at these rates the log carries a record every few hundred ms, so a
-    # block containing a record-free stretch of HOLE_S has lost data — either to a
-    # wipe or to the rig dying. Such a block cannot be repaired by arithmetic (the
-    # events are gone, only the seconds remain), so it is dropped and named.
+    # Lost data shows up at a block's EDGES, not in its middle. A wipe deletes
+    # everything written before it, so a block it hit has no records until the
+    # wipe point; a rig that died leaves none after it. Interior quiet is DATA:
+    # this link really does go 13-37 s at a stretch without a single gap over
+    # 55 ms, in both arms, and an earlier version of this check threw those
+    # blocks away as "holes" — discarding exactly the calmest evidence.
     HOLE_S = 20
     holed = []
     for w in list(windows):
-        inside = [g[0] for g in gaps if w[1] <= g[0] <= w[2]]
-        edges = [w[1]] + inside + [w[2]]
-        hole = max((b - a) / 1000.0 for a, b in zip(edges, edges[1:])) if len(edges) > 1 else 0
-        if hole >= HOLE_S:
-            holed.append((w, hole))
+        inside = sorted(g[0] for g in gaps if w[1] <= g[0] <= w[2])
+        lead = (inside[0] - w[1]) / 1000.0 if inside else (w[2] - w[1]) / 1000.0
+        tail = (w[2] - inside[-1]) / 1000.0 if inside else 0.0
+        if lead >= HOLE_S or tail >= HOLE_S:
+            holed.append((w, lead, tail))
             windows.remove(w)
     if truncated or holed:
         if truncated:
             print(f"  !! the daemon WIPED the gap log {truncated}x during this run "
                   f"(256 KiB cap, whole file discarded)")
-        for w, hole in holed:
-            print(f"  !! dropping {w[0]} block at {w[1]//1000}: {hole:.0f} s without a single "
-                  f"record — its events are gone but its seconds are not")
+        for w, lead, tail in holed:
+            print(f"  !! dropping {w[0]} block at {w[1]//1000}: log covers it only from "
+                  f"+{lead:.0f}s to -{tail:.0f}s — its events are gone but its seconds are not")
         if not windows:
             print("     nothing survives")
             return 1

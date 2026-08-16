@@ -54,7 +54,10 @@ cat > /tmp/ds5_stage_remote.sh <<'REMOTE'
 #!/bin/sh
 # runs ON the TV
 SELF=$$
-busy=$(ps ax | awk -v me="$SELF" '$1!=me && ($0 ~ /synth_audio/ || $0 ~ /autorun\.sh/) {print $1}')
+# Bracketed on purpose: awk's own argv carries this program text, and `ps ax` in
+# the same pipeline sees the sibling awk. /synth_audio/ matched the matcher and
+# reported a busy TV thirty seconds after a cold boot.
+busy=$(ps ax | awk -v me="$SELF" '$1!=me && ($0 ~ /[s]ynth_audio/ || $0 ~ /[a]utorun\.sh/) {print $1}')
 if [ -n "$busy" ]; then echo "BUSY: a measurement is still running (pids: $busy)"; exit 3; fi
 for f in ds5_synth_audio ds5_clock_probe ds5_autorun.sh; do
     [ -f "/tmp/$f.new" ] && { mv "/tmp/$f.new" "/tmp/$f"; chmod +x "/tmp/$f"; }
@@ -65,7 +68,7 @@ rm -f /tmp/ds5_ptype /tmp/ds5_linkq_ms
 echo "daemon:    $(pidof ds5_txd >/dev/null 2>&1 && echo "running pid $(pidof ds5_txd)" || echo "NOT RUNNING")"
 echo "kit:       $(ls -la /tmp/ds5_synth_audio /tmp/ds5_clock_probe /tmp/ds5_autorun.sh 2>&1 | awk '{print $NF}' | tr '\n' ' ')"
 echo "cores:     $(cat /sys/devices/system/cpu/online) (mp_enable=$(cat /proc/lg/pm/mp_enable 2>/dev/null))"
-echo "guard:     $(ps ax | awk -v me="$SELF" '$1!=me && $0 ~ /moonlight-guard/ {print "running"; exit}')"
+echo "guard:     $(ps ax | awk -v me="$SELF" '$1!=me && $0 ~ /[m]oonlight-guard/ {print "running"; exit}')"
 # The link is the precondition nothing else can substitute for: a bound template
 # means the daemon has seen an on-air report from the pad and can inject.
 echo "link:      $(tail -40 /tmp/ds5_txd.log 2>/dev/null | grep -o 'have=[01]' | tail -1) $(tail -40 /tmp/ds5_txd.log 2>/dev/null | grep -o 'L0 [0-9a-f:]*' | tail -1)"
