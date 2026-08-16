@@ -190,6 +190,14 @@ printf 'lever=%s blocks=%s block_s=%s b_ms=%s bg_load=%s bg_pin=%s\nstarted=%s\n
 # was measured that way. The file wins over the control datagram, so set it here.
 echo 10 > /tmp/ds5_inject_fifo
 echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks get cut
+# The daemon does NOT shed the oldest records at its 256 KiB cap — gaplog_flush()
+# reopens the file O_TRUNC and throws the WHOLE thing away, leaving one marker.
+# A wipe therefore lands mid-run and deletes a block's events while the block
+# keeps its full exposure in the denominator. It already did: it ate 171 s of an
+# OFF block in the 19:55 run and 89 s of one in the 19:10 run, both times
+# inflating the ON/OFF ratio. Start clean and drain after every block, so the
+# live file never gets near the cap.
+: > /tmp/ds5_gaps.log
 
 cleanup(){
     [ -n "$TOG" ] && rm -f "$TOG"
@@ -274,6 +282,14 @@ while [ "$i" -lt "$BLOCKS" ]; do
     # WiFi and bluetooth share the MT7921, so what else was on the air during a
     # block belongs in the record rather than in hindsight: a run taken while the
     # TV was streaming is not the same experiment as one taken on a quiet radio.
+    # Liveness BEFORE the row: the daemon stops binning gaps within 150 ms of the
+    # audio stopping, so a block the rig did not outlive pools as full exposure
+    # with almost no events — and lands in whichever arm was running.
+    if ! kill -0 "$RIG_PID" 2>/dev/null; then
+        say "rig died during block $i — block NOT recorded"
+        cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+        break
+    fi
     FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
         "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" \
@@ -284,7 +300,7 @@ while [ "$i" -lt "$BLOCKS" ]; do
     # silently halves the measured rate. Snapshot after every block instead and
     # let the report dedupe; overlap is cheap, a lost block is not.
     cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
-    kill -0 "$RIG_PID" 2>/dev/null || { say "rig died mid-run"; break; }
+    : > /tmp/ds5_gaps.log
 done
 
 [ -n "$TOG" ] && rm -f "$TOG"

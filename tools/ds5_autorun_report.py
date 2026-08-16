@@ -77,10 +77,13 @@ def main(argv):
         print("no blocks recorded")
         return 1
 
-    gaps = []
+    gaps, truncated = [], 0
     for line in gap_f.read_text().splitlines():
-        # G <epoch_ms> gap=<ms> out=<n> h=<handle>
+        # G <epoch_ms> gap=<ms> out=<n> h=<handle>, or the daemon's wipe marker
         if not line.startswith("G "):
+            continue
+        if line.startswith("G TRUNCATED"):
+            truncated += 1          # NEVER let this fall into the except below
             continue
         p = line.split()
         try:
@@ -92,10 +95,14 @@ def main(argv):
         return 1
     gaps.sort()
 
-    # The daemon's gap log is a capped ring that drops its OLDEST entries. A block
-    # that ended before the log's first surviving record contributed its exposure
-    # to the denominator and nothing to the numerator, which halves a rate without
-    # touching a single counter. Blocks like that are dropped, loudly.
+    # The daemon's gap log is NOT a ring that sheds its oldest entries: at 256 KiB
+    # gaplog_flush() reopens it O_TRUNC and throws the whole file away, leaving one
+    # "G TRUNCATED" marker (ds5_txd.c:1664). So the hole lands wherever the wipe
+    # happened — mid-run, mid-block — while the block keeps its full exposure in
+    # the denominator. That is not a hypothetical: it ate 171 s of an OFF block on
+    # 2026-08-16 19:55 and 89 s of one at 19:10, both times inflating ON/OFF.
+    # A block that ended before the earliest surviving record is the other half of
+    # the same failure and is still checked below.
     first_ms = gaps[0][0]
     lost = [w for w in windows if w[2] <= first_ms]
     partial = [w for w in windows if w[1] < first_ms < w[2]]
@@ -106,6 +113,30 @@ def main(argv):
         windows = [w for w in windows if w[1] >= first_ms]
         if not windows:
             print("     nothing survives — rerun with per-block snapshots")
+            return 1
+
+    # Holes: at these rates the log carries a record every few hundred ms, so a
+    # block containing a record-free stretch of HOLE_S has lost data — either to a
+    # wipe or to the rig dying. Such a block cannot be repaired by arithmetic (the
+    # events are gone, only the seconds remain), so it is dropped and named.
+    HOLE_S = 20
+    holed = []
+    for w in list(windows):
+        inside = [g[0] for g in gaps if w[1] <= g[0] <= w[2]]
+        edges = [w[1]] + inside + [w[2]]
+        hole = max((b - a) / 1000.0 for a, b in zip(edges, edges[1:])) if len(edges) > 1 else 0
+        if hole >= HOLE_S:
+            holed.append((w, hole))
+            windows.remove(w)
+    if truncated or holed:
+        if truncated:
+            print(f"  !! the daemon WIPED the gap log {truncated}x during this run "
+                  f"(256 KiB cap, whole file discarded)")
+        for w, hole in holed:
+            print(f"  !! dropping {w[0]} block at {w[1]//1000}: {hole:.0f} s without a single "
+                  f"record — its events are gone but its seconds are not")
+        if not windows:
+            print("     nothing survives")
             return 1
 
     # A run whose rig did not deliver the offered load measured a starved

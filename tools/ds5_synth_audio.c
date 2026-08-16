@@ -649,7 +649,22 @@ int main(int argc, char **argv) {
         if (now - last_st >= 200000ull) {
             last_st = now;
             struct st cur;
-            if (st_read(st_path, &cur) == 0 && cur.valid) {
+            /* An unreadable or invalidated record is the link going away, and it
+             * has to be handled OUTSIDE the success branch: the old code nested
+             * the "record went invalid" warning inside `if (cur.valid)` inside
+             * `if (... && cur.valid)`, so the only stop for a dropped link was
+             * unreachable and an invalid record simply skipped the whole block —
+             * silently, with the rig still sending. */
+            int st_ok = (st_read(st_path, &cur) == 0);
+            if ((!st_ok || !cur.valid) && !warned_invalid) {
+                warned_invalid = 1;
+                printf("[synth] STOPPING: the daemon's readiness record is %s — the link "
+                       "dropped; nothing measured from here is a gap\n",
+                       st_ok ? "invalid" : "unreadable");
+                fflush(stdout);
+                g_stop = 1;
+            }
+            if (st_ok && cur.valid) {
                 /* One-sided, like the host's: the pad drains on its own clock and
                  * has no refill path, so overfeeding parks latency permanently
                  * while underfeeding merely erodes depth. Production ran with this
@@ -674,24 +689,30 @@ int main(int argc, char **argv) {
                  * the gap ledger just goes quiet, which pools as "few gaps". So
                  * the witness is the daemon's own injection counter: it must keep
                  * up with what we send, or the run is over. */
-                if (cur.valid) {
+                /* The window has to ACCUMULATE. Re-baselining on every 200 ms poll
+                 * held d_sent at ~9 (200 ms / 21.4 ms), so the `> 40` precondition
+                 * — sized for ~900 ms of sends — could never be met and this guard
+                 * never fired once. It sat inert through the run whose link died
+                 * at 20:21: the rig kept sending into nothing, printed a healthy
+                 * rate, and the DONE line still said drop=0 while the daemon threw
+                 * away 12206 frames. So: only re-baseline when the test actually
+                 * ran, and treat a FROZEN record (inj not moving) as the same
+                 * failure — the record stays `valid` when a template dies, it just
+                 * stops changing, which is exactly what a dead link looks like
+                 * from here. */
+                uint64_t d_sent = sent - last_sent_mark;
+                if (d_sent > 40) {
                     uint32_t d_inj = cur.inj - last_inj;
-                    uint64_t d_sent = sent - last_sent_mark;
-                    if (d_sent > 40 && d_inj * 100 < d_sent * 80) {
+                    if (d_inj * 100 < d_sent * 80) {
                         printf("[synth] STOPPING: the daemon injected %u of the %llu reports "
-                               "handed over since the last check — the link is not carrying "
-                               "this load\n", d_inj, (unsigned long long) d_sent);
+                               "handed over over the last %.1f s — the link is not carrying "
+                               "this load\n", d_inj, (unsigned long long) d_sent,
+                               (double) d_sent * REPORT_US / 1e6);
                         fflush(stdout);
                         g_stop = 1;
                     }
                     last_inj = cur.inj;
                     last_sent_mark = sent;
-                } else if (!warned_invalid) {
-                    warned_invalid = 1;
-                    printf("[synth] WARNING the daemon's readiness record went invalid — "
-                           "the link dropped; nothing measured from here is a gap\n");
-                    fflush(stdout);
-                    g_stop = 1;
                 }
                 if (cur.drop_age != s.drop_age && sent > 200 && !warned_drop) {
                     warned_drop = 1;
