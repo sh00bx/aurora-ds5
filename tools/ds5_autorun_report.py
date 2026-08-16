@@ -116,6 +116,35 @@ def main(argv):
             row += f"{v[k]:6d} ev {v[k]/v['secs']*60:7.1f}/min "
         print(row)
 
+    # E1, the transfer criterion: gameplay's distribution decays smoothly across
+    # the tail, halving every 5.4 ms when fitted over 44-80 ms. The per-gap log
+    # only keeps gaps at or above its 55 ms arming threshold, so the fit here runs
+    # over 55-85 ms — the overlapping part of the same slope. A synthetic workload
+    # whose tail decays at a different rate is shaped by a different mechanism,
+    # and no lever verdict measured under it transfers to gameplay.
+    print("\nE1 tail shape (halving constant over 55-85 ms; gameplay reference 5.4 ms):")
+    for a in sorted(arms):
+        span = [(s, e) for arm, s, e, *_ in windows if arm == a]
+        bins = {}
+        for ts, ms, _o in gaps:
+            if any(s <= ts <= e for s, e in span) and 55 <= ms < 85:
+                bins[(ms - 55) // 5] = bins.get((ms - 55) // 5, 0) + 1
+        pts = [(k * 5 + 57.5, v) for k, v in sorted(bins.items()) if v > 0]
+        if len(pts) < 3:
+            print(f"  {a}: too few tail events to fit")
+            continue
+        n = len(pts)
+        sx = sum(x for x, _ in pts); sy = sum(math.log(y) for _, y in pts)
+        sxx = sum(x * x for x, _ in pts); sxy = sum(x * math.log(y) for x, y in pts)
+        denom = n * sxx - sx * sx
+        slope = (n * sxy - sx * sy) / denom if denom else 0.0
+        if slope >= 0:
+            print(f"  {a}: tail does not decay (slope {slope:+.3f}/ms) — not the gameplay shape")
+        else:
+            half = math.log(2) / -slope
+            ok = "within +-30 % of 5.4 ms" if 3.8 <= half <= 7.0 else "OUTSIDE the +-30 % band"
+            print(f"  {a}: halves every {half:.1f} ms   ({ok})")
+
     if "on" in arms and "off" in arms:
         print("\nratio ON/OFF (Poisson, 95 % CI) — the L18 witness is the >=60 ms band:")
         for k in EDGES:
