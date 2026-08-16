@@ -53,7 +53,11 @@ esac
 
 load_on(){
     [ "$LEVER" = "wifi" ] || return 0
-    nohup sh -c "while :; do curl -s -o /dev/null '$LOAD_URL' || sleep 1; done" \
+    # Rate-limited to ~72 Mbit/s on purpose rather than saturating: that is the
+    # order of the 4K60 + FEC stream the reference sessions carried on this same
+    # radio, so the control reproduces production's load instead of inventing a
+    # worst case (and it leaves the household's wifi usable).
+    nohup sh -c "while :; do curl -s --limit-rate 9M -o /dev/null '$LOAD_URL' || sleep 1; done" \
         >/dev/null 2>&1 </dev/null &
     echo $! > /tmp/ds5_autorun_load.pid
 }
@@ -142,6 +146,12 @@ while [ "$i" -lt "$BLOCKS" ]; do
     FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
     printf '%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
         "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" >> "$OUT/windows.tsv"
+    # The daemon's per-gap log is a CAPPED RING: at 256 KiB it drops the OLDEST
+    # entries and leaves one TRUNCATED marker behind. Copying it once at the end
+    # therefore loses whole early blocks while their exposure still counts — which
+    # silently halves the measured rate. Snapshot after every block instead and
+    # let the report dedupe; overlap is cheap, a lost block is not.
+    cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
     kill -0 "$RIG_PID" 2>/dev/null || { say "rig died mid-run"; break; }
 done
 
@@ -149,6 +159,7 @@ done
 load_off
 kill "$LEDGER_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
-cp /tmp/ds5_gaps.log "$OUT/gaps.log" 2>/dev/null
+cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+sort -u -k2,2 "$OUT/gaps.raw" > "$OUT/gaps.log" 2>/dev/null
 say "done -> $OUT"
 tail -1 "$OUT/synth.log"

@@ -86,6 +86,23 @@ def main(argv):
     if not gaps:
         print("gap log has no records — was /tmp/ds5_gaplog armed?")
         return 1
+    gaps.sort()
+
+    # The daemon's gap log is a capped ring that drops its OLDEST entries. A block
+    # that ended before the log's first surviving record contributed its exposure
+    # to the denominator and nothing to the numerator, which halves a rate without
+    # touching a single counter. Blocks like that are dropped, loudly.
+    first_ms = gaps[0][0]
+    lost = [w for w in windows if w[2] <= first_ms]
+    partial = [w for w in windows if w[1] < first_ms < w[2]]
+    if lost or partial:
+        print(f"  !! the gap log starts at {first_ms} — it lost earlier records "
+              f"(ring cap). Dropping {len(lost)} block(s) with no coverage and "
+              f"{len(partial)} partially covered block(s).")
+        windows = [w for w in windows if w[1] >= first_ms]
+        if not windows:
+            print("     nothing survives — rerun with per-block snapshots")
+            return 1
 
     # A run whose rig did not deliver the offered load measured a starved
     # transport, and no ratio computed from it means anything. Say so loudly
