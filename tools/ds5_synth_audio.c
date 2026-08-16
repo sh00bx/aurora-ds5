@@ -536,7 +536,7 @@ int main(int argc, char **argv) {
     send(fd, dg, ACL_TAG_LEN + R32_LEN, 0);
 
     /* ---- steady state ----------------------------------------------------- */
-    uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0;
+    uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0, last_app_check = t0;
     uint64_t sent = 0, send_err = 0, late = 0, late_us_max = 0;
     int      adj_us = 0;                    /* one-sided rate servo, see below   */
     struct st s0 = s;
@@ -574,6 +574,18 @@ int main(int argc, char **argv) {
                 if (backlog > 0) { adj_us += 8 * backlog; if (adj_us > 280) adj_us = 280; }
                 else             { adj_us -= 6; if (adj_us < 0) adj_us = 0; }
                 s = cur;
+            }
+        }
+
+        /* An unattended run can outlive the operator's patience: if somebody
+         * launches Aurora while this is feeding the pad, the session and the
+         * measurement would corrupt each other. Yield to the human immediately —
+         * the refusal at startup is not enough when runs last hours. */
+        if (!force && now - last_app_check >= 2000000ull) {
+            last_app_check = now;
+            if (app_is_running()) {
+                fprintf(stderr, "[synth] an Aurora session appeared — stopping, the pad is theirs\n");
+                break;
             }
         }
 
