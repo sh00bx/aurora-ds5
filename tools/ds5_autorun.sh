@@ -24,8 +24,15 @@
 #                          decoder and a renderer competing for the same cores.
 #                  none  = pure baseline / equivalence run
 #   blocks         how many blocks TOTAL (alternating OFF/ON, so use an even number)
-#   block_seconds  length of one block (>=120 recommended; the >=60ms band needs
-#                  a few hundred events per arm before a ratio means anything)
+#   block_seconds  length of one block. Run length is a POWER decision, not a
+#                  habit: the script prints, before the first block, the smallest
+#                  ratio each edge could resolve at the measured event rates.
+#                  Rules of thumb at parity rates (>=60 ~80/min, >=70 ~2.5/min):
+#                    4 x 120s  =  9 min  ->  >=60 down to x0.86  (plenty for L18)
+#                    6 x 120s  = 13 min  ->  >=70 down to x0.49  (tail levers)
+#                    6 x 300s  = 32 min  ->  >=70 down to x0.64, >=80 to x0.40
+#                  The tail is rare, so resolving SMALL tail effects costs half an
+#                  hour and there is no way around it but time.
 #   B_ms           pad buffer depth to advertise (default 60)
 #
 #   nohup /tmp/ds5_autorun.sh ptype 8 300 40 >/tmp/autorun.log 2>&1 &
@@ -45,10 +52,10 @@
 set -u
 
 LEVER="${1:-none}"
-BLOCKS="${2:-4}"
-BLOCK="${3:-300}"
+BLOCKS="${2:-6}"
+BLOCK="${3:-120}"
 B_MS="${4:-60}"
-GUARD=15
+GUARD=10
 
 RIG=/tmp/ds5_synth_audio
 [ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
@@ -198,6 +205,19 @@ trap 'cleanup; exit 130' INT TERM
 [ "$BG_PIN" = "1" ]  && { cores_pin;  say "background: cpu1-3 pinned online in BOTH arms"; }
 
 TOTAL=$(( BLOCKS * (BLOCK + GUARD) + 30 ))
+
+# What this run can and cannot see, stated BEFORE it produces a number. Expected
+# events per arm k = rate * exposure; the 95 % CI of a Poisson rate ratio excludes
+# 1 once |ln r| > 1.96*sqrt(2/k). Rates are the measured unlevered ones under
+# parity (>=60 ~80/min, >=70 ~2.5/min, >=80 ~0.6/min) — indicative, not a promise:
+# the >=60 level itself drifts ~1.5x across hours on this link.
+awk -v n="$BLOCKS" -v b="$BLOCK" -v t="$TOTAL" 'BEGIN{
+    split("60 70 80",E," "); split("80 2.5 0.6",R," ");
+    printf "power: %d x %ds = %.0f min exposure per arm;", n, b, (n/2*b)/60;
+    for(i=1;i<=3;i++){ k=R[i]/60*(n/2*b);
+        if(k<1){ printf "  >=%sms: too few events", E[i]; continue }
+        d=1.96*sqrt(2/k); printf "  >=%sms: resolves x<%.2f or x>%.2f", E[i], exp(-d), exp(d) }
+    printf "\n" }'
 say "starting rig for ${TOTAL}s (B=$B_MS), $BLOCKS x ${BLOCK}s blocks, lever=$LEVER"
 "$RIG" --b "$B_MS" --seconds "$TOTAL" --stats 10 >"$OUT/synth.log" 2>&1 &
 RIG_PID=$!

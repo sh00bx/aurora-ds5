@@ -18,7 +18,7 @@
 #   nohup /tmp/ds5_campaign.sh 300 60 >/tmp/campaign.log 2>&1 &
 set -u
 
-BLOCK="${1:-300}"
+BLOCK="${1:-120}"
 B_MS="${2:-60}"
 RUN=/tmp/ds5_autorun.sh
 [ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
@@ -39,12 +39,12 @@ for phase in wifi none ptype; do
     case "$phase" in
         wifi)  N=6 ;;   # the control only needs to show a signed response
         none)  N=4 ;;   # a baseline has no arms to interleave
-        ptype) N=8 ;;   # the lever needs the events
+        ptype) N=4 ;;   # judged on >=60, where 4 x 120s already resolves x0.86
     esac
     say "=== $phase: $N x ${BLOCK}s (B=$B_MS) ==="
     "$RUN" "$phase" "$N" "$BLOCK" "$B_MS" 2>&1 | sed "s/^/[$phase] /"
-    say "=== $phase done, 60 s quiet before the next ==="
-    sleep 60
+    say "=== $phase done, 30 s quiet before the next ==="
+    sleep 30
 done
 
 cleanup
