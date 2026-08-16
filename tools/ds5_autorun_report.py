@@ -248,6 +248,28 @@ def main(argv):
             print(f"  >={k:3d}ms  synthetic {mine:6.1f}/min   gameplay {lo:5.1f}-{hi:5.1f}/min"
                   f"   -> {where} the reference band")
 
+    # Pipeline depth, per arm, from the rig's own status lines. For the `feed`
+    # lever this is the witness the ratio is not allowed to be read without: the
+    # lever claims to empty the credit window, and either it did or it did not.
+    synth_f = d / "synth.log"
+    if synth_f.exists() and windows:
+        import re
+        rig0 = windows[0][1] // 1000 - 35        # rig starts ~35 s before block 1
+        qs = {}
+        for line in synth_f.read_text().splitlines():
+            m = re.match(r"\[synth\] t=(\d+)s .*\bq=(-?\d+)", line)
+            if not m:
+                continue
+            ts = (rig0 + int(m.group(1))) * 1000
+            for arm, s_, e_, *_ in windows:
+                if s_ <= ts <= e_:
+                    qs.setdefault(arm, []).append(int(m.group(2)))
+        if qs:
+            print("\ncredit window (packets in flight, from the rig's status lines):")
+            for a in sorted(qs):
+                v = qs[a]
+                print(f"  {a}: mean q={sum(v)/len(v):.1f}  (n={len(v)}, min {min(v)} max {max(v)})")
+
     if "on" in arms and "off" in arms:
         print("\nratio ON/OFF (Poisson, 95 % CI) — the L18 witness is the >=60 ms band:")
         for k in EDGES:

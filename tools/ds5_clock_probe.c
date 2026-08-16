@@ -42,6 +42,8 @@
 #define HCI_CHANNEL_MONITOR 2
 #define HCI_DEV_NONE        0xffff
 #define MON_EVENT_PKT       3
+#define MON_ACL_TX_PKT      4
+#define MON_ACL_RX_PKT      5
 #define HCI_EV_NUM_COMP_PKTS 0x13
 
 struct sockaddr_hci { uint16_t hci_family; uint16_t hci_dev; uint16_t hci_channel; };
@@ -80,6 +82,12 @@ int main(int argc, char **argv)
         perror("SO_TIMESTAMP"); return 1;
     }
 
+    /* The pad talks back, and on a TDD radio its uplink competes with our
+     * downlink for the same slots. During play the DS5 streams stick, trigger
+     * and motion state; sitting on a table it does not. That difference is the
+     * one load a rig with nobody holding the controller can never reproduce, so
+     * count it. */
+    uint64_t rx_pkts = 0, tx_pkts = 0;
     uint64_t hist_k[NEDGE], hist_u[NEDGE];
     memset(hist_k, 0, sizeof hist_k); memset(hist_u, 0, sizeof hist_u);
     uint64_t last_k = 0, last_u = 0, n = 0, lag_sum = 0, lag_max = 0, lag_zero = 0;
@@ -108,6 +116,17 @@ int main(int argc, char **argv)
         if (!k) { lag_zero++; continue; }
 
         struct hci_mon_hdr *h = (struct hci_mon_hdr *)buf;
+        if (h->opcode == MON_ACL_RX_PKT || h->opcode == MON_ACL_TX_PKT) {
+            /* ACL header: handle in the low 12 bits of the first two bytes. */
+            if (h->len >= 2) {
+                const uint8_t *a = buf + sizeof *h;
+                uint16_t hh = (uint16_t)((a[0] | (a[1] << 8)) & 0x0fff);
+                if (want_handle < 0 || hh == (uint16_t) want_handle) {
+                    if (h->opcode == MON_ACL_RX_PKT) rx_pkts++; else tx_pkts++;
+                }
+            }
+            continue;
+        }
         if (h->opcode != MON_EVENT_PKT) continue;
         const uint8_t *e = buf + sizeof *h;
         int el = h->len;
@@ -143,6 +162,8 @@ int main(int argc, char **argv)
            ", packets without a kernel stamp: %llu\n",
            seconds, (unsigned long long)n, n ? (double)lag_sum / (double)n : 0.0,
            (unsigned long long)lag_max, (unsigned long long)lag_zero);
+    printf("[clock] pad uplink %.0f pkt/s, our downlink %.0f pkt/s over %d s\n",
+           (double) rx_pkts / seconds, (double) tx_pkts / seconds, seconds);
     printf("[clock] longest gap: kernel %llu ms   userspace %llu ms\n",
            (unsigned long long)gmax_k, (unsigned long long)gmax_u);
     printf("[clock] %6s %10s %10s %10s\n", "edge", "kernel/min", "user/min", "user-kernel");

@@ -71,6 +71,71 @@
  * repaid and the credit window and pad buffer only ever fill. So the default is
  * production's no-feedback cadence, 2 x (10667 + 35). */
 #define REPORT_US    21404
+/* Runtime-adjustable copy. The cadence is normally fixed — an instrument that
+ * changes shape between arms measures itself — but the 2026-08-16 session showed
+ * the real app feeding 41.8/s against this program's 46.9/s and holding one
+ * packet in flight where this holds four. Reproducing THAT is the experiment, so
+ * the period becomes a declared lever, read from a file and logged when it moves. */
+static uint32_t g_period_us = REPORT_US;
+static const char *g_period_file = "/tmp/ds5_period_us";
+/* Burst pattern. The 18-minute Ratchet recording shows the real client is not a
+ * slower metronome at all: its instantaneous rate is 48.4/s median, 53.6 p90,
+ * 56.3 max — ABOVE the pad's 46.87/s drain — interleaved with quiet stretches
+ * (p10 = 0.2/s), averaging 41.8/s. Uniformly slowing the cadence, which is what
+ * the `feed` lever did, reproduces the average and nothing else. This does the
+ * pattern: burst above drain, then stop. "on_ms,off_ms" in /tmp/ds5_burst. */
+static uint32_t g_burst_on_ms = 0, g_burst_off_ms = 0;
+/* Co-traffic. A real session does not carry audio alone: the client also sends
+ * rumble and trigger state on the SAME link, and the daemon has a type-aware
+ * credit split precisely because the two compete. The recording bears it out —
+ * instantaneous injection peaks at 56.3/s where audio alone needs 46.9. Those
+ * extra packets consume the same credits the audio stream is waiting on, which
+ * is the last untested way gameplay differs from this rig. Reports per second in
+ * /tmp/ds5_cotraffic; 0 disables. */
+static uint32_t g_cotraffic_hz = 0;
+static void cotraffic_poll(void) {
+    FILE *f = fopen("/tmp/ds5_cotraffic", "r");
+    uint32_t v = 0;
+    if (f) { if (fscanf(f, "%u", &v) != 1) v = 0; fclose(f); }
+    if (v > 60) v = 0;                     /* refuse to flood the link outright */
+    if (v != g_cotraffic_hz) {
+        printf("[synth] co-traffic %u -> %u reports/s (0x32 alongside the audio)\n",
+               g_cotraffic_hz, v);
+        fflush(stdout);
+        g_cotraffic_hz = v;
+    }
+}
+static void burst_poll(void) {
+    FILE *f = fopen("/tmp/ds5_burst", "r");
+    uint32_t on = 0, off = 0;
+    if (f) { if (fscanf(f, "%u,%u", &on, &off) != 2) { on = off = 0; } fclose(f); }
+    if (on > 20000 || off > 20000) on = off = 0;
+    if (on != g_burst_on_ms || off != g_burst_off_ms) {
+        printf("[synth] burst %u/%u -> %u/%u ms\n", g_burst_on_ms, g_burst_off_ms, on, off);
+        fflush(stdout);
+        g_burst_on_ms = on; g_burst_off_ms = off;
+    }
+}
+/* In the off phase we send NOTHING — no encode, no datagram — exactly as the app
+ * does when the game falls silent. The daemon then stops binning gaps after
+ * AUDIO_IDLE_MS, which is not a flaw here: gameplay's tail is measured under the
+ * same suppression, so the comparison stays like for like. */
+static int burst_silent(uint64_t t_us) {
+    if (!g_burst_on_ms || !g_burst_off_ms) return 0;
+    uint64_t cycle = (uint64_t)(g_burst_on_ms + g_burst_off_ms) * 1000ull;
+    return (t_us % cycle) >= (uint64_t) g_burst_on_ms * 1000ull;
+}
+static void period_poll(void) {
+    FILE *f = fopen(g_period_file, "r");
+    uint32_t v = REPORT_US;
+    if (f) { if (fscanf(f, "%u", &v) != 1) v = REPORT_US; fclose(f); }
+    if (v < 15000 || v > 40000) v = REPORT_US;      /* refuse nonsense outright */
+    if (v != g_period_us) {
+        printf("[synth] period %u -> %u us (%.1f/s)\n", g_period_us, v, 1e6 / v);
+        fflush(stdout);
+        g_period_us = v;
+    }
+}
 #define SETSTATE_MS   1000          /* periodic standalone SetState re-assert */
 
 /* DS5 BT output CRC: CRC32 over the 0xA2 HID-output seed byte + report[0..len-4). */
@@ -625,11 +690,28 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         if (seconds > 0 && (int64_t) (now_us() - t0) >= (int64_t) seconds * 1000000) break;
 
-        if (build_0x39(&B, enc, &tone) < 0) break;
-        memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
-        if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
-                   (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
-        else sent++;
+        if (!burst_silent(now_us() - t0)) {
+            if (build_0x39(&B, enc, &tone) < 0) break;
+            memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
+            if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
+                       (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
+            else sent++;
+        }
+
+        /* Interleaved on the audio clock: one extra 0x32 every Nth report gives
+         * the requested rate without a second timer to drift against. */
+        if (g_cotraffic_hz) {
+            uint32_t every = (uint32_t) (1000000ull / g_period_us) / g_cotraffic_hz;
+            if (every < 1) every = 1;
+            if (sent && sent % every == 0) {
+                uint8_t cdg[ACL_TAG_LEN + R32_LEN];
+                memcpy(cdg, dg, ACL_TAG_LEN);       /* same tag, same bdaddr */
+                build_0x32(&B);                     /* fresh seq + CRC each time */
+                memcpy(cdg + ACL_TAG_LEN, B.r32, R32_LEN);
+                if (sendto(fd, cdg, sizeof cdg, MSG_DONTWAIT,
+                           (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
+            }
+        }
 
         uint64_t now = now_us();
         if (now - last_ss >= SETSTATE_MS * 1000ull) {
@@ -648,6 +730,9 @@ int main(int argc, char **argv) {
          * holding a backlog, decay back to nominal when it is clean. */
         if (now - last_st >= 200000ull) {
             last_st = now;
+            period_poll();
+            burst_poll();
+            cotraffic_poll();
             struct st cur;
             /* An unreadable or invalidated record is the link going away, and it
              * has to be handled OUTSIDE the success branch: the old code nested
@@ -701,7 +786,17 @@ int main(int argc, char **argv) {
                  * stops changing, which is exactly what a dead link looks like
                  * from here. */
                 uint64_t d_sent = sent - last_sent_mark;
-                /* Not during bootstrap. The first seconds are the bind, the
+                /* The window is ~9 s of sends, not ~1. The daemon republishes its
+                 * record about 5 times a second, so `inj` is up to 200 ms stale
+                 * against a `sent` read right now. Over a window the lag cancels —
+                 * unless the send RATE changed inside it, which is exactly what a
+                 * bursty producer does: 44 sent in 0.8 s against an inj snapshot
+                 * 10 reports behind reads as 77 % delivery and trips a guard whose
+                 * threshold is 80 %. That killed the first burst run 108 s in. At
+                 * 400+ reports a 10-report lag is 2.5 %, far inside the margin, and
+                 * a genuinely starved link (a third of the load) still trips it.
+                 *
+                 * Not during bootstrap either. The first seconds are the bind, the
                  * template publish and the FIFO going 3 -> 10, and frames queued
                  * before the link is ready age out by design — judging delivery
                  * there condemns every run at its own startup (it did, on the
@@ -710,13 +805,13 @@ int main(int argc, char **argv) {
                 if (sent <= 200) {
                     last_inj = cur.inj;
                     last_sent_mark = sent;
-                } else if (d_sent > 40) {
+                } else if (d_sent > 400) {
                     uint32_t d_inj = cur.inj - last_inj;
                     if (d_inj * 100 < d_sent * 80) {
                         printf("[synth] STOPPING: the daemon injected %u of the %llu reports "
                                "handed over over the last %.1f s — the link is not carrying "
                                "this load\n", d_inj, (unsigned long long) d_sent,
-                               (double) d_sent * REPORT_US / 1e6);
+                               (double) d_sent * g_period_us / 1e6);
                         fflush(stdout);
                         g_stop = 1;
                     }
@@ -759,7 +854,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
 
-        next += (uint64_t) REPORT_US + (uint64_t) adj_us;
+        next += (uint64_t) g_period_us + (uint64_t) adj_us;
         now = now_us();
         if (next <= now) {
             /* Falling behind is a measurement fault, not a hiccup to smooth over:

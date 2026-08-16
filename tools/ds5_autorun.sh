@@ -4,7 +4,7 @@
 #
 #   ds5_autorun.sh <lever> <blocks> <block_seconds> [B_ms]
 #
-#   lever          ptype | wifi | cores | cpu | none
+#   lever          ptype | wifi | cores | cpu | feed | none
 #                  ptype = the L18 packet-type clamp
 #                  wifi  = POSITIVE CONTROL: bulk download over wlan0 during ON
 #                          blocks. WiFi and bluetooth are one combo module here,
@@ -22,6 +22,12 @@
 #                          rig's even with the radio loaded and the cores pinned,
 #                          and what a stream adds that a curl does not is a
 #                          decoder and a renderer competing for the same cores.
+#                  feed  = the rig's own send period, nominal vs the measured
+#                          gameplay rate. The only lever that moves the INSTRUMENT
+#                          rather than the machine, because the 18-minute session
+#                          showed the real client holding one packet in flight
+#                          where the rig holds four — and that, not CPU and not
+#                          airtime, is what still separates them.
 #                  none  = pure baseline / equivalence run
 #   blocks         how many blocks TOTAL (alternating OFF/ON, so use an even number)
 #   block_seconds  length of one block. Run length is a POWER decision, not a
@@ -67,8 +73,21 @@ case "$LEVER" in
     wifi)  TOG=""; ON_VALUE="" ;;
     cores) TOG=""; ON_VALUE="" ;;
     cpu)   TOG=""; ON_VALUE="" ;;
+    # 24050 us = 41.6 reports/s, the rate the real client fed during the 18-minute
+    # Ratchet recording. Not tuned: it is the measured gameplay rate, and the
+    # witness is whether the credit window falls from ~4 to ~1 as it did there.
+    feed)  TOG=/tmp/ds5_period_us; ON_VALUE=24050 ;;
+    # 3000 ms on / 700 ms off at 19200 us = bursts of 52/s (the game's p75-p90)
+    # averaging 42/s (the game's mean). Both numbers are read off the recording,
+    # not tuned. The period file is set alongside, so the ON arm is one declared
+    # pattern rather than two knobs.
+    burst) TOG=/tmp/ds5_burst; ON_VALUE="3000,700" ;;
+    # 9 extra 0x32 per second: the gap between the game's peak injection rate
+    # (56.3/s) and what audio alone needs (46.9/s), i.e. the co-traffic the real
+    # client puts on the same link. Read off the recording, not chosen.
+    cotraf) TOG=/tmp/ds5_cotraffic; ON_VALUE=9 ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|none)"; exit 1 ;;
 esac
 
 CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu
@@ -258,12 +277,14 @@ while [ "$i" -lt "$BLOCKS" ]; do
     if [ $((i % 2)) -eq 0 ] && [ "$LEVER" != "none" ]; then
         ARM=on
         [ -n "$TOG" ] && { echo "$ON_VALUE" > "$TOG"; chown 0:0 "$TOG" 2>/dev/null; chmod 644 "$TOG"; }
+        [ "$LEVER" = "burst" ] && echo 19200 > /tmp/ds5_period_us
         load_on
         cores_on
         cpu_on
     else
         ARM=off
         [ -n "$TOG" ] && rm -f "$TOG"
+        [ "$LEVER" = "burst" ] && rm -f /tmp/ds5_period_us
         load_off
         cores_off
         cpu_off
