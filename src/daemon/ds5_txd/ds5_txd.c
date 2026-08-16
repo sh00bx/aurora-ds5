@@ -722,6 +722,7 @@ struct ds5_link {
     uint16_t policy_handle;  /* handle the last link-policy write was for */
     uint64_t last_policy;
     uint64_t last_unsniff;   /* last Exit_Sniff send (>=3s throttle, cap-only) */
+    uint16_t unsniff_probe_h;/* handle we already probed for an UNOBSERVED sniff */
     uint16_t flush_handle;   /* handle the last Write_Automatic_Flush_Timeout was for */
     int      flush_sent_ms;  /* value we last wrote (0 = infinite/off); -1 = nothing written */
     uint64_t last_flush_cmd; /* send throttle, shares the >=3s command budget */
@@ -836,8 +837,16 @@ static const char *g_tmpl_path;
  * we already hold, seeded by HCIGETCONNLIST. No address is hardcoded — the binding
  * self-configures, so swapping controllers needs no rebuild. The table is SHARED
  * across links (it is just the adapter's handle map). */
-struct htab_ent { uint8_t addr[6]; uint8_t known; uint8_t mode; uint8_t from_assert; };
-/* mode: HCI Mode Change (0=active,2=sniff). from_assert: this handle's address was
+struct htab_ent { uint8_t addr[6]; uint8_t known; uint8_t mode; uint8_t from_assert; uint8_t mode_seen; };
+/* mode: HCI Mode Change (0=active,2=sniff). mode_seen: that value was OBSERVED (Mode
+ * Change, or a kernel connect that by definition starts active) rather than assumed.
+ * Everything that learns a handle without a connect event -- the identity assert, the
+ * kernel conn-list seed -- writes mode=0 because it has nothing better to write, and a
+ * link that fell into sniff BEFORE this daemon started then looks active forever: the
+ * exit below never fires, 3-slot audio never fits the sniff window, and the transport
+ * silently delivers a third of the offered reports. Measured 2026-08-16: 15-21 of 46
+ * reports/s, with the pad's small uplink flowing normally the whole time. from_assert:
+ * this handle's address was
  * learned from a jail identity-assert, not a kernel connect event -> any link bound
  * off it inherits assert_learned taint (so a later kernel connect re-derives it).
  * The taint lives on the htab entry, not just the link, so it survives an
@@ -984,6 +993,7 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
     L->assert_learned=g_htab[hh].from_assert;   /* inherit the handle's taint: a rebind
                                                  * from an assert-sourced htab entry stays
                                                  * assert_learned even across idle-flaps */
+    L->unsniff_probe_h=0xFFFF;  /* a new binding re-arms the unobserved-mode probe */
     L->outstanding=0; L->last_nocp=now_ms(); txwin_reset(L);
     L->ghost=0;                 /* a fresh connection cannot owe credits for the old one */
     L->last_seen=now_ms();
@@ -2247,7 +2257,7 @@ static void handle_hci_event(const uint8_t *e, int el){
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        g_htab[hh].mode=p[3];
+        g_htab[hh].mode=p[3]; g_htab[hh].mode_seen=1;
         pthread_mutex_unlock(&g_lock);
         return;                                             /* mode never affects validity */
     }
@@ -2255,7 +2265,7 @@ static void handle_hci_event(const uint8_t *e, int el){
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel-proven, active */
+        memcpy(g_htab[hh].addr,p+3,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].mode_seen=1; g_htab[hh].from_assert=0; /* kernel-proven, active */
         struct ds5_link *L=link_by_handle(hh);
         /* An assert-learned link is dropped on ANY kernel connect for its handle, even
          * when the addresses agree: the kernel is now the authority on what this handle
@@ -2274,6 +2284,7 @@ static void handle_hci_event(const uint8_t *e, int el){
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
         g_htab[hh].known=0;
+        g_htab[hh].mode_seen=0;
         g_htab[hh].mode=0;   /* a dead link is not sniffed: a later occupant of this
                               * handle whose identity arrives via assert-learn/seed
                               * (paths that never see a Mode Change) must not inherit
@@ -2288,7 +2299,7 @@ static void handle_hci_event(const uint8_t *e, int el){
         if((p[0]!=HCI_SUBEV_LE_CONN && p[0]!=HCI_SUBEV_LE_ENH_CONN) || p[1]!=0x00) return;
         uint16_t hh=(uint16_t)((p[2]|(p[3]<<8))&0x0fff);
         pthread_mutex_lock(&g_lock);
-        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel-proven */
+        memcpy(g_htab[hh].addr,p+6,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].mode_seen=1; g_htab[hh].from_assert=0; /* kernel-proven */
         struct ds5_link *L=link_by_handle(hh);
         if(L && (L->assert_learned || memcmp(p+6,L->bound_addr,6)!=0)){
             L->have=0;
@@ -2477,7 +2488,7 @@ static void seed_conn_list(void){
     for(int i=0;i<n;i++){
         uint16_t hh=req.ci[i].handle & 0x0fff;
         if(!g_htab[hh].known || memcmp(g_htab[hh].addr,req.ci[i].bdaddr.b,6)!=0){
-            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].from_assert=0; /* kernel conn list; mode unknown -> assume active */
+            memcpy(g_htab[hh].addr,req.ci[i].bdaddr.b,6); g_htab[hh].known=1; g_htab[hh].mode=0; g_htab[hh].mode_seen=0; g_htab[hh].from_assert=0; /* kernel conn list carries no mode -> assumed, probe it */
             chg[nchg].hh=hh; memcpy(chg[nchg].a,req.ci[i].bdaddr.b,6); nchg++;
         }
     }
@@ -2519,7 +2530,7 @@ static void *capture_thread(void *arg){
          * lost. Snapshot each bound link's handle for the link-policy pin under the
          * same lock. */
         int idle_inval=0, none_bound=0, sess_active=0;
-        int lb[MAX_LINKS], pin[MAX_LINKS]; uint16_t lh[MAX_LINKS]; uint8_t md[MAX_LINKS];
+        int lb[MAX_LINKS], pin[MAX_LINKS]; uint16_t lh[MAX_LINKS]; uint8_t md[MAX_LINKS], mdseen[MAX_LINKS];
         pthread_mutex_lock(&g_lock);
         for(int i=0;i<MAX_LINKS;i++){
             /* Ghosts also expire without traffic. The NOCP path can only retire
@@ -2539,7 +2550,7 @@ static void *capture_thread(void *arg){
             }
             if(g_links[i].have && g_links[i].session_seen &&
                now_ms()-g_links[i].session_seen<=SESSION_IDLE_MS) sess_active=1;
-            lb[i]=g_links[i].have; lh[i]=g_links[i].handle; pin[i]=lb[i]; md[i]=0;
+            lb[i]=g_links[i].have; lh[i]=g_links[i].handle; pin[i]=lb[i]; md[i]=0; mdseen[i]=0;
         }
         none_bound=!any_link_bound_locked();
         /* Idle sniff-pin (2026-07-10): while ANY pad is in-session, keep every
@@ -2568,7 +2579,7 @@ static void *capture_thread(void *arg){
                     }
             }
         }
-        for(int i=0;i<MAX_LINKS;i++) if(pin[i]) md[i]=g_htab[lh[i]].mode;
+        for(int i=0;i<MAX_LINKS;i++) if(pin[i]){ md[i]=g_htab[lh[i]].mode; mdseen[i]=g_htab[lh[i]].mode_seen; }
         pthread_mutex_unlock(&g_lock);
         if(idle_inval){
             publish_all(); fprintf(stderr,"[txd] link idle -> template INVALID\n");
@@ -2607,6 +2618,20 @@ static void *capture_thread(void *arg){
                 if(md[i]==2 && t-L->last_unsniff>3000 && send_exit_sniff(lh[i])==0){
                     L->last_unsniff=t;
                     fprintf(stderr,"[txd] L%d handle=0x%03x in sniff while pinned -> Exit_Sniff sent\n",i,lh[i]);
+                }
+                /* Believed state is not observed state. When this handle's mode was
+                 * never witnessed -- we started after the connection, or learned the
+                 * identity from an assert -- "active" is an assumption, and the branch
+                 * above can never fire because the assumption says there is nothing to
+                 * exit. Ask the controller ONCE per binding instead: on a link that is
+                 * genuinely active the command is simply refused (Command Status 0x0c)
+                 * and costs one slot of the >=3s budget, while on a sniffed one it is
+                 * the difference between 15 and 46 reports per second. A real Mode
+                 * Change answers either way and sets mode_seen, so this cannot loop. */
+                else if(!mdseen[i] && L->unsniff_probe_h!=lh[i] &&
+                        t-L->last_unsniff>3000 && send_exit_sniff(lh[i])==0){
+                    L->unsniff_probe_h=lh[i]; L->last_unsniff=t;
+                    fprintf(stderr,"[txd] L%d handle=0x%03x mode never observed -> Exit_Sniff probe\n",i,lh[i]);
                 }
                 /* L1 reconcile: one Write + one Read per bind (or per toggle
                  * change), sharing the same >=3s throttle as everything else on
@@ -2881,6 +2906,7 @@ static void *capture_thread(void *arg){
                 g_htab[hh].mode=0;          /* fresh identity, no Mode Change seen: never
                                              * inherit a stale sniff flag from a previous
                                              * occupant of this 12-bit handle */
+                g_htab[hh].mode_seen=0;     /* ...and do not pretend we know it either */
                 g_htab[hh].from_assert=1;   /* jail-sourced identity: taint the htab entry
                                              * so this and any rebind off hh stay
                                              * assert_learned until a kernel connect (defence
