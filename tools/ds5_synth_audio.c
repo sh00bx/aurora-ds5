@@ -411,11 +411,17 @@ static void usage(void) {
         "  --sock <path>   daemon socket (default: the com.aurora.ds5 jail)\n"
         "  --tmpl <path>   template path, for the .st telemetry sibling\n"
         "  --stats <sec>   stats line interval (default 10)\n"
+        "  --mute          keep the transport identical but silence the pad: the 0x32\n"
+        "                  SetState carries minimum volume, so all 547 bytes and the\n"
+        "                  radio conditions stay exactly as they are. Never silence a\n"
+        "                  run by moving the pad away — that is a different experiment.\n"
+        "  --no-servo      feed strictly open-loop (see the servo note in the source)\n"
         "  --force         run even if an Aurora session is live (do not)\n");
 }
 
 int main(int argc, char **argv) {
     int    b_ms = 60, seconds = 0, fifo_depth = 10, complexity = 10, stats_iv = 10, force = 0;
+    int    mute = 0, servo = 1;
     double freq = 400.0, amp_dbfs = -30.0;
     const char *mac_arg = NULL;
     const char *sock = "/var/palm/jail/com.aurora.ds5/tmp/ds5_acl.sock";
@@ -434,6 +440,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--mac") && !last)        mac_arg = argv[++i];
         else if (!strcmp(a, "--sock") && !last)       sock = argv[++i];
         else if (!strcmp(a, "--tmpl") && !last)       tmpl = argv[++i];
+        else if (!strcmp(a, "--mute"))                mute = 1;
+        else if (!strcmp(a, "--no-servo"))            servo = 0;
         else if (!strcmp(a, "--force"))               force = 1;
         else { usage(); return 2; }
     }
@@ -496,6 +504,14 @@ int main(int argc, char **argv) {
 
     struct builder B;
     builder_init(&B, b_ms);
+    if (mute) {
+        /* Volume lives in the SetState, not in the audio: the speaker byte is a
+         * 0x80..0xFF field and the headphone byte a real 7-bit one, so this is
+         * their common floor. The Opus payload, the report length and every
+         * timing byte are untouched — which is the point. */
+        B.r32[4 + 4] = 0x00;   /* VolumeHeadphones */
+        B.r32[4 + 5] = 0x80;   /* VolumeSpeaker    */
+    }
     struct tone tone;
     tone_init(&tone, freq, amp_dbfs);
 
@@ -539,9 +555,11 @@ int main(int argc, char **argv) {
     uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0, last_app_check = t0;
     uint64_t sent = 0, send_err = 0, late = 0, late_us_max = 0;
     int      adj_us = 0;                    /* one-sided rate servo, see below   */
+    int      warned_drop = 0;
     struct st s0 = s;
-    printf("# ds5_synth_audio b=%d freq=%.0f amp=%.0fdBFS fifo=%d complexity=%d pad=%s\n",
-           b_ms, freq, amp_dbfs, fifo_depth, complexity, mac);
+    printf("# ds5_synth_audio b=%d freq=%.0f amp=%.0fdBFS fifo=%d complexity=%d servo=%d "
+           "mute=%d pad=%s\n",
+           b_ms, freq, amp_dbfs, fifo_depth, complexity, servo, mute, mac);
     fflush(stdout);
 
     while (!g_stop) {
@@ -570,9 +588,29 @@ int main(int argc, char **argv) {
             last_st = now;
             struct st cur;
             if (st_read(st_path, &cur) == 0 && cur.valid) {
-                int backlog = cur.fifo + (cur.q > 3 ? cur.q - 3 : 0);
-                if (backlog > 0) { adj_us += 8 * backlog; if (adj_us > 280) adj_us = 280; }
-                else             { adj_us -= 6; if (adj_us < 0) adj_us = 0; }
+                /* One-sided, like the host's: the pad drains on its own clock and
+                 * has no refill path, so overfeeding parks latency permanently
+                 * while underfeeding merely erodes depth. Production ran with this
+                 * servo active — often pinned at its clamp — so keeping it is the
+                 * faithful choice, not the neutral one. It is bounded at 1.3 % of
+                 * the period and `adj` is printed every stats line, because a servo
+                 * that backs off during a stall would blunt the very stall being
+                 * measured. --no-servo feeds strictly open-loop for comparison. */
+                if (servo) {
+                    int backlog = cur.fifo + (cur.q > 3 ? cur.q - 3 : 0);
+                    if (backlog > 0) { adj_us += 8 * backlog; if (adj_us > 280) adj_us = 280; }
+                    else             { adj_us -= 6; if (adj_us < 0) adj_us = 0; }
+                }
+                /* Age-drops mean the transport did not carry what was offered, and
+                 * every gap measured from here on describes starvation rather than
+                 * the link. Say it once, loudly, in the stream the harness reads. */
+                if (cur.drop_age != s.drop_age && sent > 200 && !warned_drop) {
+                    warned_drop = 1;
+                    printf("[synth] WARNING age-drops began at t=%.0fs — delivery is short of "
+                           "the offered load; blocks from here are not valid\n",
+                           (double) (now - t0) / 1e6);
+                    fflush(stdout);
+                }
                 s = cur;
             }
         }

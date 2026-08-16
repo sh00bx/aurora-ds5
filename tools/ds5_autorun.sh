@@ -43,8 +43,10 @@ case "$LEVER" in
 esac
 
 # One lever at a time: the ledger cannot attribute a delta to two of them.
-for other in /tmp/ds5_flush_ms /tmp/ds5_ghost_ttl_ms; do
-    [ -e "$other" ] && { echo "REFUSING: $other is armed"; exit 1; }
+# Lever state is DECLARED, never discovered: a knob left armed by a previous
+# session silently redefines the baseline, and this has already happened here.
+for other in /tmp/ds5_flush_ms /tmp/ds5_ghost_ttl_ms /tmp/ds5_inject_maxq /tmp/ds5_gap_inject; do
+    [ -e "$other" ] && { echo "REFUSING: $other is armed — declare it or remove it"; exit 1; }
 done
 # The link-quality poller can trip the daemon's HCI command guard ("COMMAND PATH
 # DEAD"), which pauses exactly the sniff and packet-type management an HCI lever
