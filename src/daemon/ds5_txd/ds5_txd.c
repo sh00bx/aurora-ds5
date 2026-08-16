@@ -129,6 +129,17 @@
                                        * (telemetry gate only; see last_demand). 1s is far above
                                        * the ~10-21ms audio cadence AND above the ~1/s rumble-only
                                        * floor, but far below any idle stretch. */
+#define AUDIO_IDLE_MS           150   /* no AUDIO report (0x36/0x39) for this long -> the game
+                                       * paused its pad audio, and every NOCP spacing measured
+                                       * across that pause is injection cadence, not the link.
+                                       * Third strike of "presence filter != activity filter"
+                                       * (2026-08-16, live): the user let go of R1, three
+                                       * 438-968ms game-silence pauses passed the demand gate
+                                       * (keepalives kept it fresh) and were read as link
+                                       * blackouts. Under real load audio arrives every ~21ms
+                                       * and KEEPS being injected through a genuine stall
+                                       * (credits stay free), so audio recency is the one
+                                       * signal whose sign differs between the two cases. */
 /* Edges of the cumulative NOCP-gap histogram, in ms. Chosen to straddle the
  * usable slider range (0..200, default 60) offset by one report of audio, so
  * every plausible pad buffer has an edge within a few ms of its own starvation
@@ -723,6 +734,13 @@ struct ds5_link {
      * the documented `d_inj=2` / `30:2/…/200:2` contamination. Requiring
      * last_nocp >= demand_since makes demand hold ACROSS the gap. */
     uint64_t demand_since;
+    /* Same pair again, but for AUDIO reports only (0x36/0x39) — the histogram's
+     * real gate. Demand alone cannot discriminate game silence from a link
+     * stall (see AUDIO_IDLE_MS); audio injection can, because it continues
+     * through a genuine stall and stops in silence. Relaxed atomics, same
+     * writer/reader pair as last_demand/demand_since. */
+    uint64_t last_audio;
+    uint64_t audio_since;
     /* L18 packet-type clamp (capture thread) — same believed/sent pattern as the
      * flush lever above: a handle we never wrote carries the stack default. */
     uint16_t ptype_handle;   /* handle the last Change_Connection_Packet_Type was for */
@@ -2313,8 +2331,21 @@ static void handle_hci_event(const uint8_t *e, int el){
                  * every cumulative bin (the `d_inj=2` / `30:2/…/200:2`
                  * signature). Continuous-load headline numbers are unaffected
                  * — the contamination only ever hit mixed/idle sessions. */
+                uint64_t la=__atomic_load_n(&L->last_audio,__ATOMIC_RELAXED);
+                uint64_t as=__atomic_load_n(&L->audio_since,__ATOMIC_RELAXED);
+                /* The histogram arms only while AUDIO flowed across the whole
+                 * gap: recent at the end (last_audio) and already flowing when
+                 * the gap began (last_nocp >= audio_since). A genuine link
+                 * stall passes both (injection continues on free credits);
+                 * a game-silence pause fails the recency test. This gates the
+                 * legacy gaps=/gmax counters too — a measurement change to
+                 * note in the ledger, not a format change (silence-heavy
+                 * sessions counted gaps before, and those numbers were the
+                 * lie this gate removes). */
                 if(ld && nowm>=ld && nowm-ld<DEMAND_IDLE_MS &&
-                   ds && L->last_nocp>=ds){
+                   ds && L->last_nocp>=ds &&
+                   la && nowm>=la && nowm-la<AUDIO_IDLE_MS &&
+                   as && L->last_nocp>=as){
                     uint64_t g=nowm-L->last_nocp;
                     /* Was this OUR hole? The first NOCP after a synthetic hold
                      * necessarily lands after the hold has been released, so the
@@ -3479,6 +3510,17 @@ int main(int argc,char**argv){
                     if(!prev || dnow-prev>=DEMAND_IDLE_MS)
                         __atomic_store_n(&L->demand_since,dnow,__ATOMIC_RELAXED);
                     __atomic_store_n(&L->last_demand,dnow,__ATOMIC_RELAXED);
+                    /* Audio recency is tracked separately: only 0x36/0x39 carry
+                     * pad audio, and only audio can arm the gap histogram (see
+                     * AUDIO_IDLE_MS — keepalives kept the demand gate open
+                     * through game-silence pauses and silence was binned as
+                     * link blackouts). */
+                    if(report[0]==0x36 || report[0]==0x39){
+                        uint64_t pa=__atomic_load_n(&L->last_audio,__ATOMIC_RELAXED);
+                        if(!pa || dnow-pa>=AUDIO_IDLE_MS)
+                            __atomic_store_n(&L->audio_since,dnow,__ATOMIC_RELAXED);
+                        __atomic_store_n(&L->last_audio,dnow,__ATOMIC_RELAXED);
+                    }
                 }
                 process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);
             }
