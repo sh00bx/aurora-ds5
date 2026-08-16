@@ -4,13 +4,18 @@
 #
 #   ds5_autorun.sh <lever> <blocks> <block_seconds> [B_ms]
 #
-#   lever          ptype | wifi | none
+#   lever          ptype | wifi | cores | none
 #                  ptype = the L18 packet-type clamp
 #                  wifi  = POSITIVE CONTROL: bulk download over wlan0 during ON
 #                          blocks. WiFi and bluetooth are one combo module here,
 #                          so this is a real coex perturbation even on 5 GHz. An
 #                          instrument that cannot be moved by it is a null
 #                          instrument, and nothing it says about a lever counts.
+#                  cores = LG's MP governor off + cpu1-3 forced online (what the
+#                          game-mode guard's pin_cpus does). The gap ledger is
+#                          timed by the daemon's own event loop, so the number of
+#                          cores it competes for can change the measurement as
+#                          well as the transport. Left free, this TV runs on two.
 #                  none  = pure baseline / equivalence run
 #   blocks         how many blocks TOTAL (alternating OFF/ON, so use an even number)
 #   block_seconds  length of one block (>=120 recommended; the >=60ms band needs
@@ -47,9 +52,28 @@ LOAD_URL="${LOAD_URL:-http://192.168.0.218:8001/ds5_loadtest.bin}"
 case "$LEVER" in
     ptype) TOG=/tmp/ds5_ptype;  ON_VALUE=1 ;;
     wifi)  TOG=""; ON_VALUE="" ;;
+    cores) TOG=""; ON_VALUE="" ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|wifi|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|none)"; exit 1 ;;
 esac
+
+MP=/proc/lg/pm/mp_enable
+cores_on(){
+    [ "$LEVER" = "cores" ] || return 0
+    [ -e "$MP" ] && echo 0 > "$MP" 2>/dev/null
+    for c in 1 2 3; do echo 1 > "/sys/devices/system/cpu/cpu$c/online" 2>/dev/null; done
+}
+cores_off(){
+    # The governor is handed back, not overridden the other way: hotplugging
+    # cores down is this TV's own idle behaviour and is what the OFF arm is
+    # supposed to measure.
+    [ -e "$MP" ] && echo 1 > "$MP" 2>/dev/null
+}
+# How many cores are online right now: "0-1" -> 2, "0,2-3" -> 3.
+cores_now(){
+    awk '{s=0;n=split($0,a,",");for(i=1;i<=n;i++){m=split(a[i],b,"-");s+=(m==2?b[2]-b[1]+1:1)}print s}' \
+        /sys/devices/system/cpu/online 2>/dev/null
+}
 
 load_on(){
     [ "$LEVER" = "wifi" ] || return 0
@@ -80,6 +104,12 @@ done
 if [ -e /tmp/ds5_linkq_ms ] && [ "$LEVER" != "none" ]; then
     echo "REFUSING: /tmp/ds5_linkq_ms armed — it can park the HCI command path"; exit 1
 fi
+# The game-mode guard re-asserts pin_cpus from its own loop. That is exactly the
+# knob the cores lever toggles, and a lever the machine keeps putting back is not
+# a lever — the OFF arm would silently be an ON arm.
+if [ "$LEVER" = "cores" ] && ps ax 2>/dev/null | grep -q "[g]amemode.sh"; then
+    echo "REFUSING: a game-mode guard loop is running — it would fight the OFF arm"; exit 1
+fi
 pidof ds5_txd >/dev/null 2>&1 || { echo "REFUSING: ds5_txd is not running"; exit 1; }
 
 OUT="/tmp/autorun-$LEVER-$(date +%Y%m%d-%H%M%S)"
@@ -95,6 +125,7 @@ echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks ge
 cleanup(){
     [ -n "$TOG" ] && rm -f "$TOG"
     load_off
+    cores_off
     kill "$RIG_PID" 2>/dev/null
     say "cleanup: lever disarmed, load stopped, rig stopped"
 }
@@ -128,24 +159,35 @@ while [ "$i" -lt "$BLOCKS" ]; do
         ARM=on
         [ -n "$TOG" ] && { echo "$ON_VALUE" > "$TOG"; chown 0:0 "$TOG" 2>/dev/null; chmod 644 "$TOG"; }
         load_on
+        cores_on
     else
         ARM=off
         [ -n "$TOG" ] && rm -f "$TOG"
         load_off
+        cores_off
     fi
     say "block $i/$BLOCKS arm=$ARM (guard ${GUARD}s, then ${BLOCK}s)"
     sleep "$GUARD"                      # the lever needs a reconcile pass to land
     S=$(date +%s)
     RX0=$(awk '/wlan0/{print $2}' /proc/net/dev)
-    sleep "$BLOCK"
+    # Sample the online-core set through the block instead of sleeping blind:
+    # mp_enable is a request to a governor, and the daemon's event loop — which
+    # is what timestamps every gap in this programme — competes for whatever
+    # cores are actually there. So the core count is a witness, not a setting.
+    CSUM=0; CN=0; t=0
+    while [ "$t" -lt "$BLOCK" ]; do
+        sleep 10; t=$((t+10))
+        c=$(cores_now); CSUM=$((CSUM + ${c:-0})); CN=$((CN+1))
+    done
     E=$(date +%s)
     RX1=$(awk '/wlan0/{print $2}' /proc/net/dev)
     # WiFi and bluetooth share the MT7921, so what else was on the air during a
     # block belongs in the record rather than in hindsight: a run taken while the
     # TV was streaming is not the same experiment as one taken on a quiet radio.
     FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
-    printf '%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
-        "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" >> "$OUT/windows.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
+        "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" \
+        "$(( CSUM * 10 / CN ))" >> "$OUT/windows.tsv"
     # The daemon's per-gap log is a CAPPED RING: at 256 KiB it drops the OLDEST
     # entries and leaves one TRUNCATED marker behind. Copying it once at the end
     # therefore loses whole early blocks while their exposure still counts — which
@@ -157,6 +199,7 @@ done
 
 [ -n "$TOG" ] && rm -f "$TOG"
 load_off
+cores_off
 kill "$LEDGER_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
 cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null

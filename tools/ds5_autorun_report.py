@@ -68,7 +68,9 @@ def main(argv):
         arm, s, e = f[0], f[1], f[2]
         wifi = int(f[3]) if len(f) > 3 else None
         fg = f[4] if len(f) > 4 else None
-        windows.append((arm, int(s) * 1000, int(e) * 1000, wifi, fg))
+        # cores*10, sampled every 10 s through the block (absent in older runs)
+        cores = int(f[5]) / 10.0 if len(f) > 5 and f[5].strip() else None
+        windows.append((arm, int(s) * 1000, int(e) * 1000, wifi, fg, cores))
     if not windows:
         print("no blocks recorded")
         return 1
@@ -118,10 +120,13 @@ def main(argv):
 
     EDGES = (60, 70, 80, 100)
     arms = {}
-    for arm, s, e, wifi, fg in windows:
-        a = arms.setdefault(arm, {"secs": 0.0, "wifi": [], **{k: 0 for k in EDGES}})
+    for arm, s, e, wifi, fg, cores in windows:
+        a = arms.setdefault(arm, {"secs": 0.0, "wifi": [], "cores": [],
+                                  **{k: 0 for k in EDGES}})
         if wifi is not None:
             a["wifi"].append(wifi)
+        if cores is not None:
+            a["cores"].append(cores)
         a["secs"] += (e - s) / 1000.0
         for ts, ms, out in gaps:
             if s <= ts <= e and out >= STARVE_MIN_OUT:
@@ -146,6 +151,11 @@ def main(argv):
         if w:
             print(f"  {a}: wlan0 rx {min(w)}-{max(w)} kbit/s per block"
                   + ("   (quiet radio)" if max(w) < 500 else "   (SHARED RADIO WAS BUSY)"))
+        c = arms[a]["cores"]
+        if c:
+            # The gap ledger is timed by the daemon's event loop, so how many
+            # cores it competed for belongs next to every rate on this page.
+            print(f"  {a}: {min(c):.1f}-{max(c):.1f} cores online (sampled every 10 s)")
     print(f"{'edge':>6} " + " ".join(f"{a:>18}" for a in sorted(arms)))
     for k in EDGES:
         row = f">={k:3d}ms "
