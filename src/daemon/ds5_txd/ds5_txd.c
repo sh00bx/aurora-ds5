@@ -711,6 +711,8 @@ struct ds5_link {
     uint16_t flush_handle;   /* handle the last Write_Automatic_Flush_Timeout was for */
     int      flush_sent_ms;  /* value we last wrote (0 = infinite/off); -1 = nothing written */
     uint64_t last_flush_cmd; /* send throttle, shares the >=3s command budget */
+    uint64_t last_linkq;     /* L16 poll throttle (capture thread) */
+    unsigned linkq_rot;      /* L16 round-robin index over the four status reads */
     /* per-link gap telemetry (g_lock) — the A/B acceptance signal.
      *
      * MOVED TO THE CAPTURE THREAD 2026-08-15. The histogram used to be derived in
@@ -1414,6 +1416,96 @@ static int send_read_local_features(void){
     return cmd_send(cmd,sizeof cmd,OP_READ_LOCAL_FEATURES,0,0);
 }
 
+/* ---------------------------------------------------------------------------
+ * L16 — air-side telemetry (read-only status reads).
+ *
+ * Why this exists. AMENDED 2026-08-16 late, after the gapge histogram was read
+ * against a CONTINUOUS-audio workload (Ratchet's hoverboots) for the first time.
+ *
+ * The original motivation held that NOCP measures nothing real, because the
+ * 30-79ms bands looked like BATCHED CREDIT REPORTING and the >=80ms band like
+ * game-side SILENCE. That reading came from a workload with only sporadic
+ * effects. Under continuous load it is wrong: a gap longer than B + 21.33ms
+ * starves the pad, and the count at that edge PREDICTS THE EAR — B=40 gives
+ * ~87 underruns/min (heard as dropouts), B=60 gives ~4.8 (heard as clean).
+ * So NOCP does see the symptom. The buffer floor is ~58ms, set by the tail
+ * between 60 and 80ms; gaps of 30-50ms really are the normal bundling cadence
+ * (764/min against an injection every 21.8ms) and no buffer can go under them.
+ *
+ * What NOCP still cannot say is WHY that 60-80ms tail exists — and it is
+ * INTERMITTENT (a whole 77s half of the same session had nothing above 80ms),
+ * so there is a phase-shaped cause to find. Air retransmissions are the cheapest
+ * hypothesis: they cost standing latency and add arrival jitter exactly where
+ * the tail sits. These four reads are the smallest instrument that can see them.
+ * Killing the tail is now the only remaining latency lever, worth ~20ms of
+ * buffer if it succeeds.
+ *
+ * No lever is built on this yet, deliberately. The outcomes — including the one
+ * that kills the hypothesis — are pre-registered in
+ * workspace/ds5-linkq-preregistration-2026-08-16.md, written before this code.
+ *
+ * Default OFF. Arm with `echo 1000 > /tmp/ds5_linkq_ms` (root-owned).
+ *
+ * 🚨 The scan reconciler shares cmd_send's pending queue and the g_cmd_dead
+ * guard, and scan-off is worth ~8x fewer blackouts in a live A/B. Telemetry is
+ * garnish and yields to it: ONE command per tick, round-robin over the four,
+ * and the tick is skipped outright while the queue is busy — so telemetry can
+ * never occupy a slot a reconciler needs.
+ */
+#define OP_READ_LINK_QUALITY   0x1403
+#define OP_READ_RSSI           0x1405
+#define OP_READ_AFH_MAP        0x1406
+#define OP_READ_FAILED_CONTACT 0x1408
+#define LINKQ_MIN_MS   500      /* keeps the added rate under the reconcilers' 3s budget */
+#define LINKQ_MAX_MS 10000
+#define LINKQ_PEND_HEADROOM 3   /* of CMD_PEND_MAX=8 — leave the reconcilers their slots */
+
+static volatile int g_linkq_ms = 0;          /* published toggle; 0 = off */
+/* Samples; -1 (127 for dBm) = never seen. min/max are kept deliberately: a
+ * vendor-defined link_quality that never MOVES is a MUTE INSTRUMENT, not a
+ * quiet link, and reading a flat line as "no retransmissions" would repeat the
+ * read-back mistake one level up. The pre-registration makes zero variance a
+ * disqualifying result rather than a negative one. */
+static volatile int g_lq_last=-1, g_lq_min=-1, g_lq_max=-1;
+static volatile int g_rssi_last=127, g_rssi_min=127;
+static volatile int g_afh_last=-1, g_afh_min=-1;
+static volatile int g_fcc_base=-1, g_fcc_last=-1;
+static volatile int g_linkq_off=0;           /* bitmask: opcodes that answered with an error */
+
+/* The four reads share one shape: [handle] in, status+handle+payload out. */
+static int send_status_read(uint16_t op, uint16_t handle){
+    uint8_t cmd[6]={ 0x01, (uint8_t)(op&0xff), (uint8_t)(op>>8), 2,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f) };
+    return cmd_send(cmd,sizeof cmd,op,handle,0);
+}
+
+/* CAPTURE-THREAD-ONLY (function-static cache), publishes g_linkq_ms. */
+static void linkq_refresh(void){
+    static uint64_t last=0; static int warned=0, badwarn=0;
+    uint64_t n=now_us();
+    if(last && n-last<=1000000ull) return;
+    last=n;
+    int r=read_root_int("/tmp/ds5_linkq_ms",&warned);
+    int was=g_linkq_ms;
+    if(r<0 || r==0)                              g_linkq_ms=0;
+    else if(r>=LINKQ_MIN_MS && r<=LINKQ_MAX_MS){ g_linkq_ms=r; badwarn=0; }
+    else if(!badwarn){
+        badwarn=1;
+        fprintf(stderr,"[txd] ignoring /tmp/ds5_linkq_ms=%d: outside %d..%d ms "
+                       "(polling faster would compete with the scan reconciler)\n",
+                r,LINKQ_MIN_MS,LINKQ_MAX_MS);
+    }
+    if(was && !g_linkq_ms){
+        /* Clear on disarm so a second measurement never inherits the first
+         * one's extremes — min/max are only meaningful within one armed run. */
+        g_lq_last=g_lq_min=g_lq_max=-1; g_rssi_last=g_rssi_min=127;
+        g_afh_last=g_afh_min=-1; g_fcc_base=g_fcc_last=-1; g_linkq_off=0;
+        fprintf(stderr,"[txd] linkq: disarmed\n");
+    } else if(!was && g_linkq_ms)
+        fprintf(stderr,"[txd] linkq: armed, one read every %d ms, round-robin, read-only\n",
+                g_linkq_ms);
+}
+
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
  * controller's periodic page/inquiry scan blocks the DS5 ACL link for
  * 86-234ms on a ~1.28s grid (EPISODE detector) — audible speaker dropouts and
@@ -1869,6 +1961,46 @@ static void handle_hci_event(const uint8_t *e, int el){
                 g_flush_confirmed_ms=0;
                 fprintf(stderr,"[txd] flush: read-back failed status=0x%02x -> treating as DISARMED\n",p[3]);
             }
+        } else if(op==OP_READ_LINK_QUALITY || op==OP_READ_RSSI ||
+                  op==OP_READ_AFH_MAP     || op==OP_READ_FAILED_CONTACT){
+            /* L16. A command the controller does not implement is recorded once
+             * and then never polled again — a retry storm on an unsupported
+             * opcode would spend exactly the command budget this instrument
+             * promised not to touch. */
+            if(pl>=4 && p[3]!=0x00){
+                int bit = op==OP_READ_LINK_QUALITY?1: op==OP_READ_RSSI?2:
+                          op==OP_READ_AFH_MAP?4:8;
+                if(!(g_linkq_off&bit)){
+                    g_linkq_off|=bit;
+                    fprintf(stderr,"[txd] linkq: 0x%04x returned status=0x%02x "
+                                   "-> not polling it again this run\n",op,p[3]);
+                }
+            } else if(op==OP_READ_LINK_QUALITY && pl>=7){
+                int q=p[6];
+                g_lq_last=q;
+                if(g_lq_min<0||q<g_lq_min) g_lq_min=q;
+                if(g_lq_max<0||q>g_lq_max) g_lq_max=q;
+            } else if(op==OP_READ_RSSI && pl>=7){
+                int r=(int8_t)p[6];
+                g_rssi_last=r;
+                if(g_rssi_min==127||r<g_rssi_min) g_rssi_min=r;
+            } else if(op==OP_READ_AFH_MAP && pl>=17){
+                /* p[6]=mode, p[7..16]=79-bit map. Popcount = channels AFH still
+                 * considers usable; a small number is coex having eaten the
+                 * spectrum, which is a capacity finding independent of B. */
+                int used=0;
+                for(int k=0;k<10;k++){ unsigned v=p[7+k]; while(v){ used+=v&1; v>>=1; } }
+                g_afh_last=used;
+                if(g_afh_min<0||used<g_afh_min) g_afh_min=used;
+            } else if(op==OP_READ_FAILED_CONTACT && pl>=8){
+                int c=(int)(p[6]|(p[7]<<8));
+                /* Reported as a delta from the first sample of this armed run:
+                 * the counter is cumulative and we deliberately never reset it
+                 * (Reset_Failed_Contact_Counter would clobber a value another
+                 * stack user may be watching). */
+                if(g_fcc_base<0) g_fcc_base=c;
+                g_fcc_last=c;
+            }
         } else if(op==OP_WRITE_AUTO_FLUSH && pl>=4 && p[3]!=0x00){
             /* Accepted-and-ignored is the case we fear, but an outright reject
              * must not leave a stale "armed" belief behind either. */
@@ -2224,6 +2356,7 @@ static void *capture_thread(void *arg){
          * than every 3s so a flap storm cannot flood the 0.5/s kernel drain (bursts
          * beyond that are additionally absorbed by cmd_send's unacked-queue cap). */
         ghost_ttl_refresh();   /* capture-thread-only reader; publishes g_ghost_ttl_ms */
+        linkq_refresh();       /* capture-thread-only reader; publishes g_linkq_ms */
         for(int i=0;i<MAX_LINKS;i++){
             struct ds5_link *L=&g_links[i];
             if(pin[i]){
@@ -2275,6 +2408,34 @@ static void *capture_thread(void *arg){
                     } else if(g_flush_readback_pending && t-L->last_flush_cmd>3000 &&
                               send_read_auto_flush(lh[i])==0){
                         L->last_flush_cmd=t;
+                    }
+                }
+                /* L16 poll: at most ONE read per tick, rotating over the four,
+                 * and only while the command queue has room to spare. Both
+                 * limits exist for the same reason — the scan reconciler and the
+                 * sniff pin share this queue, and they are load-bearing while
+                 * this instrument is merely curious. */
+                if(g_linkq_ms && g_pend_n<LINKQ_PEND_HEADROOM &&
+                   t-L->last_linkq>(uint64_t)g_linkq_ms){
+                    static const uint16_t rot[4]={ OP_READ_LINK_QUALITY, OP_READ_RSSI,
+                                                   OP_READ_AFH_MAP, OP_READ_FAILED_CONTACT };
+                    /* Skip opcodes this controller has already refused. If all
+                     * four are refused the loop falls through having sent
+                     * nothing, which costs four bitmask tests per tick and
+                     * leaves last_linkq untouched — cheap enough not to warrant
+                     * a separate all-dead latch. */
+                    for(int k=0;k<4;k++){
+                        uint16_t op=rot[L->linkq_rot&3];
+                        int bit=1<<(L->linkq_rot&3);
+                        L->linkq_rot++;
+                        if(g_linkq_off&bit) continue;
+                        /* Stamped whether or not the send took: a refused write
+                         * means the command path is busy, and the right response
+                         * from a curious instrument is to wait a full interval,
+                         * not to retry on the next capture pass. */
+                        L->last_linkq=t;
+                        send_status_read(op,lh[i]);
+                        break;
                     }
                 }
             } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1; }
@@ -3112,8 +3273,24 @@ int main(int argc,char**argv){
             }
             /* Measured too: this is the LONGEST single write the inject thread
              * makes, so if stderr can block at all it shows here first. */
+            /* L16 air telemetry, present ONLY while armed so an ordinary
+             * session's line stays byte-for-byte the old one (every A/B baseline
+             * in this project is a re-parse of these lines).
+             *   lq=last/min/max — link quality; min==max over a whole run means
+             *                     the instrument is MUTE, not that the link is
+             *                     clean. That reading is disqualifying, not
+             *                     negative (see the pre-registration).
+             *   rssi=last/min   — dBm. afh=last/min — usable channels of 79.
+             *   fcc=delta       — expected to stay 0 while the flush timeout is
+             *                     infinite; movement here is a real finding. */
+            char linkq[80]; linkq[0]='\0';
+            if(g_linkq_ms)
+                snprintf(linkq,sizeof linkq," lq=%d/%d/%d rssi=%d/%d afh=%d/%d fcc=%d",
+                         g_lq_last,g_lq_min,g_lq_max,g_rssi_last,g_rssi_min,
+                         g_afh_last,g_afh_min,
+                         (g_fcc_base>=0&&g_fcc_last>=0)?g_fcc_last-g_fcc_base:0);
             uint64_t t0=now_us();
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s\n",
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
@@ -3122,7 +3299,7 @@ int main(int argc,char**argv){
                  * confirmed=0 is precisely the accept-and-ignore case. */
                 g_flush_want, g_flush_confirmed_ms,
                 g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"),
-                g_cmd_dead?" CMDDEAD":"", links);
+                g_cmd_dead?" CMDDEAD":"", linkq, links);
             logw_note(t0);
             last_log=now_ms();
         }
