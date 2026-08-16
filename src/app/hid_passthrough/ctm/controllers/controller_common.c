@@ -813,6 +813,24 @@ void ctm_controller_note_b_eff(ctm_controller_t *c, unsigned b_eff,
     c->b_eff_last = b_eff;
     ctm_ctl_log(c, "B_eff %u -> %u ms (slider %u + adapt %u)",
                 prev, b_eff, slider, adapt_add);
+    /* Say so when we leave the only range anyone outside has attested for this
+     * field. Thrum's DualSenseHapticsStreamer declares the 0x91 byte as a
+     * "controller-side dejitter buffer [16,127]" and never sends above 120; we
+     * clamp at 255 and the slider reaches 200, so the top half of it plus the
+     * adaptive add (<= 40) can put the pad in a region NOBODY has evidence for.
+     *
+     * Deliberately a log line and not a clamp: 127 is one foreign comment, not a
+     * measurement, and silently amputating half a user-facing slider on that
+     * basis would be the same mistake in the other direction. The pad returns no
+     * buffer feedback at all, so an ignored or wrapped value is invisible except
+     * acoustically -- which makes this the difference between an A/B that can be
+     * interpreted afterwards and one that cannot. Settle it with
+     * tools/ds5_click_latency.py, then clamp or widen with a reason. */
+    if (b_eff > 127u || b_eff < 16u) {
+        ctm_ctl_log(c, "B_eff %u ms is outside the externally attested [16,127] "
+                       "window for the 0x91 block -- unverified pad behaviour",
+                    b_eff);
+    }
 }
 
 /* Primary input thread: blocking-poll the bridged hidraw node and forward what
