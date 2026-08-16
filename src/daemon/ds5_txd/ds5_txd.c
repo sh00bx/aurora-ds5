@@ -126,6 +126,15 @@
                                        * (telemetry gate only; see last_demand). 1s is far above
                                        * the ~10-21ms audio cadence AND above the ~1/s rumble-only
                                        * floor, but far below any idle stretch. */
+/* Edges of the cumulative NOCP-gap histogram, in ms. Chosen to straddle the
+ * usable slider range (0..200, default 60) offset by one report of audio, so
+ * every plausible pad buffer has an edge within a few ms of its own starvation
+ * threshold: B=40 reads at 60, B=60 at 80, B=100 at 120. Above 200 the pad
+ * buffer stops being the binding constraint and one overflow bin is enough. */
+#define GAPGE_N 10
+static const unsigned GAPGE_EDGE[GAPGE_N] =
+    { 30, 40, 50, 60, 70, 80, 100, 120, 160, 200 };
+
 #define HCI_SUBEV_LE_CONN       0x01   /* LE Connection Complete                 */
 #define HCI_SUBEV_LE_ENH_CONN   0x0a   /* Enhanced LE Connection Complete (BT5)  */
 
@@ -715,6 +724,26 @@ struct ds5_link {
      * quantization. Written under the lock the NOCP handler already holds; the
      * main loop snapshots them in its existing locked block. */
     long     gap30, gap50, gap80; /* NOCP-gap histogram 30-49/50-79/>=80ms */
+    /* Cumulative "at or above" histogram, GAPGE_EDGE[] in ms.
+     *
+     * The three bins above have fixed edges at 30/50/80, and the question we
+     * actually ask of them does not: a pad buffer of B ms survives a gap iff
+     * roughly g <= B + one report's worth of audio (21.33ms on batched 0x39,
+     * 10.67 on 0x36). So the decision threshold moves with the slider and never
+     * lands on a bin edge. Reading exposure for B=40 or B=60 out of 30/50/80
+     * means interpolating inside a bin, which is exactly the guesswork that sent
+     * a 2026-08-16 A/B to the ears instead of to a counter: every audible
+     * counter in the stack read zero while the pad was audibly dropping out,
+     * because the failure happens INSIDE the pad and nothing here can see it.
+     *
+     * Cumulative counts make that readable without arithmetic: at buffer B, look
+     * up the edge nearest B+21 and the number there is how often this link
+     * out-ran the pad. Lower B until it leaves zero and you have the floor —
+     * with no microphone and no subjective judgement.
+     *
+     * The old three bins stay untouched: the phase-2/4 analysis tools parse
+     * `gaps=%ld/%ld/%ld` positionally. */
+    long     gapge[GAPGE_N];
     uint64_t gap_max;             /* largest single gap this binding (ms) */
     /* Gaps we caused ourselves with the bench injector are counted SEPARATELY.
      * They must not enter the production bins — the histogram is the primary
@@ -1982,6 +2011,10 @@ static void handle_hci_event(const uint8_t *e, int el){
                         if(g>=80)      L->gap80++;
                         else if(g>=50) L->gap50++;
                         else if(g>=30) L->gap30++;
+                        /* Same gate, same lock, same event — cumulative, so one
+                         * gap lands in every bin it clears. */
+                        for(int b=0;b<GAPGE_N;b++)
+                            if(g>=GAPGE_EDGE[b]) L->gapge[b]++;
                         if(g>L->gap_max) L->gap_max=g;
                     }
                 }
@@ -2736,6 +2769,9 @@ int main(int argc,char**argv){
                     sn[i].rst=1;
                     sn[i].r30=g_links[i].gap30; sn[i].r50=g_links[i].gap50; sn[i].r80=g_links[i].gap80;
                     g_links[i].gap30=g_links[i].gap50=g_links[i].gap80=0;
+                    /* Cleared with the other bins: a rebind starts a fresh
+                     * histogram, otherwise the A/B delta spans two bindings. */
+                    memset(g_links[i].gapge,0,sizeof g_links[i].gapge);
                     g_links[i].gap_max=0;
                     g_links[i].gap_synth=0; g_links[i].gap_synth_ms=0;
                     g_links[i].tele_gen=g_links[i].nonce;
@@ -3033,7 +3069,10 @@ int main(int argc,char**argv){
              * native NOCP resolution instead of the old ~21ms-quantized sampling,
              * so it is not comparable across this build boundary — that is a
              * measurement change to note in the ledger, not a format change.) */
-            char links[MAX_LINKS*224]; int lo=0; links[0]='\0';
+            /* 224 -> 416: the cumulative histogram adds up to ~120 chars per
+             * link once it is populated, and snprintf would silently truncate
+             * the tail fields rather than the new one. */
+            char links[MAX_LINKS*416]; int lo=0; links[0]='\0';
             for(int i=0;i<MAX_LINKS;i++){
                 struct ds5_link *L=&g_links[i];
                 if(!L->ever_bound) continue;
@@ -3045,9 +3084,20 @@ int main(int argc,char**argv){
                 if(L->gap_synth)
                     snprintf(synth,sizeof synth," synth=%ld/%llums",
                              L->gap_synth,(unsigned long long)L->gap_synth_ms);
+                /* Self-describing edge:count pairs — the edges are a compile-time
+                 * choice and a bare tuple would need the reader to have this file
+                 * open. Emitted only once a bin is non-zero, so a quiet link's
+                 * line does not grow a 100-character tail of zeros. */
+                char gge[160]; int go=0; gge[0]='\0';
+                if(L->gapge[0]){
+                    go+=snprintf(gge+go,sizeof gge-go," gapge=");
+                    for(int b=0;b<GAPGE_N && go<(int)sizeof gge;b++)
+                        go+=snprintf(gge+go,sizeof gge-go,"%s%u:%ld",
+                                     b?"/":"",GAPGE_EDGE[b],L->gapge[b]);
+                }
                 lo+=snprintf(links+lo,sizeof links-lo,
                     " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld"
-                    " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s",
+                    " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s%s",
                     i,a[5],a[4],a[3],a[2],a[1],a[0],L->have,L->outstanding,L->rumble_fly,
                     L->fifo_count,L->gap30,L->gap50,L->gap80,
                     (unsigned long long)L->gap_max,
@@ -3057,7 +3107,7 @@ int main(int argc,char**argv){
                      * session-fatal leak the TTL exists to prevent, and this is
                      * where it would show. */
                     L->ghost,L->ghost_absorbed,L->ghost_expired,
-                    synth);
+                    synth,gge);
                 if(lo>=(int)sizeof links) break;
             }
             /* Measured too: this is the LONGEST single write the inject thread
