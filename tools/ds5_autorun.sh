@@ -4,7 +4,14 @@
 #
 #   ds5_autorun.sh <lever> <blocks> <block_seconds> [B_ms]
 #
-#   lever          ptype | none      ("none" = pure baseline / equivalence run)
+#   lever          ptype | wifi | none
+#                  ptype = the L18 packet-type clamp
+#                  wifi  = POSITIVE CONTROL: bulk download over wlan0 during ON
+#                          blocks. WiFi and bluetooth are one combo module here,
+#                          so this is a real coex perturbation even on 5 GHz. An
+#                          instrument that cannot be moved by it is a null
+#                          instrument, and nothing it says about a lever counts.
+#                  none  = pure baseline / equivalence run
 #   blocks         how many blocks TOTAL (alternating OFF/ON, so use an even number)
 #   block_seconds  length of one block (>=120 recommended; the >=60ms band needs
 #                  a few hundred events per arm before a ratio means anything)
@@ -36,11 +43,26 @@ RIG=/tmp/ds5_synth_audio
 [ "$(id -u)" = "0" ] || { echo "must run as root"; exit 1; }
 [ -x "$RIG" ] || { echo "REFUSING: $RIG missing"; exit 1; }
 
+LOAD_URL="${LOAD_URL:-http://192.168.0.218:8001/ds5_loadtest.bin}"
 case "$LEVER" in
     ptype) TOG=/tmp/ds5_ptype;  ON_VALUE=1 ;;
+    wifi)  TOG=""; ON_VALUE="" ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|none)"; exit 1 ;;
 esac
+
+load_on(){
+    [ "$LEVER" = "wifi" ] || return 0
+    nohup sh -c "while :; do curl -s -o /dev/null '$LOAD_URL' || sleep 1; done" \
+        >/dev/null 2>&1 </dev/null &
+    echo $! > /tmp/ds5_autorun_load.pid
+}
+load_off(){
+    [ -f /tmp/ds5_autorun_load.pid ] || return 0
+    kill "$(cat /tmp/ds5_autorun_load.pid)" 2>/dev/null
+    pkill -f "$LOAD_URL" 2>/dev/null
+    rm -f /tmp/ds5_autorun_load.pid
+}
 
 # One lever at a time: the ledger cannot attribute a delta to two of them.
 # Lever state is DECLARED, never discovered: a knob left armed by a previous
@@ -68,8 +90,9 @@ echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks ge
 
 cleanup(){
     [ -n "$TOG" ] && rm -f "$TOG"
+    load_off
     kill "$RIG_PID" 2>/dev/null
-    say "cleanup: lever disarmed, rig stopped"
+    say "cleanup: lever disarmed, load stopped, rig stopped"
 }
 trap 'cleanup; exit 130' INT TERM
 
@@ -97,10 +120,14 @@ LEDGER_PID=$!
 i=0
 while [ "$i" -lt "$BLOCKS" ]; do
     i=$((i+1))
-    if [ $((i % 2)) -eq 0 ] && [ -n "$TOG" ]; then
-        ARM=on;  echo "$ON_VALUE" > "$TOG"; chown 0:0 "$TOG" 2>/dev/null; chmod 644 "$TOG"
+    if [ $((i % 2)) -eq 0 ] && [ "$LEVER" != "none" ]; then
+        ARM=on
+        [ -n "$TOG" ] && { echo "$ON_VALUE" > "$TOG"; chown 0:0 "$TOG" 2>/dev/null; chmod 644 "$TOG"; }
+        load_on
     else
-        ARM=off; [ -n "$TOG" ] && rm -f "$TOG"
+        ARM=off
+        [ -n "$TOG" ] && rm -f "$TOG"
+        load_off
     fi
     say "block $i/$BLOCKS arm=$ARM (guard ${GUARD}s, then ${BLOCK}s)"
     sleep "$GUARD"                      # the lever needs a reconcile pass to land
@@ -119,6 +146,7 @@ while [ "$i" -lt "$BLOCKS" ]; do
 done
 
 [ -n "$TOG" ] && rm -f "$TOG"
+load_off
 kill "$LEDGER_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
 cp /tmp/ds5_gaps.log "$OUT/gaps.log" 2>/dev/null
