@@ -4,7 +4,7 @@
 #
 #   ds5_autorun.sh <lever> <blocks> <block_seconds> [B_ms]
 #
-#   lever          ptype | wifi | cores | none
+#   lever          ptype | wifi | cores | cpu | none
 #                  ptype = the L18 packet-type clamp
 #                  wifi  = POSITIVE CONTROL: bulk download over wlan0 during ON
 #                          blocks. WiFi and bluetooth are one combo module here,
@@ -16,6 +16,12 @@
 #                          timed by the daemon's own event loop, so the number of
 #                          cores it competes for can change the measurement as
 #                          well as the transport. Left free, this TV runs on two.
+#                  cpu   = CPU_N busy loops during ON blocks. The last untested
+#                          candidate for the one thing the rig cannot reproduce:
+#                          gameplay's tail beyond 70 ms is 5-10x fatter than the
+#                          rig's even with the radio loaded and the cores pinned,
+#                          and what a stream adds that a curl does not is a
+#                          decoder and a renderer competing for the same cores.
 #                  none  = pure baseline / equivalence run
 #   blocks         how many blocks TOTAL (alternating OFF/ON, so use an even number)
 #   block_seconds  length of one block (>=120 recommended; the >=60ms band needs
@@ -53,9 +59,39 @@ case "$LEVER" in
     ptype) TOG=/tmp/ds5_ptype;  ON_VALUE=1 ;;
     wifi)  TOG=""; ON_VALUE="" ;;
     cores) TOG=""; ON_VALUE="" ;;
+    cpu)   TOG=""; ON_VALUE="" ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|none)"; exit 1 ;;
 esac
+
+CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu
+CPU_PIDS=/tmp/ds5_autorun_cpu.pids
+cpu_start(){
+    : > "$CPU_PIDS"
+    i=0
+    while [ "$i" -lt "$CPU_N" ]; do
+        i=$((i+1))
+        nohup sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+        echo $! >> "$CPU_PIDS"
+    done
+}
+cpu_stop(){
+    [ -f "$CPU_PIDS" ] || return 0
+    while read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$CPU_PIDS"
+    rm -f "$CPU_PIDS"
+}
+cpu_on(){  [ "$LEVER" = "cpu" ] && cpu_start; return 0; }
+cpu_off(){ [ "$LEVER" = "cpu" ] && cpu_stop;  return 0; }
+# Busy fraction over a block, from /proc/stat: idle is field 5, and everything
+# else the kernel counts is work. A lever that says "the CPU was loaded" has to
+# show it in the same file the scheduler bills against.
+cpu_busy_pct(){   # $1 = snapshot before, $2 = snapshot after ("total idle")
+    set -- $1 $2
+    t0=$1; i0=$2; t1=$3; i1=$4
+    dt=$((t1-t0)); di=$((i1-i0))
+    [ "$dt" -gt 0 ] && echo $(( (dt-di)*100/dt )) || echo 0
+}
+cpu_snap(){ awk '/^cpu /{t=0;for(i=2;i<=NF;i++)t+=$i;print t, $5}' /proc/stat; }
 
 MP=/proc/lg/pm/mp_enable
 cores_pin(){
@@ -152,6 +188,7 @@ cleanup(){
     [ -n "$TOG" ] && rm -f "$TOG"
     load_stop            # unconditional: background conditions end with the run
     cores_unpin          # four hot cores on someone's TV is not a default
+    cpu_stop             # busy loops outlive their shell if nobody reaps them
     kill "$RIG_PID" 2>/dev/null
     say "cleanup: lever disarmed, load stopped, cores released, rig stopped"
 }
@@ -189,16 +226,19 @@ while [ "$i" -lt "$BLOCKS" ]; do
         [ -n "$TOG" ] && { echo "$ON_VALUE" > "$TOG"; chown 0:0 "$TOG" 2>/dev/null; chmod 644 "$TOG"; }
         load_on
         cores_on
+        cpu_on
     else
         ARM=off
         [ -n "$TOG" ] && rm -f "$TOG"
         load_off
         cores_off
+        cpu_off
     fi
     say "block $i/$BLOCKS arm=$ARM (guard ${GUARD}s, then ${BLOCK}s)"
     sleep "$GUARD"                      # the lever needs a reconcile pass to land
     S=$(date +%s)
     RX0=$(awk '/wlan0/{print $2}' /proc/net/dev)
+    CPU0=$(cpu_snap)
     # Sample the online-core set through the block instead of sleeping blind:
     # mp_enable is a request to a governor, and the daemon's event loop — which
     # is what timestamps every gap in this programme — competes for whatever
@@ -210,13 +250,14 @@ while [ "$i" -lt "$BLOCKS" ]; do
     done
     E=$(date +%s)
     RX1=$(awk '/wlan0/{print $2}' /proc/net/dev)
+    CPU1=$(cpu_snap)
     # WiFi and bluetooth share the MT7921, so what else was on the air during a
     # block belongs in the record rather than in hindsight: a run taken while the
     # TV was streaming is not the same experiment as one taken on a quiet radio.
     FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
         "$(( (RX1 - RX0) * 8 / BLOCK / 1000 ))" "${FG:-none}" \
-        "$(( CSUM * 10 / CN ))" >> "$OUT/windows.tsv"
+        "$(( CSUM * 10 / CN ))" "$(cpu_busy_pct "$CPU0" "$CPU1")" >> "$OUT/windows.tsv"
     # The daemon's per-gap log is a CAPPED RING: at 256 KiB it drops the OLDEST
     # entries and leaves one TRUNCATED marker behind. Copying it once at the end
     # therefore loses whole early blocks while their exposure still counts — which
@@ -229,6 +270,7 @@ done
 [ -n "$TOG" ] && rm -f "$TOG"
 load_stop            # the background conditions end with the run, BG flags or not
 cores_unpin
+cpu_stop
 kill "$LEDGER_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
 cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null

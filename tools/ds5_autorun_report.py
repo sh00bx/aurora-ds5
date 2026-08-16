@@ -70,7 +70,9 @@ def main(argv):
         fg = f[4] if len(f) > 4 else None
         # cores*10, sampled every 10 s through the block (absent in older runs)
         cores = int(f[5]) / 10.0 if len(f) > 5 and f[5].strip() else None
-        windows.append((arm, int(s) * 1000, int(e) * 1000, wifi, fg, cores))
+        # busy % of all cores over the block, from /proc/stat
+        busy = int(f[6]) if len(f) > 6 and f[6].strip() else None
+        windows.append((arm, int(s) * 1000, int(e) * 1000, wifi, fg, cores, busy))
     if not windows:
         print("no blocks recorded")
         return 1
@@ -120,13 +122,15 @@ def main(argv):
 
     EDGES = (60, 70, 80, 100)
     arms = {}
-    for arm, s, e, wifi, fg, cores in windows:
-        a = arms.setdefault(arm, {"secs": 0.0, "wifi": [], "cores": [],
+    for arm, s, e, wifi, fg, cores, busy in windows:
+        a = arms.setdefault(arm, {"secs": 0.0, "wifi": [], "cores": [], "busy": [],
                                   **{k: 0 for k in EDGES}})
         if wifi is not None:
             a["wifi"].append(wifi)
         if cores is not None:
             a["cores"].append(cores)
+        if busy is not None:
+            a["busy"].append(busy)
         a["secs"] += (e - s) / 1000.0
         for ts, ms, out in gaps:
             if s <= ts <= e and out >= STARVE_MIN_OUT:
@@ -156,6 +160,9 @@ def main(argv):
             # The gap ledger is timed by the daemon's event loop, so how many
             # cores it competed for belongs next to every rate on this page.
             print(f"  {a}: {min(c):.1f}-{max(c):.1f} cores online (sampled every 10 s)")
+        b = arms[a]["busy"]
+        if b:
+            print(f"  {a}: {min(b)}-{max(b)} % cpu busy per block")
     print(f"{'edge':>6} " + " ".join(f"{a:>18}" for a in sorted(arms)))
     for k in EDGES:
         row = f">={k:3d}ms "
