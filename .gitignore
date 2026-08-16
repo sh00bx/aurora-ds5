@@ -131,3 +131,6 @@ Temporary Items
 .smbdelete*
 # build logs
 build*.log
+
+# python bytecode from the analysis tools
+tools/__pycache__/

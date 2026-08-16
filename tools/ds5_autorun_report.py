@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Verdicts for an unattended ds5_autorun.sh run.
 
+Gaps are filtered the way the project's own pipeline filters them: only gaps with
+outstanding >= 2 count. A gap whose credit window held one packet or none is the
+producer pausing, not the link starving, and dropping that filter is what made
+earlier numbers non-comparable. The reference arms below were computed with the
+same rule, so the two sides of any comparison are the same measurement.
+
 Cuts the daemon's per-gap wall-clock log by the run's block windows and pools
 blocks into arms. Pooling is on ADDITIVE quantities -- event counts and exposed
 seconds -- never on a mean of per-block rates, which would weight a short block
@@ -15,6 +21,21 @@ where every lever in this programme is judged, are exact.
 import math
 import sys
 from pathlib import Path
+
+
+# The five preserved gameplay arms, per minute, at edges 30/40/50/60/70/80,
+# recomputed with STARVE_MIN_OUT=2 over ds5-phase2-captures/. Quoting one of them
+# as "the" reference is cherry-picking: between arms the spread is 1.1x at 50 ms,
+# 1.25x at 60 ms and 5x at 80 ms, and ratchet1 is the extreme arm at both ends.
+REFERENCE_ARMS = {
+    "ratchet1": (671.2, 497.2, 261.1, 96.1, 25.5, 12.7),
+    "ab_off1":  (500.6, 462.3, 255.7, 84.2, 17.0, 2.8),
+    "ab_off2":  (477.1, 444.5, 240.2, 80.4, 18.0, 3.2),
+    "ab_on1":   (499.0, 461.4, 254.8, 92.6, 19.4, 3.3),
+    "ab_on2":   (512.4, 476.0, 263.9, 77.0, 15.4, 2.5),
+}
+REFERENCE_EDGES = (30, 40, 50, 60, 70, 80)
+STARVE_MIN_OUT = 2
 
 
 def poisson_ratio_ci(k1, t1, k2, t2, z=1.96):
@@ -85,8 +106,8 @@ def main(argv):
         if wifi is not None:
             a["wifi"].append(wifi)
         a["secs"] += (e - s) / 1000.0
-        for ts, ms, _out in gaps:
-            if s <= ts <= e:
+        for ts, ms, out in gaps:
+            if s <= ts <= e and out >= STARVE_MIN_OUT:
                 for k in EDGES:
                     if ms >= k:
                         a[k] += 1
@@ -126,8 +147,8 @@ def main(argv):
     for a in sorted(arms):
         span = [(s, e) for arm, s, e, *_ in windows if arm == a]
         bins = {}
-        for ts, ms, _o in gaps:
-            if any(s <= ts <= e for s, e in span) and 55 <= ms < 85:
+        for ts, ms, o in gaps:
+            if any(s <= ts <= e for s, e in span) and o >= STARVE_MIN_OUT and 55 <= ms < 85:
                 bins[(ms - 55) // 5] = bins.get((ms - 55) // 5, 0) + 1
         pts = [(k * 5 + 57.5, v) for k, v in sorted(bins.items()) if v > 0]
         if len(pts) < 3:
@@ -144,6 +165,21 @@ def main(argv):
             half = math.log(2) / -slope
             ok = "within +-30 % of 5.4 ms" if 3.8 <= half <= 7.0 else "OUTSIDE the +-30 % band"
             print(f"  {a}: halves every {half:.1f} ms   ({ok})")
+
+    # E2: level against the reference, stated as the band the arms actually span.
+    base = "off" if "off" in arms else (sorted(arms)[0] if arms else None)
+    if base:
+        print(f"\nE2 level: '{base}' arm against the five gameplay arms "
+              f"(min-max across arms, same out>={STARVE_MIN_OUT} filter):")
+        for k in (60, 70, 80):
+            i = REFERENCE_EDGES.index(k)
+            lo = min(v[i] for v in REFERENCE_ARMS.values())
+            hi = max(v[i] for v in REFERENCE_ARMS.values())
+            mine = arms[base][k] / arms[base]["secs"] * 60
+            where = ("inside" if lo <= mine <= hi else
+                     "below" if mine < lo else "above")
+            print(f"  >={k:3d}ms  synthetic {mine:6.1f}/min   gameplay {lo:5.1f}-{hi:5.1f}/min"
+                  f"   -> {where} the reference band")
 
     if "on" in arms and "off" in arms:
         print("\nratio ON/OFF (Poisson, 95 % CI) — the L18 witness is the >=60 ms band:")

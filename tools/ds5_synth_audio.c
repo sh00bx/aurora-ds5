@@ -45,6 +45,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 /* ---- report geometry (host reference: Vibepollo ds5_haptics.cpp) ----------- */
 #define R39_LEN        547
@@ -61,9 +62,15 @@
 #define OFF39_OPUS_B   342
 
 /* The pad drains audio on its own ~45 kHz device clock, so one 480-sample frame
- * is 10.667 ms of playback, and a two-frame 0x39 is 21.333 ms — NOT 20 ms. This
- * is the production period; feeding faster than this is what ratchets the queue. */
-#define REPORT_US    21334
+ * is 10.667 ms of playback, and a two-frame 0x39 is 21.333 ms — NOT 20 ms.
+ *
+ * But 21334 is the pad's bare DRAIN period, and production never emits at it:
+ * the host's pacer always adds an adjustment, and with no feedback it falls back
+ * to +35 us per frame. Emitting at the drain period exactly leaves zero margin,
+ * which is the documented ratchet condition — a transient stall is then never
+ * repaid and the credit window and pad buffer only ever fill. So the default is
+ * production's no-feedback cadence, 2 x (10667 + 35). */
+#define REPORT_US    21404
 #define SETSTATE_MS   1000          /* periodic standalone SetState re-assert */
 
 /* DS5 BT output CRC: CRC32 over the 0xA2 HID-output seed byte + report[0..len-4). */
@@ -74,10 +81,15 @@
 static const uint8_t state_audio_data[63] = {
     0xB0, 0x82,             /* ValidFlags: audio only                         */
     0x00, 0x00,             /* RumbleEmulation R/L (not allowed)              */
-    0x7f,                   /* VolumeHeadphones — real 7-bit field, 0x7f = max*/
-    0xff,                   /* VolumeSpeaker — NOT 7-bit: range 0x80..0xff.
-                             * 0x7f here is the documented "6 dB too quiet"
-                             * trap; 0xff is what the host emits at full scale */
+    0x5f,                   /* VolumeHeadphones ) what PRODUCTION puts on air:  */
+    0x5f,                   /* VolumeSpeaker    ) the host writes 0x7f/0xff, but
+                             * the TV app rewrites both bytes from its own volume
+                             * setting (default 95 % -> 0x5f) on every outbound
+                             * report, and the app is the last writer before the
+                             * daemon. Reproducing the host's 0xff would recreate
+                             * a stream that never actually existed on this link.
+                             * (Note the 0x80..0xff speaker range: 0x5f sits below
+                             * its floor, which is exactly what production does.) */
     0x00,                   /* VolumeMic                                      */
     0x00,                   /* AudioControl (auto mic, speaker output path)   */
     0x00,                   /* MuteLightMode                                  */
@@ -295,6 +307,24 @@ static int find_dualsense(const char *want_mac, char *mac_out, size_t mac_sz) {
     return found;
 }
 
+/* HIDIOCGFEATURE(len) — hidraw's feature-report read. Declared here rather than
+ * pulled from linux/hidraw.h so the tool builds against a bare SDK sysroot. */
+#ifndef HIDIOCGFEATURE
+#define HIDIOCGFEATURE(len) _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x07, len)
+#endif
+
+/* Read feature report 0x05, exactly as the app does before it starts forwarding.
+ * This is not cosmetic: the read is what moves a DualSense out of its minimal BT
+ * report mode, and the pad's uplink rate is part of the air budget the downlink
+ * competes for. A rig that skips it loads the reverse channel differently from
+ * every session the reference numbers came from. Failure is not fatal — the pad
+ * may already be in full mode — but it is reported, because an unexplained
+ * uplink rate is the kind of difference that later gets blamed on the radio. */
+static int ds5_feature_probe(int fd) {
+    uint8_t buf[64] = { 0x05 };
+    return ioctl(fd, HIDIOCGFEATURE(sizeof buf), buf) < 0 ? -1 : 0;
+}
+
 static int mac_to_bytes(const char *mac, uint8_t out[6]) {
     unsigned v[6];
     if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
@@ -394,6 +424,45 @@ static int app_is_running(void) {
 }
 
 static volatile sig_atomic_t g_stop = 0;
+
+/* Seed until the daemon reports a bound link, then STOP — the hidraw fd is local
+ * to this function and closed on every exit path, because a second writer left
+ * open would put each frame on the L2CAP interrupt channel twice.
+ *
+ * The node is opened non-blocking: a blocking write into a congested pad would
+ * park this process with that fd open, which is the one state the design must
+ * not reach. This is also re-enterable, since a link that idles out mid-run
+ * needs exactly the same handshake again. */
+static int seed_until_bound(int fd, struct sockaddr_un *sa, const char *st_path,
+                            const char *hidraw_path, const uint8_t addr[6], struct st *out) {
+    int hf = open(hidraw_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (hf < 0) {
+        fprintf(stderr, "[synth] open(%s): %s\n", hidraw_path, strerror(errno));
+        return -1;
+    }
+    if (ds5_feature_probe(hf) < 0)
+        fprintf(stderr, "[synth] feature 0x05 read failed (%s) — pad may report at a "
+                        "different rate than production\n", strerror(errno));
+    uint8_t dg[ACL_TAG_LEN + DS5_BT_OUT_LEN];
+    dg[0] = ACL_TAG_M0; dg[1] = ACL_TAG_ASSERT; memcpy(dg + 2, addr, 6);
+    int bound = 0;
+    for (int i = 0; i < 40 && !bound && !g_stop; i++) {
+        uint8_t rep[DS5_BT_OUT_LEN];
+        build_lightbar(rep, 0x000018, (uint8_t) (i & 0x0F));
+        memcpy(dg + ACL_TAG_LEN, rep, DS5_BT_OUT_LEN);
+        /* assert first, then put the same bytes on air: the daemon binds on the
+         * on-air frame and matches it byte-for-byte against the live assertion */
+        sendto(fd, dg, sizeof dg, MSG_DONTWAIT, (struct sockaddr *) sa, sizeof *sa);
+        if (write(hf, rep, DS5_BT_OUT_LEN) != DS5_BT_OUT_LEN && errno != EAGAIN)
+            fprintf(stderr, "[synth] hidraw seed: %s\n", strerror(errno));
+        struct timespec ts = { 0, 60 * 1000 * 1000L };
+        nanosleep(&ts, NULL);
+        bound = (st_read(st_path, out) == 0 && out->valid);
+    }
+    close(hf);
+    if (bound) fprintf(stderr, "[synth] link bound via identity assert\n");
+    return bound ? 0 : -1;
+}
 static void on_signal(int s) { (void) s; g_stop = 1; }
 
 static void usage(void) {
@@ -481,14 +550,19 @@ int main(int argc, char **argv) {
     OpusEncoder *enc = opus_setup(complexity, &opuslib);
     if (!enc) return 1;
 
+    /* Addressed per datagram, never connect()ed. The daemon unlinks and re-binds
+     * its socket on every start, so a connected fd would keep pointing at a
+     * deleted inode after a daemon restart — sends would fail forever while the
+     * rig happily reported its own send rate. Resolving the path each time makes
+     * a restart self-healing, which is also how the app does it. */
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (fd < 0) { perror("[synth] socket"); return 1; }
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_UNIX;
     snprintf(sa.sun_path, sizeof sa.sun_path, "%s", sock);
-    if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
-        fprintf(stderr, "[synth] connect(%s): %s — is ds5_txd running?\n", sock, strerror(errno));
+    if (access(sock, F_OK) != 0) {
+        fprintf(stderr, "[synth] %s does not exist — is ds5_txd running?\n", sock);
         return 1;
     }
     fprintf(stderr, "[synth] pad %s on %s, daemon %s, opus %s\n", mac, hidraw_path, sock, opuslib);
@@ -499,7 +573,8 @@ int main(int argc, char **argv) {
      * every reference number came from. */
     {
         uint8_t ctrl[4] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_FIFO_DEPTH, (uint8_t) fifo_depth };
-        if (send(fd, ctrl, sizeof ctrl, 0) < 0) fprintf(stderr, "[synth] fifo ctrl: %s\n", strerror(errno));
+        if (sendto(fd, ctrl, sizeof ctrl, 0, (struct sockaddr *) &sa, sizeof sa) < 0)
+            fprintf(stderr, "[synth] fifo ctrl: %s\n", strerror(errno));
     }
 
     struct builder B;
@@ -518,28 +593,11 @@ int main(int argc, char **argv) {
     /* ---- bootstrap: get a link bound, then hand over to raw ACL ------------ */
     struct st s;
     memset(&s, 0, sizeof s);
-    int bound = (st_read(st_path, &s) == 0 && s.valid);
-    if (!bound) {
-        int hf = open(hidraw_path, O_WRONLY);
-        if (hf < 0) { fprintf(stderr, "[synth] open(%s): %s\n", hidraw_path, strerror(errno)); return 1; }
-        uint8_t dg[ACL_TAG_LEN + DS5_BT_OUT_LEN];
-        dg[0] = ACL_TAG_M0; dg[1] = ACL_TAG_ASSERT; memcpy(dg + 2, addr, 6);
-        for (int i = 0; i < 40 && !bound && !g_stop; i++) {
-            uint8_t rep[DS5_BT_OUT_LEN];
-            build_lightbar(rep, 0x000018, (uint8_t) (i & 0x0F));
-            memcpy(dg + ACL_TAG_LEN, rep, DS5_BT_OUT_LEN);
-            send(fd, dg, sizeof dg, MSG_DONTWAIT);
-            if (write(hf, rep, DS5_BT_OUT_LEN) != DS5_BT_OUT_LEN)
-                fprintf(stderr, "[synth] hidraw seed: %s\n", strerror(errno));
-            struct timespec ts = { 0, 60 * 1000 * 1000L };
-            nanosleep(&ts, NULL);
-            bound = (st_read(st_path, &s) == 0 && s.valid);
-        }
-        close(hf);
-        if (!bound) { fprintf(stderr, "[synth] no link bound after seeding — pad asleep?\n"); return 1; }
-        fprintf(stderr, "[synth] link bound via identity assert\n");
-    } else {
+    if (st_read(st_path, &s) == 0 && s.valid) {
         fprintf(stderr, "[synth] link already bound\n");
+    } else if (seed_until_bound(fd, &sa, st_path, hidraw_path, addr, &s) != 0) {
+        fprintf(stderr, "[synth] no link bound after seeding — pad asleep?\n");
+        return 1;
     }
 
     /* Prime the audio path before the first frame: the batched report has no room
@@ -549,13 +607,15 @@ int main(int argc, char **argv) {
     dg[0] = ACL_TAG_M0; dg[1] = ACL_TAG_INJECT; memcpy(dg + 2, addr, 6);
     build_0x32(&B);
     memcpy(dg + ACL_TAG_LEN, B.r32, R32_LEN);
-    send(fd, dg, ACL_TAG_LEN + R32_LEN, 0);
+    sendto(fd, dg, ACL_TAG_LEN + R32_LEN, 0, (struct sockaddr *) &sa, sizeof sa);
 
     /* ---- steady state ----------------------------------------------------- */
     uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0, last_app_check = t0;
     uint64_t sent = 0, send_err = 0, late = 0, late_us_max = 0;
     int      adj_us = 0;                    /* one-sided rate servo, see below   */
-    int      warned_drop = 0;
+    int      warned_drop = 0, warned_invalid = 0;
+    uint32_t last_inj = s.inj;
+    uint64_t last_sent_mark = 0;
     struct st s0 = s;
     printf("# ds5_synth_audio b=%d freq=%.0f amp=%.0fdBFS fifo=%d complexity=%d servo=%d "
            "mute=%d pad=%s\n",
@@ -567,7 +627,8 @@ int main(int argc, char **argv) {
 
         if (build_0x39(&B, enc, &tone) < 0) break;
         memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
-        if (send(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT) < 0) send_err++;
+        if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
+                   (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
         else sent++;
 
         uint64_t now = now_us();
@@ -577,7 +638,8 @@ int main(int argc, char **argv) {
             memcpy(sdg, dg, ACL_TAG_LEN);
             build_0x32(&B);
             memcpy(sdg + ACL_TAG_LEN, B.r32, R32_LEN);
-            if (send(fd, sdg, sizeof sdg, MSG_DONTWAIT) < 0) send_err++;
+            if (sendto(fd, sdg, sizeof sdg, MSG_DONTWAIT,
+                       (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
         }
 
         /* Rate servo, one-sided exactly like the host's: the pad drains on its own
@@ -604,6 +666,33 @@ int main(int argc, char **argv) {
                 /* Age-drops mean the transport did not carry what was offered, and
                  * every gap measured from here on describes starvation rather than
                  * the link. Say it once, loudly, in the stream the harness reads. */
+                /* The link can go away underneath us — the daemon invalidates a
+                 * template after ~1.5 s without inbound traffic — and every health
+                 * number this program reads comes from a record that then simply
+                 * stops changing. Without this check a block that delivered
+                 * NOTHING looks calm: rate is our own loop, drops stay zero, and
+                 * the gap ledger just goes quiet, which pools as "few gaps". So
+                 * the witness is the daemon's own injection counter: it must keep
+                 * up with what we send, or the run is over. */
+                if (cur.valid) {
+                    uint32_t d_inj = cur.inj - last_inj;
+                    uint64_t d_sent = sent - last_sent_mark;
+                    if (d_sent > 40 && d_inj * 100 < d_sent * 80) {
+                        printf("[synth] STOPPING: the daemon injected %u of the %llu reports "
+                               "handed over since the last check — the link is not carrying "
+                               "this load\n", d_inj, (unsigned long long) d_sent);
+                        fflush(stdout);
+                        g_stop = 1;
+                    }
+                    last_inj = cur.inj;
+                    last_sent_mark = sent;
+                } else if (!warned_invalid) {
+                    warned_invalid = 1;
+                    printf("[synth] WARNING the daemon's readiness record went invalid — "
+                           "the link dropped; nothing measured from here is a gap\n");
+                    fflush(stdout);
+                    g_stop = 1;
+                }
                 if (cur.drop_age != s.drop_age && sent > 200 && !warned_drop) {
                     warned_drop = 1;
                     printf("[synth] WARNING age-drops began at t=%.0fs — delivery is short of "
@@ -667,7 +756,7 @@ int main(int argc, char **argv) {
     /* Hand the daemon back its boot default so the next real session starts from
      * the state the supervisor set, not from ours. */
     uint8_t ctrl[4] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_FIFO_DEPTH, 0xFF };
-    send(fd, ctrl, sizeof ctrl, 0);
+    sendto(fd, ctrl, sizeof ctrl, 0, (struct sockaddr *) &sa, sizeof sa);
     close(fd);
     return 0;
 }
