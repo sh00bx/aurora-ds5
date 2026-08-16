@@ -92,6 +92,8 @@
 #include <sys/resource.h>   /* RLIMIT_RTPRIO + setpriority: RT scheduling in main() */
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/mman.h>       /* mlockall: a major fault in the capture thread would
+                             * inflate a measured NOCP gap (L17b, 2026-08-16) */
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/eventfd.h>    /* NOCP->main-loop kick: drain held audio the moment credits free */
@@ -119,6 +121,7 @@
 #define HCI_EV_CMD_STATUS       0x0f
 #define HCI_EV_NUM_COMP_PKTS    0x13
 #define HCI_EV_MODE_CHANGE      0x14
+#define HCI_EV_PTYPE_CHANGED    0x1d
 #define HCI_EV_LE_META          0x3e
 #define STALL_RESET_MS          150   /* credits stopped this long -> resync a link's outstanding */
 #define DEMAND_IDLE_MS         1000   /* no app report for this long -> the link is IDLE, so a
@@ -713,6 +716,18 @@ struct ds5_link {
     uint64_t last_flush_cmd; /* send throttle, shares the >=3s command budget */
     uint64_t last_linkq;     /* L16 poll throttle (capture thread) */
     unsigned linkq_rot;      /* L16 round-robin index over the four status reads */
+    /* Start of the CURRENT continuous-demand stretch (relaxed atomic, written by
+     * the main thread next to last_demand, read by the capture thread's NOCP
+     * gate). The old gate tested demand only at the END of a gap, so one idle
+     * keepalive re-armed it and a ~5s idle gap landed in every histogram bin —
+     * the documented `d_inj=2` / `30:2/…/200:2` contamination. Requiring
+     * last_nocp >= demand_since makes demand hold ACROSS the gap. */
+    uint64_t demand_since;
+    /* L18 packet-type clamp (capture thread) — same believed/sent pattern as the
+     * flush lever above: a handle we never wrote carries the stack default. */
+    uint16_t ptype_handle;   /* handle the last Change_Connection_Packet_Type was for */
+    int      ptype_sent;     /* mask we last wrote; -1 = nothing written */
+    uint64_t last_ptype_cmd; /* send throttle, shares the >=3s command budget */
     /* per-link gap telemetry (g_lock) — the A/B acceptance signal.
      *
      * MOVED TO THE CAPTURE THREAD 2026-08-15. The histogram used to be derived in
@@ -1506,6 +1521,132 @@ static void linkq_refresh(void){
                 g_linkq_ms);
 }
 
+/* ---------------------------------------------------------------------------
+ * L18 — packet-type clamp (Change_Connection_Packet_Type, 0x040F).
+ *
+ * Why. 23k demand-gated NOCP gap records (sessions 08-15/08-16, out>=2) show
+ * the 50-79ms band is STATIONARY (70-74/min across five arms of two nights),
+ * decays smoothly (halving every ~5.4ms, no periodicity), and the pad's uplink
+ * keeps flowing at baseline rate INSIDE the gaps — the piconet is alive, only
+ * our downlink packet keeps failing to complete. That is the signature of air
+ * retransmissions of a long fragile packet: 200-byte audio presumably rides
+ * 2-DH3+ while the short uplink sails through. This band is exactly what
+ * starves a 40ms pad buffer (threshold B+21.33ms), so compressing it is the
+ * one remaining latency lever (~20ms of buffer if it works).
+ *
+ * The clamp forbids every 3-slot/5-slot type except 2-DH3 and the 1-slot
+ * basics: allowed = DM1, DH1, 2-DH1, 2-DH3 (audio still fits: 2-DH3 carries
+ * up to 367B). Shorter maximum packets mean a cheaper retransmit quantum and
+ * fewer slots at risk per attempt. Bandwidth is not a concern at 9.2 KB/s.
+ *
+ * Pre-registered (workspace/ds5-l17-l18-preregistration-2026-08-16.md, written
+ * before this code): the efficacy witness is the gapge DISTRIBUTION (decay
+ * constant / >=60 rate under continuous load), NOT the 0x1D event — L1 taught
+ * us this controller stores-and-reports settings it does not apply, so the
+ * event is necessary but never sufficient. An unchanged distribution with a
+ * confirming 0x1D closes L18 as accept-and-ignore.
+ *
+ * Default OFF. Arm with `echo 1 > /tmp/ds5_ptype` (root-owned); disarm writes
+ * the full mask back so an A/B reverses without a daemon restart. Off state
+ * sends nothing and is byte-identical to 1.4.29. */
+#define OP_CHG_CONN_PTYPE 0x040f
+#define PTYPE_ALL   0xcc18   /* DM1|DH1|DM3|DH3|DM5|DH5, all EDR allowed (stack default) */
+#define PTYPE_CLAMP 0x321c   /* allow DM1|DH1|2-DH1|2-DH3; forbid 3-DH1/3-DH3/2-DH5/3-DH5;
+                              * multi-slot basic-rate types not enabled */
+static volatile int g_ptype_want = 0;    /* published toggle: 1 = clamp */
+static volatile int g_ptype_seen = -1;   /* last mask a 0x1D event reported; -1 = never */
+
+static int send_chg_ptype(uint16_t handle, uint16_t mask){
+    uint8_t cmd[8]={ 0x01,
+        OP_CHG_CONN_PTYPE&0xff, OP_CHG_CONN_PTYPE>>8, 4,
+        (uint8_t)(handle&0xff), (uint8_t)((handle>>8)&0x0f),
+        (uint8_t)(mask&0xff), (uint8_t)(mask>>8) };
+    return cmd_send(cmd,sizeof cmd,OP_CHG_CONN_PTYPE,handle,0);
+}
+
+/* CAPTURE-THREAD-ONLY (function-static cache), publishes g_ptype_want. */
+static void ptype_refresh(void){
+    static uint64_t last=0; static int warned=0, badwarn=0;
+    uint64_t n=now_us();
+    if(last && n-last<=1000000ull) return;
+    last=n;
+    int r=read_root_int("/tmp/ds5_ptype",&warned);
+    int was=g_ptype_want;
+    if(r<0 || r==0)  g_ptype_want=0;
+    else if(r==1){   g_ptype_want=1; badwarn=0; }
+    else if(!badwarn){
+        badwarn=1;
+        fprintf(stderr,"[txd] ignoring /tmp/ds5_ptype=%d: only 0/1 defined\n",r);
+    }
+    if(was!=g_ptype_want)
+        fprintf(stderr,"[txd] L18 ptype: %s (mask 0x%04x) — efficacy is judged on the gapge "
+                       "distribution, never on the 0x1D event alone\n",
+                g_ptype_want?"CLAMP":"full",g_ptype_want?PTYPE_CLAMP:PTYPE_ALL);
+}
+
+/* ---------------------------------------------------------------------------
+ * L17c — per-gap wall-clock log. The histogram proves THAT the tail exists;
+ * correlating it with anything outside the daemon (WiFi off-channel scans in
+ * `iw event -t`, coex windows) needs each gap as an EVENT with a wall-clock
+ * stamp. Ring is CAPTURE-THREAD-ONLY (the NOCP handler and the flush both run
+ * on the capture loop), so no locking beyond what the handler already holds.
+ * Default OFF; arm with `echo 1 > /tmp/ds5_gaplog` (root-owned). 55ms floor:
+ * below the audible edge at B=40 (61ms), above the bundling bulk. */
+#define GAPLOG_MIN_MS 55
+#define GAPLOG_RING   256
+#define GAPLOG_MAX_BYTES (256*1024)
+static volatile int g_gaplog_want=0;
+static struct { uint64_t wall_ms; unsigned gap; int out; uint16_t h; }
+    g_gaplog_ring[GAPLOG_RING];
+static int  g_gaplog_n=0;                /* capture-thread-only */
+static long g_gaplog_written=0, g_gaplog_lost=0;
+
+static uint64_t now_wall_ms(void){
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+    return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull;
+}
+
+/* CAPTURE-THREAD-ONLY (function-static cache), publishes g_gaplog_want. */
+static void gaplog_refresh(void){
+    static uint64_t last=0; static int warned=0;
+    uint64_t n=now_us();
+    if(last && n-last<=1000000ull) return;
+    last=n;
+    int r=read_root_int("/tmp/ds5_gaplog",&warned);
+    int was=g_gaplog_want;
+    g_gaplog_want = (r==1);
+    if(was!=g_gaplog_want)
+        fprintf(stderr,"[txd] gaplog: %s (/tmp/ds5_gaps.log, >=%dms, wall-clock ms)\n",
+                g_gaplog_want?"armed":"disarmed",GAPLOG_MIN_MS);
+}
+
+/* Drain the ring to /tmp/ds5_gaps.log. O_NOFOLLOW for the same reason as
+ * write_record_atomic (root writing into the jail-shared tmp); a jail-planted
+ * REGULAR file only pollutes telemetry we alone consume. Size-capped with a
+ * loud truncation marker — silent truncation would read as "no gaps". */
+static void gaplog_flush(void){
+    if(g_gaplog_n==0) return;
+    int fd=open("/tmp/ds5_gaps.log",O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW,0644);
+    if(fd<0){ g_gaplog_lost+=g_gaplog_n; g_gaplog_n=0; return; }
+    struct stat st;
+    if(fstat(fd,&st)==0 && st.st_size>GAPLOG_MAX_BYTES){
+        close(fd);
+        fd=open("/tmp/ds5_gaps.log",O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,0644);
+        if(fd<0){ g_gaplog_lost+=g_gaplog_n; g_gaplog_n=0; return; }
+        static const char m[]="G TRUNCATED older-entries-dropped\n";
+        if(write(fd,m,sizeof m-1)<0){ /* the entries below still tell the story */ }
+    }
+    char buf[GAPLOG_RING*48]; int o=0;
+    for(int i=0;i<g_gaplog_n && o<(int)sizeof buf-48;i++)
+        o+=snprintf(buf+o,sizeof buf-o,"G %llu gap=%u out=%d h=0x%03x\n",
+                    (unsigned long long)g_gaplog_ring[i].wall_ms,
+                    g_gaplog_ring[i].gap,g_gaplog_ring[i].out,g_gaplog_ring[i].h);
+    if(write(fd,buf,(size_t)o)==(ssize_t)o) g_gaplog_written+=g_gaplog_n;
+    else g_gaplog_lost+=g_gaplog_n;
+    close(fd);
+    g_gaplog_n=0;
+}
+
 /* BR/EDR scan control (Write_Scan_Enable). Measured live 2026-07-05: the
  * controller's periodic page/inquiry scan blocks the DS5 ACL link for
  * 86-234ms on a ~1.28s grid (EPISODE detector) — audible speaker dropouts and
@@ -2046,8 +2187,32 @@ static void handle_hci_event(const uint8_t *e, int el){
                     g_htab[arg&0x0fff].mode=0;
                     pthread_mutex_unlock(&g_lock);
                 }
+                /* L18: an outright reject means the mask was never applied —
+                 * the believed/sent state must not claim otherwise, or the A/B
+                 * would compare two identical arms and read it as
+                 * accept-and-ignore. */
+                if(op==OP_CHG_CONN_PTYPE && p[0]!=0x00){
+                    fprintf(stderr,"[txd] L18 ptype: rejected status=0x%02x handle=0x%03x\n",
+                            p[0],arg&0x0fff);
+                    /* ptype_* is capture-thread-owned, and so is this handler. */
+                    for(int k=0;k<MAX_LINKS;k++)
+                        if(g_links[k].ptype_handle==(arg&0x0fff)) g_links[k].ptype_sent=-1;
+                }
                 break;
             }
+        return;
+    }
+    if(code==HCI_EV_PTYPE_CHANGED && pl>=5){                /* status,handle(2),ptype(2) */
+        /* L18 witness W2: the controller REPORTS the new mask. Necessary but
+         * never sufficient (L1: this chip stores-and-reports settings it does
+         * not apply) — efficacy is judged on the gapge distribution. Logged on
+         * every arrival: a mask the STACK changed behind our back is exactly
+         * the kind of interference an A/B needs to know about. */
+        uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
+        int pt = p[0]==0x00 ? (int)(p[3]|(p[4]<<8)) : -1;
+        if(p[0]==0x00) g_ptype_seen=pt;
+        fprintf(stderr,"[txd] L18 ptype: Connection_Packet_Type_Changed handle=0x%03x "
+                       "status=0x%02x mask=0x%04x\n",hh,p[0],pt<0?0:(unsigned)pt);
         return;
     }
     if(code==HCI_EV_MODE_CHANGE && pl>=6){                  /* status,handle(2),mode,interval(2) */
@@ -2130,7 +2295,16 @@ static void handle_hci_event(const uint8_t *e, int el){
              * stops). */
             if(L->have && L->outstanding>0 && L->last_nocp && nowm>L->last_nocp){
                 uint64_t ld=__atomic_load_n(&L->last_demand,__ATOMIC_RELAXED);
-                if(ld && nowm>=ld && nowm-ld<DEMAND_IDLE_MS){
+                uint64_t ds=__atomic_load_n(&L->demand_since,__ATOMIC_RELAXED);
+                /* Demand must have held ACROSS the gap, not merely at its end:
+                 * last_nocp >= demand_since means the gap began inside the
+                 * current continuous-demand stretch. Without this, one idle
+                 * keepalive re-arms the end-test and a ~5s idle gap lands in
+                 * every cumulative bin (the `d_inj=2` / `30:2/…/200:2`
+                 * signature). Continuous-load headline numbers are unaffected
+                 * — the contamination only ever hit mixed/idle sessions. */
+                if(ld && nowm>=ld && nowm-ld<DEMAND_IDLE_MS &&
+                   ds && L->last_nocp>=ds){
                     uint64_t g=nowm-L->last_nocp;
                     /* Was this OUR hole? The first NOCP after a synthetic hold
                      * necessarily lands after the hold has been released, so the
@@ -2148,6 +2322,19 @@ static void handle_hci_event(const uint8_t *e, int el){
                         for(int b=0;b<GAPGE_N;b++)
                             if(g>=GAPGE_EDGE[b]) L->gapge[b]++;
                         if(g>L->gap_max) L->gap_max=g;
+                        /* L17c: the same production-binned gap as an EVENT with
+                         * a wall-clock stamp, for offline correlation with
+                         * radio-side logs. Ring + flush are capture-thread-only
+                         * (this handler runs on the capture loop). */
+                        if(g_gaplog_want && g>=GAPLOG_MIN_MS){
+                            if(g_gaplog_n<GAPLOG_RING){
+                                g_gaplog_ring[g_gaplog_n].wall_ms=now_wall_ms();
+                                g_gaplog_ring[g_gaplog_n].gap=(unsigned)g;
+                                g_gaplog_ring[g_gaplog_n].out=L->outstanding;
+                                g_gaplog_ring[g_gaplog_n].h=hh;
+                                g_gaplog_n++;
+                            } else g_gaplog_lost++;
+                        }
                     }
                 }
             }
@@ -2357,6 +2544,9 @@ static void *capture_thread(void *arg){
          * beyond that are additionally absorbed by cmd_send's unacked-queue cap). */
         ghost_ttl_refresh();   /* capture-thread-only reader; publishes g_ghost_ttl_ms */
         linkq_refresh();       /* capture-thread-only reader; publishes g_linkq_ms */
+        ptype_refresh();       /* capture-thread-only reader; publishes g_ptype_want */
+        gaplog_refresh();      /* capture-thread-only reader; publishes g_gaplog_want */
+        gaplog_flush();        /* drain the per-gap ring (capture-thread-only) */
         for(int i=0;i<MAX_LINKS;i++){
             struct ds5_link *L=&g_links[i];
             if(pin[i]){
@@ -2410,6 +2600,21 @@ static void *capture_thread(void *arg){
                         L->last_flush_cmd=t;
                     }
                 }
+                /* L18 reconcile: one Change_Connection_Packet_Type per bind or
+                 * per toggle flip, same believed/sent pattern and the same >=3s
+                 * budget as the flush lever. A fresh handle is believed to carry
+                 * the stack default (full mask), so the disarmed lever costs
+                 * zero commands per bind. */
+                {   int ptarget = g_ptype_want ? PTYPE_CLAMP : PTYPE_ALL;
+                    int pbelieved = (L->ptype_handle==lh[i]) ? L->ptype_sent : PTYPE_ALL;
+                    if(ptarget!=pbelieved && t-L->last_ptype_cmd>3000 &&
+                       send_chg_ptype(lh[i],(uint16_t)ptarget)==0){
+                        L->last_ptype_cmd=t; L->ptype_handle=lh[i]; L->ptype_sent=ptarget;
+                        fprintf(stderr,"[txd] L%d L18 ptype: handle=0x%03x -> 0x%04x (%s), "
+                                       "witness = 0x1D event + gapge distribution\n",
+                                i,lh[i],ptarget,g_ptype_want?"clamp":"full");
+                    }
+                }
                 /* L16 poll: at most ONE read per tick, rotating over the four,
                  * and only while the command queue has room to spare. Both
                  * limits exist for the same reason — the scan reconciler and the
@@ -2438,7 +2643,8 @@ static void *capture_thread(void *arg){
                         break;
                     }
                 }
-            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1; }
+            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1;
+                     L->ptype_handle=0xffff; L->ptype_sent=-1; }
         }
         /* Scan follows the SESSION, not electrical liveness. The three restores above
          * are edge-triggered on a link INVALIDATION, and since RX liveness (v11) a pad
@@ -2793,7 +2999,20 @@ int main(int argc,char**argv){
      * able to read them, so an inherited umask must not strip o+r. */
     umask(0022);
 
-    for(int i=0;i<MAX_LINKS;i++){ g_links[i].policy_handle=0xffff; g_links[i].last_nocp=now_ms(); }
+    for(int i=0;i<MAX_LINKS;i++){ g_links[i].policy_handle=0xffff; g_links[i].last_nocp=now_ms();
+                                  g_links[i].ptype_handle=0xffff; g_links[i].ptype_sent=-1; }
+
+    /* L17b: pin every mapping. The NOCP handler timestamps gaps in user space;
+     * with 470/600MB of swap in use on the TV a major fault on the capture
+     * thread's path would be measured as a LINK stall. Locking is cheap (the
+     * daemon's footprint is small and static) and turns that artefact class off.
+     * Refusal is loud but not fatal — the daemon measured fine for months
+     * without it, it just could not PROVE the gaps were the radio's. */
+    if(mlockall(MCL_CURRENT|MCL_FUTURE)==0)
+        fprintf(stderr,"[txd] mlockall: resident\n");
+    else
+        fprintf(stderr,"[txd] mlockall REFUSED (%s) — swap pressure can inflate measured gaps\n",
+                strerror(errno));
 
     publish_record(g_tmpl_path,0,0,NULL);   /* start INVALID so a stale boot file can't mislead the app */
     invalidate_stale_addr_files();          /* same for per-address files of a previous run */
@@ -3217,8 +3436,16 @@ int main(int argc,char**argv){
                 int idx=(int)(L-g_links);
                 /* stamp BEFORE process_report: demand exists even when the report is
                  * then paced away or blocked. Relaxed atomic because the capture
-                 * thread's NOCP gap gate reads it (see the field comment). */
-                __atomic_store_n(&L->last_demand,now_ms(),__ATOMIC_RELAXED);
+                 * thread's NOCP gap gate reads it (see the field comment).
+                 * demand_since marks where the CURRENT continuous stretch began:
+                 * re-stamped only when the previous demand is stale, so the gap
+                 * gate can require demand to have held across a whole gap. */
+                {   uint64_t dnow=now_ms();
+                    uint64_t prev=__atomic_load_n(&L->last_demand,__ATOMIC_RELAXED);
+                    if(!prev || dnow-prev>=DEMAND_IDLE_MS)
+                        __atomic_store_n(&L->demand_since,dnow,__ATOMIC_RELAXED);
+                    __atomic_store_n(&L->last_demand,dnow,__ATOMIC_RELAXED);
+                }
                 process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);
             }
         }
@@ -3289,8 +3516,22 @@ int main(int argc,char**argv){
                          g_lq_last,g_lq_min,g_lq_max,g_rssi_last,g_rssi_min,
                          g_afh_last,g_afh_min,
                          (g_fcc_base>=0&&g_fcc_last>=0)?g_fcc_last-g_fcc_base:0);
+            /* L18/L17c ledger fields, present ONLY while their toggles are live
+             * (same append-only contract as linkq).
+             *   ptype=want/0xseen — want is the toggle, seen the last mask a
+             *                       0x1D event REPORTED (a report, not proof).
+             *   gaplog=written/lost — lost>0 means the ring or /tmp write could
+             *                       not keep up; the log is then incomplete
+             *                       and a correlation run should say so. */
+            char ptyp[56]; ptyp[0]='\0';
+            if(g_ptype_want || g_ptype_seen>=0)
+                snprintf(ptyp,sizeof ptyp," ptype=%d/0x%04x",
+                         g_ptype_want,g_ptype_seen<0?0:(unsigned)g_ptype_seen);
+            char gpl[48]; gpl[0]='\0';
+            if(g_gaplog_want || g_gaplog_written || g_gaplog_lost)
+                snprintf(gpl,sizeof gpl," gaplog=%ld/%ld",g_gaplog_written,g_gaplog_lost);
             uint64_t t0=now_us();
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s\n",
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
@@ -3299,7 +3540,7 @@ int main(int argc,char**argv){
                  * confirmed=0 is precisely the accept-and-ignore case. */
                 g_flush_want, g_flush_confirmed_ms,
                 g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"),
-                g_cmd_dead?" CMDDEAD":"", linkq, links);
+                g_cmd_dead?" CMDDEAD":"", linkq, ptyp, gpl, links);
             logw_note(t0);
             last_log=now_ms();
         }
