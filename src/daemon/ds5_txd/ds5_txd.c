@@ -1665,10 +1665,18 @@ static void gaplog_refresh(void){
     last=n;
     int r=read_root_int("/tmp/ds5_gaplog",&warned);
     int was=g_gaplog_want;
-    g_gaplog_want = (r==1);
-    if(was!=g_gaplog_want)
-        fprintf(stderr,"[txd] gaplog: %s (/tmp/ds5_gaps.log, >=%dms, wall-clock ms)\n",
-                g_gaplog_want?"armed":"disarmed",GAPLOG_MIN_MS);
+    /* 1 = armed at the historical default (55 ms). 20..500 = armed with THAT
+     * threshold: the r36 arm's whole story happens below 55 ms (its per-report
+     * cadence is 10.67 ms, so B+cadence thresholds start at ~45+10.67), and a
+     * fixed compile-time floor left that region censored on 2026-08-17. The
+     * floor is part of the record format contract, so a run's chosen value is
+     * printed on arming and the analysis must slice with the same one. */
+    g_gaplog_want = (r==1) ? GAPLOG_MIN_MS : (r>=20 && r<=500) ? r : 0;
+    if(was!=g_gaplog_want && g_gaplog_want)
+        fprintf(stderr,"[txd] gaplog: armed (/tmp/ds5_gaps.log, >=%dms, wall-clock ms)\n",
+                g_gaplog_want);
+    else if(was!=g_gaplog_want)
+        fprintf(stderr,"[txd] gaplog: disarmed\n");
 }
 
 /* Drain the ring to /tmp/ds5_gaps.log. O_NOFOLLOW for the same reason as
@@ -2405,7 +2413,7 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
                          * a wall-clock stamp, for offline correlation with
                          * radio-side logs. Ring + flush are capture-thread-only
                          * (this handler runs on the capture loop). */
-                        if(g_gaplog_want && g>=GAPLOG_MIN_MS){
+                        if(g_gaplog_want && g>=(uint64_t)g_gaplog_want){
                             if(g_gaplog_n<GAPLOG_RING){
                                 /* kms IS wall-clock (CLOCK_REALTIME domain) — the
                                  * queue-time stamp beats a flush-time now_wall_ms()
