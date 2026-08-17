@@ -86,8 +86,15 @@ case "$LEVER" in
     # (56.3/s) and what audio alone needs (46.9/s), i.e. the co-traffic the real
     # client puts on the same link. Read off the recording, not chosen.
     cotraf) TOG=/tmp/ds5_cotraffic; ON_VALUE=9 ;;
+    # Report format: ON = single-frame 0x36 at 10.67 ms cadence (~93.7/s),
+    # OFF = batched 0x39 at 21.33 ms (~46.9/s). The daemon reads only the report
+    # id, so this is purely the rig's producer — but the verdict is judged in PAD
+    # CURRENCY with each arm's own in-flight term (B + 21.33 vs B + 10.67), never
+    # on shared fixed-ms bins: a lever that changes the send cadence moves the
+    # bins by construction (the Amendment-7 standing rule).
+    r36)   TOG=/tmp/ds5_r36; ON_VALUE=1 ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|r36|none)"; exit 1 ;;
 esac
 
 CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu

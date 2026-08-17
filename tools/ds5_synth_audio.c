@@ -61,6 +61,14 @@
 #define OFF39_OPUS_A   142
 #define OFF39_OPUS_B   342
 
+/* 0x36 offsets (single-frame form; canonical: ds5_haptics.cpp / ds5_av_play.c).
+ * Unlike the 0x39 it has room for the 63-byte SetState INLINE and carries the
+ * LONG 0x91 timing form: [0xFE][latency ms x5] with the audio counter at
+ * buf[10] (the 0x39 packs a 6-byte short form and counts at buf[9]). */
+#define OFF36_SETSTATE  13
+#define OFF36_HAPTIC    78
+#define OFF36_OPUS     144
+
 /* The pad drains audio on its own ~45 kHz device clock, so one 480-sample frame
  * is 10.667 ms of playback, and a two-frame 0x39 is 21.333 ms — NOT 20 ms.
  *
@@ -93,6 +101,16 @@ static uint32_t g_burst_on_ms = 0, g_burst_off_ms = 0;
  * is the last untested way gameplay differs from this rig. Reports per second in
  * /tmp/ds5_cotraffic; 0 disables. */
 static uint32_t g_cotraffic_hz = 0;
+/* Report-format lever (/tmp/ds5_r36 exists = unbatched). The floor arithmetic
+ * is: underrun <=> gap > B + one report period in flight. Batched 0x39 puts
+ * 21.33 ms in that term, single-frame 0x36 halves it to 10.67 — so even an
+ * UNCHANGED gap distribution is worth ~10 ms of pad buffer. The 2026-08-15
+ * "batching is load-bearing" verdict predates the out>=2 filter, the audio
+ * gate, interleaving, the kernel clock and the H-A finding (long packets
+ * retransmit; 398 B rides shorter baseband packets than 547 B) — this lever
+ * re-runs that question on the modern instrument. The daemon needs no change:
+ * it reads exactly one byte of every report, the id. */
+static int g_r36 = 0;
 static void cotraffic_poll(void) {
     FILE *f = fopen("/tmp/ds5_cotraffic", "r");
     uint32_t v = 0;
@@ -105,6 +123,16 @@ static void cotraffic_poll(void) {
         g_cotraffic_hz = v;
     }
 }
+static void r36_poll(void) {
+    int v = (access("/tmp/ds5_r36", F_OK) == 0);
+    if (v != g_r36) {
+        printf("[synth] report format -> %s\n",
+               v ? "0x36 single-frame (10.67 ms cadence)" : "0x39 batched (21.33 ms cadence)");
+        fflush(stdout);
+        g_r36 = v;
+    }
+}
+
 static void burst_poll(void) {
     FILE *f = fopen("/tmp/ds5_burst", "r");
     uint32_t on = 0, off = 0;
@@ -266,9 +294,11 @@ static void tone_fill(struct tone *t, float *pcm /* OPUS_FRAME*2 */) {
 /* ---- report builders ------------------------------------------------------- */
 struct builder {
     uint8_t  r39[R39_LEN];
+    uint8_t  r36[R36_LEN];
     uint8_t  r32[R32_LEN];
     uint8_t  seq;          /* 4-bit sequence nibble, shared across report ids */
-    uint8_t  pktctr;       /* audio packet counter: +2 per batched report      */
+    uint8_t  pktctr;       /* audio counter, +1 per FRAME (so +2 per 0x39,
+                              +1 per 0x36 — continuous across a format switch) */
     int      b_ms;         /* pad audio buffer depth we advertise              */
 };
 
@@ -299,6 +329,22 @@ static void builder_init(struct builder *B, int b_ms) {
     s[2] = 0x10 | 0x80;
     s[3] = 63;
     memcpy(s + 4, state_audio_data, 63);
+
+    /* Single-frame 0x36 skeleton (long 0x91 form, SetState inline — the
+     * production unbatched path needs no periodic 0x32). */
+    uint8_t *u = B->r36;
+    u[0]  = 0x36;
+    u[2]  = 0x11 | 0x80;
+    u[3]  = 7;
+    u[4]  = 0xFE;
+    u[5] = u[6] = u[7] = u[8] = u[9] = (uint8_t) b_ms;   /* five latency bytes */
+    u[11] = 0x10 | 0x80;
+    u[12] = 63;
+    memcpy(u + OFF36_SETSTATE, state_audio_data, 63);
+    u[76] = 0x12 | 0x80;
+    u[77] = HAPTIC_BYTES;         /* zeroed coil: silent, same as the 0x39 arm */
+    u[142] = 0x13 | 0x80;
+    u[143] = OPUS_BYTES;
 }
 
 /* Fill one 0x39 with two freshly encoded frames. Both frames go through the SAME
@@ -319,6 +365,22 @@ static int build_0x39(struct builder *B, OpusEncoder *enc, struct tone *t) {
     B->r39[9] = B->pktctr;
     B->pktctr = (uint8_t) (B->pktctr + 2);
     sign_report(B->r39, R39_LEN);
+    return 0;
+}
+
+/* One 0x36 = one fresh frame through the SAME stateful encoder. */
+static int build_0x36(struct builder *B, OpusEncoder *enc, struct tone *t) {
+    float pcm[OPUS_FRAME * 2];
+    tone_fill(t, pcm);
+    int32_t n = p_opus_encode_f(enc, pcm, OPUS_FRAME, B->r36 + OFF36_OPUS, OPUS_BYTES);
+    if (n != OPUS_BYTES) {
+        fprintf(stderr, "[synth] opus frame %d B (want %d)\n", (int) n, OPUS_BYTES);
+        return -1;
+    }
+    B->r36[1] = (uint8_t) ((B->seq++ & 0x0F) << 4);
+    B->r36[10] = B->pktctr;
+    B->pktctr = (uint8_t) (B->pktctr + 1);
+    sign_report(B->r36, R36_LEN);
     return 0;
 }
 
@@ -690,12 +752,21 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         if (seconds > 0 && (int64_t) (now_us() - t0) >= (int64_t) seconds * 1000000) break;
 
+        int r36_now = g_r36;   /* one read per tick: format and period must agree */
         if (!burst_silent(now_us() - t0)) {
-            if (build_0x39(&B, enc, &tone) < 0) break;
-            memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
-            if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
-                       (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
-            else sent++;
+            if (r36_now) {
+                if (build_0x36(&B, enc, &tone) < 0) break;
+                memcpy(dg + ACL_TAG_LEN, B.r36, R36_LEN);
+                if (sendto(fd, dg, ACL_TAG_LEN + R36_LEN, MSG_DONTWAIT,
+                           (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
+                else sent++;
+            } else {
+                if (build_0x39(&B, enc, &tone) < 0) break;
+                memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
+                if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
+                           (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
+                else sent++;
+            }
         }
 
         /* Interleaved on the audio clock: one extra 0x32 every Nth report gives
@@ -733,6 +804,7 @@ int main(int argc, char **argv) {
             period_poll();
             burst_poll();
             cotraffic_poll();
+            r36_poll();
             struct st cur;
             /* An unreadable or invalidated record is the link going away, and it
              * has to be handled OUTSIDE the success branch: the old code nested
@@ -844,9 +916,10 @@ int main(int argc, char **argv) {
         if (stats_iv > 0 && now - last_stats >= (uint64_t) stats_iv * 1000000ull) {
             last_stats = now;
             double secs = (double) (now - t0) / 1e6;
-            printf("[synth] t=%.0fs sent=%llu rate=%.1f/s err=%llu late=%llu(max %llums) "
+            printf("[synth] t=%.0fs%s sent=%llu rate=%.1f/s err=%llu late=%llu(max %llums) "
                    "adj=%dus | st: q=%d fifo=%d inj=%u drop=%u dage=%d dovf=%d g50=%d g80=%d\n",
-                   secs, (unsigned long long) sent, (double) sent / (secs > 0 ? secs : 1),
+                   secs, r36_now ? " r36" : "",
+                   (unsigned long long) sent, (double) sent / (secs > 0 ? secs : 1),
                    (unsigned long long) send_err, (unsigned long long) late,
                    (unsigned long long) (late_us_max / 1000), adj_us,
                    s.q, s.fifo, s.inj - s0.inj, s.drop - s0.drop,
@@ -854,7 +927,10 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
 
-        next += (uint64_t) g_period_us + (uint64_t) adj_us;
+        /* One frame per 0x36 -> half the period AND half the per-report servo
+         * adjustment: adj_us is sized against the two-frame cadence, and paying
+         * it in full twice as often would double the servo's authority. */
+        next += ((uint64_t) g_period_us + (uint64_t) adj_us) / (r36_now ? 2 : 1);
         now = now_us();
         if (next <= now) {
             /* Falling behind is a measurement fault, not a hiccup to smooth over:
