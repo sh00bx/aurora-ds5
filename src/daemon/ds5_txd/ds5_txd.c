@@ -658,6 +658,17 @@ struct ds5_link {
     int      outstanding;    /* our raw-ACL TX packets queued in the controller, not yet
                                 confirmed on-air (via HCI Number_Of_Completed_Packets) */
     uint64_t last_nocp;      /* last NOCP time; stall backstop if credits stop returning */
+    uint64_t last_nocp_k;    /* kernel SO_TIMESTAMP (CLOCK_REALTIME ms) of the last NOCP.
+                                Since 1.4.34 the gap histogram bins deltas of THESE stamps:
+                                the ledger's clock used to be now_ms() in this nice-19
+                                capture thread, so during a real session (50 SCHED_RR client
+                                threads) reader lag was indistinguishable from air — the one
+                                in-situ condition the clock probe never covered. Kernel
+                                stamps are taken at socket-queue time, immune to our own
+                                scheduling. Deltas only ever pair two kernel stamps
+                                (nocp_k_ok); clock domains are never mixed. */
+    uint8_t  nocp_k_ok;      /* last_nocp_k holds a kernel stamp (else the next interval
+                                falls back to the old monotonic delta) */
     uint64_t last_wr_err_log;/* rate limit for the structural-write-error line (inject) */
     uint64_t last_demand;    /* last report the APP handed us for this link. Written by the
                                 inject thread; since the gap histogram moved into the NOCP
@@ -994,7 +1005,7 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
                                                  * from an assert-sourced htab entry stays
                                                  * assert_learned even across idle-flaps */
     L->unsniff_probe_h=0xFFFF;  /* a new binding re-arms the unobserved-mode probe */
-    L->outstanding=0; L->last_nocp=now_ms(); txwin_reset(L);
+    L->outstanding=0; L->last_nocp=now_ms(); L->nocp_k_ok=0; txwin_reset(L);
     L->ghost=0;                 /* a fresh connection cannot owe credits for the old one */
     L->last_seen=now_ms();
     L->session_seen=now_ms();   /* a bind only happens off on-air HID-output = a session */
@@ -1141,6 +1152,9 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
                 }
                 L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
                 L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
+                L->nocp_k_ok=0;                     /* monotonic re-arm has no kernel twin: the
+                                                     * next NOCP restarts the kernel-stamp chain
+                                                     * instead of measuring across the write-off */
                 blocked=0;
             }
             if(blocked){
@@ -1632,6 +1646,11 @@ static struct { uint64_t wall_ms; unsigned gap; int out; uint16_t h; }
     g_gaplog_ring[GAPLOG_RING];
 static int  g_gaplog_n=0;                /* capture-thread-only */
 static long g_gaplog_written=0, g_gaplog_lost=0;
+/* Gap intervals binned WITHOUT a kernel stamp (SO_TIMESTAMP cmsg missing on the
+ * monitor packet -> old monotonic clock used for that one interval). The clock
+ * probe saw 0 missing stamps in 11448 intervals, so a nonzero here is an
+ * instrument-health witness, not an expected code path. Capture-thread-only. */
+static long g_ts_fallback=0;
 
 static uint64_t now_wall_ms(void){
     struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
@@ -2093,7 +2112,7 @@ static void *broker_thread(void *arg){
  * handle->bdaddr table; invalidate a bound link if its handle drops or is
  * reassigned to a different device. Called from capture_thread WITHOUT g_lock
  * held (it takes g_lock for the shared state, then publishes outside it). */
-static void handle_hci_event(const uint8_t *e, int el){
+static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
     if(el < 2) return;
     uint8_t code=e[0]; const uint8_t *p=e+2; int pl=el-2;   /* skip [code][param_len] */
     const char *reason=NULL; int none_bound=0;
@@ -2357,7 +2376,15 @@ static void handle_hci_event(const uint8_t *e, int el){
                    ds && L->last_nocp>=ds &&
                    la && nowm>=la && nowm-la<AUDIO_IDLE_MS &&
                    as && L->last_nocp>=as){
-                    uint64_t g=nowm-L->last_nocp;
+                    /* The binned length pairs two KERNEL stamps when both ends
+                     * have one; otherwise it degrades to the old monotonic
+                     * delta for this one interval (never mixes domains). The
+                     * gates above stay on the monotonic clock on purpose —
+                     * demand/audio freshness is bookkeeping, not the
+                     * measurement. */
+                    uint64_t g;
+                    if(kms && L->nocp_k_ok && kms>L->last_nocp_k) g=kms-L->last_nocp_k;
+                    else { g=nowm-L->last_nocp; if(!kms) g_ts_fallback++; }
                     /* Was this OUR hole? The first NOCP after a synthetic hold
                      * necessarily lands after the hold has been released, so the
                      * test is the quiet window (hold + settle), not the hold
@@ -2380,7 +2407,10 @@ static void handle_hci_event(const uint8_t *e, int el){
                          * (this handler runs on the capture loop). */
                         if(g_gaplog_want && g>=GAPLOG_MIN_MS){
                             if(g_gaplog_n<GAPLOG_RING){
-                                g_gaplog_ring[g_gaplog_n].wall_ms=now_wall_ms();
+                                /* kms IS wall-clock (CLOCK_REALTIME domain) — the
+                                 * queue-time stamp beats a flush-time now_wall_ms()
+                                 * for correlating with iw-event epochs. */
+                                g_gaplog_ring[g_gaplog_n].wall_ms=kms?kms:now_wall_ms();
                                 g_gaplog_ring[g_gaplog_n].gap=(unsigned)g;
                                 g_gaplog_ring[g_gaplog_n].out=L->outstanding;
                                 g_gaplog_ring[g_gaplog_n].h=hh;
@@ -2422,6 +2452,7 @@ static void handle_hci_event(const uint8_t *e, int el){
              * (Magic Remote etc.) suppress the 150ms backstop exactly when
              * our credits are the ones wedged. */
             L->last_nocp=nowm;
+            if(kms){ L->last_nocp_k=kms; L->nocp_k_ok=1; } else L->nocp_k_ok=0;
             /* NOCP for the bound handle also proves the LINK is alive:
              * the controller is completing OUR injections. Without this,
              * last_seen is only refreshed by kernel-path HID writes
@@ -2510,6 +2541,13 @@ static void *capture_thread(void *arg){
     ma.hci_family=AF_BLUETOOTH; ma.hci_dev=HCI_DEV_NONE; ma.hci_channel=HCI_CHANNEL_MONITOR;
     if(bind(mfd,(struct sockaddr*)&ma,sizeof ma)<0){ perror("[txd] bind monitor"); close(mfd); return NULL; }
     struct timeval tv={.tv_sec=0,.tv_usec=300000}; setsockopt(mfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    /* Kernel queue-time stamps for the gap ledger (1.4.34). Proven on this exact
+     * socket type by tools/ds5_clock_probe.c (0 missing stamps / 11448 intervals).
+     * Failure is survivable: every interval then falls back to the monotonic
+     * clock and g_ts_fallback witnesses it in the ledger. */
+    { int one=1;
+      if(setsockopt(mfd,SOL_SOCKET,SO_TIMESTAMP,&one,sizeof one)<0)
+          perror("[txd] SO_TIMESTAMP (gap clock stays userspace)"); }
     uint8_t buf[2048];
     uint64_t last_learn=0;
     /* Idle sniff-pin handle cache (capture-thread-only). The pin needs the ACL
@@ -2781,13 +2819,24 @@ static void *capture_thread(void *arg){
             }
         }
 
-        int r=(int)recv(mfd,buf,sizeof buf,0);
+        struct iovec iov={.iov_base=buf,.iov_len=sizeof buf};
+        char cbuf[64];
+        struct msghdr msg={0}; msg.msg_iov=&iov; msg.msg_iovlen=1;
+        msg.msg_control=cbuf; msg.msg_controllen=sizeof cbuf;
+        int r=(int)recvmsg(mfd,&msg,0);
         if(r<0){
             /* EAGAIN/EWOULDBLOCK is the normal 300ms SO_RCVTIMEO tick, EINTR a signal;
              * any other errno is a real socket error -> back off so we never busy-spin. */
             if(errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) usleep(50000);
             continue;
         }
+        /* Queue-time stamp of THIS packet, wall-clock ms; 0 = cmsg missing. */
+        uint64_t kms=0;
+        for(struct cmsghdr *c=CMSG_FIRSTHDR(&msg); c; c=CMSG_NXTHDR(&msg,c))
+            if(c->cmsg_level==SOL_SOCKET && c->cmsg_type==SO_TIMESTAMP){
+                struct timeval ktv; memcpy(&ktv,CMSG_DATA(c),sizeof ktv);
+                kms=(uint64_t)ktv.tv_sec*1000ull+(uint64_t)ktv.tv_usec/1000ull;
+            }
         if(r<(int)sizeof(struct hci_mon_hdr)) continue;
         struct hci_mon_hdr*h=(struct hci_mon_hdr*)buf;
         if(h->index!=TARGET_HCI_INDEX) continue;   /* track only the controller we inject on */
@@ -2810,7 +2859,7 @@ static void *capture_thread(void *arg){
             }
             continue;
         }
-        if(h->opcode==MON_EVENT_PKT){ handle_hci_event(d,dl); continue; }
+        if(h->opcode==MON_EVENT_PKT){ handle_hci_event(d,dl,kms); continue; }
         if(h->opcode==MON_ACL_RX_PKT){
             /* Inbound ACL from a BOUND handle proves that link is alive: a
              * connected DS5 streams input reports continuously (250+/s), so RX
@@ -3630,10 +3679,16 @@ int main(int argc,char**argv){
                 snprintf(ptyp,sizeof ptyp," ptype=%d/0x%04x",
                          g_ptype_want,g_ptype_seen<0?0:(unsigned)g_ptype_seen);
             char gpl[48]; gpl[0]='\0';
-            if(g_gaplog_want || g_gaplog_written || g_gaplog_lost)
+            if(g_gaplog_want || g_gaplog_lost || g_gaplog_written)
                 snprintf(gpl,sizeof gpl," gaplog=%ld/%ld",g_gaplog_written,g_gaplog_lost);
+            /* Measurement-boundary marker (1.4.34): the gap ledger's clock is the
+             * KERNEL's queue-time stamp. The number counts intervals that fell
+             * back to the userspace clock (expected 0) — always printed, so any
+             * analysis can see which clock a line was measured with. */
+            char gck[24];
+            snprintf(gck,sizeof gck," gclk=k/%ld",g_ts_fallback);
             uint64_t t0=now_us();
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s%s%s\n",
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s%s%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
@@ -3642,7 +3697,7 @@ int main(int argc,char**argv){
                  * confirmed=0 is precisely the accept-and-ignore case. */
                 g_flush_want, g_flush_confirmed_ms,
                 g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"),
-                g_cmd_dead?" CMDDEAD":"", linkq, ptyp, gpl, links);
+                g_cmd_dead?" CMDDEAD":"", linkq, ptyp, gpl, gck, links);
             logw_note(t0);
             last_log=now_ms();
         }
