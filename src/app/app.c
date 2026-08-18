@@ -29,6 +29,7 @@
 
 #if TARGET_WEBOS
 #include "platform/webos/ds5_service.h"
+#include "platform/webos/tv_game_mode.h"
 #endif
 
 PCONFIGURATION app_configuration = NULL;
@@ -113,6 +114,9 @@ int app_init(app_t *app, app_settings_loader *settings_loader, int argc, char *a
     /* Heal the bundled root transport's elevation (an app update always knocks it
      * back into the jail) and start it. Fire-and-forget on a detached thread. */
     ds5_service_bootstrap();
+    /* A previous run may have been killed mid-stream, leaving the TV on stopped
+     * services and a game picture preset. Nothing else will put that back. */
+    tv_game_mode_recover_stale();
 #endif
 
     SS4S_PostInit(argc, argv);

@@ -31,6 +31,13 @@ add_custom_target(ds5-txd ALL DEPENDS "${DS5_TXD_BIN}")
 add_dependencies(moonlight ds5-txd)
 install(PROGRAMS "${DS5_TXD_BIN}" DESTINATION services/com.aurora.ds5.txd)
 
+# The game-mode script travels with the app for the same reason the daemon does:
+# it needs root, and root work used to mean a hand-placed boot hook under
+# /var/lib/webosbrew that polled for the app instead of being told by it. The
+# app runs this through Homebrew Channel's exec at stream start and stop; see
+# src/app/platform/webos/tv_game_mode.c.
+install(PROGRAMS "${CMAKE_SOURCE_DIR}/tools/gamemode.sh" DESTINATION tools)
+
 # Generate translations
 foreach (I18N_LOCALE ${I18N_LOCALES})
     string(REPLACE "-" "/" I18N_JSON_DIR "resources/${I18N_LOCALE}")

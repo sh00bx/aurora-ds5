@@ -1,4 +1,5 @@
 #include "session_worker.h"
+
 #include "session_priv.h"
 #include "app.h"
 #include "util/bus.h"
@@ -6,6 +7,9 @@
 #include "errors.h"
 #include "util/user_event.h"
 #include "input/input_gamepad.h"
+#if TARGET_WEBOS
+#include "platform/webos/tv_game_mode.h"
+#endif
 #include "stream/connection/session_connection.h"
 #include "stream/audio/session_audio.h"
 #include "stream/video/session_video.h"
@@ -219,6 +223,15 @@ int session_worker(session_t *session) {
     }
     session_set_state(session, STREAMING_STREAMING);
     bus_pushevent(USER_STREAM_OPEN, NULL, NULL);
+#if TARGET_WEBOS
+    /* Hand the TV over to the stream: game picture/sound preset, discovery and
+     * cast services out of the DS5's airtime, cores pinned, stream threads
+     * boosted. Runs on its own thread and restores everything at thread_cleanup
+     * below -- including when this session ends in an error. */
+    if (app_configuration != NULL && app_configuration->webos_game_mode) {
+        tv_game_mode_stream_begin();
+    }
+#endif
     if (session->config.auto_adjust_bitrate || session->config.soft_recovery) {
         adaptive_bitrate_config_t abr_config = {
                 .gs_client = client,
@@ -254,6 +267,13 @@ int session_worker(session_t *session) {
     // Don't always reset status as error state should be kept
     session_set_state(session, STREAMING_NONE);
     thread_cleanup:
+#if TARGET_WEBOS
+    /* Unconditional: the begin call is gated on the preference, but the end
+     * must not be -- a preference toggled mid-session would otherwise leave the
+     * TV in game mode with nothing left to turn it off. It is a no-op when
+     * nothing was engaged. */
+    tv_game_mode_stream_end();
+#endif
     /* Restore only on a clean exit: streaming_errno != GS_OK means the session
      * ended in error/disconnect and the host is likely unreachable -- the
      * restore round-trips would just block teardown on timeouts. */

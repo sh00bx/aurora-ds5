@@ -1,6 +1,7 @@
 #!/bin/sh
 # aurora gamemode toggle for rooted webOS (LG G4 / webOS 25)
-# usage: gamemode.sh on | off | enforce | status
+# usage: gamemode.sh on | off | enforce | recover | status
+#        gamemode.sh picture-on | picture-off | picture-status   (picture half only)
 #
 # on : evict discovery/cast + non-essential broadcast services (WiFi<->BT coex
 #      relief), kill preloaded streaming apps (RAM relief -> stops swap churn),
@@ -230,6 +231,207 @@ unpin_cpus() {
 	log "LG MP governor restored (cores scale down on their own)"
 }
 
+# ------------------------------------------------------------- picture / sound
+#
+# The TV's own picture pipeline is the one latency source this script could not
+# reach before: noise reduction, the enhancers and the 24p cadence logic all sit
+# between the decoded frame and the panel. LG exposes them through
+# com.webos.settingsservice, which only answers to root -- so it belongs here,
+# next to the other root-only levers, rather than in the app.
+#
+# WHAT THIS DOES AND WHY IT IS ONLY TWO KEYS. Measured on this TV (LG G4,
+# webOS 25), picture settings are stored per DIMENSION, and the dimension for a
+# picture key includes the picture mode itself:
+#
+#   "dimension":{"dynamicRange":"sdr","pictureMode":"expert2","input":"default"}
+#
+# So every key like noiseReduction or superResolution exists once per picture
+# mode, and switching the mode brings that mode's whole set with it. The TV's
+# own "game" preset already IS the low-processing configuration -- that is what
+# it is for -- so asking for the mode does the entire job in one write.
+#
+# Writing those keys individually, the way the obvious implementation (and
+# upstream's) does, is actively harmful: the write lands in whatever bucket is
+# live at that moment, which during a mode switch is not the one you think. In
+# testing that clobbered the user's calibrated expert2 values with game-mode
+# ones, and "restoring" them afterwards wrote them into the game preset instead.
+# Two keys, each in its own bucket, is both the smaller and the safer change.
+#
+# Two more measured facts shape the rest:
+#   * A write needs the dimension COMPLETE or absent. {"dynamicRange":"sdr"} on
+#     its own is refused with "ERROR!! sending a request to DB"; dynamicRange +
+#     input is accepted, and so is omitting it. Applying omits it (the live
+#     dimension is the one we mean); the restore names it in full, because by
+#     then the panel has usually dropped back out of HDR and the HDR bucket
+#     would otherwise never be put back.
+#   * The panel switches to the HDR dimension a second or two AFTER the stream
+#     starts, and that dimension has its own pictureMode. picture_enforce
+#     therefore re-checks instead of trusting the value written at stream start,
+#     and records the HDR bucket as a second entry to restore.
+#
+# Everything written is recorded WITH its dimension in PIC_STATE. The state file
+# deliberately does not live in /tmp: if the app dies mid-stream, the next app
+# start still has to be able to hand the user their picture back.
+if [ -z "$PIC_STATE" ]; then
+	if [ -d /var/lib/webosbrew ]; then
+		PIC_STATE=/var/lib/webosbrew/aurora-gamemode.state
+	else
+		PIC_STATE=/tmp/aurora-gamemode.state
+	fi
+fi
+SS="luna://com.webos.settingsservice"
+
+# luna-send RETURNS BEFORE ITS REPLY IS READABLE, and back-to-back calls are
+# what breaks this: measured here, the same request answers 5/5 with a second of
+# air around it and 0/13 in a tight loop, with rc=0 and an empty file every
+# time. So each call gets a short settle first, writes to a FILE (a pipe loses
+# the reply far more often), and then WAITS for that file instead of trusting
+# rc. Both delays are bounded -- this runs off the UI thread, but it must never
+# hang a stream on a sulking bus.
+SS_TMP="${SS_TMP:-/tmp/.aurora-ss.$$}"
+
+ss_nap() { usleep "${1:-20000}" 2>/dev/null || sleep 1; }
+
+ss_call() {   # method payload -> reply json on stdout
+	_i=0
+	while [ $_i -lt 2 ]; do
+		ss_nap 400000
+		rm -f "$SS_TMP"
+		luna-send -n 1 -w 4000 "$SS/$1" "$2" >"$SS_TMP" 2>&1
+		_j=0
+		while [ ! -s "$SS_TMP" ] && [ $_j -lt 60 ]; do
+			ss_nap 50000
+			_j=$((_j + 1))
+		done
+		if [ -s "$SS_TMP" ]; then
+			cat "$SS_TMP"
+			rm -f "$SS_TMP"
+			return 0
+		fi
+		log "picture: no reply to $1 (attempt $((_i + 1)))"
+		_i=$((_i + 1))
+	done
+	rm -f "$SS_TMP"
+	return 1
+}
+
+# First "key":"value" hit. grep -o before sed on purpose: a greedy sed would
+# return the LAST match, which for pictureMode is the copy inside the dimension
+# object rather than the setting itself.
+json_field() {   # json key -> value
+	printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed 's/.*:"//; s/"$//'
+}
+
+# "dynamicRange:input", or "-" when the reply does not name a dynamicRange.
+# Naming half a dimension on the way back is worse than naming none.
+pic_dim() {   # reply -> dim
+	_dr=$(json_field "$1" dynamicRange)
+	[ -z "$_dr" ] && { echo "-"; return; }
+	echo "$_dr:$(json_field "$1" input)"
+}
+
+pic_dim_json() {   # dim -> ,"dimension":{...} or nothing
+	[ "$1" = "-" ] && return
+	_in=${1##*:}
+	[ -z "$_in" ] && return
+	echo ",\"dimension\":{\"dynamicRange\":\"${1%%:*}\",\"input\":\"$_in\"}"
+}
+
+pic_record() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >>"$PIC_STATE"; }
+
+# game / hdrGame / dolbyHdrGame all exist on this panel; the live dynamic range
+# decides which one to ask for. A model without them refuses the write, which we
+# log and let go -- an unknown mode name is not worth guessing around.
+pic_mode_target() {
+	case "$1" in
+	*dolby*|*Dolby*) echo dolbyHdrGame ;;
+	hdr*|HDR*) echo hdrGame ;;
+	*) echo game ;;
+	esac
+}
+
+# Switch one mode-style key to its game value and remember what it was. Used for
+# picture.pictureMode (re-checked on every enforce tick, because the HDR
+# dimension arrives late) and once for sound.soundMode.
+pic_switch() {   # category key want-value-or-empty-for-auto
+	_reply=$(ss_call getSystemSettings "{\"category\":\"$1\",\"keys\":[\"$2\"]}") || {
+		log "picture: $1.$2 not readable, left alone"
+		return
+	}
+	_cur=$(json_field "$_reply" "$2")
+	[ -z "$_cur" ] && return
+	_dim=$(pic_dim "$_reply")
+	_want=$3
+	[ -z "$_want" ] && _want=$(pic_mode_target "${_dim%%:*}")
+	# Already there -- ours from an earlier tick, or the user's own choice.
+	# Either way: nothing to change and nothing to remember.
+	[ "$_cur" = "$_want" ] && return
+	case "$_cur" in game|hdrGame|dolbyHdrGame) return ;; esac
+	# This bucket may already be recorded from an earlier tick that got
+	# reverted by the user; do not stack a second entry on top of it.
+	grep -q "^$1|$2|$_dim|" "$PIC_STATE" 2>/dev/null && return
+	_res=$(ss_call setSystemSettings "{\"category\":\"$1\",\"settings\":{\"$2\":\"$_want\"}}")
+	case "$_res" in
+	*'"returnValue":true'*)
+		pic_record "$1" "$2" "$_dim" "$_cur"
+		log "picture: $1.$2 $_cur -> $_want (dim=$_dim)"
+		;;
+	*) log "picture: $1.$2=$_want rejected, left at $_cur" ;;
+	esac
+}
+
+picture_on() {
+	# A leftover state file means a previous session never restored. Put that
+	# back first, or its values would be overwritten with game-mode values and
+	# lost for good.
+	[ -f "$PIC_STATE" ] && { log "picture: stale state from an earlier session, restoring it first"; picture_off; }
+	: >"$PIC_STATE" 2>/dev/null || { log "picture: cannot write $PIC_STATE - picture left alone"; return; }
+	pic_switch picture pictureMode
+	pic_switch sound soundMode game
+	[ -s "$PIC_STATE" ] || log "picture: already in game mode, nothing to change"
+}
+
+# Cheap re-assert: one read, and a write only on drift. This is what catches the
+# HDR dimension, which only appears once the panel has actually switched.
+picture_enforce() {
+	[ -f "$PIC_STATE" ] || return
+	pic_switch picture pictureMode
+}
+
+picture_off() {
+	[ -f "$PIC_STATE" ] || return
+	# Restore each recorded bucket by name. If the TV refuses the named
+	# dimension, fall back to the live one -- putting the value back in the
+	# wrong bucket is still better than leaving the user in game mode.
+	while IFS='|' read -r c k d o; do
+		[ -n "$k" ] || continue
+		_res=$(ss_call setSystemSettings "{\"category\":\"$c\",\"settings\":{\"$k\":\"$o\"}$(pic_dim_json "$d")}")
+		case "$_res" in
+		*'"returnValue":true'*) log "picture: restored $c.$k=$o (dim=$d)" ;;
+		*)
+			_res2=$(ss_call setSystemSettings "{\"category\":\"$c\",\"settings\":{\"$k\":\"$o\"}}")
+			case "$_res2" in
+			*'"returnValue":true'*) log "picture: restored $c.$k=$o (live dimension; $d was refused)" ;;
+			*) log "picture: RESTORE FAILED $c.$k=$o (dim=$d): $_res / $_res2" ;;
+			esac
+			;;
+		esac
+	done <"$PIC_STATE"
+	rm -f "$PIC_STATE"
+}
+
+picture_status() {
+	echo "--- picture/sound game mode ---"
+	if [ -f "$PIC_STATE" ]; then
+		echo "state: ENGAGED ($PIC_STATE)"
+		sed 's/^/  restores /' "$PIC_STATE"
+	else
+		echo "state: not engaged"
+	fi
+	echo "  now: $(json_field "$(ss_call getSystemSettings '{"category":"picture","keys":["pictureMode"]}')" pictureMode) / $(json_field "$(ss_call getSystemSettings '{"category":"sound","keys":["soundMode"]}')" soundMode)"
+}
+
+
 case "$1" in
 on)
 	log "=== GAME MODE ON ==="
@@ -245,6 +447,7 @@ on)
 	# latency anyway. Not worth the risk. (Function kept below, unused.)
 	boost_game
 	tame_quickset
+	picture_on
 	free -m | awk '/Mem:/{print "[gamemode] mem: "$4"MB free, "$7"MB avail"} /Swap:/{print "[gamemode] swap: "$3"MB used"}'
 	log "on: done"
 	;;
@@ -255,20 +458,57 @@ enforce)
 	pin_cpus >/dev/null 2>&1
 	boost_game >/dev/null 2>&1
 	tame_quickset >/dev/null 2>&1
+	picture_enforce
 	;;
 off)
 	log "=== GAME MODE OFF ==="
+	picture_off
 	restore_game
 	restore_quickset
 	start_services
 	unpin_cpus
 	log "off: done (background apps not relaunched - open them yourself)"
 	;;
+recover)
+	# Conditional "off", for app start-up: put things back only if a previous
+	# session died without doing it. Cheap to call when nothing is engaged,
+	# which is the normal case.
+	engaged=""
+	[ -f "$PIC_STATE" ] && engaged="picture"
+	[ "$(cat /proc/lg/pm/mp_enable 2>/dev/null)" = "0" ] && engaged="$engaged cpus"
+	for u in $EVICT_SERVICES; do
+		systemctl is-enabled "$u" >/dev/null 2>&1 || continue
+		systemctl is-active "$u" >/dev/null 2>&1 || { engaged="$engaged services"; break; }
+	done
+	if [ -z "$engaged" ]; then
+		log "recover: nothing left engaged"
+		exit 0
+	fi
+	log "=== RECOVER ($engaged) ==="
+	picture_off
+	restore_game
+	restore_quickset
+	start_services
+	unpin_cpus
+	log "recover: done"
+	;;
 status)
 	show_status
+	picture_status
+	;;
+# The picture half on its own -- for trying a key list out on a new panel
+# without stopping services or touching scheduling.
+picture-on)
+	picture_on
+	;;
+picture-off)
+	picture_off
+	;;
+picture-status)
+	picture_status
 	;;
 *)
-	echo "usage: $0 on|off|enforce|status"
+	echo "usage: $0 on|off|enforce|recover|status|picture-on|picture-off|picture-status"
 	exit 1
 	;;
 esac

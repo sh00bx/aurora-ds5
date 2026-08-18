@@ -205,6 +205,15 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                                           &app_configuration->show_stats_compact, false);
     pref_desc_label(view, locstr("Show minimalist one-line stats like Moonlight Android (FPS, RTT, bitrate)."), false);
 
+#if TARGET_WEBOS
+    pref_checkbox(view, locstr("TV game mode while streaming"), &app_configuration->webos_game_mode, false);
+    pref_desc_label(view,
+                    locstr("Switch the TV to its game picture and sound preset, keep discovery and casting "
+                           "services off the radio, and pin the CPU cores -- for as long as a stream runs, "
+                           "then put everything back. Needs a rooted TV with Homebrew Channel."),
+                    false);
+#endif
+
 #ifdef FEATURE_I18N_LANGUAGE_SETTINGS
     lv_obj_t *lang_label = pref_title_label(view, locstr("Language"));
 

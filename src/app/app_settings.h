@@ -52,6 +52,10 @@ typedef struct app_settings_t {
     bool hid_passthrough;
     int hid_passthrough_port;
     bool hid_passthrough_autoplug;   /* auto-bridge connected game controllers on stream start + BT hotplug */
+    /* Ask the TV for its game picture/sound preset and free the radio + cores
+     * for the stream, for as long as the stream runs. Needs root (Homebrew
+     * Channel); a no-op without it. */
+    bool webos_game_mode;
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
     /**
