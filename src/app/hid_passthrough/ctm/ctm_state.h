@@ -130,6 +130,12 @@ typedef struct {
     unsigned int speaker_volume_percent;
     uint32_t seq;   /* creation order, so a full table evicts the oldest record
                      * that no longer belongs to a present or bridged device */
+    char pref_id[96];   /* stable id the auto-plug pref was resolved under. A
+                         * record created during the enumeration race (hidraw
+                         * node up, MAC not yet readable) resolves against the
+                         * throwaway key-derived id; once the MAC appears the id
+                         * changes and the pref must be re-read, or auto-plug
+                         * stays silently off for the whole connection. */
 } ui_device_settings_t;
 
 /* One USB interface of a composite device (from the device-dir sysfs walk). */

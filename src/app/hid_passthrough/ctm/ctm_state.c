@@ -70,7 +70,24 @@ void log_append(const char *fmt, ...)
         line[written] = '\0';
     }
 
+    /* Launched from the TV home screen the app's stderr is /dev/null, so the
+     * in-memory console was the only sink and every auto-plug failure outside a
+     * stream with the panel open was undiagnosable. Mirror each line to a file
+     * in the jail's /tmp (host path /var/palm/jail/<appid>/tmp/), truncating
+     * when it grows past a bound; these lines are rare, so the file holds many
+     * app runs. */
+    static int log_fd = -2;   /* -2 = not opened yet, -1 = open failed */
+
     pthread_mutex_lock(&g_log_mutex);
+    if (log_fd == -2) {
+        log_fd = open("/tmp/aurora-hidpt.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    }
+    if (log_fd >= 0) {
+        if (lseek(log_fd, 0, SEEK_END) > 512 * 1024) {
+            (void) ftruncate(log_fd, 0);
+        }
+        (void) !write(log_fd, line, (size_t)written);
+    }
     if (g_log_used + (size_t)written + 1 >= sizeof(g_log)) {
         size_t keep = sizeof(g_log) / 2;
         if (g_log_used < keep) {

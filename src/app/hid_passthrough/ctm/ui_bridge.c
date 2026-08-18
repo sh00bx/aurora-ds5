@@ -123,12 +123,38 @@ static ui_device_settings_t *settings_record_to_evict(void)
     return oldest;
 }
 
+/* The auto-plug pref is keyed by the pad's MAC, but the record can be created
+ * while the MAC is not readable yet: the stream-start rescan right after boot
+ * and the SDL-hotplug rescan on reconnect both run inside the window where the
+ * hidraw node exists but sysfs uniq / HIDIOCGRAWUNIQ still come up empty. The
+ * lookup then resolved against the throwaway key-derived id, found nothing, and
+ * the false was latched for the rest of the connection — auto-plug dead after
+ * boot/reconnect with no diagnostic. Re-resolve whenever the identity the
+ * record was resolved under changes; later rescans merge the MAC in, the id
+ * flips from key-derived to MAC-derived, and the real pref takes effect. */
+static void record_refresh_auto_plugin(ui_device_settings_t *record, const logical_device_t *item)
+{
+    char id[96];
+    hid_pt_stable_id_for_logical(item, id, sizeof(id));
+    if (strcmp(id, record->pref_id) == 0) {
+        return;
+    }
+    snprintf(record->pref_id, sizeof(record->pref_id), "%s", id);
+    bool pref = hid_pt_prefs_get_auto_plugin(id);
+    if (pref != record->settings.auto_plugin) {
+        record->settings.auto_plugin = pref;
+        log_append("auto-plug pref re-resolved for %s (id=%s): %s",
+                   item->name, id, pref ? "on" : "off");
+    }
+}
+
 ui_device_settings_t *ui_record_for_item(const logical_device_t *item)
 {
     static uint32_t seq;
     if (!item) return NULL;
     for (int i = 0; i < g_settings_count; ++i) {
         if (strcmp(g_settings[i].key, item->key) == 0) {
+            record_refresh_auto_plugin(&g_settings[i], item);
             return &g_settings[i];
         }
     }
@@ -158,6 +184,10 @@ ui_device_settings_t *ui_record_for_item(const logical_device_t *item)
     record->settings = default_settings_for_item(item);
     record->headset_volume_percent = record->settings.headset_volume_percent;
     record->speaker_volume_percent = record->settings.speaker_volume_percent;
+    hid_pt_stable_id_for_logical(item, record->pref_id, sizeof(record->pref_id));
+    log_append("settings record for %s (id=%s): auto-plug %s",
+               item->name, record->pref_id,
+               record->settings.auto_plugin ? "on" : "off");
     return record;
 }
 
@@ -179,12 +209,18 @@ void apply_settings_to_session(const logical_device_t *item)
 
 void hid_pt_sync_auto_plugin_pref(const logical_device_t *item)
 {
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!item || !settings) {
+    ui_device_settings_t *record = ui_record_for_item(item);
+    if (!item || !record) {
         return;
     }
+    tv_bridge_worker_settings_t *settings = &record->settings;
     char stable_id[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_logical(item, stable_id, sizeof(stable_id));
+    /* Record which id this toggle was resolved under, so the re-resolve path
+     * treats the record as current: if the pref write below fails, the record
+     * keeps the user's choice for this run (as the error text promises) instead
+     * of being flipped back by the next refresh. */
+    snprintf(record->pref_id, sizeof(record->pref_id), "%s", stable_id);
     if (!hid_pt_prefs_set_auto_plugin(stable_id, settings->auto_plugin)) {
         /* The panel's checkbox reflects settings_for_item(), not the pref store,
          * so it stays ticked whatever happens here. Say so where the user can
