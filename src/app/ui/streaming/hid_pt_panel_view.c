@@ -575,27 +575,48 @@ bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target)
     return target != NULL && lv_obj_has_class(target, &lv_dropdown_class) && lv_dropdown_is_open(target);
 }
 
-void hid_pt_view_open_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown)
+void hid_pt_view_forget_dropdown(hid_pt_view_t *view)
 {
-    if (!view || !dropdown) {
-        return;
-    }
-    lv_dropdown_open(dropdown);
-    view->active_dropdown = dropdown;
-    lv_group_set_editing(view->group, true);
-}
-
-void hid_pt_view_close_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown)
-{
-    if (!view || !dropdown) {
+    if (!view) {
         return;
     }
     view->active_dropdown = NULL;
     lv_group_set_editing(view->group, false);
-    if (lv_dropdown_is_open(dropdown)) {
-        lv_dropdown_close(dropdown);
+}
+
+/**
+ * Keep the bookkeeping in step with what the widget just did on its own.
+ *
+ * The list is opened and closed by LVGL's press/release handling — a short OK
+ * toggles it open on the key's RELEASE, the next OK commits the highlighted
+ * option and closes it, a pointer click does either. The view no longer opens
+ * the list itself: it used to, on the KEY event (which arrives at key DOWN),
+ * and LVGL's own release toggle then promptly shut it again — which is why the
+ * list only stayed open for as long as OK was held.
+ *
+ * Registered without PREPROCESS, so it runs after the widget has settled, and
+ * on every event that can change the list's openness from inside the widget:
+ * RELEASED (both toggle directions), DEFOCUSED (LVGL closes on focus leaving),
+ * and VALUE_CHANGED (a pointer click on a list row commits and closes without
+ * a RELEASED on the dropdown itself).
+ */
+static void dropdown_state_sync_cb(lv_event_t *event)
+{
+    hid_pt_view_t *view = lv_event_get_user_data(event);
+    lv_obj_t *dropdown = lv_event_get_current_target(event);
+    if (!view || !view->group) {
+        return;
     }
-    lv_group_focus_obj(dropdown);
+    const bool open = lv_dropdown_is_open(dropdown);
+    const bool was_open = view->active_dropdown == dropdown;
+    if (open == was_open) {
+        return;
+    }
+    view->active_dropdown = open ? dropdown : NULL;
+    lv_group_set_editing(view->group, open);
+    if (view->cbs.dropdown_toggled) {
+        view->cbs.dropdown_toggled(view->cbs.userdata, open);
+    }
 }
 
 /* ---- the option column's labels ----------------------------------------- */
@@ -700,6 +721,9 @@ void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged
      * gets to see the line they are translating. */
     const char *text;
     switch (zone) {
+        case HID_PT_ZONE_DROPDOWN:
+            text = locstr("UP/DOWN  choose        OK  confirm        BACK  cancel");
+            break;
         case HID_PT_ZONE_OPTIONS:
             text = locstr("UP/DOWN  setting        LEFT/RIGHT  adjust        BACK  devices");
             break;
@@ -1073,6 +1097,11 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_add_event_cb(view->audio_dropdown, value_changed_cb, LV_EVENT_VALUE_CHANGED, view);
     lv_obj_add_event_cb(view->audio_dropdown, key_cb, LV_EVENT_KEY, view);
     lv_obj_add_event_cb(view->audio_dropdown, dropdown_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
+    /* After LVGL's own open/close handling (no PREPROCESS): see the comment on
+     * dropdown_state_sync_cb for why these three events cover every toggle. */
+    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_RELEASED, view);
+    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_DEFOCUSED, view);
+    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_VALUE_CHANGED, view);
 
     view->speaker_row = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
                                    HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);

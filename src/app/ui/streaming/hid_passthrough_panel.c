@@ -182,8 +182,20 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
         return;
     }
     lv_obj_t *target = lv_event_get_target(event);
-    if (!lv_obj_has_class(target, &lv_dropdown_class) ||
-        hid_pt_view_dropdown_is_open(&panel->view, target)) {
+    if (!lv_obj_has_class(target, &lv_dropdown_class)) {
+        return;
+    }
+    if (hid_pt_view_dropdown_is_open(&panel->view, target)) {
+        /* The open list owns the keys; LVGL's own KEY handler (which runs right
+         * after this preprocess hook) walks it and, on BACK, restores the
+         * selection and closes it. Only BACK needs a note: the panel's later
+         * ESC handling must know the key was spent on the list, or it would
+         * also step the cursor out of the settings column. */
+        if (lv_event_get_key(event) == LV_KEY_ESC) {
+            panel->view.dropdown_esc_spent = true;
+            hid_pt_view_forget_dropdown(&panel->view);
+            panel_update_hints(panel, target);
+        }
         return;
     }
     const uint32_t key = lv_event_get_key(event);
@@ -210,6 +222,22 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
         }
         default:
             break;
+    }
+}
+
+/* The footer follows the list: while it is up the keys pick an option, and the
+ * moment it is gone they are the settings column's again. */
+static void panel_dropdown_toggled(void *userdata, bool open)
+{
+    hid_pt_panel_t *panel = userdata;
+    if (!panel) {
+        return;
+    }
+    if (open) {
+        hid_pt_view_set_hints(&panel->view, HID_PT_ZONE_DROPDOWN,
+                              hid_pt_model_selected_is_plugged(&panel->model));
+    } else {
+        panel_update_hints(panel, panel->view.audio_dropdown);
     }
 }
 
@@ -255,8 +283,11 @@ static void panel_control_key(void *userdata, lv_event_t *event)
 
     switch (key) {
         case LV_KEY_ESC:
-            if (kind == HID_PT_WK_DROPDOWN && hid_pt_view_dropdown_is_open(&panel->view, target)) {
-                hid_pt_view_close_dropdown(&panel->view, target);
+            if (kind == HID_PT_WK_DROPDOWN && panel->view.dropdown_esc_spent) {
+                /* This BACK already cancelled the open list — LVGL's own KEY
+                 * handler restored the selection and closed it before this
+                 * handler ran. The cursor stays on the row. */
+                panel->view.dropdown_esc_spent = false;
                 break;
             }
             /* One step back out of the settings, then out of the sheet. Without
@@ -273,9 +304,13 @@ static void panel_control_key(void *userdata, lv_event_t *event)
                 /* Nothing to confirm: the value is already what it looks like. */
                 break;
             }
-            if (kind == HID_PT_WK_DROPDOWN && !hid_pt_view_dropdown_is_open(&panel->view, target)) {
-                hid_pt_view_open_dropdown(&panel->view, target);
-                break;
+            if (kind == HID_PT_WK_DROPDOWN) {
+                /* Hands off: LVGL's own press/release handling toggles the list
+                 * on the key's RELEASE — open it here on the KEY (which arrives
+                 * at key DOWN) and that same release promptly closes it again,
+                 * which is the "stays open only while OK is held" bug. The
+                 * view's dropdown_state_sync_cb picks the toggle up afterwards. */
+                return;
             }
             /* Anything else -- a device row, a switch, a button -- has its own
              * OK, and LVGL turns the key into a click on it. */
@@ -443,8 +478,8 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         hid_pt_view_update_latency_label(v, hid_pt_model_default_latency_ms(&panel->model));
     }
     /* Asked about this dropdown by name, not via the view's active_dropdown:
-     * that field is only written when the list is opened with OK, so a list the
-     * pointer indev (magic remote) opened would answer "closed" and get reset. */
+     * the widget itself is the truth about its own list, and the bookkeeping is
+     * one event behind it by design (it syncs after LVGL's toggles). */
     if (v->audio_dropdown && !hid_pt_view_dropdown_is_open(v, v->audio_dropdown)) {
         lv_dropdown_set_selected(v->audio_dropdown, (uint16_t) c.audio_mode);
     }
@@ -902,6 +937,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
             .row_focused = panel_row_focused,
             .key = panel_control_key,
             .dropdown_key = panel_dropdown_key,
+            .dropdown_toggled = panel_dropdown_toggled,
             .deleted = panel_deleted,
     };
     lv_obj_t *cont = hid_pt_view_create(&panel->view, parent, &cbs);

@@ -212,6 +212,10 @@ lv_obj_t *pref_title_label(lv_obj_t *parent, const char *title) {
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, title);
     lv_obj_set_size(label, LV_PCT(100), LV_SIZE_CONTENT);
+    /* Names its control, so it hangs onto it: air above, none below. */
+    lv_obj_set_style_pad_top(label, LV_DPX(8), 0);
+    lv_obj_set_style_pad_left(label, LV_DPX(2), 0);
+    lv_obj_set_style_text_color(label, ml_color_hex(ML_COLOR_TEXT), 0);
     return label;
 }
 
@@ -227,8 +231,10 @@ lv_obj_t *pref_desc_label(lv_obj_t *parent, const char *title, bool focusable) {
     lv_obj_add_flag(label, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_set_style_pad_left(label, LV_DPX(30), 0);
     lv_obj_set_style_text_font(label, lv_theme_get_font_small(parent), 0);
+    lv_obj_set_style_text_color(label, ml_color_hex(ML_COLOR_TEXT), 0);
+    lv_obj_set_style_text_opa(label, OVERLAY_OPA_MUTED, 0);
     lv_obj_set_style_outline_opa(label, LV_OPA_50, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_outline_color(label, lv_theme_get_color_primary(label), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_color(label, ml_color_hex(ML_COLOR_FOCUS), LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_width(label, LV_DPX(3), LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_pad(label, LV_DPX(3), LV_STATE_FOCUS_KEY);
     lv_obj_set_style_radius(label, LV_DPX(4), 0);
@@ -240,12 +246,19 @@ lv_obj_t *pref_desc_label(lv_obj_t *parent, const char *title, bool focusable) {
 }
 
 lv_obj_t *pref_header(lv_obj_t *parent, const char *title) {
+    /* The overlay's "eyebrow": a small, tracked, muted line over a seam. One
+     * quiet voice for every section heading in the app. */
     lv_obj_t *header = lv_label_create(parent);
     lv_label_set_text(header, title);
     lv_obj_set_width(header, LV_PCT(100));
-    lv_obj_set_style_pad_bottom(header, LV_DPX(4), 0);
+    lv_obj_set_style_text_font(header, lv_theme_get_font_small(parent), 0);
+    lv_obj_set_style_text_color(header, ml_color_hex(ML_COLOR_TEXT), 0);
+    lv_obj_set_style_text_opa(header, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_style_text_letter_space(header, LV_DPX(2), 0);
+    lv_obj_set_style_pad_top(header, LV_DPX(14), 0);
+    lv_obj_set_style_pad_bottom(header, LV_DPX(5), 0);
     lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_opa(header, LV_OPA_30, 0);
+    lv_obj_set_style_border_opa(header, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(header, ml_color_hex(ML_COLOR_BORDER), 0);
     lv_obj_set_style_border_width(header, LV_DPX(1), 0);
     return header;

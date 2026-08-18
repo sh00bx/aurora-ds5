@@ -366,7 +366,10 @@ static void launcher_try_auto_resume(launcher_fragment_t *controller, const uuid
     // USER_APP_FOREGROUND handler re-requests the host update and resumes then.
     if (!controller->global->foreground) { return; }
     // Only fire once per app start; let an explicit CLI/deep-link launch take priority.
-    if (controller->auto_resume_done || controller->def_app_requested) { return; }
+    // The app-level flag is the one that matters across stream cycles: this fragment
+    // is recreated after every disconnect (see app_t.auto_resume_consumed).
+    if (controller->auto_resume_done || controller->global->auto_resume_consumed ||
+        controller->def_app_requested) { return; }
     const pclist_t *node = pcmanager_node(pcmanager, uuid);
     if (node == NULL || node->state.code != SERVER_STATE_AVAILABLE) { return; }
     if (pcmanager_node_current_app(node) == 0) { return; }
@@ -374,6 +377,7 @@ static void launcher_try_auto_resume(launcher_fragment_t *controller, const uuid
     // stream ends, when currentGame is still set) can neither re-trigger nor
     // double-schedule the resume.
     controller->auto_resume_done = true;
+    controller->global->auto_resume_consumed = true;
     controller->auto_resume_uuid = *uuid;
     // Defer the actual host select: select_pc() replaces the apps fragment, whose
     // teardown unregisters a pcmanager listener — unsafe while iterating listeners
@@ -395,6 +399,7 @@ static void launcher_handle_app_foreground(launcher_fragment_t *controller) {
     // navigation and never emits USER_APP_FOREGROUND, so the guard is only re-armed on a
     // genuine background->foreground switch (e.g. webOS Home -> back to Aurora).
     controller->auto_resume_done = false;
+    controller->global->auto_resume_consumed = false;
     // Force a fresh query of the selected host; the resulting on_pc_updated re-attempts
     // auto-resume (via launcher_try_auto_resume) with up-to-date currentGame info.
     for (const pclist_t *cur = pcmanager_servers(pcmanager); cur != NULL; cur = cur->next) {

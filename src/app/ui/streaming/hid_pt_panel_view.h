@@ -72,6 +72,9 @@ typedef enum {
     HID_PT_ZONE_LIST = 0,
     HID_PT_ZONE_OPTIONS,
     HID_PT_ZONE_HEADER,
+    /** Not a place on the sheet: the audio dropdown's list is up and owns the
+     * keys, and the footer should say what they do there. */
+    HID_PT_ZONE_DROPDOWN,
 } hid_pt_zone_t;
 
 typedef struct {
@@ -87,6 +90,9 @@ typedef struct {
     void (*key)(void *userdata, lv_event_t *event);
     /** LV_EVENT_KEY | LV_EVENT_PREPROCESS on the audio dropdown only. */
     void (*dropdown_key)(void *userdata, lv_event_t *event);
+    /** The audio dropdown's list just opened or closed (any cause: OK, BACK,
+     * a pointer click, focus leaving). Bookkeeping is already up to date. */
+    void (*dropdown_toggled)(void *userdata, bool open);
     /** The panel's root object is being deleted. */
     void (*deleted)(void *userdata);
 } hid_pt_view_cbs_t;
@@ -130,8 +136,14 @@ typedef struct {
     lv_obj_t *row_buttons[HID_PT_MAX_ROWS];
     lv_obj_t *row_state_labels[HID_PT_MAX_ROWS];
     lv_obj_t *row_rails[HID_PT_MAX_ROWS];
-    /** The dropdown whose list OK opened, so ESC can close the same one. */
+    /** The dropdown whose list is up, kept in step by the view's own
+     * RELEASED/DEFOCUSED sync — however the list was opened. */
     lv_obj_t *active_dropdown;
+    /* BACK on an open list: LVGL's own KEY handler (which runs before the
+     * panel's) restores the selection and closes it. This one-shot flag is how
+     * the panel's ESC handling then knows the key was already spent on the
+     * list, so it must not also step the cursor out of the settings column. */
+    bool dropdown_esc_spent;
     /* Set while hid_pt_view_rebuild_focus_order() is emptying and refilling the
      * focus group. LVGL auto-focuses the first object added to an empty group,
      * which fires the plug-focus callback on row 0; the panel reads this flag
@@ -222,8 +234,10 @@ bool hid_pt_view_obj_is_hidden(const hid_pt_view_t *view, lv_obj_t *obj);
 /* ---- the audio dropdown's list ------------------------------------------ */
 
 bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target);
-void hid_pt_view_open_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown);
-void hid_pt_view_close_dropdown(hid_pt_view_t *view, lv_obj_t *dropdown);
+/** Drop the open-list bookkeeping without touching the widget. For the case
+ * where LVGL itself is about to close the list (BACK) and only the panel's
+ * notion of "a list is up" has to go. */
+void hid_pt_view_forget_dropdown(hid_pt_view_t *view);
 
 /* ---- the option column's labels ----------------------------------------- */
 

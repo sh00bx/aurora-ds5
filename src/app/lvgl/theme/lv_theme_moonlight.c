@@ -7,6 +7,10 @@
 #include "lvgl/ext/lv_child_group.h"
 
 static lv_style_t knob_shadow;
+/* Focus is a chalk edge, never a hue — the overlay's rule, applied to every
+ * focusable widget the default theme would otherwise ring in its accent
+ * colour. Colour is reserved for state (teal = on/active). */
+static lv_style_t focus_chalk;
 
 static void apply_cb(lv_theme_t *, lv_obj_t *);
 
@@ -30,11 +34,21 @@ void lv_theme_moonlight_init(lv_theme_t *theme, const app_fonts_t *fonts, app_t 
     lv_style_set_shadow_color(&knob_shadow, lv_color_black());
     lv_style_set_shadow_width(&knob_shadow, LV_DPX(5));
     lv_style_set_shadow_opa(&knob_shadow, LV_OPA_50);
+    lv_style_init(&focus_chalk);
+    lv_style_set_outline_color(&focus_chalk, ml_color_hex(ML_COLOR_FOCUS));
+    lv_style_set_outline_width(&focus_chalk, LV_DPX(2));
+    lv_style_set_outline_opa(&focus_chalk, LV_OPA_COVER);
+    lv_style_set_outline_pad(&focus_chalk, LV_DPX(2));
+    /* The soft white bloom the overlay's slabs wear on focus. */
+    lv_style_set_shadow_color(&focus_chalk, ml_color_hex(ML_COLOR_FOCUS));
+    lv_style_set_shadow_width(&focus_chalk, LV_DPX(16));
+    lv_style_set_shadow_opa(&focus_chalk, OVERLAY_OPA_BLOOM);
 }
 
 void lv_theme_moonlight_deinit(lv_theme_t *theme) {
     (void) theme;
     lv_style_reset(&knob_shadow);
+    lv_style_reset(&focus_chalk);
 }
 
 const lv_font_t *lv_theme_moonlight_get_iconfont_large(lv_obj_t *obj) {
@@ -64,10 +78,7 @@ static void apply_cb(lv_theme_t *theme, lv_obj_t *obj) {
             lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
             lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE_HI), LV_STATE_PRESSED);
             lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE_HI), LV_STATE_FOCUSED);
-            lv_obj_set_style_outline_color(obj, ml_color_hex(ML_COLOR_PRIMARY), LV_STATE_FOCUS_KEY);
-            lv_obj_set_style_outline_width(obj, LV_DPX(2), LV_STATE_FOCUS_KEY);
-            lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
-            lv_obj_set_style_outline_pad(obj, LV_DPX(2), LV_STATE_FOCUS_KEY);
+            lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
             lv_obj_set_style_text_color(obj, ml_color_hex(ML_COLOR_TEXT), 0);
         }
     }
@@ -108,6 +119,7 @@ static void apply_cb(lv_theme_t *theme, lv_obj_t *obj) {
         lv_obj_set_style_text_color(obj, ml_color_hex(ML_COLOR_TEXT), 0);
         lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_BORDER), 0);
         lv_obj_set_style_border_width(obj, LV_DPX(1), 0);
+        lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
         lv_obj_add_event_cb(obj, lv_start_text_input, LV_EVENT_FOCUSED, theme);
         lv_obj_add_event_cb(obj, lv_stop_text_input, LV_EVENT_DEFOCUSED, theme);
     } else if (lv_obj_check_type(obj, &lv_msgbox_class)) {
@@ -140,9 +152,12 @@ static void apply_cb(lv_theme_t *theme, lv_obj_t *obj) {
         lv_dropdown_set_symbol(obj, MAT_SYMBOL_ARROW_DROP_DOWN);
         lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE_ALT), 0);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(obj, LV_DPX(6), 0);
         lv_obj_set_style_text_color(obj, ml_color_hex(ML_COLOR_TEXT), 0);
         lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_BORDER), 0);
         lv_obj_set_style_border_width(obj, LV_DPX(1), 0);
+        lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_FOCUS), LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
     } else if (lv_obj_check_type(obj, &lv_dropdownlist_class)) {
         lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE), 0);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
@@ -154,8 +169,33 @@ static void apply_cb(lv_theme_t *theme, lv_obj_t *obj) {
     } else if (lv_obj_check_type(obj, &lv_checkbox_class)) {
         lv_obj_set_style_text_font(obj, lv_theme_moonlight_get_iconfont_large(obj),
                                    LV_PART_INDICATOR | LV_STATE_CHECKED);
+        /* A settings row, in the overlay's shape: a dark slab with a seam
+         * hairline, lifting behind a chalk edge when the cursor arrives. */
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE), 0);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_BORDER), 0);
+        lv_obj_set_style_border_width(obj, LV_DPX(1), 0);
+        lv_obj_set_style_radius(obj, LV_DPX(6), 0);
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE_HI), LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_FOCUS), LV_STATE_FOCUS_KEY);
+        lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
+        /* The tick box: seam edge idle, teal fill once checked — same story the
+         * overlay's switches tell. */
+        lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_BORDER), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_SURFACE_HI), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_border_color(obj, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(obj, lv_color_black(), LV_PART_INDICATOR | LV_STATE_CHECKED);
     } else if (lv_obj_check_type(obj, &lv_slider_class)) {
         lv_obj_add_style(obj, &knob_shadow, LV_PART_KNOB);
+        /* Track and fill like the overlay's sliders: faint chalk track, teal
+         * fill, chalk knob. Focus is the chalk ring the whole app shares. */
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_TEXT), 0);
+        lv_obj_set_style_bg_opa(obj, 40, 0);
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(obj, ml_color_hex(ML_COLOR_TEXT), LV_PART_KNOB);
+        lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
     }
     if (set_font) {
         lv_obj_set_style_text_font(obj, theme->font_normal, 0);

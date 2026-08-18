@@ -220,6 +220,11 @@ typedef struct {
     char key[96];
     autoplug_state_t state;
     int fail_count;
+    /* When the entry entered GIVEUP (mono_ms). GIVEUP is a rest, not a verdict:
+     * the reconcile re-arms the entry after a while, because the commonest way
+     * to collect three failures is a host agent that is simply not up yet in
+     * the first seconds of a stream. */
+    uint64_t giveup_ms;
 } autoplug_entry_t;
 
 extern autoplug_entry_t g_autoplug[MAX_DEVICES];

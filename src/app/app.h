@@ -41,6 +41,14 @@ typedef struct app_t {
      * pipeline accepts frames at all. Platforms that never emit those events
      * leave it at its initial true. */
     bool foreground;
+    /* One auto-resume per app start / per background->foreground return. Lives
+     * here and not in the launcher fragment: on webOS the whole LVGL UI is torn
+     * down for the stream and the launcher is a FRESH fragment after every
+     * disconnect — a guard inside the fragment resets with it, and the host
+     * refresh that follows (currentGame still set: the game keeps running on
+     * the host) yanked the user straight back into the stream they had just
+     * left. */
+    bool auto_resume_consumed;
     SDL_threadID main_thread_id;
     os_info_t os_info;
     app_settings_t settings;

@@ -107,9 +107,13 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_layout(topbar, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(topbar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(topbar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_bg_color(topbar, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(topbar, ml_color_hex(ML_COLOR_BG), 0);
     lv_obj_set_style_bg_opa(topbar, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(topbar, 0, 0);
+    /* The seam hairline the overlay's header wears, so the bar reads as the
+     * same chrome in and out of a stream. */
+    lv_obj_set_style_border_side(topbar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(topbar, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(topbar, ml_color_hex(ML_COLOR_BORDER), 0);
     lv_obj_set_style_pad_hor(topbar, LV_DPX(20), 0);
     lv_obj_set_style_pad_ver(topbar, LV_DPX(8), 0);
     lv_obj_set_style_pad_gap(topbar, LV_DPX(10), 0);
@@ -126,6 +130,8 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_t *title_label = lv_label_create(topbar);
     lv_obj_set_style_text_font(title_label, lv_theme_get_font_large(topbar), 0);
     lv_obj_set_style_text_color(title_label, ml_color_hex(ML_COLOR_TEXT), 0);
+    /* Tracked caps: the same "eyebrow" voice the overlay's headings use. */
+    lv_obj_set_style_text_letter_space(title_label, LV_DPX(3), 0);
     lv_label_set_text_static(title_label, "AURORA");
 
     controller->profile_dropdown = lv_dropdown_create(topbar);
@@ -191,7 +197,7 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_height(filter_row, LV_DPX(LAUNCHER_FILTERBAR_DPX));
     lv_obj_add_flag(filter_row, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(filter_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(filter_row, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(filter_row, ml_color_hex(ML_COLOR_BG), 0);
     lv_obj_set_style_bg_opa(filter_row, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_hor(filter_row, LV_DPX(24), 0);
     lv_obj_set_style_pad_ver(filter_row, LV_DPX(4), 0);
@@ -226,7 +232,8 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
      * former, an outline the latter, so they never have to compete. */
     lv_obj_set_style_bg_color(platform_bar, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_bg_opa(platform_bar, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_border_color(platform_bar, ml_color_hex(ML_COLOR_PRIMARY), LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_text_color(platform_bar, lv_color_black(), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_color(platform_bar, ml_color_hex(ML_COLOR_FOCUS), LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_width(platform_bar, LV_DPX(3), LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_opa(platform_bar, LV_OPA_COVER, LV_PART_ITEMS | LV_STATE_FOCUS_KEY);
     lv_btnmatrix_set_btn_ctrl_all(platform_bar, LV_BTNMATRIX_CTRL_CLICK_TRIG | LV_BTNMATRIX_CTRL_NO_REPEAT);
@@ -245,7 +252,7 @@ lv_obj_t *launcher_win_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_width(detail, LV_PCT(100));
     lv_obj_set_height(detail, LV_PCT(100));
     lv_obj_clear_flag(detail, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(detail, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(detail, ml_color_hex(ML_COLOR_BG), 0);
     lv_obj_set_style_bg_opa(detail, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(detail, 0, 0);
     lv_obj_add_event_cb(detail, detail_group_add, LV_EVENT_CHILD_CREATED, controller);

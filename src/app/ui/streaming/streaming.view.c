@@ -43,6 +43,7 @@ static void throughput_columns(streaming_controller_t *controller, lv_obj_t *par
 
 lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     streaming_controller_t *controller = (streaming_controller_t *) self;
+    app_t *app = controller->global;
     lv_obj_t *obj = lv_obj_create(parent);
     lv_obj_remove_style_all(obj);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
@@ -81,10 +82,21 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_clear_flag(video, LV_OBJ_FLAG_CLICKABLE);
     /* The game shrinks into this rectangle while the overlay is up. A hairline
      * around it says the crop is deliberate rather than the picture having lost
-     * its bottom half. */
-    lv_obj_set_style_border_width(video, LV_DPX(1), 0);
-    lv_obj_set_style_border_color(video, lv_color_hex(OVERLAY_SEAM), 0);
-    lv_obj_set_style_border_opa(video, LV_OPA_COVER, 0);
+     * its bottom half.
+     *
+     * Only when the backend actually repositions video, though. The NDL
+     * pipeline (ndl-webos5 — what `auto` picks on this hardware) declares
+     * UI_COMPOSITING: the frame stays fullscreen behind the UI and
+     * streaming_enter_overlay() never calls SetDisplayArea. There the hairline
+     * framed nothing — an empty rectangle floating over the game. Keep the
+     * object (show_overlay() reads its coords), just never paint it. */
+    if (app->ss4s.video_cap.transform & SS4S_VIDEO_CAP_TRANSFORM_UI_COMPOSITING) {
+        lv_obj_add_flag(video, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_set_style_border_width(video, LV_DPX(1), 0);
+        lv_obj_set_style_border_color(video, lv_color_hex(OVERLAY_SEAM), 0);
+        lv_obj_set_style_border_opa(video, LV_OPA_COVER, 0);
+    }
 
     lv_obj_t *bottom_stack = lv_obj_create(overlay);
     lv_obj_remove_style_all(bottom_stack);

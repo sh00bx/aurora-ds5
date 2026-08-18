@@ -49,6 +49,20 @@ typedef struct {
     lv_obj_t *embed_root;
     lv_obj_t *embed_appbar;
 
+/** Room for every category the nav can carry; entries_len is the live count. */
+#define SETTINGS_EMBED_MAX_SECTIONS 8
+    /* The embedded sheet: a category rail on the left, ONE category's settings
+     * on the right, and a footer naming the keys — the same three-part shape
+     * as the in-game HID sheet, instead of five panes stacked into one long
+     * scroll. */
+    lv_obj_t *embed_nav_items[SETTINGS_EMBED_MAX_SECTIONS];
+    lv_obj_t *embed_nav_rails[SETTINGS_EMBED_MAX_SECTIONS];
+    lv_obj_t *embed_sections[SETTINGS_EMBED_MAX_SECTIONS];
+    lv_obj_t *embed_hint;
+    int embed_active;
+    /** True while the cursor is in the settings column (detail_group pushed). */
+    bool embed_in_detail;
+
     /** Modal pane opened from the embedded AppBar (popup); destroyed when closed. */
     lv_obj_t *pane_mbox;
     lv_fragment_t *pane_fragment;

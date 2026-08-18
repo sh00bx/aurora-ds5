@@ -929,6 +929,13 @@ bool plug_in_node(logical_device_t *item, int scan_index)
  * UI thread), skip plug attempts for this many polls so an unreachable/slow host
  * can't stall the main loop every tick. */
 #define AUTOPLUG_FAIL_COOLDOWN_POLLS 4
+/* GIVEUP is temporary: re-arm the entry after this long. Three failures are
+ * collected in about ten seconds of polling, and the commonest reason is that
+ * the host's agent is not up yet that early in a stream (game still launching,
+ * service restarting after a display-topology change). Giving up for good then
+ * left the pad on SDL for the whole stream even though "auto-plug on next
+ * stream" was enabled — the user had to bridge it by hand every time. */
+#define AUTOPLUG_GIVEUP_RETRY_MS 30000u
 static int g_autoplug_plug_cooldown;
 
 static autoplug_entry_t *autoplug_entry_for(const char *key, bool create)
@@ -1123,6 +1130,7 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
                     }
                     if (instant && ++de->fail_count >= AUTOPLUG_MAX_FAILS) {
                         de->state = AUTOPLUG_GIVEUP;
+                        de->giveup_ms = mono_ms();
                         log_append("auto-plug: %s died instantly %d times; giving up",
                                    item->name, de->fail_count);
                     } else {
@@ -1162,6 +1170,15 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             continue;
         }
         autoplug_entry_t *e = autoplug_entry_for(item->key, true);
+        if (e && e->state == AUTOPLUG_GIVEUP &&
+            mono_ms() - e->giveup_ms >= AUTOPLUG_GIVEUP_RETRY_MS) {
+            /* The rest is over; whatever kept the plug failing (an agent that
+             * was still booting, a hidraw that was still settling) has had time
+             * to clear. One fresh round of attempts. */
+            e->state = AUTOPLUG_PENDING;
+            e->fail_count = 0;
+            log_append("auto-plug: retrying %s after give-up pause", item->name);
+        }
         if (!e || e->state != AUTOPLUG_PENDING) {
             continue;   /* DONE (user-managed) or GIVEUP */
         }
@@ -1183,8 +1200,17 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             log_append("auto-plugged %s (%s)", item->name, kind);
             /* success is cheap; keep going so a second controller plugs the same tick */
         } else {
-            if (++e->fail_count >= AUTOPLUG_MAX_FAILS) {
+            /* A transport failure is the agent's absence, not this device's
+             * fault: the failed round trip just stamped the reachability
+             * backoff, which is why ctm_agent_reachable() answers false right
+             * here. Do not count it toward GIVEUP — the retry cadence alone
+             * (cooldown below, and the give-up pause above) paces the attempts,
+             * and the plug goes through as soon as the agent answers. Only a
+             * failure with the agent plainly reachable is a device-local one
+             * worth holding against the entry. */
+            if (ctm_agent_reachable() && ++e->fail_count >= AUTOPLUG_MAX_FAILS) {
                 e->state = AUTOPLUG_GIVEUP;
+                e->giveup_ms = mono_ms();
                 log_append("auto-plug: giving up on %s after %d attempts", item->name, e->fail_count);
             }
             /* A failure means a blocking agent round-trip just stalled the UI thread.

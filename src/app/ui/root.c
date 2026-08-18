@@ -133,10 +133,16 @@ void app_ui_open(app_ui_t *ui, bool open_launcher, const app_launch_params_t *pa
     disp->bg_opa = 0;
     ui->disp = disp;
 
-    lv_theme_t *parent_theme = lv_disp_get_theme(ui->disp);
+    /* The driver registered LVGL's default theme with its stock palette, and
+     * that theme styles everything apply_cb doesn't touch — which is where the
+     * material-blue focus rings and grey plates came from. Re-init it in place
+     * with the app palette, so even the widgets nobody restyled speak the
+     * overlay's language: teal for "on", dark ink surfaces. */
+    lv_theme_t *parent_theme = lv_theme_default_init(ui->disp, ml_color_hex(ML_COLOR_PRIMARY),
+                                                     ml_color_hex(ML_COLOR_PRIMARY_DIM), true,
+                                                     ui->theme.font_normal);
     ui->theme.color_primary = ml_color_hex(ML_COLOR_PRIMARY);
     ui->theme.color_secondary = ml_color_hex(ML_COLOR_PRIMARY_DIM);
-    (void) parent_theme;
     lv_theme_set_parent(&ui->theme, parent_theme);
     lv_disp_set_theme(ui->disp, &ui->theme);
 
