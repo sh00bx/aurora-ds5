@@ -14,6 +14,8 @@
 #define SHEET_W        LV_DPX(880)
 #define HEADER_H       LV_DPX(52)
 #define BODY_PAD       LV_DPX(12)
+/* Header + padded body at its pane cap: the sheet's one, static height. */
+#define SHEET_H        (HEADER_H + 2 * BODY_PAD + PANE_MAX_H)
 #define DEV_COL_W      LV_DPX(300)
 /* What the sheet's 92 % cap leaves for a body pane once the header and the
  * body padding are taken off (the key-hint footer is gone, its 38dpx returned
@@ -896,11 +898,12 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
 
     lv_obj_t *sheet = lv_obj_create(cont);
     view->sheet = sheet;
-    /* As tall as it needs to be, not as tall as it is allowed to be. A fixed 92 %
-     * left a third of the sheet empty under the last setting, which is most of
-     * what made a five-row panel feel like a takeover of the screen. */
-    lv_obj_set_size(sheet, SHEET_W, LV_SIZE_CONTENT);
-    lv_obj_set_style_min_height(sheet, LV_DPX(300), 0);
+    /* Static height on purpose. Content-sizing made the centered sheet grow
+     * when the selected device had more option rows (a bridged DS5), so the
+     * whole panel visibly hopped a few pixels upward on selection. The fixed
+     * box is what one full option column measures; anything taller scrolls
+     * inside its pane instead of moving the sheet. */
+    lv_obj_set_size(sheet, SHEET_W, SHEET_H);
     lv_obj_center(sheet);
     lv_obj_set_style_max_width(sheet, LV_PCT(96), 0);
     lv_obj_set_style_max_height(sheet, LV_PCT(92), 0);
