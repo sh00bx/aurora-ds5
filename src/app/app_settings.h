@@ -56,6 +56,9 @@ typedef struct app_settings_t {
      * for the stream, for as long as the stream runs. Needs root (Homebrew
      * Channel); a no-op without it. */
     bool webos_game_mode;
+    /* DS5 touchpad as desktop mouse on the host: 0=off, 1=auto (only while no
+     * game runs), 2=always. Sent to the host bridge on every session. */
+    int ds5_touchpad_mouse;
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
     /**

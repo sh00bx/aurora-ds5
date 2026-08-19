@@ -1653,10 +1653,10 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_bg_color(scroll, ml_color_hex(ML_COLOR_TEXT), LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(scroll, 60, LV_PART_SCROLLBAR);
 
-    /* ---- footer: what the keys do, right here, right now ---- */
-    lv_obj_t *footer = embed_bar(panel, LV_DPX(38), LV_BORDER_SIDE_TOP);
-    c->embed_hint = embed_eyebrow(footer, NULL);
-    lv_obj_center(c->embed_hint);
+    /* No footer key-hint bar: the sheet reads cleaner without it, and the
+     * remote's behaviour is discoverable enough. embed_hint stays NULL, which
+     * embed_update_hint() already tolerates. */
+    c->embed_hint = NULL;
 
     return backdrop;
 }

@@ -187,6 +187,7 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->hid_passthrough_port = 48054;
     config->hid_passthrough_autoplug = true;
     config->webos_game_mode = true;
+    config->ds5_touchpad_mouse = 1;
 
 #if defined(TARGET_WEBOS)
     config->soft_recovery = true;
@@ -273,6 +274,7 @@ bool settings_save(app_settings_t *config) {
     ini_write_int(fp, "hid_passthrough_port", config->hid_passthrough_port);
     ini_write_bool(fp, "hid_passthrough_autoplug", config->hid_passthrough_autoplug);
     ini_write_bool(fp, "webos_game_mode", config->webos_game_mode);
+    ini_write_int(fp, "ds5_touchpad_mouse", config->ds5_touchpad_mouse);
 
     ini_write_section(fp, "video");
     ini_write_string(fp, "decoder", config->decoder);
@@ -498,6 +500,11 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->hid_passthrough_autoplug = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("webos_game_mode")) {
         config->webos_game_mode = INI_IS_TRUE(value);
+    } else if (INI_NAME_MATCH("ds5_touchpad_mouse")) {
+        set_int(&config->ds5_touchpad_mouse, value);
+        if (config->ds5_touchpad_mouse < 0 || config->ds5_touchpad_mouse > 2) {
+            config->ds5_touchpad_mouse = 1;
+        }
     } else if (INI_NAME_MATCH("hid_passthrough_port")) {
         set_int(&config->hid_passthrough_port, value);
         if (config->hid_passthrough_port <= 0 || config->hid_passthrough_port > 65535) {

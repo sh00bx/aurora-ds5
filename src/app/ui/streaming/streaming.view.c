@@ -16,12 +16,11 @@
  * One command in the bottom bar.
  *
  * @p key_colour is the LG remote colour key that also triggers it, drawn as the
- * slab's leading rail; OVERLAY_SEAM means the command has no key. @p key_name is
- * the same fact in words for anyone not holding that remote, and is NULL when
- * there is no key to name.
+ * slab's leading rail; OVERLAY_SEAM means the command has no key. The rail is
+ * the whole legend — the "Red key" style captions are gone on purpose.
  */
 static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *parent, const char *label,
-                                uint32_t key_colour, const char *key_name);
+                                uint32_t key_colour);
 
 static lv_obj_t *stat_label(streaming_controller_t *controller, lv_obj_t *parent, const char *title,
                             lv_coord_t pad_hor);
@@ -146,14 +145,14 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
      * each command below wears the one that presses it. Virtual Mouse has no key,
      * so its rail stays seam-grey — the absence is the information. */
     lv_obj_t *kbd_btn = command_button(controller, actions, locstr("Full keyboard"),
-                                       OVERLAY_KEY_BLUE, locstr("Blue key"));
+                                       OVERLAY_KEY_BLUE);
     lv_obj_t *vmouse_btn = command_button(controller, actions, locstr("Virtual Mouse"),
-                                          OVERLAY_SEAM, NULL);
+                                          OVERLAY_SEAM);
 
 #if defined(TARGET_WEBOS)
     if (app_configuration->hid_passthrough) {
         controller->hid_devices_btn = command_button(controller, actions, locstr("HID Devices"),
-                                                     OVERLAY_KEY_GREEN, locstr("Green key"));
+                                                     OVERLAY_KEY_GREEN);
     }
 #endif
 
@@ -162,9 +161,9 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
     lv_obj_set_flex_grow(actions_spacing, 1);
 
     lv_obj_t *suspend_btn = command_button(controller, actions, locstr("Disconnect"),
-                                           OVERLAY_KEY_YELLOW, locstr("Yellow key"));
+                                           OVERLAY_KEY_YELLOW);
     lv_obj_t *exit_btn = command_button(controller, actions, locstr("Quit game"),
-                                        OVERLAY_KEY_RED, locstr("Red key"));
+                                        OVERLAY_KEY_RED);
 
     lv_obj_t *stats = lv_obj_create(overlay);
     lv_obj_remove_style_all(stats);
@@ -316,7 +315,7 @@ void streaming_styles_init(streaming_controller_t *controller) {
 }
 
 static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *parent, const char *label,
-                                uint32_t key_colour, const char *key_name) {
+                                uint32_t key_colour) {
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_remove_style_all(btn);
@@ -341,7 +340,7 @@ static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *pa
     lv_obj_remove_style_all(text);
     lv_obj_set_size(text, LV_SIZE_CONTENT, LV_PCT(100));
     lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_flex_align(text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_hor(text, LV_DPX(15), 0);
     lv_obj_set_style_pad_gap(text, LV_DPX(4), 0);
     lv_obj_clear_flag(text, LV_OBJ_FLAG_SCROLLABLE);
@@ -350,15 +349,6 @@ static lv_obj_t *command_button(streaming_controller_t *controller, lv_obj_t *pa
     lv_obj_t *name = lv_label_create(text);
     lv_obj_add_style(name, &controller->overlay_button_label_style, 0);
     lv_label_set_text(name, label);
-
-    /* Kept even when there is no key, so every command's name sits on the same
-     * line whether or not the one next to it has a second one. */
-    lv_obj_t *key = lv_label_create(text);
-    lv_obj_set_style_text_font(key, lv_theme_get_font_small(text), 0);
-    lv_obj_set_style_text_color(key, lv_color_hex(OVERLAY_CHALK), 0);
-    lv_obj_set_style_text_opa(key, OVERLAY_OPA_FAINT, 0);
-    lv_obj_set_style_text_letter_space(key, LV_DPX(2), 0);
-    lv_label_set_text(key, key_name != NULL ? key_name : "");
     return btn;
 }
 

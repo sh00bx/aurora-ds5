@@ -13,12 +13,12 @@
  * as one vertical line instead of eight differently-shaped rows. */
 #define SHEET_W        LV_DPX(880)
 #define HEADER_H       LV_DPX(52)
-#define FOOTER_H       LV_DPX(38)
 #define BODY_PAD       LV_DPX(12)
 #define DEV_COL_W      LV_DPX(300)
-/* What the sheet's 92 % cap leaves for a body pane once the header, the footer
- * and the body padding are taken off. Both panes stop growing here and scroll. */
-#define PANE_MAX_H     LV_DPX(390)
+/* What the sheet's 92 % cap leaves for a body pane once the header and the
+ * body padding are taken off (the key-hint footer is gone, its 38dpx returned
+ * to the panes). Both panes stop growing here and scroll. */
+#define PANE_MAX_H     LV_DPX(428)
 #define DEV_ROW_H      LV_DPX(54)
 #define OPT_ROW_H      LV_DPX(36)
 #define ROW_GAP        LV_DPX(6)
@@ -1126,21 +1126,10 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_label_set_recolor(view->audio_warning_label, true);
     lv_obj_add_flag(view->audio_warning_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* ---- footer: what the four keys do, right here, right now ---- */
-    lv_obj_t *footer = lv_obj_create(sheet);
-    lv_obj_remove_style_all(footer);
-    lv_obj_set_size(footer, LV_PCT(100), FOOTER_H);
-    lv_obj_set_style_bg_color(footer, lv_color_hex(OVERLAY_CHALK), 0);
-    lv_obj_set_style_bg_opa(footer, OVERLAY_OPA_BAR, 0);
-    lv_obj_set_style_border_side(footer, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_border_width(footer, LV_DPX(1), 0);
-    lv_obj_set_style_border_color(footer, lv_color_hex(OVERLAY_SEAM), 0);
-    lv_obj_set_style_border_opa(footer, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_hor(footer, LV_DPX(16), 0);
-    lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
-    view->hint_label = eyebrow(footer, NULL, OVERLAY_CHALK, OVERLAY_OPA_MUTED);
-    lv_obj_center(view->hint_label);
-    hid_pt_view_set_hints(view, HID_PT_ZONE_LIST, false);
+    /* No footer key-hint bar: the sheet reads cleaner without it. hint_label
+     * stays NULL, which hid_pt_view_set_hints() already tolerates, so the zone
+     * bookkeeping call sites can stay as they are. */
+    view->hint_label = NULL;
 
     hid_pt_view_rebuild_focus_order(view);
 

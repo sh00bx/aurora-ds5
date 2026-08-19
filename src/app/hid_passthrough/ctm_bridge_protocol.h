@@ -20,10 +20,14 @@ enum ctmb_message_type {
     CTMB_MSG_ERROR = 8,
     CTMB_MSG_FEATURE_SET = 9,
     CTMB_MSG_ENUM = 10,          /* forwarded composite USB enumeration (puck) */
-    CTMB_MSG_PACE_FEEDBACK = 11  /* TV -> host inject-queue telemetry (rate servo).
+    CTMB_MSG_PACE_FEEDBACK = 11, /* TV -> host inject-queue telemetry (rate servo).
                                     Sent ONLY when HOST_CONFIG advertised
                                     CTMB_HOSTCFG_PACE_FEEDBACK, so a CTM host
                                     never sees the type. */
+    CTMB_MSG_TPMOUSE = 12        /* TV -> host: user preference for the host's
+                                    DS5 touchpad-mouse synthesis. Sent once after
+                                    the HOST_CONFIG handshake; hosts that predate
+                                    the type ignore it (default switch arm). */
 };
 
 /* ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host). */
@@ -76,6 +80,13 @@ typedef struct {
     uint8_t paced_report_ids[16];
     uint8_t reserved[31];
 } ctmb_host_config_t;
+
+/* CTMB_MSG_TPMOUSE payload. mode: 0=off, 1=auto (host synthesizes mouse only
+ * while no game runs), 2=always. */
+typedef struct __attribute__((packed)) ctmb_tpmouse_t {
+    uint8_t mode;
+    uint8_t reserved[7];
+} ctmb_tpmouse_t;
 
 /* CTMB_MSG_PACE_FEEDBACK payload: snapshot of ds5_txd's raw-ACL inject queue
  * for this pad's link (from the "<tmpl>.<mac>.st" record), forwarded ~4/s.

@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 
 #include "ctm_controller.h"
+#include "app.h"
 #include "ctm_controller_priv.h"
 #include "ctm_composite.h"
 #include "ctm_feature_worker.h"
@@ -1181,6 +1182,17 @@ static int handshake(ctm_controller_t *c, const ctmb_device_caps_t *caps,
         break;
     }
     if (host_cfg->bt_pace_us == 0) host_cfg->bt_pace_us = 10667;
+    /* Tell the host how the user wants its DS5 touchpad-mouse synthesis. Fire
+     * and forget: an older host drops the unknown type on the floor, and the
+     * TV setting is re-asserted on every session, so the host never needs to
+     * persist it. */
+    if (app_configuration != NULL) {
+        ctmb_tpmouse_t tp;
+        memset(&tp, 0, sizeof(tp));
+        int mode = app_configuration->ds5_touchpad_mouse;
+        tp.mode = (uint8_t) (mode >= 0 && mode <= 2 ? mode : 1);
+        (void) ctm_ctl_send(c, CTMB_MSG_TPMOUSE, CTMB_FLAG_OK, 0, &tp, sizeof(tp));
+    }
     return 0;
 }
 

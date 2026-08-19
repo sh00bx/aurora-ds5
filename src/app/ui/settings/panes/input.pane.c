@@ -90,6 +90,16 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                            "Other controllers keep using standard Moonlight emulation."),
                     false);
 
+    static const pref_dropdown_int_entry_t tpmouse_entries[] = {
+            {"Desktop only", 1, true},
+            {"Always", 2, false},
+            {"Off", 0, false},
+    };
+    pref_title_label(view, locstr("DS5 touchpad as desktop mouse"));
+    pref_dropdown_int(view, tpmouse_entries, 3, &app_configuration->ds5_touchpad_mouse, NULL);
+    pref_desc_label(view, locstr("Move the PC mouse with the DualSense touchpad. \"Desktop only\" hands the "
+                                 "touchpad back to any running game."), false);
+
     pane->deadzone_label = pref_title_label(view, locstr("Analog stick deadzone"));
     pane->deadzone_slider = pref_slider(view, &app_configuration->stick_deadzone, 0, 20, 1);
     lv_obj_set_width(pane->deadzone_slider, LV_PCT(100));
