@@ -231,7 +231,7 @@ unpin_cpus() {
 	log "LG MP governor restored (cores scale down on their own)"
 }
 
-# ------------------------------------------------------------- picture / sound
+# --------------------------------------------------------------------- picture
 #
 # The TV's own picture pipeline is the one latency source this script could not
 # reach before: noise reduction, the enhancers and the 24p cadence logic all sit
@@ -351,8 +351,8 @@ pic_mode_target() {
 }
 
 # Switch one mode-style key to its game value and remember what it was. Used for
-# picture.pictureMode (re-checked on every enforce tick, because the HDR
-# dimension arrives late) and once for sound.soundMode.
+# picture.pictureMode, re-checked on every enforce tick because the HDR
+# dimension arrives late.
 pic_switch() {   # category key want-value-or-empty-for-auto
 	_reply=$(ss_call getSystemSettings "{\"category\":\"$1\",\"keys\":[\"$2\"]}") || {
 		log "picture: $1.$2 not readable, left alone"
@@ -386,8 +386,12 @@ picture_on() {
 	# lost for good.
 	[ -f "$PIC_STATE" ] && { log "picture: stale state from an earlier session, restoring it first"; picture_off; }
 	: >"$PIC_STATE" 2>/dev/null || { log "picture: cannot write $PIC_STATE - picture left alone"; return; }
+	# SOUND IS DELIBERATELY LEFT ALONE. The TV's "game" sound preset sounds bad
+	# on this panel, and the audio path has no latency problem that the preset
+	# would fix -- the picture pipeline was the one this script had to reach.
+	# (picture_off still restores a sound.soundMode line from a state file
+	# written by an older build, so an interrupted upgrade puts it back.)
 	pic_switch picture pictureMode
-	pic_switch sound soundMode game
 	[ -s "$PIC_STATE" ] || log "picture: already in game mode, nothing to change"
 }
 
@@ -421,14 +425,14 @@ picture_off() {
 }
 
 picture_status() {
-	echo "--- picture/sound game mode ---"
+	echo "--- picture game mode ---"
 	if [ -f "$PIC_STATE" ]; then
 		echo "state: ENGAGED ($PIC_STATE)"
 		sed 's/^/  restores /' "$PIC_STATE"
 	else
 		echo "state: not engaged"
 	fi
-	echo "  now: $(json_field "$(ss_call getSystemSettings '{"category":"picture","keys":["pictureMode"]}')" pictureMode) / $(json_field "$(ss_call getSystemSettings '{"category":"sound","keys":["soundMode"]}')" soundMode)"
+	echo "  now: $(json_field "$(ss_call getSystemSettings '{"category":"picture","keys":["pictureMode"]}')" pictureMode)"
 }
 
 

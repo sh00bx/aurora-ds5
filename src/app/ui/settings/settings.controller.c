@@ -99,7 +99,11 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
 
 static void embed_cancel_cb(lv_event_t *e);
 
-static void settings_embed_refocus_appbar(settings_controller_t *c);
+static void embed_close_key(lv_event_t *e);
+
+static void settings_embed_refocus_after_popup(settings_controller_t *c);
+
+static bool embed_button_mode(settings_controller_t *c);
 
 static void embed_popup_add_objs_recursive(lv_obj_t *parent, lv_group_t *g);
 
@@ -976,20 +980,28 @@ static void embed_popup_cancel_cb(lv_event_t *e) {
 /* Launcher-embedded settings: second AppBar + pane popups (below main top bar) */
 /* ------------------------------------------------------------------------- */
 
-static void settings_embed_refocus_appbar(settings_controller_t *c) {
-    if (!c->embed_appbar || !c->nav_group) {
+/* A pane popup just went away. Put the cursor back where the user left it --
+ * the setting they were editing, or its category slab. (This used to park it on
+ * the app bar's first button instead, which was inert while Close was outside
+ * every focus group; now that Close IS a focus stop, parking there would send
+ * the cursor to the corner after every sub-dialog.) */
+static void settings_embed_refocus_after_popup(settings_controller_t *c) {
+    if (!c->nav_group) {
         return;
     }
-    uint32_t n = lv_obj_get_child_cnt(c->embed_appbar);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *ch = lv_obj_get_child(c->embed_appbar, i);
-        if (lv_obj_check_type(ch, &lv_btn_class)) {
-            lv_group_focus_obj(ch);
-            if (app_ui_get_input_mode(&c->app->ui.input) & UI_INPUT_MODE_BUTTON_FLAG) {
-                lv_obj_add_state(ch, LV_STATE_FOCUS_KEY);
-            }
-            break;
-        }
+    lv_obj_t *obj = NULL;
+    if (c->embed_in_detail && c->detail_group) {
+        obj = lv_group_get_focused(c->detail_group);
+    }
+    if (obj == NULL && c->embed_active >= 0 && c->embed_active < entries_len) {
+        obj = c->embed_nav_items[c->embed_active];
+    }
+    if (obj == NULL) {
+        return;
+    }
+    lv_group_focus_obj(obj);
+    if (embed_button_mode(c)) {
+        lv_obj_add_state(obj, LV_STATE_FOCUS_KEY);
     }
 }
 
@@ -1029,7 +1041,7 @@ static void embed_pane_mbox_delete_cb(lv_event_t *e) {
     c->pane_mbox = NULL;
     c->active_dropdown = NULL;
     if (c->launcher_host) {
-        settings_embed_refocus_appbar(c);
+        settings_embed_refocus_after_popup(c);
     }
 }
 
@@ -1374,6 +1386,17 @@ static void embed_nav_key(lv_event_t *e) {
     }
 }
 
+/* Close is the first member of the nav group, i.e. the stop above the category
+ * rail: DOWN walks back into the categories. UP has nowhere to go (the group
+ * does not wrap) and RIGHT would jump the cursor from the top-right corner to
+ * the top-LEFT slab, which reads as a glitch -- both are left alone. */
+static void embed_close_key(lv_event_t *e) {
+    settings_controller_t *c = lv_event_get_user_data(e);
+    if (lv_event_get_key(e) == LV_KEY_DOWN) {
+        lv_group_focus_next(c->nav_group);
+    }
+}
+
 /* Runs for every widget the panes create, at creation time (CHILD_CREATED
  * always bubbles, so one handler on the section sees the whole subtree). Key
  * handlers are attached here and only here — attaching again in bulk after
@@ -1410,6 +1433,11 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
      * already carries on_detail_key (pane_child_attach_handlers) and bubbles,
      * so a second registration here would run each key press twice. */
     lv_obj_add_event_cb(controller->close_btn, embed_cancel_cb, LV_EVENT_CANCEL, controller);
+    /* FIRST in the group, before any category: the group does not wrap, so this
+     * is what UP from the top category reaches -- and the only way the cursor
+     * can get to the corner the button is drawn in. */
+    lv_obj_add_event_cb(controller->close_btn, embed_close_key, LV_EVENT_KEY, controller);
+    lv_group_add_obj(controller->nav_group, controller->close_btn);
 
     const lv_font_t *icon_font = lv_theme_moonlight_get_iconfont_normal(controller->nav);
     for (int i = 0; i < entries_len && i < SETTINGS_EMBED_MAX_SECTIONS; i++) {
@@ -1592,8 +1620,10 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_height(sp, LV_DPX(4));
     lv_obj_set_flex_grow(sp, 1);
 
-    /* The overlay's quiet outlined button, worn by Close. Not a focus stop:
-     * BACK is the couch way out, the pointer can still click it. */
+    /* The overlay's quiet outlined button, worn by Close. BACK is still the
+     * short way out, but the cursor has to be able to GET here: it sits first
+     * in the nav group (see on_launcher_embedded_view_created), so UP from the
+     * top category lands on it. Which means it also has to LOOK focused. */
     lv_obj_t *close_btn = lv_btn_create(bar);
     c->close_btn = close_btn;
     lv_obj_remove_style_all(close_btn);
@@ -1606,10 +1636,21 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_pad_hor(close_btn, LV_DPX(13), 0);
     lv_obj_set_style_bg_color(close_btn, ml_color_hex(ML_COLOR_SURFACE_HI), LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(close_btn, LV_OPA_20, LV_STATE_PRESSED);
+    /* The same focus dress the category slabs wear: lifted plate, teal edge,
+     * a little bloom. */
+    lv_obj_set_style_bg_color(close_btn, ml_color_hex(ML_COLOR_SURFACE_HI), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(close_btn, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(close_btn, ml_color_hex(ML_COLOR_FOCUS), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_opa(close_btn, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_width(close_btn, LV_DPX(20), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_color(close_btn, ml_color_hex(ML_COLOR_FOCUS), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_opa(close_btn, OVERLAY_OPA_BLOOM, LV_STATE_FOCUS_KEY);
     lv_obj_t *close_label = embed_eyebrow(close_btn, locstr("CLOSE"));
     lv_obj_center(close_label);
     lv_obj_clear_flag(close_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(close_btn, embed_fechar_btn_cb, LV_EVENT_CLICKED, c);
+    /* Out of the DEFAULT group lv_btn_create put it in; the sheet's own
+     * nav_group takes it once that exists. */
     lv_group_remove_obj(close_btn);
 
     /* ---- body: categories left, the active category's settings right ---- */
