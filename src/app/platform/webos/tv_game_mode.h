@@ -12,7 +12,8 @@
  * ships inside this IPK; this is the part that decides WHEN it runs.
  *
  * Begin/end are safe to call unbalanced: end without begin does nothing, and a
- * second begin while one is running is ignored.
+ * begin while the previous cycle is still restoring is deferred to that worker
+ * (it runs a fresh cycle when its teardown is done) rather than dropped.
  */
 void tv_game_mode_stream_begin(void);
 

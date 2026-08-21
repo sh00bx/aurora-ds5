@@ -57,6 +57,12 @@ static struct {
     pthread_cond_t cond;
     bool running;
     bool stop;
+    /* A stream reached STREAMING while the worker was still busy (tearing the
+     * previous cycle down, or running the start-up recovery). The worker picks
+     * this up when its shell work is done and runs one more full cycle instead
+     * of exiting -- dropping such a begin would leave the whole new session
+     * without game mode. */
+    bool restart;
 } state = {
         .lock = PTHREAD_MUTEX_INITIALIZER,
         .cond = PTHREAD_COND_INITIALIZER,
@@ -122,77 +128,118 @@ static bool wait_or_stop(int ms) {
 }
 
 static void *game_mode_thread(void *arg) {
-    (void) arg;
-    bool engaged = run_verb("on");
+    /* Non-NULL arg: run the start-up "recover" pass first. Recovery shares
+     * this thread -- and the running flag -- with the stream path on purpose:
+     * a recover and an "on" must never drive two gamemode.sh shells at once,
+     * or one shell restarts the services the other just stopped. */
+    bool recover_first = arg != NULL;
+    while (true) {
+        if (recover_first) {
+            recover_first = false;
+            /* "recover" is the conditional form of "off": it looks for the
+             * traces a killed session leaves behind (the picture state file,
+             * the parked power governor) and only then puts things back, so a
+             * normal start costs one round trip and changes nothing. */
+            run_verb("recover");
+        } else {
+            bool engaged = run_verb("on");
 
-    if (engaged) {
-        size_t step = 0;
-        while (true) {
-            int ms = step < sizeof(ENFORCE_SCHEDULE_MS) / sizeof(ENFORCE_SCHEDULE_MS[0])
-                             ? ENFORCE_SCHEDULE_MS[step]
-                             : ENFORCE_STEADY_MS;
-            step++;
-            if (wait_or_stop(ms)) {
-                break;
+            if (engaged) {
+                size_t step = 0;
+                while (true) {
+                    int ms = step < sizeof(ENFORCE_SCHEDULE_MS) / sizeof(ENFORCE_SCHEDULE_MS[0])
+                                     ? ENFORCE_SCHEDULE_MS[step]
+                                     : ENFORCE_STEADY_MS;
+                    step++;
+                    if (wait_or_stop(ms)) {
+                        break;
+                    }
+                    if (!run_verb("enforce")) {
+                        /* One failed tick proves nothing about what is still
+                         * engaged: exec fails transiently too (memory pressure
+                         * is a steady state on this TV, and the script can
+                         * exit non-zero while services stay stopped). Stop
+                         * spending a round trip per tick, but keep the final
+                         * "off" -- it is a no-op if root is really gone, and
+                         * it is the only restore path in every other case. */
+                        while (!wait_or_stop(ENFORCE_STEADY_MS)) {
+                        }
+                        break;
+                    }
+                }
+            } else {
+                /* Nothing was engaged, but still wait for the session to end
+                 * so a second stream does not start a second thread. */
+                while (!wait_or_stop(ENFORCE_STEADY_MS)) {
+                }
             }
-            if (!run_verb("enforce")) {
-                /* Root went away mid-session. Nothing to re-assert and nothing
-                 * to restore -- stop spending a luna round trip on it. */
-                engaged = false;
-                break;
+
+            if (engaged) {
+                run_verb("off");
             }
         }
-    } else {
-        /* Nothing was engaged, but still wait for the session to end so a
-         * second stream does not start a second thread. */
-        while (!wait_or_stop(ENFORCE_STEADY_MS)) {
+
+        pthread_mutex_lock(&state.lock);
+        if (state.restart) {
+            /* A stream began while the shell work above was still running;
+             * give it the cycle it asked for instead of exiting. */
+            state.restart = false;
+            state.stop = false;
+            pthread_mutex_unlock(&state.lock);
+            continue;
         }
+        state.running = false;
+        state.stop = false;
+        pthread_mutex_unlock(&state.lock);
+        return NULL;
     }
+}
 
-    if (engaged) {
-        run_verb("off");
+/* Spawn the detached worker. Detached: nothing joins it, and
+ * HLunaServiceCallSync has no timeout of its own, so it must never sit on the
+ * UI thread. arg goes to game_mode_thread (non-NULL = recover first). */
+static bool spawn_worker(void *arg) {
+    pthread_attr_t attr;
+    pthread_t tid;
+    if (pthread_attr_init(&attr) != 0) {
+        return false;
     }
-
-    pthread_mutex_lock(&state.lock);
-    state.running = false;
-    state.stop = false;
-    pthread_mutex_unlock(&state.lock);
-    return NULL;
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, game_mode_thread, arg);
+    pthread_attr_destroy(&attr);
+    return rc == 0;
 }
 
 void tv_game_mode_stream_begin(void) {
     pthread_mutex_lock(&state.lock);
     if (state.running) {
+        /* The worker still exists: the previous cycle is tearing down (one
+         * "off" is seconds of luna work) or the start-up recovery is running.
+         * Leave it a note to run a fresh cycle for this session once its
+         * shell work is done. */
+        state.restart = true;
         pthread_mutex_unlock(&state.lock);
         return;
     }
     state.running = true;
     state.stop = false;
+    state.restart = false;
     pthread_mutex_unlock(&state.lock);
 
-    pthread_attr_t attr;
-    pthread_t tid;
-    if (pthread_attr_init(&attr) != 0) {
-        goto failed;
+    if (!spawn_worker(NULL)) {
+        commons_log_warn("GameMode", "could not start the game mode thread");
+        pthread_mutex_lock(&state.lock);
+        state.running = false;
+        pthread_mutex_unlock(&state.lock);
     }
-    /* Detached: nothing joins this, and HLunaServiceCallSync has no timeout of
-     * its own, so it must never sit on the UI thread. */
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    int rc = pthread_create(&tid, &attr, game_mode_thread, NULL);
-    pthread_attr_destroy(&attr);
-    if (rc == 0) {
-        return;
-    }
-    commons_log_warn("GameMode", "could not start the game mode thread");
-failed:
-    pthread_mutex_lock(&state.lock);
-    state.running = false;
-    pthread_mutex_unlock(&state.lock);
 }
 
 void tv_game_mode_stream_end(void) {
     pthread_mutex_lock(&state.lock);
     bool running = state.running;
+    /* A begin deferred behind a still-running teardown belongs to the session
+     * that is ending right here -- cancel the deferred cycle with it. */
+    state.restart = false;
     state.stop = true;
     pthread_cond_broadcast(&state.cond);
     pthread_mutex_unlock(&state.lock);
@@ -205,25 +252,22 @@ void tv_game_mode_stream_end(void) {
     }
 }
 
-static void *recover_thread(void *arg) {
-    (void) arg;
-    /* "recover" is the conditional form of "off": it looks for the traces a
-     * killed session leaves behind (the picture state file, the parked power
-     * governor) and only then puts things back, so a normal start costs one
-     * round trip and changes nothing. */
-    run_verb("recover");
-    return NULL;
-}
-
 void tv_game_mode_recover_stale(void) {
-    pthread_attr_t attr;
-    pthread_t tid;
-    if (pthread_attr_init(&attr) != 0) {
+    pthread_mutex_lock(&state.lock);
+    if (state.running) {
+        pthread_mutex_unlock(&state.lock);
         return;
     }
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&tid, &attr, recover_thread, NULL) != 0) {
+    state.running = true;
+    state.stop = false;
+    state.restart = false;
+    pthread_mutex_unlock(&state.lock);
+    /* Any non-NULL arg means "recover first"; &state is simply a handy one. */
+    if (!spawn_worker(&state)) {
         commons_log_warn("GameMode", "could not start the recovery thread");
+        pthread_mutex_lock(&state.lock);
+        state.running = false;
+        state.restart = false;
+        pthread_mutex_unlock(&state.lock);
     }
-    pthread_attr_destroy(&attr);
 }

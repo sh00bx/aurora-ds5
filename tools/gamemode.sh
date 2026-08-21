@@ -385,7 +385,14 @@ picture_on() {
 	# back first, or its values would be overwritten with game-mode values and
 	# lost for good.
 	[ -f "$PIC_STATE" ] && { log "picture: stale state from an earlier session, restoring it first"; picture_off; }
-	: >"$PIC_STATE" 2>/dev/null || { log "picture: cannot write $PIC_STATE - picture left alone"; return; }
+	if [ -f "$PIC_STATE" ]; then
+		# picture_off kept what it could not restore -- still the only record
+		# of the user's preset, so it must not be truncated away. pic_switch
+		# skips buckets that are already recorded, so appending on top is safe.
+		log "picture: keeping the unrestored state for the next off"
+	else
+		: >"$PIC_STATE" 2>/dev/null || { log "picture: cannot write $PIC_STATE - picture left alone"; return 0; }
+	fi
 	# SOUND IS DELIBERATELY LEFT ALONE. The TV's "game" sound preset sounds bad
 	# on this panel, and the audio path has no latency problem that the preset
 	# would fix -- the picture pipeline was the one this script had to reach.
@@ -398,15 +405,24 @@ picture_on() {
 # Cheap re-assert: one read, and a write only on drift. This is what catches the
 # HDR dimension, which only appears once the panel has actually switched.
 picture_enforce() {
-	[ -f "$PIC_STATE" ] || return
+	# return 0, not bare return: this is the enforce verb's last command, and a
+	# missing state file would otherwise exit the whole script with status 1 --
+	# which the app reads as "root is gone" and stops the cycle over.
+	[ -f "$PIC_STATE" ] || return 0
 	pic_switch picture pictureMode
 }
 
 picture_off() {
-	[ -f "$PIC_STATE" ] || return
+	[ -f "$PIC_STATE" ] || return 0
 	# Restore each recorded bucket by name. If the TV refuses the named
 	# dimension, fall back to the live one -- putting the value back in the
 	# wrong bucket is still better than leaving the user in game mode.
+	# A line that fails BOTH ways is carried into a fresh state file instead of
+	# being dropped with the old one: the state file is the only record of the
+	# user's preset, so it may only die with a successful restore. The next
+	# off/recover retries whatever is left.
+	_keep="$PIC_STATE.retry"
+	rm -f "$_keep"
 	while IFS='|' read -r c k d o; do
 		[ -n "$k" ] || continue
 		_res=$(ss_call setSystemSettings "{\"category\":\"$c\",\"settings\":{\"$k\":\"$o\"}$(pic_dim_json "$d")}")
@@ -416,12 +432,20 @@ picture_off() {
 			_res2=$(ss_call setSystemSettings "{\"category\":\"$c\",\"settings\":{\"$k\":\"$o\"}}")
 			case "$_res2" in
 			*'"returnValue":true'*) log "picture: restored $c.$k=$o (live dimension; $d was refused)" ;;
-			*) log "picture: RESTORE FAILED $c.$k=$o (dim=$d): $_res / $_res2" ;;
+			*)
+				log "picture: RESTORE FAILED $c.$k=$o (dim=$d): $_res / $_res2"
+				printf '%s|%s|%s|%s\n' "$c" "$k" "$d" "$o" >>"$_keep"
+				;;
 			esac
 			;;
 		esac
 	done <"$PIC_STATE"
-	rm -f "$PIC_STATE"
+	if [ -f "$_keep" ]; then
+		mv -f "$_keep" "$PIC_STATE"
+		log "picture: kept the failed buckets for the next off/recover"
+	else
+		rm -f "$PIC_STATE"
+	fi
 }
 
 picture_status() {
@@ -435,6 +459,39 @@ picture_status() {
 	echo "  now: $(json_field "$(ss_call getSystemSettings '{"category":"picture","keys":["pictureMode"]}')" pictureMode)"
 }
 
+
+# ----------------------------------------------------------------------- lock
+#
+# State-changing verbs must not interleave: two shells racing can strand the
+# eviction ("on" stops a service, a parallel "recover" restarts it and it then
+# stays up for the whole session -- enforce never stops services) or fight over
+# PIC_STATE. The app serialises its own calls on one worker thread, so
+# contention here means a manual run or a stray legacy guard -- rare, but the
+# damage lasts a whole session, so lock anyway. flock is proven on this exact
+# TV (moonlight-guard.sh single-instances through `flock -x -n` on an fd), and
+# ONLY those proven flags are used: busybox flock has no -w, so the bounded
+# wait is a retry loop. Bounded, because a verb holds the lock for however
+# long its luna work takes (a worst-case off is tens of seconds) and the app's
+# luna call would otherwise hang forever behind a wedged holder. If flock is
+# missing we run unlocked, exactly as before -- worse than locking, far better
+# than never running.
+GM_LOCK="${GM_LOCK:-/tmp/aurora-gamemode.lock}"
+case "$1" in
+on|off|enforce|recover|picture-on|picture-off)
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$GM_LOCK"
+		_lw=0
+		until flock -x -n 9 2>/dev/null; do
+			_lw=$((_lw + 1))
+			if [ "$_lw" -gt 90 ]; then
+				log "lock: $GM_LOCK still held after 90s - giving up on '$1'"
+				exit 1
+			fi
+			sleep 1
+		done
+	fi
+	;;
+esac
 
 case "$1" in
 on)
