@@ -955,8 +955,18 @@ static void settings_dropdown_cancel_cb(lv_event_t *e) {
         lv_event_stop_bubbling(e);
         return;
     }
+    if (c->suppress_pane_back) {
+        /* The ESC of this same press already closed the list (the KEY
+         * preprocess runs before the indev's follow-up CANCEL). Swallow the
+         * CANCEL so one BACK press does not close the list AND act as back. */
+        c->suppress_pane_back = false;
+        c->active_dropdown = NULL;
+        lv_event_stop_bubbling(e);
+        return;
+    }
+    /* No list was open: let the CANCEL bubble so BACK on a closed dropdown
+     * steps back exactly like BACK on any other row. */
     c->active_dropdown = NULL;
-    lv_event_stop_bubbling(e);
 }
 
 static void embed_popup_cancel_cb(lv_event_t *e) {
@@ -1516,6 +1526,11 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
         lv_obj_set_height(section, LV_SIZE_CONTENT);
         lv_obj_add_flag(section, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(section, LV_OBJ_FLAG_SCROLLABLE);
+        /* BACK in the settings column arrives as LV_EVENT_CANCEL on the focused
+         * widget and must bubble widget -> pane -> section -> detail to reach
+         * on_back_request. The section is the one hop lv_obj_create() does not
+         * give the flag, and without it the CANCEL dies right here. */
+        lv_obj_add_flag(section, LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_add_event_cb(section, embed_section_child_added, LV_EVENT_CHILD_CREATED, controller);
         lv_fragment_t *pane = lv_fragment_create(entries[i].cls, controller);
         lv_fragment_create_obj(pane, section);

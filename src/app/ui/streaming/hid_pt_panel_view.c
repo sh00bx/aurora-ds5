@@ -245,10 +245,16 @@ void hid_pt_view_list_clear(hid_pt_view_t *view)
     if (!view || !view->list) {
         return;
     }
+    /* lv_obj_clean() frees the rows front to back, and deleting the focused
+     * row makes the group refocus its neighbour mid-clean. Raise the rebuild
+     * guard so that FOCUSED does not reach the panel's row bookkeeping while
+     * row_buttons[] still points at rows that are already freed. */
+    view->rebuilding = true;
     lv_obj_clean(view->list);
     memset(view->row_buttons, 0, sizeof(view->row_buttons));
     memset(view->row_state_labels, 0, sizeof(view->row_state_labels));
     memset(view->row_rails, 0, sizeof(view->row_rails));
+    view->rebuilding = false;
 }
 
 void hid_pt_view_list_show_empty(hid_pt_view_t *view)
