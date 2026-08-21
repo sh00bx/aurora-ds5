@@ -97,6 +97,12 @@ case "$LEVER" in
     *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|r36|none)"; exit 1 ;;
 esac
 
+# Every toggle file a lever can arm — the daemon reads ptype, the rig reads the
+# other four. The burst arm writes TWO of them (its TOG plus period_us), so
+# "remove $TOG" was never the whole cleanup: a knob that survives the run
+# silently redefines the next run's baseline in BOTH arms.
+LEVER_FILES="/tmp/ds5_ptype /tmp/ds5_period_us /tmp/ds5_burst /tmp/ds5_cotraffic /tmp/ds5_r36"
+
 CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu
 CPU_PIDS=/tmp/ds5_autorun_cpu.pids
 cpu_start(){
@@ -177,7 +183,9 @@ load_off(){ [ "$BG_LOAD" = "1" ] && return 0; load_stop; }
 # One lever at a time: the ledger cannot attribute a delta to two of them.
 # Lever state is DECLARED, never discovered: a knob left armed by a previous
 # session silently redefines the baseline, and this has already happened here.
-for other in /tmp/ds5_flush_ms /tmp/ds5_ghost_ttl_ms /tmp/ds5_inject_maxq /tmp/ds5_gap_inject; do
+# The current lever's own TOG is refused too: armed before the run began it is
+# undeclared state all the same, poisoning the warm-up and the first OFF block.
+for other in /tmp/ds5_flush_ms /tmp/ds5_ghost_ttl_ms /tmp/ds5_inject_maxq /tmp/ds5_gap_inject $LEVER_FILES; do
     [ -e "$other" ] && { echo "REFUSING: $other is armed — declare it or remove it"; exit 1; }
 done
 # The link-quality poller can trip the daemon's HCI command guard ("COMMAND PATH
@@ -231,7 +239,7 @@ echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks ge
 : > /tmp/ds5_gaps.log
 
 cleanup(){
-    [ -n "$TOG" ] && rm -f "$TOG"
+    rm -f $LEVER_FILES   # the whole inventory: burst arms period_us alongside its TOG
     load_stop            # unconditional: background conditions end with the run
     cores_unpin          # four hot cores on someone's TV is not a default
     cpu_stop             # busy loops outlive their shell if nobody reaps them
@@ -337,7 +345,7 @@ while [ "$i" -lt "$BLOCKS" ]; do
     : > /tmp/ds5_gaps.log
 done
 
-[ -n "$TOG" ] && rm -f "$TOG"
+rm -f $LEVER_FILES   # ALL lever files: an even block count ends ON, knobs armed
 load_stop            # the background conditions end with the run, BG flags or not
 cores_unpin
 cpu_stop

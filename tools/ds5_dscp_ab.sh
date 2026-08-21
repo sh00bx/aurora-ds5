@@ -29,10 +29,14 @@ if ssh "$TV" 'ps ax' | grep -q "[d]s5_autorun"; then
     say "REFUSING: an autorun measurement is running on the TV"; exit 1
 fi
 
-TOTAL=$(( BLOCKS * (BLOCK + GUARD) + 60 ))
+# 10 s per block on top of BLOCK+GUARD: each block spends ~5 unbudgeted ssh
+# roundtrips, and the 15 s warm-up below comes out of the same budget. A rig
+# that outlives the last block by a minute is harmless — cleanup kills it — but
+# one that dies mid-block turns every later block into a silent instrument.
+TOTAL=$(( BLOCKS * (BLOCK + GUARD + 10) + 60 ))
 say "pinning cores, arming gaplog, starting rig for ${TOTAL}s"
 ssh "$TV" 'echo 0 > /proc/lg/pm/mp_enable; for c in 1 2 3; do echo 1 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done; echo 10 > /tmp/ds5_inject_fifo; echo 1 > /tmp/ds5_gaplog; rm -f /tmp/ds5_r36 /tmp/ds5_ptype /tmp/ds5_linkq_ms; : > /tmp/ds5_gaps.log'
-ssh "$TV" "nohup /tmp/ds5_synth_audio --b 60 --seconds $TOTAL --stats 30 >/tmp/rig_dscp.log 2>&1 &"
+ssh "$TV" "nohup /tmp/ds5_synth_audio --b 60 --seconds $TOTAL --stats 30 --mute >/tmp/rig_dscp.log 2>&1 &"
 sleep 15
 ssh "$TV" 'tail -1 /tmp/rig_dscp.log'
 
@@ -62,6 +66,16 @@ while [ "$i" -lt "$BLOCKS" ]; do
     RX1=$(ssh "$TV" "awk '/wlan0/{print \$2}' /proc/net/dev")
     ssh "$TV" 'cat /tmp/ds5_gaps.log; : > /tmp/ds5_gaps.log' > "$OUT/gaps_${i}_${ARM}.log"
     kill "$BLAST_PID" 2>/dev/null; wait "$BLAST_PID" 2>/dev/null; BLAST_PID=""
+    # Liveness BEFORE the row (ds5_autorun.sh's rule): the rig stops itself on
+    # link drops, delivery shortfalls, Aurora starts and its --seconds budget,
+    # and the daemon stops binning 150 ms later — a block the rig did not
+    # outlive would pool full exposure with near-zero events into whichever arm
+    # was running. Abort, because every later block is dead the same way.
+    if ! ssh "$TV" 'ps ax | grep -q "[s]ynth_audio" && ! grep -q "STOPPING\|stopping\|DONE" /tmp/rig_dscp.log'; then
+        say "rig not alive after block $i — block NOT recorded, aborting"
+        ssh "$TV" 'tail -2 /tmp/rig_dscp.log'
+        break
+    fi
     MB=$(( (RX1 - RX0) * 8 / (E - S) / 1000000 ))
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$ARM" "$S" "$E" "$MB" >> "$OUT/windows.tsv"
     say "block $i/$BLOCKS arm=$ARM dscp=$DSCP tv_rx=${MB}Mbit/s records=$(grep -c '^G ' "$OUT/gaps_${i}_${ARM}.log")"

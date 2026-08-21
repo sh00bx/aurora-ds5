@@ -17,10 +17,14 @@
 #                      guard does today, and the state the user normally plays in)
 # OFF arm = unboosted (SCHED_OTHER nice 0: what removing the boost would give)
 #
-# The guard's own loop re-asserts the boost every 3 s, so it is stopped for the
-# duration and restarted afterwards — an OFF arm the machine keeps undoing is not
-# an OFF arm. Everything else the guard applied (pinned cores, stopped services)
-# persists on its own and is left alone, so the arms differ in ONE thing.
+# Since 1.5.3 the boost is re-asserted from INSIDE the app: tv_game_mode.c runs
+# `gamemode.sh enforce` every 15 s for the life of the session, and enforce
+# re-boosts every client thread. An OFF arm the machine keeps undoing is not an
+# OFF arm, and that loop cannot be stopped from out here without ending the very
+# session under test — so OFF blocks run a re-clear faster than the tick, and a
+# block whose witness shows the re-clear losing is dropped and aborts the run.
+# Everything else game mode applied (pinned cores, stopped services) persists on
+# its own and is left alone, so the arms differ in ONE thing.
 set -u
 BLOCKS="${1:-6}"
 BLOCK="${2:-90}"
@@ -58,6 +62,24 @@ boost_off(){                    # what restore_game does
         renice -n 0 -p "$tid" >/dev/null 2>&1
     done
 }
+# Neutralise the in-app enforce for the OFF arm. The app's game-mode thread
+# takes no outside input, so the only robust counter is a faster clock: a
+# keeper that re-clears every 2 s bounds a re-boosted stretch at ~2 s per 15-s
+# tick (~13 % of an OFF block, against ~85 % with nothing holding the arm
+# down). The block witness below still gets the last word.
+UNBOOST_PID=""
+unboost_start(){
+    [ "$LEVER" = "boost" ] || return 0
+    [ -n "$UNBOOST_PID" ] && return 0
+    ( while :; do boost_off; sleep 2; done ) &
+    UNBOOST_PID=$!
+}
+unboost_stop(){
+    [ -n "$UNBOOST_PID" ] || return 0
+    kill "$UNBOOST_PID" 2>/dev/null
+    wait "$UNBOOST_PID" 2>/dev/null
+    UNBOOST_PID=""
+}
 # Read-back is not effect: count how many of the client's threads REALLY hold a
 # real-time policy right now. A block whose witness disagrees with its arm is not
 # evidence, and this project has paid for that lesson more than once.
@@ -94,6 +116,7 @@ lever_witness(){
 
 restore_all(){
     if [ "$LEVER" = "boost" ]; then
+        unboost_stop
         boost_on                               # leave the user in the state they play in
         [ -x "$GUARD_SH" ] && { nohup "$GUARD_SH" >/dev/null 2>&1 & }
         say "restored: client boosted, guard restarted"
@@ -122,14 +145,20 @@ say "client up (pid $CP) — waiting for audio to actually flow"
 # the blocks would measure an idle link with a full denominator. Wait for the
 # injection counter to move like real audio (>20/s) before starting the clock.
 n=0
+AUDIO_OK=0
 while [ "$n" -lt 90 ]; do
     a=$(grep -o '^\[txd\] inj=[0-9]*' /tmp/ds5_txd.log | tail -1 | cut -d= -f2)
     sleep 10
     b=$(grep -o '^\[txd\] inj=[0-9]*' /tmp/ds5_txd.log | tail -1 | cut -d= -f2)
-    [ -n "$a" ] && [ -n "$b" ] && [ "$((b - a))" -gt 200 ] && break
+    [ -n "$a" ] && [ -n "$b" ] && [ "$((b - a))" -gt 200 ] && { AUDIO_OK=1; break; }
     [ -z "$(client_pid)" ] && { say "client gone while waiting for audio"; exit 1; }
     n=$((n+1))
 done
+# The gate must confirm, not merely stop looping: falling out of the loop after
+# 15 min would start the blocks on exactly the idle link the comment above
+# warns about — presence is not activity, and a run without events is not a
+# null result, it is no run.
+[ "$AUDIO_OK" = "1" ] || { say "REFUSING: no audio after 15 min — the client is up but nothing streams"; exit 1; }
 say "audio flowing -> $BLOCKS x ${BLOCK}s into $OUT (lever=$LEVER)"
 
 # The in-situ two-clock witness (finding 2a): the probe's userspace column IS the
@@ -142,11 +171,13 @@ if [ -x /tmp/ds5_clock_probe ]; then
 fi
 
 if [ "$LEVER" = "boost" ]; then
-    # The guard would re-assert the boost inside 3 s and quietly turn every OFF
-    # arm into an ON arm. For the ptype lever the guard is left RUNNING: the boost
-    # is the user's normal play state and must hold in both arms.
+    # The legacy standalone guard would re-assert the boost inside 3 s: stop it
+    # where it still exists. The in-IPK enforce loop (every 15 s since 1.5.3)
+    # has no such handle — the OFF arm's unboost keeper deals with it instead.
+    # For the ptype lever everything is left RUNNING: the boost is the user's
+    # normal play state and must hold in both arms.
     if [ -f "$GUARD_PIDFILE" ]; then
-        kill "$(cat "$GUARD_PIDFILE")" 2>/dev/null && say "guard loop stopped for the run"
+        kill "$(cat "$GUARD_PIDFILE")" 2>/dev/null && say "legacy guard loop stopped for the run"
     fi
 fi
 # Hold the cores constant across arms so the only difference is the lever.
@@ -159,8 +190,8 @@ LEDGER=$!
 i=0
 while [ "$i" -lt "$BLOCKS" ]; do
     i=$((i+1))
-    if [ $((i % 2)) -eq 0 ]; then ARM=on;  lever_on
-    else                          ARM=off; lever_off
+    if [ $((i % 2)) -eq 0 ]; then ARM=on;  unboost_stop; lever_on
+    else                          ARM=off; lever_off; unboost_start
     fi
     say "block $i/$BLOCKS arm=$ARM (guard ${GUARD_S}s, then ${BLOCK}s)"
     sleep "$GUARD_S"
@@ -179,6 +210,20 @@ while [ "$i" -lt "$BLOCKS" ]; do
         say "client exited during block $i — block NOT recorded"
         cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
         break
+    fi
+    # The witness gets the last word: with the keeper running, a boosted thread
+    # at the end of an OFF block can only be an enforce tick from the last ~2 s.
+    # Give the keeper one more pass; if the boost is STILL standing, the keeper
+    # has lost and every further OFF arm would be an ON arm — drop the block
+    # and abort rather than pool contaminated evidence.
+    if [ "$LEVER" = "boost" ] && [ "$ARM" = "off" ] && [ "${RR1:-0}" -gt 0 ]; then
+        sleep 3
+        RR1=$(lever_witness)
+        if [ "${RR1:-0}" -gt 0 ]; then
+            say "OFF arm still boosted after re-clear (rt-threads $RR1) — block $i NOT recorded, aborting"
+            cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+            break
+        fi
     fi
     D=$((E - S)); [ "$D" -lt 1 ] && D=1
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \

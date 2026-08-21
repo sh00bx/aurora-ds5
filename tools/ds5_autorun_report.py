@@ -76,6 +76,13 @@ def main(argv):
     if not windows:
         print("no blocks recorded")
         return 1
+    # The rig-time anchor must hang off the CONFIGURED first block, taken here
+    # BEFORE the lost/partial and HOLE filters below can drop it: windows.tsv
+    # rows are written sequentially from block 1, but the report's windows list
+    # shrinks, and an anchor read off "the first survivor" is late by a whole
+    # block whenever block 1 fell — which lands every rig q-sample in the
+    # OPPOSITE (alternating) arm.
+    rig0_ms = windows[0][1]
 
     gaps, truncated = [], 0
     for line in gap_f.read_text().splitlines():
@@ -254,7 +261,7 @@ def main(argv):
     synth_f = d / "synth.log"
     if synth_f.exists() and windows:
         import re
-        rig0 = windows[0][1] // 1000 - 35        # rig starts ~35 s before block 1
+        rig0 = rig0_ms // 1000 - 35              # rig starts ~35 s before block 1
         qs = {}
         for line in synth_f.read_text().splitlines():
             m = re.match(r"\[synth\] t=(\d+)s .*\bq=(-?\d+)", line)

@@ -81,6 +81,7 @@ class Run:
         self.maxq = None
         self.ledger = []        # (inj, drop, maxq, [links])
         self.episodes = []
+        self.wrapped_secs = 0   # SEC rows discarded for physically absurd rates
         self._read_sniff(os.path.join(path, "sniff.log"))
         self._read_txd(os.path.join(path, "txd.log"))
         self._read_manifest(os.path.join(path, "manifest.txt"))
@@ -101,6 +102,15 @@ class Run:
                 prev = t
                 d = {k: float(m.group(k)) for k in
                      ("rel", "tx31", "tx36", "tx39", "rx", "lerx", "letx", "oth", "gaps")}
+                # A sniffer built before the disconnect fix wraps its uint64
+                # deltas to ~1.8e19 when a handle drops mid-capture; parsed as
+                # a float that one row dominates baseline_rates() and forces
+                # every in-gap ratio to ×0.00. No real rate on this link comes
+                # near 1e6/s, so anything above it is the wrap, not data.
+                if any(d[k] > 1e6 for k in ("tx31", "tx36", "tx39", "rx",
+                                            "lerx", "letx", "oth", "gaps")):
+                    self.wrapped_secs += 1
+                    continue
                 d["t"] = t
                 d["links"] = int(m.group("links"))
                 d["out"] = int(m.group("out"))
@@ -220,6 +230,9 @@ def report_run(r, verbose):
         for k in keys:
             print(f"   {k:14s} {r.manifest[k]}")
     dur = (r.secs[-1]["t"] - r.secs[0]["t"]) if len(r.secs) > 1 else 0
+    if r.wrapped_secs:
+        print(f"   ⚠ {r.wrapped_secs} SEC row(s) discarded: counter-wrap rates "
+              f"(>1e6/s) from a pad disconnect mid-capture")
     act = r.active
     print(f"   capture        {dur / 60:.1f} min, {len(act)} active s "
           f"({100.0 * len(act) / max(1, len(r.secs)):.0f}% of the slice)")

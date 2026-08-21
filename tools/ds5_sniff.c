@@ -116,6 +116,12 @@ static volatile sig_atomic_t g_stop;
  * handles whose type is still unproven. Kept apart on purpose — merging them
  * would let unclassified BR/EDR chatter masquerade as an LE correlation. */
 static uint64_t g_le_rx, g_le_tx, g_oth_rx, g_oth_tx;
+/* Counters of BR/EDR handles that are gone. The SEC line sums only the LIVE
+ * handles, so without folding the dead ones back in a disconnect makes the
+ * running totals drop below the previous second's and the uint64 delta wraps
+ * to ~1.8e19 — one such line, parsed as a valid rate, dominates every baseline
+ * the report tooling averages from this log. */
+static uint64_t g_dead_tx31, g_dead_tx36, g_dead_tx39, g_dead_rx;
 static uint64_t g_gaps_total, g_ev_total;
 static FILE *g_out;
 
@@ -183,6 +189,16 @@ static void snap(struct hstate *H){
     H->s_le_rx=g_le_rx; H->s_le_tx=g_le_tx;
     H->s_oth_rx=g_oth_rx; H->s_oth_tx=g_oth_tx;
 }
+/* Fold a handle's counters into the dead totals before its slot is zeroed —
+ * on disconnect, and on the conn events that reuse a slot without one. Only
+ * BR/EDR counts: the SEC sums skip LE and UNKNOWN handles, so retiring them
+ * would inflate exactly the totals this exists to keep monotonic. */
+static void retire(struct hstate *H){
+    if(H->known && !H->is_le){
+        g_dead_tx31+=H->tx31; g_dead_tx36+=H->tx36; g_dead_tx39+=H->tx39;
+        g_dead_rx+=H->rx_pkts;
+    }
+}
 
 static void handle_event(const uint8_t *e, int el){
     if(el<2) return;
@@ -193,6 +209,7 @@ static void handle_event(const uint8_t *e, int el){
         if(pl<11 || p[0]!=0x00) return;   /* status,handle(2),bdaddr(6),link_type,encr */
         {   uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
             struct hstate *H=&g_h[hh];
+            retire(H);                /* slot reuse without a seen disconnect */
             memset(H,0,sizeof *H);
             memcpy(H->addr,p+3,6); H->known=1; H->last_nocp=now_ms();
             emit("EV","conn h=0x%03x addr=%s link_type=%u",hh,
@@ -205,6 +222,7 @@ static void handle_event(const uint8_t *e, int el){
             emit("EV","disconn h=0x%03x reason=0x%02x gaps=%ld/%ld/%ld gmax=%llu",hh,
                  (unsigned)p[3],g_h[hh].gap30,g_h[hh].gap50,g_h[hh].gap80,
                  (unsigned long long)g_h[hh].gapmax);
+            retire(&g_h[hh]);
             memset(&g_h[hh],0,sizeof g_h[hh]);
         }
         return;
@@ -243,6 +261,7 @@ static void handle_event(const uint8_t *e, int el){
         if((p[0]!=SUBEV_LE_CONN && p[0]!=SUBEV_LE_ENH_CONN) || p[1]!=0x00) return;
         {   uint16_t hh=(uint16_t)((p[2]|(p[3]<<8))&0x0fff);
             struct hstate *H=&g_h[hh];
+            retire(H);                /* slot reuse without a seen disconnect */
             memset(H,0,sizeof *H);
             memcpy(H->addr,p+6,6); H->known=1; H->is_le=1;
             H->have_role=1; H->role=p[4]; H->last_nocp=now_ms();
@@ -391,7 +410,10 @@ int main(int argc, char **argv){
 
         uint64_t t=now_ms();
         if(sec_rows && t-tsec>=1000){
-            uint64_t tx31=0,tx36=0,tx39=0,rx=0; long out=0; int nlinks=0;
+            /* seed with the dead totals: keeps the sums monotonic across a
+             * disconnect, so the p_* deltas below can never wrap */
+            uint64_t tx31=g_dead_tx31,tx36=g_dead_tx36,tx39=g_dead_tx39,rx=g_dead_rx;
+            long out=0; int nlinks=0;
             for(int i=0;i<NHANDLE;i++){
                 struct hstate *H=&g_h[i];
                 if(!H->known || H->is_le) continue;
