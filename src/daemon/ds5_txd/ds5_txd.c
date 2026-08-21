@@ -1060,6 +1060,10 @@ static volatile int g_ghost_ttl_ms = 0;
  * ledger line reads this snapshot instead of calling it, so the two threads
  * never race on those statics. */
 static volatile int g_flush_want = 0;
+static volatile int g_flush_ever = 0;    /* the lever was armed at least once this run —
+                                          * same role as g_ptype_ever: an UNKNOWN handle
+                                          * then converges to the target instead of being
+                                          * assumed spec-default (see the L18 rules) */
 
 /* Inject one output report as a raw-ACL frame onto link L under g_lock, honoring
  * the credit window. Critical section identical in scope to the legacy inline path
@@ -1425,7 +1429,7 @@ static int flush_ms_want(void){
         int r=read_root_int("/tmp/ds5_flush_ms",&warned);
         if(r<0)                    v=0;                      /* absent = off */
         else if(r==0)              v=0;                      /* explicit off */
-        else if(r>=FLUSH_MS_MIN && r<=FLUSH_MS_MAX){ v=r; badwarn=0; }
+        else if(r>=FLUSH_MS_MIN && r<=FLUSH_MS_MAX){ v=r; g_flush_ever=1; badwarn=0; }
         else if(!badwarn){
             badwarn=1;
             fprintf(stderr,"[txd] ignoring /tmp/ds5_flush_ms=%d: outside %d..%d ms "
@@ -1471,6 +1475,24 @@ static int send_read_auto_flush(uint16_t handle){
 static int send_read_local_features(void){
     uint8_t cmd[4]={ 0x01, OP_READ_LOCAL_FEATURES&0xff, OP_READ_LOCAL_FEATURES>>8, 0 };
     return cmd_send(cmd,sizeof cmd,OP_READ_LOCAL_FEATURES,0,0);
+}
+
+/* The latched flush timeout dies WITH the ACL connection. Called when a handle
+ * is witnessed dead or reassigned (DISCONN, or a kernel CONN reusing it after a
+ * lost DISCONN): drop the believed record — the handle's next occupant is a
+ * fresh connection at the spec default, and believed=-1 lets an armed run
+ * re-converge with one write + read-back — and the read-back confirmation, or
+ * inject_one's PB split would stay armed across a real reconnect with nothing
+ * behind it. flush_* is capture-thread-owned, and so is handle_hci_event. */
+static void flush_conn_gone(uint16_t hh){
+    for(int k=0;k<MAX_LINKS;k++)
+        if(g_links[k].flush_handle==hh){
+            g_links[k].flush_handle=0xffff; g_links[k].flush_sent_ms=-1;
+            if(g_flush_confirmed_ms)
+                fprintf(stderr,"[txd] flush: handle=0x%03x gone -> confirmed timeout "
+                               "cleared (PB split off until re-confirmed)\n",hh);
+            g_flush_confirmed_ms=0;
+        }
 }
 
 /* ---------------------------------------------------------------------------
@@ -2306,6 +2328,8 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
         }
         none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
+        flush_conn_gone(hh);   /* a kernel connect on hh = its previous occupant is dead
+                                * (covers a lost DISCONN reusing the handle) */
     } else if(code==HCI_EV_DISCONN_COMPLETE && pl>=4){      /* status,handle(2),reason */
         if(p[0]!=0x00) return;
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
@@ -2320,6 +2344,7 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
         if(L){ L->have=0; reason="bound handle disconnected"; }
         none_bound=!any_link_bound_locked();
         pthread_mutex_unlock(&g_lock);
+        flush_conn_gone(hh);
     } else if(code==HCI_EV_LE_META && pl>=12){              /* subev,status,handle(2),role,atype,addr(6) */
         /* Legacy (0x01) and Enhanced (0x0A) LE Connection Complete share the same
          * prefix layout through peer_addr, so one offset path covers both. */
@@ -2698,8 +2723,16 @@ static void *capture_thread(void *arg){
                      * we have not written to is infinite by definition (that is
                      * the spec default for a fresh connection), so a disarmed
                      * lever costs zero commands per bind instead of one
-                     * redundant "set infinite" on every reconnect. */
-                    int believed = (L->flush_handle==lh[i]) ? L->flush_sent_ms : 0;
+                     * redundant "set infinite" on every reconnect. Same
+                     * believed-state RULES as the L18 ptype lever below — the
+                     * controller latches this timeout per ACL connection too:
+                     * once the lever has been armed this run (g_flush_ever),
+                     * an UNKNOWN handle converges to the target with one write
+                     * (the read-back then confirms what the link really
+                     * carries) instead of being assumed default; a run that
+                     * never arms keeps the zero-commands-per-bind contract. */
+                    int believed = (L->flush_handle==lh[i]) ? L->flush_sent_ms
+                                   : (g_flush_ever ? -1 : 0);
                     if(target!=believed &&
                        t-L->last_flush_cmd>3000 && send_auto_flush(lh[i],target)==0){
                         L->last_flush_cmd=t; L->flush_handle=lh[i]; L->flush_sent_ms=target;
@@ -2775,12 +2808,16 @@ static void *capture_thread(void *arg){
                         break;
                     }
                 }
-            /* ptype state deliberately NOT reset here: pin loss is routinely
-             * just idle-invalidate, the ACL connection (and its latched mask)
-             * outlives it, and this reset is exactly what ate the disarm on
-             * 08-16. A genuinely new handle is caught by the
-             * ptype_handle==lh[i] check in the reconcile above. */
-            } else { L->policy_handle=0xffff; L->flush_handle=0xffff; L->flush_sent_ms=-1; }
+            /* ptype and flush state deliberately NOT reset here: pin loss is
+             * routinely just idle-invalidate, the ACL connection (and its
+             * latched mask/timeout) outlives it, and this reset is exactly
+             * what ate the ptype disarm on 08-16 — the flush reset was the
+             * same bug (disarm compared 0==0 and never wrote the infinite
+             * timeout back while the link kept flushing). A genuinely new
+             * handle is caught by the *_handle==lh[i] checks in the reconcile
+             * above; a REAL disconnect/reassign is cleaned up by
+             * flush_conn_gone() in the event handler. */
+            } else { L->policy_handle=0xffff; }
         }
         /* Scan follows the SESSION, not electrical liveness. The three restores above
          * are edge-triggered on a link INVALIDATION, and since RX liveness (v11) a pad
@@ -3148,7 +3185,8 @@ int main(int argc,char**argv){
     umask(0022);
 
     for(int i=0;i<MAX_LINKS;i++){ g_links[i].policy_handle=0xffff; g_links[i].last_nocp=now_ms();
-                                  g_links[i].ptype_handle=0xffff; g_links[i].ptype_sent=-1; }
+                                  g_links[i].ptype_handle=0xffff; g_links[i].ptype_sent=-1;
+                                  g_links[i].flush_handle=0xffff; g_links[i].flush_sent_ms=-1; }
 
     /* L17b: pin every mapping. The NOCP handler timestamps gaps in user space;
      * with 470/600MB of swap in use on the TV a major fault on the capture

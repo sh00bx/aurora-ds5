@@ -162,6 +162,7 @@ logging is what makes the rest of this observable.
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 0ef0decc3f260191c9d10b13ee35a485, 80600 bytes   (flush latch survives pin flap, 1.5.8)
     # md5 b61d95378ccdb30a51fb8866bb9e33d3, 79160 bytes   (measurement phase, 1.4.23)
     # md5 a5524813257d2b8a0e67cadfc170da62, 78676 bytes   (+ daemon hardening phase)
     # md5 0939f76761c39ebe702f3aae6eb624fc, 78504 bytes   (d1557da + jail-uid patch)
