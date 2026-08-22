@@ -1,4 +1,15 @@
 #!/bin/sh
+# SUPERSEDED since 1.5.3 -- do NOT install this next to a 1.5.x app. The app
+# drives game mode itself now (src/app/platform/webos/tv_game_mode.c calls the
+# gamemode.sh that ships inside the IPK), off the session's own start/stop
+# instead of off process presence, so this guard would be a SECOND controller
+# on the same TV: it turns game mode on while the app is merely open, menus
+# included, and its 3s re-assert re-pins the cores seconds after the in-app
+# "off" has put them back. gamemode.sh's "recover" verb stops a still-installed
+# copy of this (pidfile + boot hook) once per app start for exactly that reason.
+# Kept in the tree because the ds5 measurement rig still drives an installed
+# copy, and because it is the only description of how the old setup behaved.
+#
 # moonlight-guard: persistent root watcher for rooted webOS (LG G4).
 # While the aurora/moonlight client PROCESS EXISTS, continuously enforce game
 # mode (evict streaming/cast background apps + services on entry, keep the client
