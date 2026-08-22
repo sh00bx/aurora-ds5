@@ -139,6 +139,43 @@ static void record_refresh_auto_plugin(ui_device_settings_t *record, const logic
     if (strcmp(id, record->pref_id) == 0) {
         return;
     }
+    /* Only ever true between the user's toggle and this, the next identity
+     * change, whichever way the migration below then goes. */
+    bool migrate = record->pref_provisional && record->pref_id[0] != '\0';
+    record->pref_provisional = false;
+    if (migrate) {
+        /* Direction reversed for this one case: the user toggled auto-plug while
+         * the record still hung off the throwaway key-derived id, so the record
+         * holds the newer fact and the MAC id holds whatever it held before.
+         * Reading the record back from the MAC id here is what silently undid a
+         * choice the panel had already reported as saved. Move the value across
+         * and drop the entry under the throwaway id — hidrawN churns on every
+         * reconnect, and an opted-in entry under a dead id is the one thing
+         * pref_upsert never recycles, so it would hold one of the 32 slots for
+         * good.
+         *
+         * Drop it FIRST. Nothing will ever look that id up again, so the order
+         * costs nothing when there is room — and when the store is genuinely
+         * full of opted-in devices it is the one slot the write below can have,
+         * because pref_upsert only recycles opted-out entries. Writing first
+         * failed in exactly the case the migration exists for. */
+        bool want = record->settings.auto_plugin;
+        hid_pt_prefs_set_auto_plugin(record->pref_id, false);
+        snprintf(record->pref_id, sizeof(record->pref_id), "%s", id);
+        if (hid_pt_prefs_set_auto_plugin(id, want)) {
+            log_append("auto-plug pref migrated for %s (id=%s): %s",
+                       item->name, id, want ? "on" : "off");
+        } else {
+            /* Refused even after the clear, which means there was nothing to
+             * clear: the toggle's own write had already been turned away by a
+             * full table, so no slot was ever taken under the throwaway id. The
+             * record keeps the user's choice for this run, as the error text
+             * promises; re-reading the store here is the revert this branch
+             * exists to stop. */
+            ctm_set_plug_error("Auto-plug for %s could not be saved", item->name);
+        }
+        return;
+    }
     snprintf(record->pref_id, sizeof(record->pref_id), "%s", id);
     bool pref = hid_pt_prefs_get_auto_plugin(id);
     if (pref != record->settings.auto_plugin) {
@@ -216,6 +253,19 @@ void hid_pt_sync_auto_plugin_pref(const logical_device_t *item)
     tv_bridge_worker_settings_t *settings = &record->settings;
     char stable_id[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_logical(item, stable_id, sizeof(stable_id));
+    /* Is this landing on the throwaway key-derived id (MAC not readable yet)?
+     * Then the value is about to be stored where nothing will ever look for it
+     * again, and the next re-resolve has to carry it over instead of reading the
+     * record back. Only an actual change counts: the commit path calls this on
+     * every OK, and re-asserting the stored value must not claim the identity of
+     * a device whose real pref lives under its MAC. */
+    char key_id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id(item->key, key_id, sizeof(key_id));
+    if (strcmp(stable_id, key_id) != 0) {
+        record->pref_provisional = false;
+    } else if (hid_pt_prefs_get_auto_plugin(stable_id) != settings->auto_plugin) {
+        record->pref_provisional = true;
+    }
     /* Record which id this toggle was resolved under, so the re-resolve path
      * treats the record as current: if the pref write below fails, the record
      * keeps the user's choice for this run (as the error text promises) instead
@@ -972,7 +1022,27 @@ bool plug_in_node(logical_device_t *item, int scan_index)
  * left the pad on SDL for the whole stream even though "auto-plug on next
  * stream" was enabled — the user had to bridge it by hand every time. */
 #define AUTOPLUG_GIVEUP_RETRY_MS 30000u
+/* ...but not at the same cadence forever. Since the reachability gate below
+ * keeps transport failures out of the fail count, what still reaches GIVEUP is
+ * device-local, and its expensive form is the session that dies the instant it
+ * starts: the plug already handed the pad to the bridge and excluded it from
+ * Moonlight, so every retry round costs the running game a second or two of
+ * dead controller. The rest therefore doubles with each round (30 s, 60 s,
+ * 120 s) and the last one is final — a pad that cannot be bridged stops
+ * stealing input after a few minutes instead of every 30 s for the whole
+ * stream. A session that survives clears the budget again. */
+#define AUTOPLUG_GIVEUP_MAX_ROUNDS 4
 static int g_autoplug_plug_cooldown;
+
+/* Length of the rest after `rounds` give-ups (rounds >= 1). */
+static uint64_t autoplug_giveup_pause_ms(int rounds)
+{
+    int shift = rounds > 1 ? rounds - 1 : 0;
+    if (shift > 4) {
+        shift = 4;   /* cap at 8 minutes; rounds is bounded anyway */
+    }
+    return (uint64_t) AUTOPLUG_GIVEUP_RETRY_MS << shift;
+}
 
 static autoplug_entry_t *autoplug_entry_for(const char *key, bool create)
 {
@@ -1005,6 +1075,7 @@ void autoplug_mark_pending(const char *key)
     if (e) {
         e->state = AUTOPLUG_PENDING;
         e->fail_count = 0;
+        e->giveup_rounds = 0;   /* deliberate re-arm: give it the full budget again */
     }
 }
 
@@ -1163,12 +1234,27 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
                 if (de) {
                     if (!instant) {
                         de->fail_count = 0;
+                        /* A session that ran for a while is the only proof that
+                         * bridging this pad works at all, so the escalating
+                         * give-up budget starts over from here. */
+                        de->giveup_rounds = 0;
                     }
                     if (instant && ++de->fail_count >= AUTOPLUG_MAX_FAILS) {
                         de->state = AUTOPLUG_GIVEUP;
                         de->giveup_ms = mono_ms();
-                        log_append("auto-plug: %s died instantly %d times; giving up",
-                                   item->name, de->fail_count);
+                        de->giveup_rounds++;
+                        if (de->giveup_rounds >= AUTOPLUG_GIVEUP_MAX_ROUNDS) {
+                            /* Final. Say it where the user can see it: from the
+                             * couch, silently stopping is indistinguishable from
+                             * auto-plug never having been on, and the only other
+                             * evidence is the pad that keeps flickering away
+                             * from the game. */
+                            ctm_set_plug_error("Auto-plug for %s keeps failing; stopped retrying",
+                                               item->name);
+                        } else {
+                            log_append("auto-plug: %s died instantly %d times; giving up for now",
+                                       item->name, de->fail_count);
+                        }
                     } else {
                         de->state = AUTOPLUG_PENDING;
                         log_append("auto-plug: dead session for %s; re-plugging", item->name);
@@ -1206,14 +1292,15 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             continue;
         }
         autoplug_entry_t *e = autoplug_entry_for(item->key, true);
-        if (e && e->state == AUTOPLUG_GIVEUP &&
-            mono_ms() - e->giveup_ms >= AUTOPLUG_GIVEUP_RETRY_MS) {
+        if (e && e->state == AUTOPLUG_GIVEUP && e->giveup_rounds < AUTOPLUG_GIVEUP_MAX_ROUNDS &&
+            mono_ms() - e->giveup_ms >= autoplug_giveup_pause_ms(e->giveup_rounds)) {
             /* The rest is over; whatever kept the plug failing (an agent that
              * was still booting, a hidraw that was still settling) has had time
              * to clear. One fresh round of attempts. */
             e->state = AUTOPLUG_PENDING;
             e->fail_count = 0;
-            log_append("auto-plug: retrying %s after give-up pause", item->name);
+            log_append("auto-plug: retrying %s after give-up pause %d of %d",
+                       item->name, e->giveup_rounds, AUTOPLUG_GIVEUP_MAX_ROUNDS);
         }
         if (!e || e->state != AUTOPLUG_PENDING) {
             continue;   /* DONE (user-managed) or GIVEUP */
@@ -1247,7 +1334,14 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             if (ctm_agent_reachable() && ++e->fail_count >= AUTOPLUG_MAX_FAILS) {
                 e->state = AUTOPLUG_GIVEUP;
                 e->giveup_ms = mono_ms();
-                log_append("auto-plug: giving up on %s after %d attempts", item->name, e->fail_count);
+                e->giveup_rounds++;
+                if (e->giveup_rounds >= AUTOPLUG_GIVEUP_MAX_ROUNDS) {
+                    ctm_set_plug_error("Auto-plug for %s keeps failing; stopped retrying",
+                                       item->name);
+                } else {
+                    log_append("auto-plug: giving up on %s for now after %d attempts",
+                               item->name, e->fail_count);
+                }
             }
             /* A failure means a blocking agent round-trip just stalled the UI thread.
              * Stop after the first failure this tick and back off, so an unreachable

@@ -136,6 +136,13 @@ typedef struct {
                          * throwaway key-derived id; once the MAC appears the id
                          * changes and the pref must be re-read, or auto-plug
                          * stays silently off for the whole connection. */
+    bool pref_provisional;  /* the auto-plug value in `settings` was changed by
+                             * the user while `pref_id` was still that throwaway
+                             * id. It has to travel to the real id when the MAC
+                             * turns up: re-reading the record from the MAC id
+                             * would silently undo a choice the panel already
+                             * reported as saved. True only between the toggle
+                             * and the next identity change. */
 } ui_device_settings_t;
 
 /* One USB interface of a composite device (from the device-dir sysfs walk). */
@@ -231,6 +238,12 @@ typedef struct {
      * to collect three failures is a host agent that is simply not up yet in
      * the first seconds of a stream. */
     uint64_t giveup_ms;
+    /* How many of those rests the entry has already taken. The rest gets longer
+     * with each one and the last one is final: an auto-plug that keeps dying
+     * the moment it starts takes the pad away from the running game for a
+     * second or two per attempt, so an unbounded re-arm is worse than not
+     * retrying at all. Reset only when a bridge session actually survives. */
+    int giveup_rounds;
 } autoplug_entry_t;
 
 extern autoplug_entry_t g_autoplug[MAX_DEVICES];

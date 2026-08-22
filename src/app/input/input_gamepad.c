@@ -47,6 +47,56 @@ void app_input_ds5_idle_lightbar_release(void) {
     ds5_idle_lb_release();
 }
 
+#if FEATURE_GAMEPAD_TOUCHPAD_GRAB
+/* The touchpad grab is an EVIOCGRAB on the pad's own event node, and that is
+ * exclusive system-wide: while it is held, the webOS compositor gets nothing
+ * from the DS4/DS5 touchpad either. That is the whole point while Aurora is on
+ * screen, but the app stays alive after the user switches away (see the
+ * SDL_APP_DIDENTERFOREGROUND comment in app.c), and a grab held there leaves the
+ * touchpad dead as a TV pointer in every other app until Aurora is quit, with
+ * nothing on screen to connect the two. So the grab follows the foreground
+ * lifecycle.
+ *
+ * Those lifecycle events never reach app_input_handle_event - app.c consumes
+ * them in its own event filter - so app.c calls in here from the two handlers it
+ * already has. That filter runs from app_process_events on the main thread, the
+ * same call site that already opens and closes controllers: the slots need no
+ * lock of their own, and the SDL calls below are made under exactly the locks
+ * app_input_init_gamepad's SDL_GameControllerOpen is already made under. An SDL
+ * event watch looks like the tidier hook and is not: a watch body runs on
+ * whichever thread pushed the event, while SDL holds its event-watcher lock and,
+ * for joystick events, its joystick lock - so resolving a controller in there
+ * inverts the two. */
+static bool touchpad_foreground = true;
+
+void app_input_gamepad_set_foreground(app_input_t *input, bool foreground) {
+    if (foreground == touchpad_foreground) {
+        return;
+    }
+    touchpad_foreground = foreground;
+    for (size_t i = 0; i < input->max_num_gamepads; i++) {
+        app_gamepad_state_t *state = &input->gamepads[i];
+        if (!foreground) {
+            gamepad_touchpad_release(state->touchpad);
+            state->touchpad = NULL;
+            continue;
+        }
+        if (state->instance_id == -1 || state->touchpad != NULL) {
+            continue;
+        }
+        /* Resolve the controller through SDL instead of trusting the slot's
+         * stored pointer: a pad that was unplugged and replugged while we were
+         * in the background has a new handle, and SDL answers NULL for a
+         * controller it no longer holds at all. */
+        SDL_GameController *controller = SDL_GameControllerFromInstanceID(state->instance_id);
+        if (controller == NULL) {
+            continue;
+        }
+        state->touchpad = gamepad_touchpad_grab(controller);
+    }
+}
+#endif
+
 #ifdef TARGET_WEBOS
 static bool str_contains_ci(const char *haystack, const char *needle);
 static bool webos_name_is_non_gamepad(const char *name);
@@ -82,8 +132,11 @@ bool app_input_init_gamepad(app_input_t *input, int device_index) {
 #if FEATURE_GAMEPAD_TOUCHPAD_GRAB
         // Keep the platform's input stack away from the controller touchpad, so it
         // can't consume swipes as system gestures. SDL's own touchpad events are
-        // unaffected.
-        state->touchpad = gamepad_touchpad_grab(controller);
+        // unaffected. A pad that arrives while Aurora sits in the background is
+        // left alone until the app comes back, see above.
+        if (touchpad_foreground) {
+            state->touchpad = gamepad_touchpad_grab(controller);
+        }
 #endif
         input->activeGamepadMask |= 1 << state->gs_id;
         input->gamepads_count++;

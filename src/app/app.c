@@ -26,6 +26,7 @@
 #include "app_session.h"
 #include "stream/embed_wrapper.h"
 #include "profile/profile_manager.h"
+#include "input/input_gamepad.h"
 
 #if TARGET_WEBOS
 #include "platform/webos/ds5_service.h"
@@ -191,6 +192,11 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
     switch (event->type) {
         case SDL_APP_WILLENTERBACKGROUND: {
             app->foreground = false;
+            /* Give the controller touchpad back to the platform. The grab is
+             * exclusive system-wide, so holding it while Aurora sits in the
+             * background leaves the pad's touchpad dead as a TV pointer in every
+             * other app, with nothing on screen to explain it. */
+            app_input_gamepad_set_foreground(&app->input, false);
             // Interrupt streaming because app will go to background
             if (app_ui_is_opened(&app->ui) && app->session != NULL) {
                 session_interrupt(app->session, false, STREAMING_INTERRUPT_BACKGROUND);
@@ -199,6 +205,8 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
         }
         case SDL_APP_DIDENTERFOREGROUND: {
             app->foreground = true;
+            // Take the controller touchpad back, see above.
+            app_input_gamepad_set_foreground(&app->input, true);
             lv_obj_invalidate(lv_scr_act());
             /* Re-arm auto-resume on a genuine background->foreground transition. The
              * cold-start auto-resume is one-shot; switching away and back to Aurora on

@@ -4,6 +4,8 @@
 #include <SDL_joystick.h>
 #include <SDL_gamecontroller.h>
 
+#include "config.h"
+
 typedef struct app_input_t app_input_t;
 typedef struct app_gamepad_state_t app_gamepad_state_t;
 
@@ -47,3 +49,14 @@ app_gamepad_state_t *app_input_gamepad_state_by_instance_id(app_input_t *input, 
  * input shutdown so quitting the app does not leave the pad on the in-use
  * colour; the per-controller open/close path does this on its own. */
 void app_input_ds5_idle_lightbar_release(void);
+
+#if FEATURE_GAMEPAD_TOUCHPAD_GRAB
+/* Track the app's foreground state for the controller touchpad grab. The grab is
+ * an exclusive EVIOCGRAB, so it must not outlive the foreground - it would leave
+ * the pad's touchpad dead as a TV pointer in every other app. Call it from the
+ * SDL_APP_WILLENTERBACKGROUND / SDL_APP_DIDENTERFOREGROUND handlers; it walks
+ * the gamepad slots without locking and is main-thread only. */
+void app_input_gamepad_set_foreground(app_input_t *input, bool foreground);
+#else
+#define app_input_gamepad_set_foreground(input, foreground) ((void) 0)
+#endif

@@ -913,7 +913,7 @@ static void *input_thread_main(void *arg)
             break;
         }
         if (!(pfds[0].revents & POLLIN)) continue;
-        int coal_n = 0, drained = 0;
+        int coal_n = 0, drained = 0, stateless_n = 0;
         for (;;) {
             uint8_t buf[CTM_MAX_REPORT];
             ssize_t n = read(hid_fd, buf, sizeof(buf));
@@ -941,6 +941,7 @@ static void *input_thread_main(void *arg)
                                    "— device is streaming something else", seen);
                 }
                 drained++;
+                stateless_n++;
                 continue;
             }
             uint8_t id = buf[0];
@@ -986,8 +987,15 @@ static void *input_thread_main(void *arg)
             }
             ctm_stat_add(&c->stats.reports_in, 1);
         }
-        if (drained > coal_n)
-            ctm_stat_add(&c->stats.coalesced, (unsigned long)(drained - coal_n));
+        /* The stateless drops above are in `drained` so the liveness timeout
+         * still sees the pad as alive, but they never took a coalescing slot.
+         * Leaving them in this difference reported a mic-arming episode (~100
+         * Opus frames/s) as ~100 coalesced reports/s, i.e. as the combo-chip
+         * starvation burst that coalescing normally signals — the exact reading
+         * the stateless counter was added to tell apart. */
+        int coalesced_n = drained - stateless_n - coal_n;
+        if (coalesced_n > 0)
+            ctm_stat_add(&c->stats.coalesced, (unsigned long) coalesced_n);
     }
     return NULL;
 }
