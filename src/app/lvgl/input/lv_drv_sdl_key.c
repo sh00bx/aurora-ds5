@@ -81,6 +81,22 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     if (state->last_read_tick != 0 && state->state == LV_INDEV_STATE_PRESSED &&
         input->key.indev != NULL && lv_tick_elaps(state->last_read_tick) >= KEY_STALL_THRESHOLD_MS) {
         lv_indev_wait_release(input->key.indev);
+        /* Parking swallows the release as well: LVGL forces its last_state to
+         * RELEASED, so the release branch that would send LV_EVENT_RELEASED
+         * never runs. A widget that took the ENTER press already wears
+         * LV_STATE_PRESSED, which only RELEASED or PRESS_LOST ever clears, so
+         * it would sit there looking held down -- and a button matrix would go
+         * on drawing every key the cursor visits as pressed -- until the next
+         * full press and release. Take the state off by hand instead: sending
+         * LV_EVENT_RELEASED would fire the click the parking exists to
+         * suppress, and LV_EVENT_PRESS_LOST is pointer-shaped, lv_btnmatrix
+         * answers it by dropping btn_id_sel, which on a keypad is not the press
+         * target but the cursor -- the soft keyboard would lose its place. */
+        lv_group_t *group = input->key.indev->group;
+        lv_obj_t *pressed = group != NULL ? lv_group_get_focused(group) : NULL;
+        if (pressed != NULL) {
+            lv_obj_clear_state(pressed, LV_STATE_PRESSED);
+        }
     }
     state->last_read_tick = lv_tick_get();
     if (state->text_remain > 0) {

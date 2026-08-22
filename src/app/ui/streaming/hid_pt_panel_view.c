@@ -19,7 +19,8 @@
 #define DEV_COL_W      LV_DPX(300)
 /* What the sheet's 92 % cap leaves for a body pane once the header and the
  * body padding are taken off (the key-hint footer is gone, its 38dpx returned
- * to the panes). Both panes stop growing here and scroll. */
+ * to the panes). It sizes the sheet; the panes measure themselves against the
+ * body box they actually get, which is this minus the error bar when it is up. */
 #define PANE_MAX_H     LV_DPX(428)
 #define DEV_ROW_H      LV_DPX(54)
 #define OPT_ROW_H      LV_DPX(36)
@@ -989,7 +990,14 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     /* ---- body: devices left, the selected device's settings right ---- */
     lv_obj_t *body_row = lv_obj_create(sheet);
     lv_obj_remove_style_all(body_row);
-    lv_obj_set_size(body_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_width(body_row, LV_PCT(100));
+    /* Exactly what the static sheet has left under the header, never more. The
+     * error bar above is a flex sibling and LVGL's flex does not shrink, so a
+     * content-sized body would be pushed past the sheet's fixed bottom edge the
+     * moment the bar appears -- and the sheet clips, so the lowest rows would
+     * simply be gone. Growing into the remainder makes the bar take its height
+     * out of the panes, which is what their scrolling is there for. */
+    lv_obj_set_flex_grow(body_row, 1);
     lv_obj_set_flex_flow(body_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(body_row, BODY_PAD, 0);
     lv_obj_set_style_pad_gap(body_row, LV_DPX(12), 0);
@@ -997,7 +1005,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
 
     lv_obj_t *left_pane = lv_obj_create(body_row);
     lv_obj_remove_style_all(left_pane);
-    lv_obj_set_size(left_pane, DEV_COL_W, LV_SIZE_CONTENT);
+    lv_obj_set_size(left_pane, DEV_COL_W, LV_PCT(100));
     lv_obj_set_flex_flow(left_pane, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(left_pane, LV_DPX(8), 0);
     lv_obj_clear_flag(left_pane, LV_OBJ_FLAG_SCROLLABLE);
@@ -1007,10 +1015,11 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
 
     view->list = lv_obj_create(left_pane);
     lv_obj_remove_style_all(view->list);
-    lv_obj_set_size(view->list, LV_PCT(100), LV_SIZE_CONTENT);
-    /* The cap the sheet's own 92 % works out to, minus its bars. Past it the list
-     * scrolls instead of pushing the sheet off the screen. */
-    lv_obj_set_style_max_height(view->list, PANE_MAX_H, 0);
+    lv_obj_set_width(view->list, LV_PCT(100));
+    /* Everything the body box has left below the DEVICES label -- a fixed cap
+     * would ignore both the label and the error bar and send the last rows
+     * below the sheet's edge. Past it the list scrolls. */
+    lv_obj_set_flex_grow(view->list, 1);
     lv_obj_set_style_pad_right(view->list, LV_DPX(4), 0);
     lv_obj_add_flag(view->list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(view->list, LV_SCROLLBAR_MODE_AUTO);
@@ -1022,7 +1031,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_t *right_pane = lv_obj_create(body_row);
     lv_obj_remove_style_all(right_pane);
     lv_obj_set_height(right_pane, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_height(right_pane, PANE_MAX_H, 0);
+    lv_obj_set_style_max_height(right_pane, LV_PCT(100), 0);
     lv_obj_set_flex_grow(right_pane, 1);
     lv_obj_set_flex_flow(right_pane, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(right_pane, ROW_GAP, 0);

@@ -1323,6 +1323,23 @@ static void embed_set_active(settings_controller_t *c, int index) {
     }
     lv_group_remove_all_objs(c->detail_group);
     embed_popup_add_objs_recursive(c->embed_sections[index], c->detail_group);
+    if (!c->embed_in_detail) {
+        /* The first object put into an emptied group is focused by LVGL on the
+         * spot, and since this runs inside the keypad's own processing it also
+         * gets the FOCUS_KEY dress: a second cursor glowing in the settings
+         * column while the real one is still on the category rail. The group
+         * focus is wanted (it is where RIGHT will land), only the look is not
+         * -- and lv_group_focus_obj() in embed_enter_detail re-sends FOCUSED
+         * even to the object that already holds the focus, so it comes back.
+         * Not when the cursor is already in the column: a mouse click on
+         * another category swaps the sections underneath it, and that first
+         * row is then genuinely focused. */
+        lv_obj_t *ghost = lv_group_get_focused(c->detail_group);
+        if (ghost != NULL) {
+            lv_event_send(ghost, LV_EVENT_DEFOCUSED, lv_indev_get_act());
+            lv_obj_clear_state(ghost, LV_STATE_FOCUS_KEY);
+        }
+    }
     lv_obj_scroll_to_y(c->detail, 0, LV_ANIM_OFF);
 }
 
