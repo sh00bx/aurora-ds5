@@ -159,9 +159,91 @@ Still open from that phase and deliberately not done here: hardening
 device — check that first, because getting it wrong breaks logging outright, and
 logging is what makes the rest of this observable.
 
+## Instrument integrity (2026-08-22)
+
+Deep-review follow-ups, all in the *measurement* half — where an instrument that
+lies is worse than no instrument. None of them changes how audio is delivered.
+
+* **The auto-flush read-back must prove it is ours.** The monitor socket carries
+  the whole stack's command traffic, so any `Read_Automatic_Flush_Timeout` answer
+  with a finite value used to arm the PB rewrite in the *default* data path. The
+  confirmed timeout is now kept **per link** (the controller latches it per ACL
+  connection) and is only taken from an answer to a read-back of ours naming a
+  handle we wrote to. A rejected write now disarms that link's split instead of
+  both pads'. The ledger keeps its frozen `flush=want/confirmed/lmp` spelling;
+  the middle number is the largest value any link confirmed.
+
+  Refusing an answer is not the same as forgetting we asked. An answer that is
+  well-formed but unattributable — on an error status the controller may echo
+  handle 0 or a stale one — is matched against the *pend queue* instead, which
+  carries the handle we asked about, and consumes that read: leaving it
+  outstanding would turn the reconcile into a read every 3 s for the rest of the
+  session on a queue the kernel drains at roughly one command every two seconds,
+  starving the sniff pin, the scan reconciler and L18. Asking is bounded at three
+  reads per write for the same reason. Neither path ever confirms anything — this
+  lever fails towards disarmed — and both count into the **appended** `flushrb=`
+  ledger field, because `flush=80/0/pb` on its own cannot tell an honest
+  "infinite" answer (accept-and-ignore, a result) from an answer that was thrown
+  away (no result at all). A block whose ledger carries `flushrb>0` has not
+  measured this lever.
+* **`flush_events` counts something.** HCI `Flush_Occurred` (0x11) is parsed and
+  attributed per handle. The field has shipped in the v2 `DS5Q` record since
+  1.4.24 and was a hard 0 the whole time, so an A/B reading it would have
+  concluded "accept-and-ignore" from an unwired counter. It moves only on real
+  coex episodes — the synthetic hold leaves nothing queued to flush.
+* **An LMP-level packet-type failure is corrected.**
+  `Connection_Packet_Type_Changed` with an error status arrives *after* a Command
+  Status of `0x00`, so the reject path never saw it and `ptype_sent` — the only
+  record of what the link carries — kept claiming the clamp had been applied,
+  which would run an armed night unclamped. The belief is dropped so the 3 s
+  reconcile re-converges; three consecutive LMP failures park the lever (outcome
+  E1), exactly like an outright reject.
+
+  Both the counter and the park are gated on the handle being one **we** changed.
+  The monitor socket carries every `0x1D` on `hci0` and the LG stack changes
+  packet types for its own links, so an ungated counter would measure the radio:
+  two foreign failures plus our own restore's `0x22` would park the lever, and
+  since the park stops the reconcile in *both* directions the link would stay
+  clamped for the rest of the connection while the ledger reports `ptype=0` — the
+  baseline poisoning this whole believed-state discipline exists to prevent. For
+  the same reason `ptype=want/seen` now only reports a mask seen on a link of
+  ours, and a run that never armed the lever can neither count a failure nor
+  print the parked line. Parking while some link is *not* known to carry the full
+  mask still leaves that link clamped until it disconnects; that case now says so
+  in the log, in as many words, so the OFF blocks after it are not read as clean.
+* **Gap intervals are cross-checked against the monotonic clock.** The kernel
+  queue-time stamps are `CLOCK_REALTIME`, which the TV steps: a forward step
+  lands entirely inside one interval and would enter `gap80`/`gapge`/`gap_max`
+  and the gap log as a several-hundred-ms blackout that never happened. When the
+  two clocks disagree by more than 50 ms the smaller delta is used and the
+  interval is counted in the **appended** `gskew=` ledger field (expected 0).
+* **`/tmp/ds5_gaplog` refuses out-of-range values loudly** and keeps the previous
+  state, like every other tunable here. `echo 10 >` used to disarm the log in
+  silence, and the run was only discovered lost when the report said it had no
+  records. Valid: `0`, `1` (= 55 ms floor) and `20..500` ms.
+
+  The refusal reaches the values that never got as far as the range check, too.
+  Content that is not a usable number at all — a typo'd word, or a value beyond
+  the shared 0..100000 sanity cap — used to arrive at every tunable as a bare
+  `-1`, indistinguishable from "no file", and disarmed the instrument in exactly
+  the silence this bullet claims to have fixed. The reader now separates *absent*
+  (nothing to obey; the tunable falls back to its default) from *refused* (quoted
+  back once in the log; every tunable keeps the state it already had). Absent
+  still includes an empty read, which is also what a read racing the truncate
+  half of `echo N > file` sees. `/tmp/ds5_inject_maxq` and `/tmp/ds5_inject_fifo`
+  now say so on an out-of-range number as well, so "like every other tunable
+  here" is literally true.
+
+One trap left for the *analysis* side, not fixable in here: the gap log's
+`wall_ms` is the **packet's** kernel stamp, so both links of one NOCP event carry
+the same value. A merge that de-duplicates on that field alone (`sort -u -k2,2`)
+therefore drops one of the two lines a radio-global 2-pad blackout produces —
+exactly the most interesting event class. De-duplicate on the whole line.
+
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 c6378659fe4660bbbbc84d2109320ef8, 80852 bytes   (per-link flush latch, Flush_Occurred, clock/ledger integrity, 1.5.9)
     # md5 0ef0decc3f260191c9d10b13ee35a485, 80600 bytes   (flush latch survives pin flap, 1.5.8)
     # md5 b61d95378ccdb30a51fb8866bb9e33d3, 79160 bytes   (measurement phase, 1.4.23)
     # md5 a5524813257d2b8a0e67cadfc170da62, 78676 bytes   (+ daemon hardening phase)

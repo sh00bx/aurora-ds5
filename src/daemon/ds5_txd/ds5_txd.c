@@ -119,6 +119,7 @@
 #define HCI_EV_DISCONN_COMPLETE 0x05
 #define HCI_EV_CMD_COMPLETE     0x0e
 #define HCI_EV_CMD_STATUS       0x0f
+#define HCI_EV_FLUSH_OCCURRED   0x11
 #define HCI_EV_NUM_COMP_PKTS    0x13
 #define HCI_EV_MODE_CHANGE      0x14
 #define HCI_EV_PTYPE_CHANGED    0x1d
@@ -402,6 +403,14 @@ static inline void logw_note(uint64_t t0){
  * `warned` latches one line per call site: a refused file is re-read every second,
  * so it must be neither silent (the operator's edit would just stop working) nor
  * repeated. */
+/* Return codes: >=0 is the value. RRI_ABSENT means there is nothing to obey —
+ * no file, or one we refused to read — and the caller's tunable falls back to its
+ * default. RRI_BAD means the file IS there, root-owned, and its content is not a
+ * number this daemon can use: an operator typo, which must not disarm a running
+ * instrument the way `echo 10 > /tmp/ds5_gaplog` once did. It is reported once
+ * here and every caller keeps the state it already had. */
+#define RRI_ABSENT (-1)
+#define RRI_BAD    (-2)
 static int read_root_int(const char *path, int *warned){
     int fd=open(path,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     if(fd<0){
@@ -414,7 +423,7 @@ static int read_root_int(const char *path, int *warned){
             fprintf(stderr,"[txd] ignoring %s: open failed errno=%d (%s)\n",
                     path,errno,strerror(errno));
         }
-        return -1;
+        return RRI_ABSENT;
     }
     struct stat st;
     if(fstat(fd,&st)<0 || !S_ISREG(st.st_mode) || st.st_uid!=0){
@@ -422,14 +431,34 @@ static int read_root_int(const char *path, int *warned){
             *warned=1;
             fprintf(stderr,"[txd] ignoring %s: not a root-owned regular file\n",path);
         }
-        close(fd); return -1;
+        close(fd); return RRI_ABSENT;
     }
     char b[32]; ssize_t n=read(fd,b,sizeof b-1);
     close(fd);
-    if(n<=0) return -1;
+    /* An empty read is ABSENT, not a typo: it is also what a read racing the
+     * truncate half of the operator's own `echo N > file` sees, and one warning
+     * per second about a value that arrives a millisecond later helps nobody. */
+    if(n<=0) return RRI_ABSENT;
     b[n]='\0';
     char *end=NULL; long v=strtol(b,&end,10);
-    if(end==b || v<0 || v>100000) return -1;
+    if(end==b || v<0 || v>100000){
+        /* The content is quoted back, printable-only and bounded, because the
+         * whole point is that the operator sees WHICH edit was refused. */
+        if(warned && !*warned){
+            char shown[24]; int si=0;
+            for(ssize_t i=0;i<n && si<(int)sizeof shown-1;i++){
+                unsigned char c=(unsigned char)b[i];
+                if(c=='\n' || c=='\r') break;
+                shown[si++] = (c>=0x20 && c<0x7f) ? (char)c : '?';
+            }
+            shown[si]='\0';
+            *warned=1;
+            fprintf(stderr,"[txd] ignoring %s=\"%s\": not a usable number (0..100000) "
+                           "-> the tunable keeps its previous state\n",path,shown);
+        }
+        return RRI_BAD;
+    }
+    if(warned) *warned=0;   /* re-arm: one line per refusal episode, not per run */
     return (int)v;
 }
 
@@ -458,12 +487,21 @@ static int read_root_int(const char *path, int *warned){
  * (180->5). 12 is the balance: drops ~14/10s, input 482/10s (~3% under floor). */
 #define INJECT_MAXQ_DEFAULT 12
 static int inject_maxq(void){
-    static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0; static int warned=0;
+    static int q=INJECT_MAXQ_DEFAULT; static uint64_t last=0; static int warned=0, badwarn=0;
     uint64_t n=now_us();
     if(last==0 || n-last>1000000ull){
         last=n;
         int v=read_root_int("/tmp/ds5_inject_maxq",&warned);
-        if(v>=1 && v<=1000) q=v;
+        if(v>=1 && v<=1000){ q=v; badwarn=0; }
+        else if(v>=0 && !badwarn){
+            /* Out of range is refused LOUDLY and the window keeps its current
+             * value: a silently ignored edit reads at the pad exactly like one
+             * that was applied and did nothing, which is the wrong conclusion to
+             * hand a sweep. One line per refusal episode, on the 1/s cache tick. */
+            badwarn=1;
+            fprintf(stderr,"[txd] ignoring /tmp/ds5_inject_maxq=%d: outside 1..1000 "
+                           "-> window stays %d\n",v,q);
+        }
     }
     return q;
 }
@@ -494,12 +532,18 @@ static int inject_maxq(void){
 static int g_fifo_override=-1;   /* ACL_CTRL_FIFO_DEPTH; main thread only */
 
 static int inject_fifo(void){
-    static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0; static int warned=0;
+    static int d=INJECT_FIFO_DEFAULT; static uint64_t last=0; static int warned=0, badwarn=0;
     uint64_t n=now_us();
     if(last==0 || n-last>1000000ull){
         last=n;
         int v=read_root_int("/tmp/ds5_inject_fifo",&warned);
-        if(v>=0 && v<=FIFO_MAX) d=v;
+        if(v>=0 && v<=FIFO_MAX){ d=v; badwarn=0; }
+        else if(v>=0 && !badwarn){
+            /* Same rule as the window above: refuse loudly, keep the depth. */
+            badwarn=1;
+            fprintf(stderr,"[txd] ignoring /tmp/ds5_inject_fifo=%d: outside 0..%d "
+                           "-> depth stays %d\n",v,FIFO_MAX,d);
+        }
     }
     /* Session override from the app (it knows whether the HOST runs the rate
      * servo that bounds a deep FIFO's parked latency) wins over the boot/file
@@ -719,7 +763,8 @@ struct ds5_link {
      * out, which is by design and not a failure. */
     long     drop_age;       /* FIFO age-out (> FIFO_MAX_AGE_MS): intended shed */
     long     drop_ovf;       /* FIFO overflow evict-to-fit: could not keep up */
-    long     flush_events;   /* controller-side auto-flush (0 until 0x0C28 ships) */
+    long     flush_events;   /* controller-side auto-flush: one per HCI Flush_Occurred
+                              * (0x11) witnessed for this link's handle */
     /* previous identity pending an invalid-publish (g_lock). When a slot is
      * re-bound to a DIFFERENT pad before the old pad's invalidation was
      * published (main-thread invalidate racing a capture rebind), the old
@@ -736,6 +781,26 @@ struct ds5_link {
     uint16_t unsniff_probe_h;/* handle we already probed for an UNOBSERVED sniff */
     uint16_t flush_handle;   /* handle the last Write_Automatic_Flush_Timeout was for */
     int      flush_sent_ms;  /* value we last wrote (0 = infinite/off); -1 = nothing written */
+    /* What the READ-BACK confirmed for THIS handle (0 = nothing confirmed); the
+     * only thing inject_one's PB split is allowed to key on. Per link because the
+     * controller latches the timeout per ACL connection: while it was one global,
+     * a second pad's rejected write disarmed the split for a first pad whose link
+     * kept flushing, and its 0x31 SetState went out flushable again. Capture-
+     * thread-written, inject-thread-read as a relaxed atomic (the same discipline
+     * as last_demand — a stale read costs one frame's flags, never coherence). */
+    int      flush_confirmed_ms;
+    int      flush_rb_pending;   /* a read-back of OURS is outstanding for flush_handle.
+                                  * Per link like everything else about this lever: while
+                                  * it was one global flag, the first pad's answer cleared
+                                  * it and the second pad's read was never even sent, so
+                                  * its link stayed unconfirmed for the whole session.
+                                  * Capture-thread-only (reconcile + event handler). */
+    int      flush_rb_tries;     /* reads sent for the CURRENT flush_rb_pending. Bounded:
+                                  * an answer that never arrives (or one we can never
+                                  * attribute) must not turn the 3s reconcile into a
+                                  * standing retry loop — the kernel drains roughly one
+                                  * command every 2s and the sniff pin, the scan
+                                  * reconciler and L18 share that budget. */
     uint64_t last_flush_cmd; /* send throttle, shares the >=3s command budget */
     uint64_t last_linkq;     /* L16 poll throttle (capture thread) */
     unsigned linkq_rot;      /* L16 round-robin index over the four status reads */
@@ -1015,13 +1080,11 @@ static void link_bind(struct ds5_link *L, const uint8_t hdr8[8], uint16_t hh){
  * it (definition and rationale live with the command senders further down).
  * Capture-thread-written, main-thread-read — same discipline as g_cmd_dead.
  *   g_lmp_nonflush      -1 unanswered / 0 controller lacks LMP bit 54 / 1 has it
- *   g_flush_confirmed_ms the timeout the controller CONFIRMED on read-back.
- *                        The split keys off THIS, never off the write, so a
- *                        controller that accepted-and-ignored the command leaves
- *                        the packet boundary flags exactly as they were. */
+ * The timeout the controller CONFIRMED on read-back is kept PER LINK
+ * (ds5_link.flush_confirmed_ms). The split keys off that confirmation, never off
+ * the write, so a controller that accepted-and-ignored the command leaves the
+ * packet boundary flags exactly as they were. */
 static volatile int g_lmp_nonflush = -1;
-static volatile int g_flush_confirmed_ms = 0;
-static volatile int g_flush_readback_pending = 0;
 
 /* ---- L4: ghost in-flight accounting ---------------------------------------
  *
@@ -1064,6 +1127,21 @@ static volatile int g_flush_ever = 0;    /* the lever was armed at least once th
                                           * same role as g_ptype_ever: an UNKNOWN handle
                                           * then converges to the target instead of being
                                           * assumed spec-default (see the L18 rules) */
+/* Read-backs this run that never became a confirmation: the answer named a handle
+ * we never wrote to while a read of ours was outstanding (an error status lets the
+ * controller echo handle 0 or a stale one, and the packet is well-formed either
+ * way), or no answer arrived before the bounded retries ran out. Each one leaves a
+ * write UNCONFIRMED, and `flush=want/0/pb` alone cannot tell that apart from a
+ * controller that answered honestly with "infinite" — the accept-and-ignore case.
+ * So it ships in the ledger as an APPENDED field: a run whose read-back was thrown
+ * away must not be scoreable as a measured one. Capture-thread-written,
+ * main-thread-read, same discipline as the other ledger counters. */
+static long g_flush_rb_lost = 0;
+/* Reads per write before the lever gives up on being confirmed. Three at the
+ * shared >=3s throttle is ~9s of asking — long enough to ride out a busy command
+ * queue, short enough that a controller which never answers this opcode cannot
+ * spend the budget the sniff pin and the scan reconciler need. */
+#define FLUSH_RB_MAX_READS 3
 
 /* Inject one output report as a raw-ACL frame onto link L under g_lock, honoring
  * the credit window. Critical section identical in scope to the legacy inline path
@@ -1169,16 +1247,18 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
                 frame[3]=(uint8_t)(acl&0xff); frame[4]=(uint8_t)(acl>>8);
                 frame[5]=(uint8_t)(l2&0xff);  frame[6]=(uint8_t)(l2>>8);
                 /* L1 PB class split. Only once the controller has CONFIRMED a
-                 * finite flush timeout by read-back, and only then, do the
-                 * packet boundary flags start meaning anything: audio stays
-                 * PB=2 (automatically flushable — stale audio is worthless,
-                 * dropping it beats replaying it late), while 0x31/0x32 control
-                 * go out PB=0 (non-flushable) because a flushed SetState can
-                 * leave the pad routing audio to the wrong sink for ~1s.
+                 * finite flush timeout by read-back FOR THIS LINK — the timeout
+                 * is latched per ACL connection, so another pad's answer says
+                 * nothing about this one — do the packet boundary flags start
+                 * meaning anything: audio stays PB=2 (automatically flushable —
+                 * stale audio is worthless, dropping it beats replaying it
+                 * late), while 0x31/0x32 control go out PB=0 (non-flushable)
+                 * because a flushed SetState can leave the pad routing audio to
+                 * the wrong sink for ~1s.
                  * Untouched while disarmed: the template's own flags survive
                  * byte-for-byte, so the off state is the pre-L1 behaviour and
                  * not merely a similar one. */
-                if(g_flush_confirmed_ms>0)
+                if(__atomic_load_n(&L->flush_confirmed_ms,__ATOMIC_RELAXED)>0)
                     frame[2] = (uint8_t)((frame[2]&0xCF) | (is_audio_report(rep[0]) ? (2<<4) : (0<<4)));
                 frame[9]=0xA2; memcpy(frame+10,rep,n);
                 ssize_t wr=write(rawfd,frame,10+n);
@@ -1427,7 +1507,9 @@ static int flush_ms_want(void){
     if(last==0 || n-last>1000000ull){
         last=n;
         int r=read_root_int("/tmp/ds5_flush_ms",&warned);
-        if(r<0)                    v=0;                      /* absent = off */
+        if(r==RRI_BAD){ /* content refused above — keep the state, a typo must
+                           not disarm a running instrument */ }
+        else if(r<0)               v=0;                      /* absent = off */
         else if(r==0)              v=0;                      /* explicit off */
         else if(r>=FLUSH_MS_MIN && r<=FLUSH_MS_MAX){ v=r; g_flush_ever=1; badwarn=0; }
         else if(!badwarn){
@@ -1448,7 +1530,8 @@ static void ghost_ttl_refresh(void){
     if(last && n-last<=1000000ull) return;
     last=n;
     int r=read_root_int("/tmp/ds5_ghost_ttl_ms",&warned);
-    if(r<0 || r==0) g_ghost_ttl_ms=0;                     /* absent/0 = off */
+    if(r==RRI_BAD){ /* content refused above — keep the state */ }
+    else if(r<0 || r==0) g_ghost_ttl_ms=0;                /* absent/0 = off */
     else if(r>=GHOST_TTL_MIN_MS && r<=GHOST_TTL_MAX_MS){ g_ghost_ttl_ms=r; badwarn=0; }
     else if(!badwarn){
         badwarn=1;
@@ -1488,11 +1571,24 @@ static void flush_conn_gone(uint16_t hh){
     for(int k=0;k<MAX_LINKS;k++)
         if(g_links[k].flush_handle==hh){
             g_links[k].flush_handle=0xffff; g_links[k].flush_sent_ms=-1;
-            if(g_flush_confirmed_ms)
+            g_links[k].flush_rb_pending=0;   /* the answer it waits for died with the link */
+            g_links[k].flush_rb_tries=0;
+            if(__atomic_load_n(&g_links[k].flush_confirmed_ms,__ATOMIC_RELAXED))
                 fprintf(stderr,"[txd] flush: handle=0x%03x gone -> confirmed timeout "
                                "cleared (PB split off until re-confirmed)\n",hh);
-            g_flush_confirmed_ms=0;
+            __atomic_store_n(&g_links[k].flush_confirmed_ms,0,__ATOMIC_RELAXED);
         }
+}
+
+/* The link a Write/Read_Automatic_Flush_Timeout answer belongs to, matched on the
+ * handle WE wrote to; NULL = the answer is not ours. The monitor socket carries
+ * the whole stack's command traffic, so every flush answer has to prove it is one
+ * of ours before it may touch state the data path reads. flush_* is capture-
+ * thread-owned and so is the caller, hence no lock. */
+static struct ds5_link *flush_link_by_handle(uint16_t hh){
+    for(int k=0;k<MAX_LINKS;k++)
+        if(g_links[k].flush_handle==hh) return &g_links[k];
+    return NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1566,7 +1662,8 @@ static void linkq_refresh(void){
     last=n;
     int r=read_root_int("/tmp/ds5_linkq_ms",&warned);
     int was=g_linkq_ms;
-    if(r<0 || r==0)                              g_linkq_ms=0;
+    if(r==RRI_BAD){ /* content refused above — keep the state */ }
+    else if(r<0 || r==0)                         g_linkq_ms=0;
     else if(r>=LINKQ_MIN_MS && r<=LINKQ_MAX_MS){ g_linkq_ms=r; badwarn=0; }
     else if(!badwarn){
         badwarn=1;
@@ -1623,6 +1720,38 @@ static volatile int g_ptype_ever = 0;    /* the toggle was armed at least once t
 static volatile int g_ptype_refused = 0; /* controller rejected 0x040F: stop reconciling
                                           * (a 3s retry loop against a standing refusal
                                           * would eat the command budget forever) */
+/* CONSECUTIVE failures reported by the 0x1D event itself (LMP level, e.g. 0x22
+ * Response Timeout), counted ONLY for handles we changed ourselves — the monitor
+ * socket carries the whole stack's 0x1D traffic and a counter fed by it would
+ * measure the radio, not the lever. Those arrive AFTER a Command Status of 0x00,
+ * so the reject path above never sees them; each one is retried, but a standing
+ * failure is the same closed lever and must stop spending the command budget.
+ * Capture-thread-only: the 0x1D handler and the reconcile both run there. */
+#define PTYPE_LMP_FAIL_MAX 3
+static int g_ptype_lmp_fail = 0;
+
+/* Parking stops the reconcile in BOTH directions — the restore to PTYPE_ALL sits
+ * behind the same !g_ptype_refused test as the clamp — so a park that happens
+ * while some link is not known to carry the full mask leaves that link clamped
+ * until it disconnects. The ledger's ptype=want/seen can show it, but only to
+ * somebody who reads the pair; say it plainly at the moment it happens, because
+ * every OFF block measured afterwards is a clamped baseline. Capture-thread-only,
+ * like everything else that touches ptype_* state. */
+static void ptype_park_note(void){
+    if(!g_ptype_ever) return;
+    for(int k=0;k<MAX_LINKS;k++)
+        if(g_links[k].ptype_handle!=0xffff && g_links[k].ptype_sent!=PTYPE_ALL){
+            char b[16];
+            if(g_links[k].ptype_sent<0) snprintf(b,sizeof b,"unknown");
+            else snprintf(b,sizeof b,"0x%04x",(unsigned)g_links[k].ptype_sent);
+            fprintf(stderr,"[txd] L18 ptype: parked while handle=0x%03x is not known to carry "
+                           "the full mask (last written %s) -> the restore is parked with it, so "
+                           "a clamp can outlive the disarm until the pad reconnects; treat OFF "
+                           "blocks after this line as unproven, not as baseline\n",
+                    g_links[k].ptype_handle,b);
+            return;
+        }
+}
 
 static int send_chg_ptype(uint16_t handle, uint16_t mask){
     uint8_t cmd[8]={ 0x01,
@@ -1640,7 +1769,8 @@ static void ptype_refresh(void){
     last=n;
     int r=read_root_int("/tmp/ds5_ptype",&warned);
     int was=g_ptype_want;
-    if(r<0 || r==0)  g_ptype_want=0;
+    if(r==RRI_BAD){ /* content refused above — keep the state */ }
+    else if(r<0 || r==0)  g_ptype_want=0;
     else if(r==1){   g_ptype_want=1; g_ptype_ever=1; badwarn=0; }
     else if(!badwarn){
         badwarn=1;
@@ -1673,6 +1803,18 @@ static long g_gaplog_written=0, g_gaplog_lost=0;
  * probe saw 0 missing stamps in 11448 intervals, so a nonzero here is an
  * instrument-health witness, not an expected code path. Capture-thread-only. */
 static long g_ts_fallback=0;
+/* Intervals whose two clocks DISAGREED: the kernel stamp lives on CLOCK_REALTIME,
+ * which the TV steps (NTP), and a forward step falls entirely inside one interval
+ * — it would enter gap80/gapge/gap_max and the gap log as a several-hundred-ms
+ * blackout that never happened, which is the one artefact class this instrument
+ * must not invent. The monotonic delta cannot step but can be inflated by our own
+ * scheduling delay, so neither clock is believed alone. Tolerance: the two are
+ * read microseconds apart in the healthy case, while ntpd never STEPS by less than
+ * ~128 ms (smaller corrections are slewed at 500 ppm), so 50 ms separates the two
+ * populations without ever tripping on jitter. Capture-thread-only, witnessed in
+ * the ledger next to g_ts_fallback. */
+#define GAP_CLOCK_TOL_MS 50
+static long g_ts_skew=0;
 
 static uint64_t now_wall_ms(void){
     struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
@@ -1681,7 +1823,7 @@ static uint64_t now_wall_ms(void){
 
 /* CAPTURE-THREAD-ONLY (function-static cache), publishes g_gaplog_want. */
 static void gaplog_refresh(void){
-    static uint64_t last=0; static int warned=0;
+    static uint64_t last=0; static int warned=0, badwarn=0;
     uint64_t n=now_us();
     if(last && n-last<=1000000ull) return;
     last=n;
@@ -1693,7 +1835,22 @@ static void gaplog_refresh(void){
      * fixed compile-time floor left that region censored on 2026-08-17. The
      * floor is part of the record format contract, so a run's chosen value is
      * printed on arming and the analysis must slice with the same one. */
-    g_gaplog_want = (r==1) ? GAPLOG_MIN_MS : (r>=20 && r<=500) ? r : 0;
+    if(r==RRI_BAD){ /* content refused above — keep the state */ }
+    else if(r<0 || r==0) g_gaplog_want=0;                  /* absent/0 = off */
+    else if(r==1){  g_gaplog_want=GAPLOG_MIN_MS; badwarn=0; }
+    else if(r>=20 && r<=500){ g_gaplog_want=r;   badwarn=0; }
+    else if(!badwarn){
+        /* Every other tunable here refuses an out-of-range value LOUDLY, and this
+         * one silently mapped it to "disarmed": arming with e.g. 10 (a plausible
+         * floor for the r36 regime, whose story plays below 55 ms) left the log
+         * off and /tmp/ds5_gaps.log empty, and the run was only discovered lost
+         * when the report said it had no records. Keep the previous state so a
+         * typo cannot disarm a running instrument either. */
+        badwarn=1;
+        fprintf(stderr,"[txd] ignoring /tmp/ds5_gaplog=%d: only 0, 1 (=%d ms) or 20..500 ms "
+                       "-> gap log stays %s\n",
+                r,GAPLOG_MIN_MS,g_gaplog_want?"armed":"disarmed");
+    }
     if(was!=g_gaplog_want && g_gaplog_want)
         fprintf(stderr,"[txd] gaplog: armed (/tmp/ds5_gaps.log, >=%dms, wall-clock ms)\n",
                 g_gaplog_want);
@@ -2168,19 +2325,78 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
                                "-> auto-flush stays DISARMED\n",p[3]);
             }
         } else if(op==OP_READ_AUTO_FLUSH && pl>=8){         /* ncmd,op(2),status,handle(2),timeout(2) */
-            g_flush_readback_pending=0;
-            if(p[3]==0x00){
+            /* This answer is what arms the PB rewrite in the DEFAULT data path,
+             * and the monitor stream is the whole stack's, not ours — so it
+             * counts only when we asked for a read-back AND the handle it names
+             * is one we wrote to ourselves. Without both tests a foreign read of
+             * some other device's link would arm the split on a pad whose LMP
+             * bit 54 was never even probed, and the disarmed path would quietly
+             * stop being byte-identical to the pre-L1 one. The write only ever
+             * goes out on the g_lmp_nonflush==1 path, so a confirmation that
+             * reaches a link of ours also carries that feature bit with it. */
+            uint16_t rh=(uint16_t)((p[4]|(p[5]<<8))&0x0fff);
+            struct ds5_link *FL=flush_link_by_handle(rh);
+            if(!FL || !FL->flush_rb_pending){
+                /* Not attributable BY HANDLE — but it may still be the answer to a
+                 * read of ours: on an error status the controller is free to echo
+                 * handle 0 or a stale one, and the packet stays well-formed. The
+                 * pend queue is the ownership proof the reject paths already use,
+                 * and its entry carries the handle WE asked about, so the oldest
+                 * outstanding read of this opcode is the one being answered here.
+                 * Consuming it is not cosmetic: leaving flush_rb_pending set turns
+                 * the reconcile into a read every 3s for the rest of the session on
+                 * a queue the kernel drains at ~1 command per 2s, which is the
+                 * standing-refusal retry loop the g_ptype_refused latch exists to
+                 * prevent. It is consumed WITHOUT confirming anything and with the
+                 * previous confirmation dropped — an answer we cannot attribute is
+                 * no evidence about the link, and this lever fails towards disarmed,
+                 * never towards armed on a guess. The cost is counted (ledger
+                 * flushrb=) so the run cannot be scored as a measured one.
+                 * The trade, deliberately taken: a genuinely foreign answer that
+                 * lands while a read of ours is in flight costs us that read-back.
+                 * That direction is a lost measurement on a link left in the
+                 * default data path — the other direction is a retry loop that
+                 * eats the command budget the sniff pin and scan reconciler need. */
+                static int unattr_warned=0;
+                struct ds5_link *OL=NULL;
+                for(int i=0;i<g_pend_n && !OL;i++)
+                    if(g_pend[i].op==OP_READ_AUTO_FLUSH)
+                        OL=flush_link_by_handle((uint16_t)(g_pend[i].arg&0x0fff));
+                if(OL && OL->flush_rb_pending){
+                    OL->flush_rb_pending=0; OL->flush_rb_tries=0;
+                    __atomic_store_n(&OL->flush_confirmed_ms,0,__ATOMIC_RELAXED);
+                    g_flush_rb_lost++;
+                    if(!unattr_warned){
+                        unattr_warned=1;
+                        fprintf(stderr,"[txd] flush: Read_Automatic_Flush_Timeout answer names "
+                                       "handle=0x%03x status=0x%02x, our read was for handle=0x%03x "
+                                       "-> read-back DISCARDED, that write stays unconfirmed "
+                                       "(PB split off; see flushrb= in the ledger)\n",
+                                rh,p[3],OL->flush_handle);
+                    }
+                } else {
+                    static int foreign_warned=0;
+                    if(!foreign_warned){
+                        foreign_warned=1;
+                        fprintf(stderr,"[txd] flush: ignoring Read_Automatic_Flush_Timeout answer "
+                                       "for handle=0x%03x%s\n",
+                                rh,FL?" (no read-back of ours pending)":" (not a handle we wrote)");
+                    }
+                }
+            } else if(p[3]==0x00){
+                FL->flush_rb_pending=0; FL->flush_rb_tries=0;
                 uint16_t slots=(uint16_t)(p[6]|(p[7]<<8));
                 int ms=(int)(((long)slots*5)/8);
-                int was=g_flush_confirmed_ms;
-                g_flush_confirmed_ms=ms;
+                int was=__atomic_load_n(&FL->flush_confirmed_ms,__ATOMIC_RELAXED);
+                __atomic_store_n(&FL->flush_confirmed_ms,ms,__ATOMIC_RELAXED);
                 if(was!=ms)
                     fprintf(stderr,"[txd] flush: read-back handle=0x%03x -> %u slots = %d ms%s\n",
-                            (unsigned)((p[4]|(p[5]<<8))&0x0fff),slots,ms,
+                            rh,slots,ms,
                             ms? " (ARMED: audio PB=2 flushable, 0x31/0x32 PB=0 protected)"
                               : " (infinite: disarmed)");
             } else {
-                g_flush_confirmed_ms=0;
+                FL->flush_rb_pending=0; FL->flush_rb_tries=0;
+                __atomic_store_n(&FL->flush_confirmed_ms,0,__ATOMIC_RELAXED);
                 fprintf(stderr,"[txd] flush: read-back failed status=0x%02x -> treating as DISARMED\n",p[3]);
             }
         } else if(op==OP_READ_LINK_QUALITY || op==OP_READ_RSSI ||
@@ -2225,9 +2441,24 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
             }
         } else if(op==OP_WRITE_AUTO_FLUSH && pl>=4 && p[3]!=0x00){
             /* Accepted-and-ignored is the case we fear, but an outright reject
-             * must not leave a stale "armed" belief behind either. */
-            g_flush_confirmed_ms=0;
-            fprintf(stderr,"[txd] flush: Write_Automatic_Flush_Timeout rejected status=0x%02x\n",p[3]);
+             * must not leave a stale "armed" belief behind either. Attributed by
+             * the handle the answer carries (status,handle(2)): a reject for one
+             * pad used to disarm the split for BOTH, and the other pad's link —
+             * still flushing at its confirmed timeout — went back to sending
+             * 0x31 SetState with the template's flushable flags, which is the
+             * wrong-sink hazard the split exists to prevent. An answer too short
+             * to carry a handle keeps the old blanket clear: fail towards
+             * disarmed, never towards armed on a guess. */
+            int rh = pl>=6 ? (int)((p[4]|(p[5]<<8))&0x0fff) : -1;
+            for(int k=0;k<MAX_LINKS;k++)
+                if(rh<0 || g_links[k].flush_handle==(uint16_t)rh)
+                    __atomic_store_n(&g_links[k].flush_confirmed_ms,0,__ATOMIC_RELAXED);
+            if(rh>=0)
+                fprintf(stderr,"[txd] flush: Write_Automatic_Flush_Timeout rejected status=0x%02x "
+                               "handle=0x%03x\n",p[3],rh);
+            else
+                fprintf(stderr,"[txd] flush: Write_Automatic_Flush_Timeout rejected status=0x%02x "
+                               "(answer carried no handle)\n",p[3]);
         }
         for(int i=0;i<g_pend_n;i++)                         /* pop the oldest matching pend */
             if(g_pend[i].op==op){
@@ -2284,6 +2515,7 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
                     /* ptype_* is capture-thread-owned, and so is this handler. */
                     for(int k=0;k<MAX_LINKS;k++)
                         if(g_links[k].ptype_handle==(arg&0x0fff)) g_links[k].ptype_sent=-1;
+                    ptype_park_note();
                 }
                 break;
             }
@@ -2297,10 +2529,68 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
          * the kind of interference an A/B needs to know about. */
         uint16_t hh=(uint16_t)((p[1]|(p[2]<<8))&0x0fff);
         int pt = p[0]==0x00 ? (int)(p[3]|(p[4]<<8)) : -1;
-        if(p[0]==0x00) g_ptype_seen=pt;
+        /* Attribution BEFORE any state moves. The monitor socket carries every
+         * 0x1D on hci0 — only the HCI index is filtered — and the LG stack changes
+         * packet types for its own links, so an ungated counter would make
+         * "consecutive failures" a property of the RADIO instead of our lever: two
+         * foreign failures plus our own restore's 0x22 reach the cap, g_ptype_refused
+         * latches, and since !g_ptype_refused wraps the WHOLE reconcile — the restore
+         * to PTYPE_ALL included — the link would stay CLAMPED for the rest of the
+         * connection while the ledger reports ptype=0 — the silently-clamped OFF
+         * baseline the believed-state rules below were written for. The same test keeps
+         * g_ptype_seen (the ledger's `seen`) from reporting a foreign link's mask as
+         * ours. This is the ownership proof the reject path already applies by
+         * popping our own pend entry; here it is the handle, because ptype_handle is
+         * 0xffff until we send and we only ever send once the lever has been armed
+         * this run — so a run that never armed can neither count a failure nor print
+         * the parked-lever line. */
+        int ours=0;
+        for(int k=0;k<MAX_LINKS;k++)
+            if(g_links[k].ptype_handle==hh){ ours=1; break; }
+        if(p[0]==0x00){
+            if(ours){ g_ptype_seen=pt; g_ptype_lmp_fail=0; }
+        }
+        else if(ours){
+            /* The change failed on the LMP level, which the Command Status
+             * (0x00, "started") could not tell us: the mask was never applied,
+             * so the optimistic ptype_sent from the send is a lie about what the
+             * link carries — and since ptype_sent is the ONLY record of that,
+             * the reconcile would compare believed==target and never send
+             * again. An armed run would then measure an unclamped link while
+             * the ledger says clamp. Drop the belief so the >=3s reconcile
+             * re-converges, and park the lever after PTYPE_LMP_FAIL_MAX
+             * consecutive failures OF OUR OWN: a standing LMP failure is outcome
+             * E1 just like an outright reject, and the command budget it would
+             * burn is shared with the sniff pin and the scan reconciler. */
+            for(int k=0;k<MAX_LINKS;k++)
+                if(g_links[k].ptype_handle==hh) g_links[k].ptype_sent=-1;
+            if(++g_ptype_lmp_fail>=PTYPE_LMP_FAIL_MAX && !g_ptype_refused){
+                g_ptype_refused=1;
+                fprintf(stderr,"[txd] L18 ptype: %d consecutive LMP-level failures of our own "
+                               "-> lever parked for this run (E1)\n",g_ptype_lmp_fail);
+                ptype_park_note();
+            }
+        }
         fprintf(stderr,"[txd] L18 ptype: Connection_Packet_Type_Changed handle=0x%03x "
-                       "status=0x%02x mask=0x%04x\n",hh,p[0],pt<0?0:(unsigned)pt);
+                       "status=0x%02x mask=0x%04x%s\n",hh,p[0],pt<0?0:(unsigned)pt,
+                ours?"":" (another stack user's link, not counted)");
         return;
+    }
+    if(code==HCI_EV_FLUSH_OCCURRED && pl>=2){               /* handle(2) */
+        /* L1's only DIRECT witness. The gapge distribution shows whether the
+         * lever changed anything; whether the controller ever actually THREW
+         * DATA AWAY is observable in this event and nowhere else — and only on
+         * real coex episodes, since the synthetic hold leaves nothing queued to
+         * flush. The counter ships per link in the .st record, which has been
+         * reading a hard 0 ever since 0x0C28 started shipping in 1.4.24, so an
+         * A/B that reads the flush count would have concluded
+         * accept-and-ignore from an unwired counter. */
+        uint16_t hh=(uint16_t)((p[0]|(p[1]<<8))&0x0fff);
+        pthread_mutex_lock(&g_lock);
+        struct ds5_link *L=link_by_handle(hh);
+        if(L) L->flush_events++;
+        pthread_mutex_unlock(&g_lock);
+        return;                                             /* a flush never affects validity */
     }
     if(code==HCI_EV_MODE_CHANGE && pl>=6){                  /* status,handle(2),mode,interval(2) */
         if(p[0]!=0x00) return;
@@ -2415,9 +2705,23 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
                      * gates above stay on the monotonic clock on purpose —
                      * demand/audio freshness is bookkeeping, not the
                      * measurement. */
-                    uint64_t g;
-                    if(kms && L->nocp_k_ok && kms>L->last_nocp_k) g=kms-L->last_nocp_k;
-                    else { g=nowm-L->last_nocp; if(!kms) g_ts_fallback++; }
+                    uint64_t g, gm=nowm-L->last_nocp;
+                    if(kms && L->nocp_k_ok){
+                        if(kms>L->last_nocp_k){
+                            uint64_t gk=kms-L->last_nocp_k;
+                            /* Cross-check against the monotonic reference: when
+                             * the two disagree beyond the tolerance one of them
+                             * has been stretched, and inflation is the failure
+                             * mode in BOTH directions (wall-clock step vs. our
+                             * own scheduling stall), so the smaller delta is the
+                             * defensible one. */
+                            if(gk>gm+GAP_CLOCK_TOL_MS || gm>gk+GAP_CLOCK_TOL_MS){
+                                g = gk<gm ? gk : gm;
+                                g_ts_skew++;
+                            } else g=gk;
+                        } else { g=gm; g_ts_skew++; }   /* wall clock stepped backwards */
+                    }
+                    else { g=gm; if(!kms) g_ts_fallback++; }
                     /* Was this OUR hole? The first NOCP after a synthetic hold
                      * necessarily lands after the hold has been released, so the
                      * test is the quiet window (hold + settle), not the hold
@@ -2736,13 +3040,32 @@ static void *capture_thread(void *arg){
                     if(target!=believed &&
                        t-L->last_flush_cmd>3000 && send_auto_flush(lh[i],target)==0){
                         L->last_flush_cmd=t; L->flush_handle=lh[i]; L->flush_sent_ms=target;
-                        g_flush_readback_pending=1;
+                        L->flush_rb_pending=1; L->flush_rb_tries=0;
                         fprintf(stderr,"[txd] L%d flush: Write_Automatic_Flush_Timeout handle=0x%03x "
                                        "-> %d ms (%u slots), verifying by read-back\n",
                                 i,lh[i],target,(unsigned)(target?FLUSH_SLOTS(target):0));
-                    } else if(g_flush_readback_pending && t-L->last_flush_cmd>3000 &&
-                              send_read_auto_flush(lh[i])==0){
-                        L->last_flush_cmd=t;
+                    } else if(L->flush_rb_pending && t-L->last_flush_cmd>3000){
+                        /* Asking is BOUNDED. A controller that never answers this
+                         * opcode (or answers it unattributably) would otherwise be
+                         * asked every 3s for the rest of the session, and this
+                         * queue is shared with the sniff pin, the scan reconciler
+                         * and L18 — the same budget argument that parks the ptype
+                         * lever after a standing refusal. Giving up drops the
+                         * confirmation as well: the write was never proven, and an
+                         * unproven write must not keep the PB split alive. A failed
+                         * send costs nothing and is retried on the next pass, so
+                         * only commands that actually went out are counted. */
+                        if(L->flush_rb_tries>=FLUSH_RB_MAX_READS){
+                            L->flush_rb_pending=0;
+                            __atomic_store_n(&L->flush_confirmed_ms,0,__ATOMIC_RELAXED);
+                            g_flush_rb_lost++;
+                            fprintf(stderr,"[txd] L%d flush: no read-back for handle=0x%03x after "
+                                           "%d reads -> giving up, that write stays UNCONFIRMED "
+                                           "(PB split off; see flushrb= in the ledger)\n",
+                                    i,lh[i],FLUSH_RB_MAX_READS);
+                        } else if(send_read_auto_flush(lh[i])==0){
+                            L->last_flush_cmd=t; L->flush_rb_tries++;
+                        }
                     }
                 }
                 /* L18 reconcile: one Change_Connection_Packet_Type per bind or
@@ -3731,18 +4054,46 @@ int main(int argc,char**argv){
              * KERNEL's queue-time stamp. The number counts intervals that fell
              * back to the userspace clock (expected 0) — always printed, so any
              * analysis can see which clock a line was measured with. */
-            char gck[24];
-            snprintf(gck,sizeof gck," gclk=k/%ld",g_ts_fallback);
+            char gck[56]; int gco=0;
+            gco+=snprintf(gck,sizeof gck," gclk=k/%ld",g_ts_fallback);
+            /* APPENDED, never substituted (the field above keeps its spelling):
+             * intervals where the wall-clock and monotonic deltas disagreed, i.e.
+             * a clock step or a scheduling stall. Expected 0; anything else says
+             * which run's tail numbers to distrust. */
+            if(g_ts_skew && gco>0 && gco<(int)sizeof gck)
+                snprintf(gck+gco,sizeof gck-(size_t)gco," gskew=%ld",g_ts_skew);
+            /* `flush=want/confirmed/lmp` keeps its frozen spelling now that the
+             * confirmation is per link: the number printed is the largest one any
+             * link confirmed, so a single-pad session reads exactly as before.
+             * want>0 with 0 here is the accept-and-ignore case ONLY when the
+             * appended flushrb= field is absent — see there. */
+            int fconf=0;
+            for(int i=0;i<MAX_LINKS;i++){
+                int c=__atomic_load_n(&g_links[i].flush_confirmed_ms,__ATOMIC_RELAXED);
+                if(c>fconf) fconf=c;
+            }
+            /* APPENDED beside the frozen triple, never substituted into it (the
+             * gskew= precedent): read-backs that were discarded or never answered.
+             * Two lines that both say confirmed=0 mean different things — the
+             * controller answering "infinite" is accept-and-ignore and IS a result,
+             * an answer we could not attribute is no result at all — and with two
+             * pads the max() above can even print another link's confirmation next
+             * to a link whose answer was thrown away. A block whose ledger carries
+             * flushrb>0 has not measured this lever. */
+            char frb[32]; frb[0]='\0';
+            if(g_flush_rb_lost)
+                snprintf(frb,sizeof frb," flushrb=%ld",g_flush_rb_lost);
             uint64_t t0=now_us();
-            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s%s%s%s\n",
+            fprintf(stderr,"[txd] inj=%ld drop=%ld cred:%ld trunc:%ld badlen:%ld noninj:%ld nolink:%ld ambig:%ld backoff=%ld maxq=%d fifo=%d scanctr=%ld pend=%d logw=%llu/%ld/%ld flush=%d/%d/%s%s%s%s%s%s%s%s\n",
                 injected,dropped,d_cred,d_trunc,d_badlen,d_noninj,d_nolink,d_ambig,
                 paced,inject_maxq(),inject_fifo(),g_scan_ctr,g_pend_n,
                 (unsigned long long)g_logw_max_us,g_logw_slow,g_logw_n,
                 /* want / confirmed-by-read-back / LMP bit54. The middle number is
                  * the only one that means the lever is live; want>0 with
-                 * confirmed=0 is precisely the accept-and-ignore case. */
-                g_flush_want, g_flush_confirmed_ms,
-                g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"),
+                 * confirmed=0 is the accept-and-ignore case unless flushrb>0 says
+                 * the answer never reached us. */
+                g_flush_want, fconf,
+                g_lmp_nonflush<0?"?":(g_lmp_nonflush?"pb":"nopb"), frb,
                 g_cmd_dead?" CMDDEAD":"", linkq, ptyp, gpl, gck, links);
             logw_note(t0);
             last_log=now_ms();
