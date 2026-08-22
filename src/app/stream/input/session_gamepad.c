@@ -22,8 +22,31 @@
 #define QUIT_BUTTONS (PLAY_FLAG | BACK_FLAG | LB_FLAG | RB_FLAG)
 /** Hold Select (Back) this long to toggle pinned performance stats (Artemis-style). */
 #define GAMEPAD_HOLD_STATS_MS 4000
+/** Moonlight slots we can index: app_input_t keeps gamepads[16] and the announce mask is 16 bit. */
+#define GAMEPAD_SLOTS 16
 
 static bool quit_combo_pressed = false;
+
+/*
+ * Last battery reading each slot was told to the host. LiSendControllerBatteryEvent() queues
+ * whatever it is handed, so the "only on change" filter has to live here -- the send rides on
+ * the button path and would otherwise put a reliable control packet on the wire per press.
+ * Zero-initialised is safe as "nothing sent yet": a real reading is never STATE_UNKNOWN,
+ * because gamepad_battery_read() reports no reading at all instead.
+ */
+static uint8_t battery_state_sent[GAMEPAD_SLOTS];
+static uint8_t battery_percentage_sent[GAMEPAD_SLOTS];
+
+/*
+ * Slots whose arrival event carried LI_CCAP_BATTERY_STATE. Nothing else may put a battery
+ * packet on the wire for a slot: the host builds its emulated pad from the capabilities in the
+ * arrival event, and the only way to correct that set afterwards is a second arrival for the
+ * same slot, which makes the host tear the pad down and recreate it in the middle of a game.
+ * The price is a pad SDL had no power level for at arrival -- a HIDAPI DualSense hot-plugged
+ * mid-session, before its first input report -- staying silent about its battery until the
+ * next session, which is the honest half of the trade.
+ */
+static uint16_t battery_announced_mask = 0;
 
 /** Hold timer only detects Select→stats shortcut; Select is still forwarded to the host. */
 static SDL_TimerID stats_hold_timer = 0;
@@ -42,6 +65,10 @@ static bool filter_deadzone_2axis(stream_input_t *input, short *x, short *y);
 static void stream_input_send_unannounced_gamepads(stream_input_t *input);
 
 static void stream_input_send_buttons(stream_input_t *input, app_gamepad_state_t *gamepad);
+
+static bool gamepad_battery_read(SDL_GameController *controller, uint8_t *state, uint8_t *percentage);
+
+static void stream_input_send_gamepad_battery(stream_input_t *input, app_gamepad_state_t *gamepad);
 
 static void cancel_stats_hold(void);
 
@@ -446,8 +473,23 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
         commons_log_info("Input", "  controller capability: RGB LED");
     }
 #endif
+    uint8_t battery_state, battery_percentage;
+    /* Only claim the capability when SDL has an actual reading for this pad. Claiming it for a
+     * pad that never reports one leaves the host waiting for a value that never comes. */
+    battery_announced_mask &= (uint16_t) ~(1u << (unsigned) gamepad->gs_id);
+    if (gamepad_battery_read(gamepad->controller, &battery_state, &battery_percentage)) {
+        capabilities |= LI_CCAP_BATTERY_STATE;
+        battery_announced_mask |= (uint16_t) (1u << (unsigned) gamepad->gs_id);
+        commons_log_info("Input", "  controller capability: battery state");
+    }
     LiSendControllerArrivalEvent(gamepad->gs_id, stream_input_moonlight_active_mask(input), type, 0xFFFFFFFF,
                                  capabilities);
+    /* Drop whatever an earlier pad in this slot reported, then hand over the current value at
+     * once: the filter below only fires on a change, so a pad that sits on one bucket for the
+     * whole session would never tell the host anything. */
+    battery_state_sent[gamepad->gs_id] = LI_BATTERY_STATE_UNKNOWN;
+    battery_percentage_sent[gamepad->gs_id] = LI_BATTERY_PERCENTAGE_UNKNOWN;
+    stream_input_send_gamepad_battery(input, gamepad);
 }
 
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad) {
@@ -491,6 +533,77 @@ static void stream_input_send_buttons(stream_input_t *input, app_gamepad_state_t
     LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), gamepad->buttons,
                                gamepad->leftTrigger, gamepad->rightTrigger, gamepad->leftStickX, gamepad->leftStickY,
                                gamepad->rightStickX, gamepad->rightStickY);
+    /* Rides on the button path rather than a timer of its own: SDL refreshes the power level
+     * from the pad's own reports, and the change filter makes this free until a bucket moves.
+     * Buttons, not axes -- the stick path sends its own LiSendMultiControllerEvent, and hanging
+     * a battery check off every stick sample would buy nothing over a press. */
+    stream_input_send_gamepad_battery(input, gamepad);
+}
+
+/*
+ * What SDL knows about the pad's battery. SDL2 only exposes the coarse bucket the pad itself
+ * reports, so the percentages below are the labels Moonlight agreed on for those buckets, not
+ * a measurement. Returns false when there is no reading -- a pad SDL sees no level for (an
+ * ordinary wired-looking HID, or one still in its first reports) must not be announced to the
+ * host as an empty battery.
+ */
+static bool gamepad_battery_read(SDL_GameController *controller, uint8_t *state, uint8_t *percentage) {
+#if SDL_VERSION_ATLEAST(2, 0, 4)
+    switch (SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(controller))) {
+        case SDL_JOYSTICK_POWER_EMPTY:
+            *state = LI_BATTERY_STATE_DISCHARGING;
+            *percentage = 5;
+            return true;
+        case SDL_JOYSTICK_POWER_LOW:
+            *state = LI_BATTERY_STATE_DISCHARGING;
+            *percentage = 20;
+            return true;
+        case SDL_JOYSTICK_POWER_MEDIUM:
+            *state = LI_BATTERY_STATE_DISCHARGING;
+            *percentage = 50;
+            return true;
+        case SDL_JOYSTICK_POWER_FULL:
+            *state = LI_BATTERY_STATE_DISCHARGING;
+            *percentage = 90;
+            return true;
+        case SDL_JOYSTICK_POWER_WIRED:
+            /* On USB SDL cannot tell charging from charged and has no percentage either. */
+            *state = LI_BATTERY_STATE_CHARGING;
+            *percentage = LI_BATTERY_PERCENTAGE_UNKNOWN;
+            return true;
+        default:
+            return false;
+    }
+#else
+    (void) controller;
+    (void) state;
+    (void) percentage;
+    return false;
+#endif
+}
+
+static void stream_input_send_gamepad_battery(stream_input_t *input, app_gamepad_state_t *gamepad) {
+    if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
+        return;
+    }
+    /* Never report a battery the arrival event said this pad has not got -- see
+     * battery_announced_mask. SDL can learn a level after arrival, and sending it anyway would
+     * make the wire disagree with the capabilities the host configured the pad from. */
+    if ((battery_announced_mask & (1u << (unsigned) gamepad->gs_id)) == 0) {
+        return;
+    }
+    uint8_t state, percentage;
+    if (!gamepad_battery_read(gamepad->controller, &state, &percentage)) {
+        return;
+    }
+    if (battery_state_sent[gamepad->gs_id] == state && battery_percentage_sent[gamepad->gs_id] == percentage) {
+        return;
+    }
+    battery_state_sent[gamepad->gs_id] = state;
+    battery_percentage_sent[gamepad->gs_id] = percentage;
+    /* Sunshine-only extension; on a GFE host this returns LI_ERR_UNSUPPORTED without queueing
+     * anything, so there is nothing to gate on the server flavour here. */
+    LiSendControllerBatteryEvent((uint8_t) gamepad->gs_id, state, percentage);
 }
 
 static void cancel_stats_hold(void) {

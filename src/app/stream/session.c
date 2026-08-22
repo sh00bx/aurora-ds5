@@ -22,6 +22,7 @@
 #include <string.h>
 #include "hid_passthrough/ctm/ctm_state.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
+#include "platform/webos/tv_game_mode.h"
 #endif
 
 // Expected luminance values in SEI are in units of 0.0001 cd/m2
@@ -29,6 +30,22 @@
 
 int streaming_errno = GS_OK;
 char streaming_errmsg[1024];
+
+#if defined(TARGET_WEBOS)
+/* Last HDR state a game-mode cycle actually took; -1 = nothing taken yet. The notify is
+ * edge-triggered by contract: every call landing on a running cycle costs one gamemode.sh
+ * round trip. Latching only on a kick the cycle actually TOOK is what makes an early signal
+ * survivable -- setHdrMode arrives on the callback thread, which starts inside
+ * LiStartConnection and therefore before the game-mode cycle exists, so that first notify is
+ * dropped; leaving the latch alone lets the next signal of the same state be offered again.
+ * Whether one comes is up to the host, and the panel's own dimension re-check covers it if
+ * none does.
+ *
+ * Atomic because the two writers are different threads: session_create() on the main thread
+ * clears it, streaming_set_hdr() runs on moonlight's async callback thread. Sessions are
+ * serialised today, so this is about not leaving a race here for the day they are not. */
+static SDL_atomic_t game_mode_hdr_notified = {-1};
+#endif
 
 static bool streaming_sops_supported(PDISPLAY_MODE modes, int w, int h, int fps);
 
@@ -84,6 +101,8 @@ session_t *session_create(app_t *app, const CONFIGURATION *config, const SERVER_
          * reads the stored value when it builds gamepad_mask for gs_start_app. */
         session->input.moonlightExcludedMask = hid_pt_moonlight_excluded_mask_at_start(&app->input);
     }
+    /* A fresh session has told the game-mode worker nothing yet, whatever the last one left. */
+    SDL_AtomicSet(&game_mode_hdr_notified, -1);
 #endif
     SDL_ThreadFunction worker_fn = (SDL_ThreadFunction) session_worker;
 #if FEATURE_EMBEDDED_SHELL
@@ -311,6 +330,24 @@ void streaming_set_hdr(session_t *session, bool hdr) {
         populate_hdr_info_vui(&info, &session->config.stream);
         SS4S_PlayerVideoSetHDRInfo(session->player, &info);
     }
+#if defined(TARGET_WEBOS)
+    /* The panel moves to a different picture dimension a beat after HDR engages, and that
+     * dimension carries its own picture mode -- the game preset has to be asked for again over
+     * there. The enforce schedule finds it on its own, but only at its next tick. Deliberately
+     * out of reach of the ignored-disable path above: that one leaves the pipeline (and with it
+     * the panel) in HDR, so there is nothing for the worker to re-assert. */
+    if (app_configuration != NULL && app_configuration->webos_game_mode &&
+        SDL_AtomicGet(&game_mode_hdr_notified) != (int) hdr) {
+        /* Latch on the answer, not on the attempt: this callback thread starts inside
+         * LiStartConnection, i.e. before the worker calls tv_game_mode_stream_begin(), so an
+         * HDR-at-connect notify usually finds no running cycle and is dropped. Latching it
+         * anyway would mean no repeat of that same state ever reaches the worker again, and
+         * the panel would wait for the enforce tick after all. */
+        if (tv_game_mode_notify_hdr(hdr)) {
+            SDL_AtomicSet(&game_mode_hdr_notified, (int) hdr);
+        }
+    }
+#endif
 }
 
 void streaming_error(session_t *session, int code, const char *fmt, ...) {
@@ -380,15 +417,25 @@ void session_config_init(app_t *app, session_config_t *config, const SERVER_DATA
     if (video_cap.codecs & SS4S_VIDEO_H264) {
         config->stream.supportedVideoFormats |= VIDEO_FORMAT_H264;
     }
+    /* Main10 is offered when HDR is on and, independently, when the user asks for a 10-bit
+     * picture -- but both go through video_cap.hdr, because on this protocol offering a
+     * 10-bit format IS the HDR request: libgamestream appends hdrMode=1 and the clientHdrCap
+     * block to the launch URL (client.c), and moonlight-common-c puts dynamicRangeMode=1 in
+     * the SDP as soon as the negotiated format is 10-bit (SdpGenerator.c). A host with HDR
+     * available answers that with PQ, and setHdrMode(true) then drives the HDR metadata path
+     * here. A decoder that says it cannot do HDR (ndl/esplayer has no SetHDRInfo at all) would
+     * render that PQ picture through its BT.709 pipeline, so the 10-bit option must not be a
+     * way around the same capability check the HDR option makes. */
+    const bool want_10bit = video_cap.hdr && (app_config->hdr || app_config->force_10bit);
     if (app_config->hevc && video_cap.codecs & SS4S_VIDEO_H265) {
         config->stream.supportedVideoFormats |= VIDEO_FORMAT_H265;
-        if (app_config->hdr && video_cap.hdr) {
+        if (want_10bit) {
             config->stream.supportedVideoFormats |= VIDEO_FORMAT_H265_MAIN10;
         }
     }
     if (app_config->av1 && video_cap.codecs & SS4S_VIDEO_AV1) {
         config->stream.supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN8;
-        if (app_config->hdr && video_cap.hdr) {
+        if (want_10bit) {
             config->stream.supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN10;
         }
     }

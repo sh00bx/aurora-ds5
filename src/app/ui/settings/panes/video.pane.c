@@ -18,6 +18,8 @@ typedef struct video_pane_t {
     lv_obj_t *conflict_hint;
     lv_obj_t *hdr_checkbox;
     lv_obj_t *hdr_hint;
+    lv_obj_t *force_10bit_checkbox;
+    lv_obj_t *force_10bit_hint;
     lv_obj_t *idr_refresh_checkbox;
     lv_obj_t *idr_refresh_slider;
     lv_obj_t *idr_refresh_hint;
@@ -136,11 +138,17 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     controller->hdr_checkbox = hdr_checkbox;
     controller->hdr_hint = hdr_hint;
 
-    hdr_state_update(controller);
-
     lv_obj_t *hdr_more = pref_desc_label(view, locstr("Learn more about HDR feature."), true);
     lv_obj_set_style_text_color(hdr_more, lv_theme_get_color_primary(hdr_more), 0);
     lv_obj_add_flag(hdr_more, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *force_10bit_checkbox = pref_checkbox(view, locstr("Request 10-bit video (Main10)"),
+                                                   &app_configuration->force_10bit, false);
+    controller->force_10bit_checkbox = force_10bit_checkbox;
+    controller->force_10bit_hint = pref_desc_label(view, NULL, false);
+
+    /* Runs once both HDR and 10-bit widgets exist -- it writes to both. */
+    hdr_state_update(controller);
 
     lv_obj_add_event_cb(vdec_dropdown, module_changed_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hevc_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
@@ -232,6 +240,31 @@ static void hdr_state_update(video_pane_t *controller) {
         lv_label_set_text(controller->hdr_hint,
                           locstr("HDR10 (PQ) when the host streams HDR (HEVC Main10 or AV1 Main10). "
                                  "HDR always uses limited color range (SMPTE ST 2084 standard)."));
+    }
+    /* Same decoder-HDR gate as the checkbox above, and for the same reason: offering a 10-bit
+     * format is how this protocol asks for HDR (hdrMode=1 in the launch URL, dynamicRangeMode=1
+     * in the SDP), so a decoder that cannot take HDR info must not be talked into a PQ stream
+     * from here either. Main10 then rides on HEVC or AV1; with neither of them on there is no
+     * 10-bit format to ask for. Both flags are the ones the HDR hint above reads, so the
+     * H265/AV1 checkboxes already drive this through hdr_state_update_cb. */
+    if (app->ss4s.video_cap.hdr == 0) {
+        lv_obj_add_state(controller->force_10bit_checkbox, LV_STATE_DISABLED);
+        lv_label_set_text_fmt(controller->force_10bit_hint,
+                              locstr("%s decoder doesn't support HDR, and a 10-bit request is an HDR "
+                                     "request on this protocol."),
+                              SS4S_ModuleInfoGetName(app->ss4s.selection.video_module));
+    } else if (!want_hevc_hdr && !want_av1_hdr) {
+        lv_obj_add_state(controller->force_10bit_checkbox, LV_STATE_DISABLED);
+        lv_label_set_text(controller->force_10bit_hint,
+                          locstr("Enable H265 and/or AV1 (if supported) to ask for a 10-bit stream."));
+    } else {
+        lv_obj_clear_state(controller->force_10bit_checkbox, LV_STATE_DISABLED);
+        lv_label_set_text(controller->force_10bit_hint,
+                          locstr("Offer the host a Main10 bitstream with HDR off, against banding in dark "
+                                 "SDR gradients. A 10-bit offer is also this protocol's HDR request, so a "
+                                 "Sunshine-family host that has HDR available may answer with PQ instead. "
+                                 "It also turns every reconnect to a running app into a full launch "
+                                 "(30 s timeout) rather than a resume."));
     }
 }
 

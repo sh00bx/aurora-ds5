@@ -182,6 +182,18 @@ int session_worker(session_t *session) {
     session_apply_smooth_pacing_env(session);
     session_video_prepare_stream();
 
+#if TARGET_WEBOS
+    /* Buffers first, sockets second: net.core.rmem_max only clamps sockets created after the
+     * write, and LiStartConnection creates every socket this session has, which is what pins
+     * this call to this thread and this spot. It does hold the connection up: the callee runs
+     * the luna call on a thread of its own and waits a few seconds for it, then goes on
+     * without it, so the worst case is a stream on the stock receive buffer rather than a
+     * "Connecting" screen that cannot be cancelled. tv_game_mode_stream_end() at
+     * thread_cleanup puts the knobs back on every path, including this one failing. */
+    if (app_configuration != NULL && app_configuration->webos_game_mode) {
+        tv_game_mode_net_prepare();
+    }
+#endif
     connect_mark("li_start");
     int startResult = LiStartConnection(&server->serverInfo, &session->config.stream,
                                         session_connection_callbacks_prepare(session),
@@ -216,7 +228,7 @@ int session_worker(session_t *session) {
     session_set_state(session, STREAMING_STREAMING);
     bus_pushevent(USER_STREAM_OPEN, NULL, NULL);
 #if TARGET_WEBOS
-    /* Hand the TV over to the stream: game picture/sound preset, discovery and
+    /* Hand the TV over to the stream: game picture preset, discovery and
      * cast services out of the DS5's airtime, cores pinned, stream threads
      * boosted. Runs on its own thread and restores everything at thread_cleanup
      * below -- including when this session ends in an error. */

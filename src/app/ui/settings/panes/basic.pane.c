@@ -208,9 +208,11 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 #if TARGET_WEBOS
     pref_checkbox(view, locstr("TV game mode while streaming"), &app_configuration->webos_game_mode, false);
     pref_desc_label(view,
-                    locstr("Switch the TV to its game picture and sound preset, keep discovery and casting "
-                           "services off the radio, and pin the CPU cores -- for as long as a stream runs, "
-                           "then put everything back. Needs a rooted TV with Homebrew Channel."),
+                    locstr("Switch the TV to its game picture preset, keep discovery and casting "
+                           "services off the radio, pin the CPU cores, and raise the kernel's network "
+                           "receive buffers so a burst of video isn't dropped before Moonlight reads it "
+                           "-- for as long as a stream runs, then put everything back. Needs a rooted TV "
+                           "with Homebrew Channel."),
                     false);
 #endif
 

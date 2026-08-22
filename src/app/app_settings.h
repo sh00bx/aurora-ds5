@@ -52,7 +52,7 @@ typedef struct app_settings_t {
     bool hid_passthrough;
     int hid_passthrough_port;
     bool hid_passthrough_autoplug;   /* auto-bridge connected game controllers on stream start + BT hotplug */
-    /* Ask the TV for its game picture/sound preset and free the radio + cores
+    /* Ask the TV for its game picture preset and free the radio + cores
      * for the stream, for as long as the stream runs. Needs root (Homebrew
      * Channel); a no-op without it. */
     bool webos_game_mode;
@@ -60,6 +60,17 @@ typedef struct app_settings_t {
      * game runs), 2=always. Sent to the host bridge on every session. */
     int ds5_touchpad_mouse;
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
+    /**
+     * Ask for a Main10 bitstream even with the HDR option off. The panel is 10-bit either way,
+     * so an 8-bit stream is what puts visible banding into dark gradients. What it is NOT is a
+     * way to get 10 bits without HDR: on this protocol offering a 10-bit format IS the HDR
+     * request (libgamestream appends hdrMode=1, moonlight-common-c sets dynamicRangeMode=1), so
+     * a host with HDR available may well answer with PQ -- see the long note in
+     * session_config_init. For that reason it is gated on the same video_cap.hdr the HDR option
+     * is gated on, costs a little bitrate, and is off by default. Rides on HEVC or AV1: there is
+     * no 10-bit H264 format to ask for.
+     */
+    bool force_10bit;
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
     /**
      * Tell the host the display is variable-refresh, via clientVrrRequested on the launch URL.

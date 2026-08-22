@@ -172,6 +172,7 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->absmouse = true;
     config->virtual_mouse = false;
     config->hdr = false;
+    config->force_10bit = false;
     config->force_full_color_range = false;
     config->vrr = false;
     config->hevc = true;
@@ -279,6 +280,7 @@ bool settings_save(app_settings_t *config) {
     ini_write_section(fp, "video");
     ini_write_string(fp, "decoder", config->decoder);
     ini_write_bool(fp, "hdr", config->hdr);
+    ini_write_bool(fp, "force_10bit", config->force_10bit);
     ini_write_bool(fp, "force_full_color_range", config->force_full_color_range);
     ini_write_bool(fp, "vrr", config->vrr);
     ini_write_bool(fp, "hevc", config->hevc);
@@ -457,6 +459,8 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->soft_recovery = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "pause_at_decode_time")) {
         /* Upstream-Legacy: dort entfernt, bei uns nie eingefuehrt — still ignorieren. */
+    } else if (INI_FULL_MATCH("video", "force_10bit")) {
+        config->force_10bit = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "force_full_color_range")) {
         config->force_full_color_range = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("surround")) {
