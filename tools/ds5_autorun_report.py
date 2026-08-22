@@ -17,8 +17,14 @@ bands below that are simply absent here; the >=60 and >=70 ms bands, which are
 where every lever in this programme is judged, are exact.
 
     ds5_autorun_report.py /path/to/autorun-ptype-20260816-1900
+
+Exit status is part of the output: 0 = a verdict was produced, 1 = the run could
+not be read (missing files, or nothing survives the coverage filters), 2 = usage,
+3 = the run was read but the verdict it asks for is REFUSED by the preregistration
+(today that is lever=r36, which may not be judged on shared fixed-ms bins).
 """
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -49,6 +55,80 @@ def poisson_ratio_ci(k1, t1, k2, t2, z=1.96):
     return r, r * math.exp(-z * se), r * math.exp(z * se)
 
 
+def censored_log_slope(pts):
+    """The old estimator, kept only as a sensitivity number: OLS on log(count)
+    over the OCCUPIED bins. It cannot represent an empty bin at all."""
+    p = [(x, k) for x, k in pts if k > 0]
+    if len(p) < 2:
+        return None
+    n = float(len(p))
+    sx = sum(x for x, _ in p)
+    sy = sum(math.log(k) for _, k in p)
+    sxx = sum(x * x for x, _ in p)
+    sxy = sum(x * math.log(k) for x, k in p)
+    den = n * sxx - sx * sx
+    return (n * sxy - sx * sy) / den if den else None
+
+
+def poisson_log_slope(pts, iters=60, tol=1e-10):
+    """Slope of log(rate) against gap width, fitted as a Poisson GLM (log link).
+
+    An empty tail bin is DATA, not a missing value: zero events at 80 ms is the
+    strongest evidence there is that the tail decays fast. Ordinary least
+    squares on log(count) cannot hold such a bin (log 0), so it silently fits
+    only the occupied ones — and conditioning on k>0 lifts every thin bin to at
+    least one event, which tilts the line FLAT and reports the halving constant
+    systematically too slow. Over the 5-6 sparsely filled bins this window
+    produces, that bias is the difference between passing and failing the
+    +-30 % transfer criterion, i.e. it decides whether a lever verdict is
+    declared transferable to gameplay.
+
+    The 5.4 ms gameplay reference was fitted on bins with hundreds of events
+    each, where both estimators agree to well inside a decimal; the divergence
+    is a property of the rig's thin tail, not of the reference.
+
+    Newton-Raphson on (a, b) of log mu = a + b*x. Two parameters, so the step is
+    a closed-form 2x2 solve; x is centred first because x ~ 80 and x^2 ~ 6400
+    otherwise make the information matrix needlessly ill-conditioned. Returns
+    the slope per ms, or None if it did not converge.
+    """
+    if len(pts) < 2:
+        return None
+    xbar = sum(x for x, _ in pts) / float(len(pts))
+    p = [(x - xbar, float(k)) for x, k in pts]
+    # Start on OLS over log(k + 0.5): defined for empty bins and close enough
+    # that Newton needs a handful of steps.
+    n = float(len(p))
+    sx = sum(x for x, _ in p)
+    sy = sum(math.log(k + 0.5) for _, k in p)
+    sxx = sum(x * x for x, _ in p)
+    sxy = sum(x * math.log(k + 0.5) for x, k in p)
+    den = n * sxx - sx * sx
+    if not den:
+        return None
+    b = (n * sxy - sx * sy) / den
+    a = (sy - b * sx) / n
+    for _ in range(iters):
+        s0 = s1 = h00 = h01 = h11 = 0.0
+        for x, k in p:
+            mu = math.exp(max(-60.0, min(60.0, a + b * x)))
+            s0 += k - mu
+            s1 += (k - mu) * x
+            h00 += mu
+            h01 += mu * x
+            h11 += mu * x * x
+        det = h00 * h11 - h01 * h01
+        if det <= 0:
+            return None
+        da = (h11 * s0 - h01 * s1) / det
+        db = (h00 * s1 - h01 * s0) / det
+        a += da
+        b += db
+        if abs(da) < tol and abs(db) < tol:
+            return b
+    return None
+
+
 def main(argv):
     if len(argv) != 2:
         print(__doc__)
@@ -59,6 +139,22 @@ def main(argv):
         if not f.exists():
             print(f"missing {f}")
             return 1
+
+    # WHICH lever a run moved decides which verdicts it is allowed to produce,
+    # so it is read out of the run instead of assumed. ds5_autorun.sh writes
+    # conditions.txt for exactly this reason; the directory name
+    # (autorun-<lever>-<stamp>) is the fallback for runs taken before it did.
+    lever = None
+    cond = d / "conditions.txt"
+    if cond.exists():
+        m = re.search(r"\blever=(\S+)", cond.read_text(errors="ignore"))
+        if m:
+            lever = m.group(1)
+    if lever is None:
+        m = re.match(r"autorun-([A-Za-z0-9]+)-\d", d.name)
+        if m:
+            lever = m.group(1)
+    print(f"run {d.name}   lever={lever or 'UNKNOWN'}")
 
     windows = []
     for line in win_f.read_text().splitlines():
@@ -203,6 +299,10 @@ def main(argv):
         b = arms[a]["busy"]
         if b:
             print(f"  {a}: {min(b)}-{max(b)} % cpu busy per block")
+    if lever == "r36":
+        print("  !! lever=r36 halves the send cadence in the ON arm (0x36 every 10.67 ms")
+        print("     against 0x39 every 21.33 ms). The columns below are each arm's own")
+        print("     measurement; they are NOT in the same currency and must not be divided.")
     print(f"{'edge':>6} " + " ".join(f"{a:>18}" for a in sorted(arms)))
     for k in EDGES:
         row = f">={k:3d}ms "
@@ -217,28 +317,65 @@ def main(argv):
     # over 55-85 ms — the overlapping part of the same slope. A synthetic workload
     # whose tail decays at a different rate is shaped by a different mechanism,
     # and no lever verdict measured under it transfers to gameplay.
-    print("\nE1 tail shape (halving constant over 55-85 ms; gameplay reference 5.4 ms):")
+    print("\nE1 tail shape (halving constant over 55-85 ms, Poisson fit over ALL six")
+    print("bins including the empty ones; gameplay reference 5.4 ms):")
+    # Amendment 7 again, and for the same reason as the ON/OFF ratio below: these
+    # are shared fixed-ms bins. The r36 ON arm's gaps carry a different in-flight
+    # term (B + 10.67 ms against B + 21.33 ms), so the 55-85 ms window cuts the
+    # two arms' distributions in different places — the +-30 % transfer verdict
+    # would then be reporting the cadence. It is a per-arm figure rather than a
+    # ratio, which is exactly why it needs refusing explicitly: it is the last
+    # fixed-bin number on this page an operator could still quote for an r36 run.
+    if lever == "r36":
+        print("  REFUSED for lever=r36 (Amendment 7, preregistered): same shared fixed-ms")
+        print("  bins as the ratio below, so the +-30 % pass/fail would be about the send")
+        print("  cadence and not the tail shape. The bin counts are printed instead —")
+        print("  they are the observation; only a pad-currency refit (each arm's own")
+        print("  B + in-flight term, which this report does not compute) may turn them")
+        print("  into a halving constant.")
+    elif lever is None:
+        print("  !! lever UNKNOWN — if this was an r36 run the fit below is invalid by")
+        print("     preregistration (shared fixed-ms bins). Identify the run first.")
     for a in sorted(arms):
         span = [(s, e) for arm, s, e, *_ in windows if arm == a]
-        bins = {}
+        # Every bin of the window exists, occupied or not. An empty 80-85 bin is
+        # the fastest-decay evidence in the sample and dropping it is what made
+        # the old fit read slow; see poisson_log_slope().
+        bins = {k: 0 for k in range(6)}
         for ts, ms, o in gaps:
             if any(s <= ts <= e for s, e in span) and o >= STARVE_MIN_OUT and 55 <= ms < 85:
-                bins[(ms - 55) // 5] = bins.get((ms - 55) // 5, 0) + 1
-        pts = [(k * 5 + 57.5, v) for k, v in sorted(bins.items()) if v > 0]
-        if len(pts) < 3:
-            print(f"  {a}: too few tail events to fit")
+                bins[(ms - 55) // 5] += 1
+        pts = [(k * 5 + 57.5, v) for k, v in sorted(bins.items())]
+        occupied = [x for x in pts if x[1] > 0]
+        if lever == "r36":
+            print(f"  {a}: bin counts 55-85 ms (5 ms bins) "
+                  + " ".join(f"{55 + k * 5}-{60 + k * 5}:{bins[k]}" for k in range(6))
+                  + f"   ({sum(v for _, v in pts)} events, no constant fitted)")
             continue
-        n = len(pts)
-        sx = sum(x for x, _ in pts); sy = sum(math.log(y) for _, y in pts)
-        sxx = sum(x * x for x, _ in pts); sxy = sum(x * math.log(y) for x, y in pts)
-        denom = n * sxx - sx * sx
-        slope = (n * sxy - sx * sy) / denom if denom else 0.0
+        if len(occupied) < 3:
+            print(f"  {a}: too few tail events to fit "
+                  f"({sum(v for _, v in pts)} events in {len(occupied)} of 6 bins)")
+            continue
+        slope = poisson_log_slope(pts)
+        if slope is None:
+            print(f"  {a}: tail fit did not converge — report the bin counts, not a constant")
+            continue
         if slope >= 0:
             print(f"  {a}: tail does not decay (slope {slope:+.3f}/ms) — not the gameplay shape")
-        else:
-            half = math.log(2) / -slope
-            ok = "within +-30 % of 5.4 ms" if 3.8 <= half <= 7.0 else "OUTSIDE the +-30 % band"
-            print(f"  {a}: halves every {half:.1f} ms   ({ok})")
+            continue
+        half = math.log(2) / -slope
+        ok = "within +-30 % of 5.4 ms" if 3.8 <= half <= 7.0 else "OUTSIDE the +-30 % band"
+        # The censored number is printed alongside precisely because the verdict
+        # moved when the estimator did: an operator comparing this run against a
+        # note written before this change has to see both, and a large spread
+        # between them means the tail is too thin for either to be quoted.
+        cens = censored_log_slope(pts)
+        sens = (f"   [old censored log-OLS: {math.log(2) / -cens:.1f} ms]"
+                if cens is not None and cens < 0 else "")
+        print(f"  {a}: halves every {half:.1f} ms   ({ok}){sens}")
+        if len(occupied) < 6:
+            print(f"       ({6 - len(occupied)} of 6 bins empty, "
+                  f"{sum(v for _, v in pts)} events — the empty ones are IN the fit)")
 
     # E2: level against the reference, stated as the band the arms actually span.
     base = "off" if "off" in arms else (sorted(arms)[0] if arms else None)
@@ -260,7 +397,6 @@ def main(argv):
     # lever claims to empty the credit window, and either it did or it did not.
     synth_f = d / "synth.log"
     if synth_f.exists() and windows:
-        import re
         rig0 = rig0_ms // 1000 - 35              # rig starts ~35 s before block 1
         qs = {}
         for line in synth_f.read_text().splitlines():
@@ -278,6 +414,27 @@ def main(argv):
                 print(f"  {a}: mean q={sum(v)/len(v):.1f}  (n={len(v)}, min {min(v)} max {max(v)})")
 
     if "on" in arms and "off" in arms:
+        # Amendment 7, declared in ds5_autorun.sh's r36 comment BEFORE the lever
+        # was ever run: a lever that changes the send cadence moves these bins by
+        # construction, so an ON/OFF ratio taken across shared fixed-ms edges
+        # measures the re-binning and not the lever. This report cannot compute
+        # the pad-currency edges (each arm's own B + in-flight term), so the only
+        # honest thing left is to refuse the number rather than print one that
+        # looks like every other verdict on this page.
+        if lever == "r36":
+            print("\nratio ON/OFF: REFUSED for lever=r36 (Amendment 7, preregistered).")
+            print("  This lever is judged in PAD CURRENCY with each arm's own in-flight")
+            print("  term (B + 21.33 ms OFF vs B + 10.67 ms ON), never on shared fixed-ms")
+            print("  bins — the ON arm's bins are displaced by the cadence itself, so a")
+            print("  ratio across them would be an artefact with a confidence interval.")
+            print("  Still readable above: each arm's own event table, the rig's delivery")
+            print("  line and the credit-window means. The verdict needs the pad-currency")
+            print("  edges, which this report does not compute.")
+            return 3
+        if lever is None:
+            print("\n  !! lever UNKNOWN (no conditions.txt, and the directory name does not")
+            print("     name one). If this was an r36 run the block below is invalid by")
+            print("     preregistration — identify the run before quoting it.")
         print("\nratio ON/OFF (Poisson, 95 % CI) — the L18 witness is the >=60 ms band:")
         for k in EDGES:
             r, lo, hi = poisson_ratio_ci(arms["on"][k], arms["on"]["secs"],

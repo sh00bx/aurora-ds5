@@ -50,7 +50,8 @@
 #
 # Output: /tmp/autorun-<lever>-<stamp>/
 #   windows.tsv   arm, start_epoch_s, end_epoch_s   (guards excluded)
-#   gaps.log      the daemon's per-gap wall-clock log, copied at the end
+#   gaps.log      the daemon's per-gap wall-clock log, rotated out of /tmp
+#                 after every block and merged (whole-line dedupe) at the end
 #   ledger.log    every daemon status line seen during the run
 #   synth.log     the rig's own delivery accounting — READ THIS FIRST: a block
 #                 whose rig did not deliver ~46.9/s with drop=0 measured a
@@ -237,21 +238,65 @@ echo 1 > /tmp/ds5_gaplog          # per-gap wall-clock records are how blocks ge
 # inflating the ON/OFF ratio. Start clean and drain after every block, so the
 # live file never gets near the cap.
 : > /tmp/ds5_gaps.log
+# The rotate below leaves its last snapshot lying in /tmp on purpose, so a clean
+# start has to remove that as deliberately as it empties the live log: merging a
+# previous run's leftovers into this run's gaps.raw would date events into blocks
+# that never saw them.
+GAPSNAP=/tmp/ds5_gaps.snap
+rm -f "$GAPSNAP"
 
+# The per-block snapshot RENAMES the daemon's log, it never copies-then-truncates
+# it: gaplog_flush() runs once per capture wakeup, so it can append between the
+# copy and the ': >', and the truncate then throws those entries away having
+# never reached gaps.raw — the same silent loss the per-block drain exists to
+# prevent, only smaller. rename() is atomic, and the daemon holds NO descriptor
+# across flushes (gaplog_flush opens /tmp/ds5_gaps.log O_CREAT|O_APPEND, writes
+# and closes inside one call), so its next flush simply creates the path anew and
+# nothing has to tell it to reopen. The only records that can still land in the
+# renamed file come from a flush already inside its own open/write/close when the
+# rename happened; the NEXT rotate collects those by appending the leftover
+# snapshot before replacing it. Re-reading a snapshot costs duplicate lines, and
+# duplicate lines cost nothing because the merge dedupes whole lines.
+gap_rotate(){
+    [ -f "$GAPSNAP" ] && cat "$GAPSNAP" >> "$OUT/gaps.raw" 2>/dev/null
+    if mv -f /tmp/ds5_gaps.log "$GAPSNAP" 2>/dev/null; then
+        cat "$GAPSNAP" >> "$OUT/gaps.raw" 2>/dev/null
+    fi                       # no live log = nothing rotated; the snapshot stands
+    return 0
+}
+
+# Both pids are declared before the trap is installed: cleanup() runs under
+# `set -u`, and an INT arriving before the rig or the ledger tail was started
+# would otherwise abort the trap on an unbound variable instead of disarming.
+RIG_PID=""
+LEDGER_PID=""
+RIG_DIED=0
+BUDGET_OUT=0
 cleanup(){
     rm -f $LEVER_FILES   # the whole inventory: burst arms period_us alongside its TOG
     load_stop            # unconditional: background conditions end with the run
     cores_unpin          # four hot cores on someone's TV is not a default
     cpu_stop             # busy loops outlive their shell if nobody reaps them
-    kill "$RIG_PID" 2>/dev/null
-    say "cleanup: lever disarmed, load stopped, cores released, rig stopped"
+    [ -n "$LEDGER_PID" ] && kill "$LEDGER_PID" 2>/dev/null
+    [ -n "$RIG_PID" ] && kill "$RIG_PID" 2>/dev/null
+    say "cleanup: lever disarmed, load stopped, cores released, rig+ledger stopped"
 }
 trap 'cleanup; exit 130' INT TERM
 
 [ "$BG_LOAD" = "1" ] && { load_start; say "background: wlan0 load held up in BOTH arms"; }
 [ "$BG_PIN" = "1" ]  && { cores_pin;  say "background: cpu1-3 pinned online in BOTH arms"; }
 
-TOTAL=$(( BLOCKS * (BLOCK + GUARD) + 30 ))
+# The rig's --seconds budget has to cover everything this loop spends, not just
+# the blocks: the 20 s warm-up before the first one, and per block a guard, the
+# block itself and all the shell work around it — a cores_now subshell every
+# 10 s of the block, three date/awk pairs, the gap rotate. On a TV that runs on
+# two cores those spawns are not free, and the old +30 s left about ten seconds
+# of margin for the lot, so a perfectly healthy run could reach its last block
+# with the rig already finished. That is the expensive direction to be wrong in:
+# the block is lost and, through ds5_campaign.sh's gate on the positive control,
+# so is the rest of the night. A rig that outlives the loop costs nothing — it
+# is TERMed after the last block and still prints its DONE accounting.
+TOTAL=$(( 20 + BLOCKS * (BLOCK + GUARD + 10) + 60 ))
 
 # What this run can and cannot see, stated BEFORE it produces a number. Expected
 # events per arm k = rate * exposure; the 95 % CI of a Poisson rate ratio excludes
@@ -283,7 +328,14 @@ fi
 DELIVER=$(awk '/^\[synth\] t=/{r=$4} END{print r}' "$OUT/synth.log")
 say "warm-up delivery: ${DELIVER:-unknown} (want ~rate=46.9/s)"
 
-nohup sh -c 'while :; do tail -n 0 -F /tmp/ds5_txd.log; done' >"$OUT/ledger.log" 2>&1 &
+# tail runs DIRECTLY, never wrapped in a restart loop. Killing the wrapper only
+# kills the wrapper: the inner tail is reparented to init with its fd on THIS
+# run's ledger.log still open, and it then appends every future daemon line to a
+# finished run — a later re-analysis of that directory counts foreign rebinds and
+# reads foreign flush states, and the leaked processes stack up run after run on
+# the TV. -F already retries by itself if the daemon's log goes away, which is
+# all the loop ever bought.
+nohup tail -n 0 -F /tmp/ds5_txd.log >"$OUT/ledger.log" 2>&1 </dev/null &
 LEDGER_PID=$!
 
 i=0
@@ -327,9 +379,43 @@ while [ "$i" -lt "$BLOCKS" ]; do
     # Liveness BEFORE the row: the daemon stops binning gaps within 150 ms of the
     # audio stopping, so a block the rig did not outlive pools as full exposure
     # with almost no events — and lands in whichever arm was running.
+    #
+    # kill -0 alone cannot answer WHY it is gone. A background child that exited
+    # normally fails the signal exactly like one that crashed, because the shell
+    # has reaped both — so a rig that merely ran off the end of its budget looks
+    # identical to a dead instrument, and treating that as a dead instrument
+    # throws away every completed block plus, via the campaign gate, the night.
+    # The rig's own log is the discriminator (the same one ds5_dscp_ab.sh greps):
+    # it announces STOPPING — or a lowercase "stopping" from its Aurora check —
+    # before it gives up for cause, and it prints DONE on the way out of its send
+    # loop. DONE is printed on BOTH paths, so it means "the loop ended", not "the
+    # loop ended well": STOPPING has to be tested first and wins where both are
+    # present. Only that one says the run is broken; a DONE with no STOPPING is a
+    # rig that simply reached its --seconds, which costs the block that was under
+    # way and leaves every earlier block exactly as valid as it was.
+    #
+    # That reading only holds because every abnormal exit of the rig announces
+    # itself: the guards, the readiness refusal and the encode failure all print
+    # STOPPING before they leave the loop. An exit that leaves DONE alone behind
+    # would be filed here as a healthy short run, which is why a silent break in
+    # ds5_synth_audio.c is a bug in THIS discriminator too.
     if ! kill -0 "$RIG_PID" 2>/dev/null; then
-        say "rig died during block $i — block NOT recorded"
-        cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+        gap_rotate
+        # -iF, not a BRE alternation: this also has to run under busybox grep.
+        if grep -qiF stopping "$OUT/synth.log" 2>/dev/null; then
+            say "rig STOPPED FOR CAUSE during block $i — block NOT recorded"
+            tail -3 "$OUT/synth.log"
+            RIG_DIED=1
+        elif grep -qF '[synth] DONE' "$OUT/synth.log" 2>/dev/null; then
+            say "rig reached the end of its ${TOTAL}s budget during block $i — block NOT recorded"
+            BUDGET_OUT=1
+        else
+            # No DONE, no STOPPING: it did not finish its loop and it did not say
+            # why — killed from outside, or gone with the process. Broken run.
+            say "rig vanished during block $i with no DONE line — block NOT recorded"
+            tail -3 "$OUT/synth.log"
+            RIG_DIED=1
+        fi
         break
     fi
     FG=$(sed -n 's/.*"appId":"\([^"]*\)".*/\1/p' /var/luna/preferences/last_foreground_app_id.json 2>/dev/null)
@@ -339,10 +425,9 @@ while [ "$i" -lt "$BLOCKS" ]; do
     # The daemon's per-gap log is a CAPPED RING: at 256 KiB it drops the OLDEST
     # entries and leaves one TRUNCATED marker behind. Copying it once at the end
     # therefore loses whole early blocks while their exposure still counts — which
-    # silently halves the measured rate. Snapshot after every block instead and
+    # silently halves the measured rate. Rotate it after every block instead and
     # let the report dedupe; overlap is cheap, a lost block is not.
-    cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
-    : > /tmp/ds5_gaps.log
+    gap_rotate
 done
 
 rm -f $LEVER_FILES   # ALL lever files: an even block count ends ON, knobs armed
@@ -350,8 +435,38 @@ load_stop            # the background conditions end with the run, BG flags or n
 cores_unpin
 cpu_stop
 kill "$LEDGER_PID" 2>/dev/null
+# The rig is now budgeted deliberately PAST the last block, so waiting for it to
+# end by itself would idle here for the whole headroom. TERM makes it fall out of
+# its send loop and print the DONE line the operator is told to read first, so
+# the delivery accounting survives the shortcut; the wait only reaps it.
+kill "$RIG_PID" 2>/dev/null
 wait "$RIG_PID" 2>/dev/null
-cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
-sort -u -k2,2 "$OUT/gaps.raw" > "$OUT/gaps.log" 2>/dev/null
+gap_rotate
+# Dedupe on the WHOLE line, never on the stamp alone: with a key, `sort -u`
+# compares only that key, and the daemon stamps EVERY link of one NOCP event with
+# the same wall-clock ms — a radio-global blackout that ends both pads of a
+# two-pad session writes two records with an identical stamp and a different h=,
+# of which the keyed dedupe silently kept one. That halved exactly the event
+# class this programme is here to count. Making the stamp artificially unique
+# would falsify it instead; whole-line dedupe cannot drop a real record, because
+# two gaps of the same length on the same handle in the same millisecond cannot
+# both exist (a record only enters at >=20 ms, so consecutive gaps are that far
+# apart), while the overlap the rotate deliberately produces is byte-identical
+# and collapses as intended.
+sort -u "$OUT/gaps.raw" > "$OUT/gaps.log" 2>/dev/null
 say "done -> $OUT"
 tail -1 "$OUT/synth.log"
+# A run that lost blocks is not a run, and the exit status has to say so:
+# ds5_campaign.sh gates the whole campaign on the positive control, and a
+# control that died half way through must not read as a control that passed.
+if [ "$RIG_DIED" = "1" ]; then
+    say "INCOMPLETE: the rig died mid-run — only $((i - 1)) of $BLOCKS blocks are recorded"
+    exit 1
+fi
+# Running out of budget inside the last block is NOT that failure: the instrument
+# worked for every block it reported, and those blocks are a valid interleaved
+# run. Exiting 1 here would abort the campaign over a stopwatch, so say what is
+# missing — nobody may quote $BLOCKS when fewer were measured — and pass.
+if [ "$BUDGET_OUT" = "1" ]; then
+    say "SHORT: the rig's budget ended inside block $i — $((i - 1)) of $BLOCKS blocks recorded, all of them good"
+fi

@@ -114,7 +114,28 @@ lever_witness(){
     esac
 }
 
+# Both instrument pids are declared before the trap is installed: restore_all()
+# runs under `set -u`, and an INT arriving before the ledger tail or the clock
+# probe was started would otherwise abort the trap on an unbound variable
+# instead of restoring the machine.
+LEDGER_PID=""
+PROBE_PID=""
 restore_all(){
+    # The instruments end with the run on EVERY path, INT included. A tail -F
+    # left behind keeps appending future daemon lines to a finished run's
+    # ledger.log, so a later re-analysis of that directory reads foreign
+    # rebinds and foreign flush states. The clock probe left behind sits on an
+    # open monitor socket: it only ends by itself while the channel keeps
+    # talking, which is precisely what a finished session stops doing.
+    [ -n "$LEDGER_PID" ] && kill "$LEDGER_PID" 2>/dev/null
+    # The probe answers SIGTERM by leaving its loop and printing the two-clock
+    # summary -- the whole point of running it. That write is behind one recv
+    # timeout (200 ms), so give it a moment before the shell exits and the run
+    # directory is called finished; without the pause probe.log ends mid-run.
+    if [ -n "$PROBE_PID" ]; then
+        kill "$PROBE_PID" 2>/dev/null
+        sleep 1
+    fi
     if [ "$LEVER" = "boost" ]; then
         unboost_stop
         boost_on                               # leave the user in the state they play in
@@ -129,6 +150,30 @@ trap 'restore_all; exit 130' INT TERM
 
 echo 1 > /tmp/ds5_gaplog
 : > /tmp/ds5_gaps.log
+# The rotate below leaves its last snapshot lying in /tmp on purpose, so a clean
+# start has to remove that as deliberately as it empties the live log: a previous
+# run's leftovers merged into this run's gaps.raw would date events into blocks
+# that never saw them.
+GAPSNAP=/tmp/ds5_gaps.snap
+rm -f "$GAPSNAP"
+
+# The per-block snapshot RENAMES the daemon's log, it never copies-then-truncates
+# it: gaplog_flush() runs once per capture wakeup, so it can append between the
+# copy and the ': >', and the truncate then throws those entries away having
+# never reached gaps.raw. rename() is atomic, and the daemon holds NO descriptor
+# across flushes (it opens /tmp/ds5_gaps.log O_CREAT|O_APPEND, writes and closes
+# inside one call), so its next flush creates the path anew and nothing has to
+# tell it to reopen. Records from a flush already inside its own open/write/close
+# at the instant of the rename land in the renamed file and are collected by the
+# NEXT rotate, which appends the leftover snapshot before replacing it; the
+# duplicate lines that costs are free, because the merge dedupes whole lines.
+gap_rotate(){
+    [ -f "$GAPSNAP" ] && cat "$GAPSNAP" >> "$OUT/gaps.raw" 2>/dev/null
+    if mv -f /tmp/ds5_gaps.log "$GAPSNAP" 2>/dev/null; then
+        cat "$GAPSNAP" >> "$OUT/gaps.raw" 2>/dev/null
+    fi                       # no live log = nothing rotated; the snapshot stands
+    return 0
+}
 printf 'lever=%s blocks=%s block_s=%s\nstarted=%s\n' \
     "$LEVER" "$BLOCKS" "$BLOCK" "$(date '+%F %T')" > "$OUT/conditions.txt"
 
@@ -167,7 +212,8 @@ say "audio flowing -> $BLOCKS x ${BLOCK}s into $OUT (lever=$LEVER)"
 if [ -x /tmp/ds5_clock_probe ]; then
     /tmp/ds5_clock_probe --seconds $(( BLOCKS * (BLOCK + GUARD_S) + 120 )) \
         > "$OUT/probe.log" 2>&1 &
-    say "clock probe running alongside"
+    PROBE_PID=$!
+    say "clock probe running alongside (pid $PROBE_PID)"
 fi
 
 if [ "$LEVER" = "boost" ]; then
@@ -184,8 +230,15 @@ fi
 [ -e /proc/lg/pm/mp_enable ] && echo 0 > /proc/lg/pm/mp_enable
 for c in 1 2 3; do echo 1 > "/sys/devices/system/cpu/cpu$c/online" 2>/dev/null; done
 
-nohup sh -c 'while :; do tail -n 0 -F /tmp/ds5_txd.log; done' >"$OUT/ledger.log" 2>&1 &
-LEDGER=$!
+# tail runs DIRECTLY, never wrapped in a restart loop. Killing the wrapper kills
+# only the wrapper: the inner tail is reparented to init with its fd on THIS
+# run's ledger.log still open, and it then appends every future daemon line to a
+# finished run — a later re-analysis of that directory counts foreign rebinds and
+# reads foreign flush states, and the leaked processes stack up run after run on
+# the TV. -F already retries by itself if the daemon's log goes away, which is
+# all the loop ever bought.
+nohup tail -n 0 -F /tmp/ds5_txd.log >"$OUT/ledger.log" 2>&1 </dev/null &
+LEDGER_PID=$!
 
 i=0
 while [ "$i" -lt "$BLOCKS" ]; do
@@ -208,7 +261,7 @@ while [ "$i" -lt "$BLOCKS" ]; do
     RR1=$(lever_witness)
     if [ -z "$(client_pid)" ]; then
         say "client exited during block $i — block NOT recorded"
-        cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+        gap_rotate
         break
     fi
     # The witness gets the last word: with the keeper running, a boosted thread
@@ -221,7 +274,7 @@ while [ "$i" -lt "$BLOCKS" ]; do
         RR1=$(lever_witness)
         if [ "${RR1:-0}" -gt 0 ]; then
             say "OFF arm still boosted after re-clear (rt-threads $RR1) — block $i NOT recorded, aborting"
-            cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
+            gap_rotate
             break
         fi
     fi
@@ -229,13 +282,21 @@ while [ "$i" -lt "$BLOCKS" ]; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ARM" "$S" "$E" \
         "$(( (RX1 - RX0) * 8 / D / 1000 ))" "aurora" "$(( CSUM * 10 / CN ))" \
         "$(busy_pct "$C0" "$C1")" "$RR0/$RR1" >> "$OUT/windows.tsv"
-    cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
-    : > /tmp/ds5_gaps.log
+    gap_rotate
     say "block $i recorded (${D}s, rt-threads $RR0->$RR1)"
 done
 
-cat /tmp/ds5_gaps.log >> "$OUT/gaps.raw" 2>/dev/null
-sort -u -k2,2 "$OUT/gaps.raw" > "$OUT/gaps.log" 2>/dev/null
-kill "$LEDGER" 2>/dev/null
-restore_all
+gap_rotate
+# Dedupe on the WHOLE line, never on the stamp alone: with a key, `sort -u`
+# compares only that key, and the daemon stamps EVERY link of one NOCP event with
+# the same wall-clock ms — a radio-global blackout that ends both pads of a
+# two-pad session writes two records with an identical stamp and a different h=,
+# of which the keyed dedupe silently kept one. That halved exactly the event
+# class this programme is here to count. Making the stamp artificially unique
+# would falsify it instead; whole-line dedupe cannot drop a real record, because
+# two gaps of the same length on the same handle in the same millisecond cannot
+# both exist, while the overlap the rotate deliberately produces is byte-identical
+# and collapses as intended.
+sort -u "$OUT/gaps.raw" > "$OUT/gaps.log" 2>/dev/null
+restore_all              # reaps the ledger tail and the clock probe as well
 say "done -> $OUT"

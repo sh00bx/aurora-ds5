@@ -99,7 +99,8 @@ static uint32_t g_burst_on_ms = 0, g_burst_off_ms = 0;
  * instantaneous injection peaks at 56.3/s where audio alone needs 46.9. Those
  * extra packets consume the same credits the audio stream is waiting on, which
  * is the last untested way gameplay differs from this rig. Reports per second in
- * /tmp/ds5_cotraffic; 0 disables. */
+ * /tmp/ds5_cotraffic; 0 disables, and a rate the current tick rate cannot carry
+ * is refused rather than approximated. */
 static uint32_t g_cotraffic_hz = 0;
 /* Report-format lever (/tmp/ds5_r36 exists = unbatched). The floor arithmetic
  * is: underrun <=> gap > B + one report period in flight. Batched 0x39 puts
@@ -111,11 +112,43 @@ static uint32_t g_cotraffic_hz = 0;
  * re-runs that question on the modern instrument. The daemon needs no change:
  * it reads exactly one byte of every report, the id. */
 static int g_r36 = 0;
+/* Ticks per second the audio loop actually runs at right now. Both inputs are
+ * declared levers that move under a running rig — the 0x36 format puts one frame
+ * per report and so halves the period, the feed lever changes the period itself
+ * — which is why anything that has to agree with the tick rate reads it here
+ * instead of assuming the default. */
+/* One-sided rate servo, moved out of the loop so tick_rate_hz can read it. */
+static int g_adj_us = 0;
+
+static double tick_rate_hz(void) {
+    /* g_adj_us belongs in here: the serviced period is g_period_us + g_adj_us, and at
+     * the servo's clamp that is enough to make the top co-traffic rung deliverable
+     * in one arm and not in the other -- exactly the arm asymmetry this function
+     * exists to rule out. */
+    long p = (long) g_period_us + (long) g_adj_us;
+    if (p < 1) {
+        p = 1;
+    }
+    return 1e6 * (g_r36 ? 2.0 : 1.0) / (double) p;
+}
+
 static void cotraffic_poll(void) {
     FILE *f = fopen("/tmp/ds5_cotraffic", "r");
     uint32_t v = 0;
     if (f) { if (fscanf(f, "%u", &v) != 1) v = 0; fclose(f); }
-    if (v > 60) v = 0;                     /* refuse to flood the link outright */
+    /* Out-of-range used to fold silently into 0, i.e. an arm that declared a
+     * co-traffic load and carried none. Name the refused value once per value:
+     * this poll runs five times a second. */
+    if (v > 60) {
+        static uint32_t refused;
+        if (v != refused) {
+            refused = v;
+            printf("[synth] REFUSING co-traffic %u reports/s: this rig caps what it will put "
+                   "on the link at 60/s — co-traffic stays off\n", v);
+            fflush(stdout);
+        }
+        v = 0;
+    }
     if (v != g_cotraffic_hz) {
         printf("[synth] co-traffic %u -> %u reports/s (0x32 alongside the audio)\n",
                g_cotraffic_hz, v);
@@ -502,6 +535,7 @@ struct st {
     int      valid, q, fifo, maxq, fifo_cap;
     uint32_t inj, drop, seq;
     int      g50, g80, flush, nocp_age, drop_age, drop_ovf;
+    int      v2;                 /* the gap-ledger half was actually published */
 };
 static int st_read(const char *path, struct st *o) {
     uint8_t r[36];
@@ -516,9 +550,37 @@ static int st_read(const char *path, struct st *o) {
     o->drop = (uint32_t) r[16] | ((uint32_t) r[17] << 8) | ((uint32_t) r[18] << 16) | ((uint32_t) r[19] << 24);
     o->seq  = (uint32_t) r[20] | ((uint32_t) r[21] << 8) | ((uint32_t) r[22] << 16) | ((uint32_t) r[23] << 24);
     if (n >= 36 && r[4] >= 2) {
+        o->v2 = 1;
         o->g50 = r[24] | (r[25] << 8); o->g80 = r[26] | (r[27] << 8);
         o->flush = r[28] | (r[29] << 8); o->nocp_age = r[30] | (r[31] << 8);
         o->drop_age = r[32] | (r[33] << 8); o->drop_ovf = r[34] | (r[35] << 8);
+    } else {
+        /* A v1 record is 24 bytes and byte-identical up to there, so it parses
+         * fine — it just has no gap-ledger half. Zero that half here instead of
+         * leaving whatever the caller's stack held: the age-drop guard compares
+         * this sample's drop_age against the previous one, and two pieces of
+         * garbage that happen to differ fire "age-drops began" and condemn a
+         * perfectly good block, while DONE prints random drop_age/drop_ovf that
+         * the analysis then reads as data. Version skew is the real case here —
+         * a rig staged by ds5_stage.sh against the older ds5_txd still inside
+         * the installed IPK. */
+        o->v2 = 0;
+        o->g50 = o->g80 = o->flush = o->nocp_age = 0;
+        o->drop_age = o->drop_ovf = 0;
+        /* Zeroing alone traded garbage for silence: a run against a v1 daemon
+         * then prints drop_age=0 and g50=0 and reads as a clean block, when in
+         * truth that half of the record was never published. Say it once, in the
+         * stream the harness keeps — the zeros mean ABSENT, not clean. */
+        static int said_v1;
+        if (!said_v1) {
+            said_v1 = 1;
+            printf("[synth] NOTICE: no gap ledger in this record (%d bytes, version %u) — "
+                   "either the daemon still publishes v1 or the read was short: g50/g80/"
+                   "flush/nocp_age/drop_age/drop_ovf read 0 because they are ABSENT, not "
+                   "clean, and the age-drop guard has nothing to watch\n",
+                   (int) n, (unsigned) r[4]);
+            fflush(stdout);
+        }
     }
     return 0;
 }
@@ -713,6 +775,16 @@ int main(int argc, char **argv) {
          * timing byte are untouched — which is the point. */
         B.r32[4 + 4] = 0x00;   /* VolumeHeadphones */
         B.r32[4 + 5] = 0x80;   /* VolumeSpeaker    */
+        /* The 0x36 carries its own copy of the very same SetState inline, and
+         * that copy is never rebuilt afterwards (build_0x36 renews only Opus,
+         * seq, counter and CRC). Patching just the standalone 0x32 would leave
+         * the r36 arm audible: with /tmp/ds5_r36 armed the pad hears ~94
+         * unmuted inline SetStates a second against one muted 0x32 a second, so
+         * the volume would flap instead of sitting at the floor — and the two
+         * arms would then differ in SetState CONTENT, not only in report
+         * format, which is the one thing a format lever must not do. */
+        B.r36[OFF36_SETSTATE + 4] = 0x00;
+        B.r36[OFF36_SETSTATE + 5] = 0x80;
     }
     struct tone tone;
     tone_init(&tone, freq, amp_dbfs);
@@ -739,10 +811,12 @@ int main(int argc, char **argv) {
     /* ---- steady state ----------------------------------------------------- */
     uint64_t t0 = now_us(), next = t0, last_ss = t0, last_st = t0, last_stats = t0, last_app_check = t0;
     uint64_t sent = 0, send_err = 0, late = 0, late_us_max = 0;
-    int      adj_us = 0;                    /* one-sided rate servo, see below   */
+    /* the one-sided rate servo lives at file scope (g_adj_us): tick_rate_hz has
+     * to see it, or it reports a tick rate the loop is not actually serving */
     int      warned_drop = 0, warned_invalid = 0, warned_late = 0;
     uint32_t last_inj = s.inj;
     uint64_t last_sent_mark = 0;
+    uint64_t co_next = 0;                   /* co-traffic deadline, see below    */
     struct st s0 = s;
     printf("# ds5_synth_audio b=%d freq=%.0f amp=%.0fdBFS fifo=%d complexity=%d servo=%d "
            "mute=%d pad=%s\n",
@@ -753,28 +827,70 @@ int main(int argc, char **argv) {
         if (seconds > 0 && (int64_t) (now_us() - t0) >= (int64_t) seconds * 1000000) break;
 
         int r36_now = g_r36;   /* one read per tick: format and period must agree */
+        int sent_now = 0;      /* did an audio report actually go out this tick? */
         if (!burst_silent(now_us() - t0)) {
             if (r36_now) {
-                if (build_0x36(&B, enc, &tone) < 0) break;
+                if (build_0x36(&B, enc, &tone) < 0) {
+                    /* Say it: leaving the loop in silence prints only DONE, and
+                     * DONE without a reason reads downstream as "the run simply
+                     * reached its budget" -- a broken instrument filed as a
+                     * healthy short run. */
+                    printf("[synth] STOPPING: could not build a 0x36 report (opus encode failed) at %.1fs\n",
+                           (double) (now_us() - t0) / 1e6);
+                    fflush(stdout);
+                    break;
+                }
                 memcpy(dg + ACL_TAG_LEN, B.r36, R36_LEN);
                 if (sendto(fd, dg, ACL_TAG_LEN + R36_LEN, MSG_DONTWAIT,
                            (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
-                else sent++;
+                else { sent++; sent_now = 1; }
             } else {
-                if (build_0x39(&B, enc, &tone) < 0) break;
+                if (build_0x39(&B, enc, &tone) < 0) {
+                    /* Say it: leaving the loop in silence prints only DONE, and
+                     * DONE without a reason reads downstream as "the run simply
+                     * reached its budget" -- a broken instrument filed as a
+                     * healthy short run. */
+                    printf("[synth] STOPPING: could not build a 0x39 report (opus encode failed) at %.1fs\n",
+                           (double) (now_us() - t0) / 1e6);
+                    fflush(stdout);
+                    break;
+                }
                 memcpy(dg + ACL_TAG_LEN, B.r39, R39_LEN);
                 if (sendto(fd, dg, ACL_TAG_LEN + R39_LEN, MSG_DONTWAIT,
                            (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
-                else sent++;
+                else { sent++; sent_now = 1; }
             }
         }
 
-        /* Interleaved on the audio clock: one extra 0x32 every Nth report gives
-         * the requested rate without a second timer to drift against. */
-        if (g_cotraffic_hz) {
-            uint32_t every = (uint32_t) (1000000ull / g_period_us) / g_cotraffic_hz;
-            if (every < 1) every = 1;
-            if (sent && sent % every == 0) {
+        /* Co-traffic rides the audio ticks but is paced on the clock, not on a
+         * report counter. The declared rate is what the arm is supposed to
+         * carry, so it has to come out the same in both report formats and at
+         * every period — two arms carrying different co-traffic invalidate every
+         * ratio measured between them, which is the one thing this lever must
+         * not do.
+         *
+         * "One extra 0x32 every Nth report" cannot deliver that. N is an
+         * integer, so plain flooring already makes most of the accepted rates
+         * come out different in the 0x36 arm than in the 0x39 one, and from
+         * ~47/s upwards the divisor bottoms out at 1: the 0x39 arm then sends
+         * one per tick while the 0x36 arm, ticking twice as often, sends exactly
+         * twice as much — the doubling this lever was fixed for, surviving in
+         * the range the burst numbers point at. A deadline has neither problem:
+         * it is exact at any tick rate and does not care which lever moved
+         * underneath it.
+         *
+         * `sent_now` still gates the whole thing — during a burst-off phase the
+         * client is silent on this link, co-traffic included, and `sent` freezing
+         * on a failing sendto must not make this fire on every tick. The
+         * deadline is re-based rather than repaid when it falls more than one
+         * interval behind, so a silent phase is not followed by a catch-up
+         * burst. */
+        if (g_cotraffic_hz && sent_now) {
+            uint64_t co_now = now_us();
+            uint64_t co_iv  = 1000000ull / g_cotraffic_hz;
+            if (!co_next || co_now > co_next + co_iv) co_next = co_now;
+            if (co_now >= co_next) {
+                co_next += co_iv;
                 uint8_t cdg[ACL_TAG_LEN + R32_LEN];
                 memcpy(cdg, dg, ACL_TAG_LEN);       /* same tag, same bdaddr */
                 build_0x32(&B);                     /* fresh seq + CRC each time */
@@ -805,6 +921,22 @@ int main(int argc, char **argv) {
             burst_poll();
             cotraffic_poll();
             r36_poll();
+            /* One 0x32 rides one audio tick, so the tick rate is the hard ceiling
+             * on the co-traffic this rig can put on the link: 46.7/s batched at
+             * the default period, half that if the feed lever doubles the period.
+             * Above it the pacer would quietly deliver the tick rate instead of
+             * the declared rate, which is exactly the mislabelled load the
+             * deadline pacing exists to prevent — so refuse the run rather than
+             * measure one. Checked here, after the polls, because both the period
+             * and the format can move mid-run. */
+            if (g_cotraffic_hz && (double) g_cotraffic_hz > tick_rate_hz()) {
+                printf("[synth] STOPPING: %u co-traffic reports/s asked for, but the audio loop "
+                       "ticks %.1f times a second (%s at %u us) and one 0x32 rides one tick — "
+                       "this arm cannot carry the load it declares\n",
+                       g_cotraffic_hz, tick_rate_hz(), g_r36 ? "0x36" : "0x39", g_period_us);
+                fflush(stdout);
+                g_stop = 1;
+            }
             struct st cur;
             /* An unreadable or invalidated record is the link going away, and it
              * has to be handled OUTSIDE the success branch: the old code nested
@@ -832,8 +964,8 @@ int main(int argc, char **argv) {
                  * measured. --no-servo feeds strictly open-loop for comparison. */
                 if (servo) {
                     int backlog = cur.fifo + (cur.q > 3 ? cur.q - 3 : 0);
-                    if (backlog > 0) { adj_us += 8 * backlog; if (adj_us > 280) adj_us = 280; }
-                    else             { adj_us -= 6; if (adj_us < 0) adj_us = 0; }
+                    if (backlog > 0) { g_adj_us += 8 * backlog; if (g_adj_us > 280) g_adj_us = 280; }
+                    else             { g_adj_us -= 6; if (g_adj_us < 0) g_adj_us = 0; }
                 }
                 /* Age-drops mean the transport did not carry what was offered, and
                  * every gap measured from here on describes starvation rather than
@@ -921,16 +1053,16 @@ int main(int argc, char **argv) {
                    secs, r36_now ? " r36" : "",
                    (unsigned long long) sent, (double) sent / (secs > 0 ? secs : 1),
                    (unsigned long long) send_err, (unsigned long long) late,
-                   (unsigned long long) (late_us_max / 1000), adj_us,
+                   (unsigned long long) (late_us_max / 1000), g_adj_us,
                    s.q, s.fifo, s.inj - s0.inj, s.drop - s0.drop,
                    s.drop_age, s.drop_ovf, s.g50, s.g80);
             fflush(stdout);
         }
 
         /* One frame per 0x36 -> half the period AND half the per-report servo
-         * adjustment: adj_us is sized against the two-frame cadence, and paying
+         * adjustment: g_adj_us is sized against the two-frame cadence, and paying
          * it in full twice as often would double the servo's authority. */
-        next += ((uint64_t) g_period_us + (uint64_t) adj_us) / (r36_now ? 2 : 1);
+        next += ((uint64_t) g_period_us + (uint64_t) g_adj_us) / (r36_now ? 2 : 1);
         now = now_us();
         if (next <= now) {
             /* Falling behind is a measurement fault, not a hiccup to smooth over:
@@ -961,11 +1093,14 @@ int main(int argc, char **argv) {
     struct st fin;
     if (st_read(st_path, &fin) != 0) fin = s;
     printf("[synth] DONE %.1fs sent=%llu rate=%.2f/s send_err=%llu late=%llu late_max=%llums "
-           "inj=%u drop=%u drop_age=%d drop_ovf=%d\n",
+           "inj=%u drop=%u drop_age=%d drop_ovf=%d%s\n",
            secs, (unsigned long long) sent, (double) sent / (secs > 0 ? secs : 1),
            (unsigned long long) send_err, (unsigned long long) late,
            (unsigned long long) (late_us_max / 1000),
-           fin.inj - s0.inj, fin.drop - s0.drop, fin.drop_age, fin.drop_ovf);
+           fin.inj - s0.inj, fin.drop - s0.drop, fin.drop_age, fin.drop_ovf,
+           /* The one line the report reads. A v1 daemon's zeros must not pass
+            * through it looking like a measured zero. */
+           fin.v2 ? "" : " [v1 record: no gap ledger]");
     /* Hand the daemon back its boot default so the next real session starts from
      * the state the supervisor set, not from ours. */
     uint8_t ctrl[4] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_FIFO_DEPTH, 0xFF };

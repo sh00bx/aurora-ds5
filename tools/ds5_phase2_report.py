@@ -216,6 +216,51 @@ class Run:
         return out, tot
 
 
+def ledger_drops(ledger):
+    """Drops accumulated over a ledger slice, as a sum of increments.
+
+    The ledger counters are NOT monotone: they accumulate and are periodically
+    zeroed (observed live 2026-08-16: gaps=2838/1635/126 followed by 0/0/1 on
+    the next line). A last-minus-first delta therefore reports whatever
+    happened since the most recent reset and silently discards everything
+    before it — for a 7-minute block that can be most of the block.
+
+    Summing increments and treating any decrease as a reset boundary (the new
+    value is then itself the increment) survives both the periodic zeroing and
+    a mid-slice rebind. It over-reports only if a counter both resets AND is
+    already non-zero on its first line after the reset, which costs at most one
+    interval's worth.
+
+    The FIRST line is a baseline, never an increment: it carries whatever the
+    daemon accumulated since it started or since its last reset, which for a
+    daemon that has been up for hours is a four-digit head start. Counting it
+    credits every slice with the whole prehistory of the link and makes the
+    drop columns — the witness for "the shed is working as designed" — read
+    orders of magnitude too high in BOTH arms.
+    """
+    tot = [0, 0, 0]
+    prev = None
+    seen = 0
+    for entry in ledger:
+        links = entry[3]
+        if not links:
+            continue
+        seen += 1
+        cur = [sum(int(l[k]) for l in links) for k in ("dage", "dovf", "doth")]
+        if prev is None:
+            prev = cur
+            continue
+        for i in range(3):
+            tot[i] += cur[i] - prev[i] if cur[i] >= prev[i] else cur[i]
+        prev = cur
+    if seen < 2:
+        # One ledger line (or none) is a baseline with nothing to subtract it
+        # from -- not a measured zero. Saying 0/0/0 there would put "no drops"
+        # on the page for a slice that never spanned an interval.
+        return None
+    return tuple(tot)
+
+
 def fmt_ratio(ing, base):
     if base is None or base <= 0.001:
         return f"{ing:8.1f}/s      (no baseline)"
@@ -397,8 +442,11 @@ def report_run(r, verbose):
 
 def compare(runs, active_min):
     """2.6: the ladder table. Rungs are only comparable as rates."""
-    print(f"\n{'=' * 78}\n LADDER COMPARISON (2.6)\n{'=' * 78}")
-    hdr = f"{'run':<12}{'maxq':>5}{'active_s':>10}{'30-49':>9}{'50-79':>9}{'≥80':>8}{'drops a/o/x':>16}{'0x31 ×':>9}"
+    hdr = f"{'run':<12}{'maxq':>5}{'active_s':>10}{'30-49':>9}{'50-79':>9}{'≥80':>8}{'drops a/o/x':>16}{'0x31 ×':>11}"
+    # Banner width follows the header: the 0x31 column has grown once already,
+    # and a banner that no longer spans its own table reads as a broken table.
+    rule = '=' * max(78, len(hdr))
+    print(f"\n{rule}\n LADDER COMPARISON (2.6)\n{rule}")
     print(hdr)
     print("-" * len(hdr))
     for r in runs:
@@ -407,25 +455,45 @@ def compare(runs, active_min):
             print(f"{r.name:<12}{str(r.maxq or '?'):>5}{0:>10}   (no active seconds)")
             continue
         per_min = 60.0 / len(act)
-        c = Counter(band(g["gap"]) for g in r.active_gaps())
-        drops = "-"
-        if r.ledger:
-            f, l = r.ledger[0], r.ledger[-1]
-            def sl(e):
-                return e[3][0] if e[3] else None
-            if sl(f) and sl(l):
-                drops = "/".join(str(int(sl(l)[k]) - int(sl(f)[k])) for k in ("dage", "dovf", "doth"))
+        ag = r.active_gaps()
+        c = Counter(band(g["gap"]) for g in ag)
+        # Increments with a baseline, not last-minus-first: the drop counters
+        # are zeroed periodically, so a rung that happened to span a reset used
+        # to print a partial — or negative — delta.
+        _d = ledger_drops(r.ledger) if r.ledger else None
+        drops = "/".join(str(x) for x in _d) if _d else "no interval"
         base = r.baseline_rates()
-        ing, _ = r.in_gap_rates(r.active_gaps())
-        ratio = (ing["tx31"] / base["tx31"]) if (ing and base["tx31"] > 0.001) else 0
+        # Silent gaps carry exactly one 0x31 heartbeat by construction, and
+        # dividing it by their (long) duration is the "0x31 is elevated during
+        # starvation" artefact report_run excludes for the same reason. A rung
+        # with many menu pauses would otherwise show a fake X4 signal.
+        aud, _ = Run.split_audio(ag)
+        ing, _ = r.in_gap_rates(aud)
+        # There are two ways this rung can have NO ratio, and neither of them is
+        # "0x31 was not elevated": every active gap may have been silent, leaving
+        # nothing audio-starved to measure inside, or the run may carry no 0x31
+        # baseline to divide by. Printing 0.00 for either states the strongest
+        # claim this column can make — X4 is dead — on the strength of a rung
+        # that measured nothing, so print what actually happened instead.
+        if ing is None:
+            ratio = "no aud gap"
+        elif base["tx31"] <= 0.001:
+            ratio = "no 0x31 tx"
+        else:
+            ratio = f"{ing['tx31'] / base['tx31']:.2f}"
         print(f"{r.name:<12}{str(r.maxq or '-'):>5}{len(act):>10}"
               f"{c['30-49'] * per_min:>9.1f}{c['50-79'] * per_min:>9.1f}{c['≥80'] * per_min:>8.1f}"
-              f"{drops:>16}{ratio:>9.2f}")
+              f"{drops:>16}{ratio:>11}")
     print("\n Adopt the smallest maxq whose clean-phase ≥80 rate matches the 12 rung.")
     print(" Age-drops appearing at the low rungs are INTENDED (that is the shed), not")
     print(" the abort criterion — that is why drop_total was split in Phase 1.")
     print(" Alternate rungs across days: coex weather drifts, and a rung measured only")
     print(" on one evening is a measurement of that evening.")
+    print(" 0x31 × is over AUDIO-starved gaps only and drops are summed increments,")
+    print(" so the columns mean the same thing here as in the per-run section above.")
+    print(" 'no aud gap' / 'no 0x31 tx' in that column are NOT a ×0 verdict: the first")
+    print(" rung had no audio-starved gap to look inside, the second no baseline to")
+    print(" divide by. Neither rung measured X4 at all.")
 
 
 def main():

@@ -57,8 +57,30 @@ block(){   # $1 = label, $2 = on|off
         say "DISARM L1                     -> block $1"
     fi
     sleep "$GUARD"
+    # A block that did not run is not a block that is missing — it is a block
+    # that ds5_ab_pool will replace with whatever stale directory of that name
+    # still lies in /tmp/phase2, i.e. yesterday's OFF arm pooled against today's
+    # ON arm. That is exactly the cross-phase comparison the interleaving exists
+    # to prevent, so a failed slice ends the A/B instead of thinning it.
     "$RUN" "$1" "$BLOCK"
+    blk_st=$?                  # NOT `$?` inside an `if ! ...` — that is the negation's
+    if [ "$blk_st" -ne 0 ]; then
+        say "ABORTING: $RUN failed on block $1 (exit $blk_st)"
+        say "  A partial A/B is worse than none — do NOT pool what was produced."
+        cleanup
+        exit 1
+    fi
 }
+
+# Refuse before the session is spent, not on block three: ds5_phase2_run.sh
+# refuses an existing label directory by design, and finding that out 14 minutes
+# in costs the whole evening's play.
+for lbl in ab_off1 ab_on1 ab_off2 ab_on2; do
+    if [ -e "/tmp/phase2/$lbl" ]; then
+        echo "REFUSING: /tmp/phase2/$lbl exists — move or remove the previous A/B first"
+        exit 1
+    fi
+done
 
 say "interleaved L1 A/B: 4 x ${BLOCK}s (+${GUARD}s guards), flush=${FLUSH_MS}ms"
 block ab_off1 off

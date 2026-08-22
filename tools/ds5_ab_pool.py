@@ -21,8 +21,9 @@ says so out loud.
 
   ds5_ab_pool.py --off ab_off1 ab_off2 --on ab_on1 ab_on2
 
-Reuses Run from ds5_phase2_report.py, so the activity filter and the
-audio-starved/silent split are the same code, not a second implementation.
+Reuses Run and ledger_drops from ds5_phase2_report.py, so the activity filter,
+the audio-starved/silent split and the reset-tolerant drop arithmetic are the
+same code, not a second implementation.
 """
 
 import argparse
@@ -32,7 +33,8 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ds5_phase2_report import Run, BANDS, band, ACTIVE_MIN_AUDIO_RATE  # noqa: E402
+from ds5_phase2_report import (Run, BANDS, band, ledger_drops,  # noqa: E402
+                               ACTIVE_MIN_AUDIO_RATE)
 
 
 # A gap counts as real starvation only if something was queued BEHIND the packet
@@ -65,6 +67,7 @@ class Arm:
         self.out_max = 0
         self.gmax = 0
         self.drops = [0, 0, 0]      # age / ovf / other, summed over block deltas
+        self.drops_unknown = 0      # blocks whose ledger never spanned an interval
         self.flush_states = set()
         for r in self.blocks:
             act = r.active
@@ -79,41 +82,19 @@ class Arm:
                 self.out_max = max(self.out_max, max(g["out"] for g in gaps))
             if starved:
                 self.gmax = max(self.gmax, max(g["gap"] for g in starved))
-            d = block_drops(r)
-            self.drops = [a + b for a, b in zip(self.drops, d)]
+            d = ledger_drops(r.ledger)
+            if d is None:
+                # A block whose ledger never spanned an interval has no drop
+                # figure to contribute; folding a 0/0/0 in would read as "this
+                # block was clean" instead of "this block did not say".
+                self.drops_unknown += 1
+            else:
+                self.drops = [a + b for a, b in zip(self.drops, d)]
             self.flush_states |= block_flush_states(r.path)
 
     def rate(self, b):
         """Events per minute of ACTIVE play."""
         return 60.0 * self.audio[b] / self.active_s if self.active_s else 0.0
-
-
-def block_drops(r):
-    """Drops accumulated over the block, as a sum of increments.
-
-    The ledger counters are NOT monotone: they accumulate and are periodically
-    zeroed (observed live 2026-08-16: gaps=2838/1635/126 followed by 0/0/1 on
-    the next line). A last-minus-first delta therefore reports whatever
-    happened since the most recent reset and silently discards everything
-    before it — for a 7-minute block that can be most of the block.
-
-    Summing increments and treating any decrease as a reset boundary (the new
-    value is then itself the increment) survives both the periodic zeroing and
-    a mid-block rebind. It over-reports only if a counter both resets AND is
-    already non-zero on its first line after the reset, which costs at most one
-    interval's worth.
-    """
-    tot = [0, 0, 0]
-    prev = [0, 0, 0]
-    for entry in r.ledger:
-        links = entry[3]
-        if not links:
-            continue
-        cur = [sum(int(l[k]) for l in links) for k in ("dage", "dovf", "doth")]
-        for i in range(3):
-            tot[i] += cur[i] - prev[i] if cur[i] >= prev[i] else cur[i]
-        prev = cur
-    return tuple(tot)
 
 
 def block_flush_states(path):
@@ -164,7 +145,8 @@ def main():
         print(f"   {arm.name:<4} {len(arm.blocks)} block(s): "
               f"{', '.join(r.name for r in arm.blocks)}")
         print(f"        active play {arm.active_s / 60.0:.1f} min · "
-              f"drops age/ovf/oth {'/'.join(str(x) for x in arm.drops)} · "
+              f"drops age/ovf/oth {'/'.join(str(x) for x in arm.drops)}"
+              f"{f' (+{arm.drops_unknown} block(s) without an interval)' if arm.drops_unknown else ''} · "
               f"max starved gap {arm.gmax} ms · max outstanding {arm.out_max}")
         print(f"        ledger flush= {', '.join(sorted(arm.flush_states)) or '(none seen)'}")
 
