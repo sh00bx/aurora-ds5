@@ -36,6 +36,16 @@ static int aud_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATIO
             .sampleRate = opusConfig->sampleRate,
             .samplesPerFrame = SAMPLES_PER_FRAME,
     };
+    if (opusConfig->channelCount == 6) {
+        /*
+         * The 5.1 channel order is the open question (which codec, whose remap); log what the
+         * host actually sent so the decision rests on a reading instead of an assumption.
+         */
+        commons_log_info("Session", "Opus 5.1 from host: streams=%d coupled=%d mapping=[%u,%u,%u,%u,%u,%u]",
+                         opusConfig->streams, opusConfig->coupledStreams,
+                         opusConfig->mapping[0], opusConfig->mapping[1], opusConfig->mapping[2],
+                         opusConfig->mapping[3], opusConfig->mapping[4], opusConfig->mapping[5]);
+    }
     if (session->audio_cap.codecs & SS4S_AUDIO_OPUS && SS4S_GetAudioPreferredCodecs(&info) & SS4S_AUDIO_OPUS) {
         codec = SS4S_AUDIO_OPUS;
         decoder = NULL;
@@ -169,5 +179,18 @@ AUDIO_RENDERER_CALLBACKS ss4s_aud_callbacks = {
         .init = aud_init,
         .cleanup = aud_cleanup,
         .decodeAndPlaySample = aud_feed,
+#if TARGET_WEBOS
+        /*
+         * No direct submit on webOS. Direct submit runs aud_feed on Limelight's RTP receive
+         * thread, and everything expensive this platform can put in that path sits right
+         * here: the sink may transcode surround Opus (NDL re-encodes anything whose channel
+         * order it cannot pass through), and on the PCM path we decode six channels ourselves
+         * a few lines up. Either one stalls the socket reads long enough to lose audio
+         * packets at 4K bitrates -- upstream aurora-tv #59/#66, where 5.1 went silent for
+         * seconds at a time. Limelight's own decoder thread absorbs the cost instead.
+         */
+        .capabilities = 0,
+#else
         .capabilities = CAPABILITY_DIRECT_SUBMIT,
+#endif
 };
