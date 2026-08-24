@@ -30,9 +30,13 @@ static inline int ds5_acl_is_injectable(unsigned char report_id)
     /* 0x39 = batched audio/haptics (two Opus frames + two coil blocks per report,
      * 547 B) — same L2CAP HID-interrupt channel, lengths recomputed per send, and
      * the TV controller's ACL_Data_Packet_Length is 1021 (measured 2026-08-02) so
-     * the 552-byte PDU still goes out unfragmented. */
+     * the 552-byte PDU still goes out unfragmented.
+     * 0x11/0x14/0x17 = the DS4's Layout-B family (effects / SBC audio); the
+     * bundled daemon's injectable() carries the same list, so client and daemon
+     * stay lockstep inside one IPK. */
     return report_id == 0x31 || report_id == 0x32 ||
-           report_id == 0x36 || report_id == 0x39;
+           report_id == 0x36 || report_id == 0x39 ||
+           report_id == 0x11 || report_id == 0x14 || report_id == 0x17;
 }
 
 /* ds5_acl_tx_send() return codes. */
