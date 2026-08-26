@@ -243,9 +243,9 @@ lv_obj_t *pref_desc_label(lv_obj_t *parent, const char *title, bool focusable) {
     lv_obj_set_style_outline_pad(label, LV_DPX(3), LV_STATE_FOCUS_KEY);
     lv_obj_set_style_radius(label, LV_DPX(4), 0);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    if (title) {
-        lv_label_set_text(label, title);
-    }
+    /* Always set a text: lv_label_create's default is a literal "Text", which
+     * would otherwise leak into the tooltip of the control above it. */
+    lv_label_set_text(label, title ? title : "");
     return label;
 }
 

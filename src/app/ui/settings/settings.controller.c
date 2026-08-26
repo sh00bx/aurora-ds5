@@ -24,30 +24,16 @@
 typedef struct {
     const char *icon;
     const char *name;
-    /** One line for the footer while the category itself is focused. */
-    const char *desc;
     const lv_fragment_class_t *cls;
 } settings_entry_t;
 
 static const settings_entry_t entries[] = {
-        {MAT_SYMBOL_SETTINGS,        translatable("Streaming"),
-                translatable("Resolution, FPS, bitrate, stats overlay and profiles"),
-                &settings_pane_basic_cls},
-        {MAT_SYMBOL_DESKTOP_WINDOWS, translatable("Host"),
-                translatable("What the host computer does when a stream starts"),
-                &settings_pane_host_cls},
-        {MAT_SYMBOL_SPORTS_ESPORTS,  translatable("Input"),
-                translatable("Mouse, keyboard and controller options"),
-                &settings_pane_input_cls},
-        {MAT_SYMBOL_VOLUME_UP,       translatable("Audio"),
-                translatable("Audio backend and sound channels"),
-                &settings_pane_audio_cls},
-        {MAT_SYMBOL_VIDEO_SETTINGS,  translatable("Video"),
-                translatable("Codec, HDR and decoder options"),
-                &settings_pane_video_cls},
-        {MAT_SYMBOL_TUNE,            translatable("Experimental"),
-                translatable("Pacing, recovery and other experiments"),
-                &settings_pane_experimental_cls},
+        {MAT_SYMBOL_SETTINGS,        translatable("Streaming"),    &settings_pane_basic_cls},
+        {MAT_SYMBOL_DESKTOP_WINDOWS, translatable("Host"),         &settings_pane_host_cls},
+        {MAT_SYMBOL_SPORTS_ESPORTS,  translatable("Input"),        &settings_pane_input_cls},
+        {MAT_SYMBOL_VOLUME_UP,       translatable("Audio"),        &settings_pane_audio_cls},
+        {MAT_SYMBOL_VIDEO_SETTINGS,  translatable("Video"),        &settings_pane_video_cls},
+        {MAT_SYMBOL_TUNE,            translatable("Experimental"), &settings_pane_experimental_cls},
 };
 static const int entries_len = sizeof(entries) / sizeof(settings_entry_t);
 
@@ -1381,7 +1367,7 @@ static bool embed_collect_desc(lv_obj_t *focused, char *buf, size_t buflen) {
  * backdrop's last child, so it wins the z-order against everything the sheet
  * draws). Any movement hides it and restarts the clock — the professional
  * hover-tooltip pattern, driven by focus instead of a pointer. */
-#define EMBED_TOOLTIP_DELAY_MS 600
+#define EMBED_TOOLTIP_DELAY_MS 1000
 #define EMBED_TOOLTIP_MAX_W LV_DPX(430)
 
 static void embed_tooltip_hide(settings_controller_t *c) {
@@ -1403,26 +1389,19 @@ static void embed_tooltip_schedule(settings_controller_t *c) {
     lv_timer_resume(c->embed_tooltip_timer);
 }
 
-static void embed_tooltip_place(settings_controller_t *c, lv_obj_t *anchor, bool rail) {
+static void embed_tooltip_place(settings_controller_t *c, lv_obj_t *anchor) {
     lv_area_t aa, ra;
     lv_obj_get_coords(anchor, &aa);
     lv_obj_get_coords(c->embed_root, &ra);
     lv_coord_t tw = lv_obj_get_width(c->embed_tooltip);
     lv_coord_t th = lv_obj_get_height(c->embed_tooltip);
     lv_coord_t margin = LV_DPX(10);
-    lv_coord_t x, y;
-    if (rail) {
-        /* Beside the category slab, pointing into the sheet. */
-        x = aa.x2 + margin;
-        y = aa.y1 + (lv_area_get_height(&aa) - th) / 2;
-    } else {
-        /* Under the focused row — over whatever comes next, never over the row
-         * itself — and above it when the bottom of the sheet is too close. */
-        x = aa.x1;
-        y = aa.y2 + margin;
-        if (y + th > ra.y2 - margin) {
-            y = aa.y1 - margin - th;
-        }
+    /* Under the focused row — over whatever comes next, never over the row
+     * itself — and above it when the bottom of the sheet is too close. */
+    lv_coord_t x = aa.x1;
+    lv_coord_t y = aa.y2 + margin;
+    if (y + th > ra.y2 - margin) {
+        y = aa.y1 - margin - th;
     }
     if (x + tw > ra.x2 - margin) { x = ra.x2 - margin - tw; }
     if (x < ra.x1 + margin) { x = ra.x1 + margin; }
@@ -1442,26 +1421,19 @@ static void embed_tooltip_show(settings_controller_t *c) {
         lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    lv_obj_t *anchor = NULL;
-    const char *text = NULL;
-    char buf[1024];
-    bool rail = !c->embed_in_detail;
-    if (c->embed_in_detail && c->detail_group) {
-        anchor = lv_group_get_focused(c->detail_group);
-        if (embed_collect_desc(anchor, buf, sizeof(buf))) {
-            text = buf;
-        }
-    } else if (c->nav_group) {
-        anchor = lv_group_get_focused(c->nav_group);
-        if (anchor != c->close_btn && c->embed_active >= 0 && c->embed_active < entries_len &&
-            entries[c->embed_active].desc != NULL) {
-            text = locstr(entries[c->embed_active].desc);
-        }
-    }
-    if (anchor == NULL || text == NULL || text[0] == '\0') {
+    /* Only for the settings column. The category slabs on the rail name
+     * themselves well enough; a bubble there was just noise. */
+    if (!c->embed_in_detail || c->detail_group == NULL) {
         lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    lv_obj_t *anchor = lv_group_get_focused(c->detail_group);
+    char buf[1024];
+    if (anchor == NULL || !embed_collect_desc(anchor, buf, sizeof(buf))) {
+        lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    const char *text = buf;
     /* Wrap width from the text itself, so one short sentence gets a snug bubble
      * instead of a full-width plate with air on the right. */
     const lv_font_t *font = lv_obj_get_style_text_font(c->embed_hint, 0);
@@ -1471,7 +1443,7 @@ static void embed_tooltip_show(settings_controller_t *c) {
     lv_label_set_text(c->embed_hint, text);
     lv_obj_clear_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
     lv_obj_update_layout(c->embed_tooltip);
-    embed_tooltip_place(c, anchor, rail);
+    embed_tooltip_place(c, anchor);
 }
 
 static void embed_tooltip_show_cb(lv_timer_t *timer) {

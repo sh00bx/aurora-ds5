@@ -36,6 +36,7 @@ void update_conflict_hint(app_t *app, lv_obj_t *hint) {
             .audio_module = app_configuration->audio_backend,
     };
     if (module_is_auto(preferences.video_module) || module_is_auto(preferences.audio_module)) {
+        lv_label_set_text(hint, "");
         lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
         return;
     }
@@ -50,6 +51,7 @@ void update_conflict_hint(app_t *app, lv_obj_t *hint) {
         lv_label_set_text_fmt(hint, locstr("%s is conflicting with %s"), adec->name, vdec->name);
         lv_obj_clear_flag(hint, LV_OBJ_FLAG_HIDDEN);
     } else {
+        lv_label_set_text(hint, "");
         lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN);
     }
 }
