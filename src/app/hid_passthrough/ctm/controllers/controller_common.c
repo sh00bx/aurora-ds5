@@ -78,6 +78,14 @@ struct hidraw_devinfo { unsigned int bustype; short vendor; short product; };
 typedef struct {
     int fd;
     char path[64];
+    /* A pad exposes several nodes and we grab them all, but the motion-sensor
+     * one reports gravity forever -- as an activity source it would report "the
+     * user is playing" for as long as the pad exists, and a knock against the
+     * table would count as input. Only nodes with at least one key bit (buttons,
+     * touchpad) speak for the user. The others are still drained, just not
+     * believed. Mirrors the daemon's own node-selection rule; the two have to
+     * agree, and they ship in the same IPK. */
+    int is_activity_source;
     int32_t ref[CTM_IDLE_ABS_SLOTS];
     int32_t thr[CTM_IDLE_ABS_SLOTS];   /* -1 = axis absent on this node */
 } evdev_grab_t;
@@ -225,6 +233,7 @@ struct ctm_controller {
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
     int evdev_grab_count;
     uint64_t evdev_tick_us;        /* last evdev_activity_tick() sweep */
+    uint64_t evdev_claim_us;       /* last idle-claim sent to the daemon */
 
     FILE *log;
 
@@ -774,11 +783,25 @@ static int open_device_any_tier(ctm_controller_t *c, ctmb_device_caps_t *caps,
 #define CTM_IDLE_ABS_DIVISOR 32
 #define CTM_IDLE_ABS_MIN      4
 #define CTM_IDLE_TICK_MS    250
+/* Claim heartbeat. Repeated rather than sent once, so a daemon restarted in the
+ * middle of a session relearns that this pad is reported for -- otherwise it
+ * would fall back to vetoing every expiry for the rest of the session. Cheap:
+ * one 9-byte datagram, and it is timer-neutral by design on the daemon side. */
+#define CTM_IDLE_CLAIM_MS 30000
 
 /* Record each axis' resting value and deadband, so the first real push is a
  * delta from where the stick actually sits rather than from zero. */
 static void seed_evdev_deadbands(evdev_grab_t *g)
 {
+    unsigned long keybits[(KEY_MAX / (8 * sizeof(long))) + 1];
+    memset(keybits, 0, sizeof(keybits));
+    g->is_activity_source = 0;
+    if (ioctl(g->fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0) {
+        for (size_t i = 0; i < sizeof(keybits) / sizeof(keybits[0]); ++i) {
+            if (keybits[i]) { g->is_activity_source = 1; break; }
+        }
+    }
+
     unsigned long absbits[(ABS_MAX / (8 * sizeof(long))) + 1];
     memset(absbits, 0, sizeof(absbits));
     int have = ioctl(g->fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0;
@@ -821,6 +844,15 @@ static void evdev_activity_tick(ctm_controller_t *c)
     }
     c->evdev_tick_us = now;
 
+    /* Claim first, and before any activity has necessarily happened: the daemon
+     * has to know our silence is meaningful even in a session where nobody ever
+     * touches the pad. */
+    if (!c->evdev_claim_us ||
+        now - c->evdev_claim_us >= (uint64_t) CTM_IDLE_CLAIM_MS * 1000ull) {
+        ds5_acl_tx_claim_pad_idle(c->acl_tx);
+        c->evdev_claim_us = now;
+    }
+
     int active = 0;
     for (int i = 0; i < c->evdev_grab_count; ++i) {
         evdev_grab_t *g = &c->evdev_grabs[i];
@@ -829,6 +861,7 @@ static void evdev_activity_tick(ctm_controller_t *c)
             struct input_event ev[16];
             ssize_t r = read(g->fd, ev, sizeof(ev));   /* fd is O_NONBLOCK */
             if (r <= 0) break;
+            if (!g->is_activity_source) continue;   /* drained, not believed */
             size_t cnt = (size_t) r / sizeof(ev[0]);
             for (size_t k = 0; k < cnt; ++k) {
                 if (ev[k].type == EV_KEY) {
@@ -912,6 +945,8 @@ static void release_evdev_grabs(ctm_controller_t *c)
         }
     }
     c->evdev_grab_count = 0;
+    /* Next session re-claims from scratch (it may face a different daemon). */
+    c->evdev_claim_us = 0;
 }
 
 

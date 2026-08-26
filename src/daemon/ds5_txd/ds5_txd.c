@@ -259,6 +259,18 @@ static const unsigned GAPGE_EDGE[GAPGE_N] =
  * disconnect a pad that is being played with. The app rate-limits these; one per
  * second is enough to hold a five-minute timer open. */
 #define ACL_CTRL_PAD_ACTIVITY  0x04
+/* Code 0x05 = the app declaring it will report activity for this pad,
+ * [A5][5C][05][addr 6 LSB-first]. Separate from 0x04 because it must NOT touch
+ * the idle timer: the app repeats it on a slow heartbeat (so a daemon that
+ * restarted mid-session relearns it), and a heartbeat that reset the timer
+ * would keep every pad alive forever.
+ *
+ * It exists because activity alone cannot carry this signal: a session where
+ * the user never touches the pad produces no activity report at all, so the
+ * daemon would conclude the app does not speak this protocol and let the grab
+ * probe veto every expiry -- exactly the case where the timeout is most
+ * wanted. The claim says "my silence means silence". */
+#define ACL_CTRL_PAD_IDLE_CLAIM 0x05
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -2316,6 +2328,13 @@ struct idle_pad {
     uint64_t last_act;              /* now_ms() of the last input that counted */
     uint64_t last_try;
     int      tries;
+    /* The app has reported activity for this pad at least once, i.e. it speaks
+     * ACL_CTRL_PAD_ACTIVITY. That turns its SILENCE into evidence: we no longer
+     * have to treat a grabbed node as "cannot tell" and can time the pad out
+     * during a session like anywhere else. Without this the grab probe vetoes
+     * every expiry while a session holds the pad, and the timeout simply does
+     * not exist for the one case where a pad is most likely to be left on. */
+    int      saw_app_ping;
 };
 static struct idle_pad g_idle_pads[IDLE_DC_MAX_PADS];
 /* Guards g_idle_pads. The watchdog thread owns the table, but the main loop
@@ -2394,14 +2413,35 @@ static struct idle_pad *idle_pad_for(const char *mac, int create){
     return NULL;
 }
 
+static void idle_fmt_mac(char out[18], const uint8_t a[6]){
+    snprintf(out,18,"%02x:%02x:%02x:%02x:%02x:%02x",a[5],a[4],a[3],a[2],a[1],a[0]);
+}
+
+/* Mark a pad as one the app reports for. Idempotent and timer-neutral. */
+static void idle_note_claim_addr(const uint8_t a[6]){
+    char mac[18]; idle_fmt_mac(mac,a);
+    pthread_mutex_lock(&g_idle_mtx);
+    struct idle_pad *P=idle_pad_for(mac,0);
+    if(P && !P->saw_app_ping){
+        P->saw_app_ping=1;
+        fprintf(stderr,"[txd] idle: %s claimed by the app -> its silence counts\n",mac);
+    }
+    pthread_mutex_unlock(&g_idle_mtx);
+}
+
 /* The app's activity report for a pad it holds an EVIOCGRAB on. Address arrives
  * LSB-first, as in every other tagged datagram on this socket. */
 static void idle_note_activity_addr(const uint8_t a[6]){
-    char mac[18];
-    snprintf(mac,sizeof mac,"%02x:%02x:%02x:%02x:%02x:%02x",a[5],a[4],a[3],a[2],a[1],a[0]);
+    char mac[18]; idle_fmt_mac(mac,a);
     pthread_mutex_lock(&g_idle_mtx);
     struct idle_pad *P=idle_pad_for(mac,0);
-    if(P){ P->last_act=now_ms(); P->tries=0; }
+    if(P){
+        P->last_act=now_ms(); P->tries=0;
+        if(!P->saw_app_ping){
+            P->saw_app_ping=1;
+            fprintf(stderr,"[txd] idle: %s reports activity -> its silence counts\n",mac);
+        }
+    }
     pthread_mutex_unlock(&g_idle_mtx);
 }
 
@@ -2636,8 +2676,9 @@ static void *idle_thread(void *arg){
              * app in the same IPK, or one that never got the report out), the
              * pad simply stays connected. */
             int grabbed=0;
-            for(int k=0;k<P->nn && !grabbed;k++)
-                if(P->n[k].fd>=0 && idle_node_grabbed(&P->n[k])) grabbed=1;
+            if(!P->saw_app_ping)
+                for(int k=0;k<P->nn && !grabbed;k++)
+                    if(P->n[k].fd>=0 && idle_node_grabbed(&P->n[k])) grabbed=1;
             if(grabbed){
                 /* Re-arm rather than retry in a tight loop: the next check is one
                  * full idle period away, and it costs one probe per pad per period. */
@@ -4375,6 +4416,8 @@ int main(int argc,char**argv){
                         }
                     } else if(rep[2]==ACL_CTRL_PAD_ACTIVITY && n>=9){
                         idle_note_activity_addr(&rep[3]);
+                    } else if(rep[2]==ACL_CTRL_PAD_IDLE_CLAIM && n>=9){
+                        idle_note_claim_addr(&rep[3]);
                     } else if(rep[2]==ACL_CTRL_IDLE_LB_CLEAR){
                         /* Drop the app selection; the boot default paints again.
                          * The client sends this for "connected, unused" instead of

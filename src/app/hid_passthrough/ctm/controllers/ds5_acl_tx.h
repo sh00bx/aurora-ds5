@@ -69,6 +69,16 @@ void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth);
  * rate-limited by the caller; the daemon also probes the grab before acting, so
  * a missed report costs nothing worse than a pad that stays on. */
 void ds5_acl_tx_note_pad_activity(ds5_acl_tx_t *t);
+
+/* Declare that we report this pad's activity, so the daemon may treat our
+ * SILENCE as real silence and time the pad out during a session.
+ *
+ * Needed separately from the activity report because a session in which the
+ * user never touches the pad emits no activity at all -- the daemon would then
+ * assume we do not speak this protocol and refuse to ever time that pad out,
+ * which is precisely the session that should time out. Timer-neutral, so the
+ * caller can repeat it on a heartbeat to survive a daemon restart. */
+void ds5_acl_tx_claim_pad_idle(ds5_acl_tx_t *t);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 
 /* Daemon inject-queue telemetry (v9 "<tmpl>.st" record): the session loop
