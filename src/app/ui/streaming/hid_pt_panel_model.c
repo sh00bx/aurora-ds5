@@ -134,10 +134,10 @@ const char *hid_pt_model_plug_error(void)
 
 bool hid_pt_model_battery_text(const hid_pt_model_t *model, char *buf, size_t len)
 {
-    if (!buf || len == 0 || !hid_pt_model_selected_is_ds5(model)) {
+    if (!buf || len == 0 || !hid_pt_model_selected_has_battery(model)) {
         return false;
     }
-    /* Non-NULL: hid_pt_model_selected_is_ds5() just resolved the same key. */
+    /* Non-NULL: hid_pt_model_selected_has_battery() just resolved the same key. */
     const logical_device_t *item = selected_item(model);
     int session_index = session_index_for_key(item->key);
     ctm_controller_status_t st;
@@ -165,6 +165,16 @@ bool hid_pt_model_selected_is_ds5(const hid_pt_model_t *model)
 {
     const char *kind = selected_kind(model);
     return kind && strcmp(kind, "ds5") == 0;
+}
+
+/* Deliberately wider than is_ds5(): both Sony pads report a battery through
+ * their controller's on_input_report hook, while the haptics row above stays
+ * DS5-only because the DS4 has motors, not coils. Gating the battery line on
+ * is_ds5() is what left a bridged DS4 with no charge anywhere in the UI. */
+bool hid_pt_model_selected_has_battery(const hid_pt_model_t *model)
+{
+    const char *kind = selected_kind(model);
+    return kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0);
 }
 
 bool hid_pt_model_selected_has_audio(const hid_pt_model_t *model)

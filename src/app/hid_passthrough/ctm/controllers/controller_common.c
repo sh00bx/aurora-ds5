@@ -381,9 +381,12 @@ void ctm_controller_update_battery(ctm_controller_t *c, uint8_t level, uint8_t s
     __atomic_store_n(&c->battery_updated_us, ctm_now_us(), __ATOMIC_RELEASE);
 }
 
-void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw)
+/* Three identical samples before a raw status byte is believed (filters the
+ * single-report flicker both pads show around the level boundaries). Shared by
+ * the DS5 and DS4 decoders below, which disagree about what the byte MEANS but
+ * agree about how noisy it is. */
+static bool battery_raw_settled(ctm_controller_t *c, uint8_t raw)
 {
-    if (!c) return;
     if (raw == c->battery_raw_last) {
         if (c->battery_raw_stable < 255) {
             c->battery_raw_stable++;
@@ -392,8 +395,13 @@ void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw)
         c->battery_raw_last = raw;
         c->battery_raw_stable = 1;
     }
-    /* Require three identical samples before updating (filters touchpad noise). */
-    if (c->battery_raw_stable < 3) {
+    return c->battery_raw_stable >= 3;
+}
+
+void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw)
+{
+    if (!c) return;
+    if (!battery_raw_settled(c, raw)) {
         return;
     }
 
@@ -412,6 +420,45 @@ void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw)
         }
     } else if (charge != 0) {
         return;
+    }
+    ctm_controller_update_battery(c, level, status);
+}
+
+/* DS4 status byte -> the same 0..10 level + status the panel renders.
+ *
+ * The DS4 does NOT use the DS5's nibble layout, which is why feeding this byte
+ * to ctm_controller_update_battery_raw() above silently reports nothing: there
+ * the high nibble is a charging STATE (0 discharging, 1 charging, 2 full) and
+ * anything else is rejected, while on the DS4 the high nibble carries flags --
+ * cable 0x10, mic 0x20, headphones 0x40 -- so a pad with a headset plugged in
+ * lands on "state 4" and is thrown away.
+ *
+ * Semantics per Linux hid-sony dualshock4_parse_report: low nibble is the
+ * level, bit 4 is the cable state, and the two scales differ by one step --
+ * on battery the pad counts 0..9, on the cable 0..10, and a value above 10
+ * while cabled means charge complete.
+ */
+void ctm_controller_update_battery_ds4(ctm_controller_t *c, uint8_t raw)
+{
+    if (!c) return;
+    if (!battery_raw_settled(c, raw)) {
+        return;
+    }
+
+    uint8_t level = raw & 0x0Fu;
+    bool cabled = (raw & 0x10u) != 0;
+    uint8_t status;
+    if (!cabled) {
+        status = 0;                       /* discharging */
+        level = (uint8_t) (level + 1u);   /* 0..9 -> 1..10 */
+    } else if (level > 10u) {
+        status = 2;                       /* charge complete */
+        level = 10u;
+    } else {
+        status = 1;                       /* charging */
+    }
+    if (level > 10u) {
+        level = 10u;
     }
     ctm_controller_update_battery(c, level, status);
 }

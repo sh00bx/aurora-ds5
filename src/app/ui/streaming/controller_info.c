@@ -26,12 +26,20 @@
 
 #endif
 
-/* Sony DualSense family — the only pads whose battery byte lives at the fixed
- * offset decoded below. DS4/Xbox/puck use different layouts, so they go through
- * SDL's coarse power level instead. */
+/* Sony pads whose battery byte this file knows how to decode. The DualSense
+ * family and the DualShock 4 disagree about both the offset and the meaning of
+ * the byte (see ds_parse_battery), so each has its own branch; Xbox/puck have
+ * no layout here and go through SDL's coarse power level instead.
+ *
+ * The DS4 pair matters because a bridged DS4 has no SDL power level at all: SDL
+ * only learns a PS4 pad's charge in its "enhanced mode", which our pump never
+ * lets it reach because the pump owns the pad's output reports. Without this
+ * the row read "-" forever. */
 #define DS_VENDOR_SONY  0x054c
 #define DS_PRODUCT_DS5  0x0ce6
 #define DS_PRODUCT_EDGE 0x0df2
+#define DS_PRODUCT_DS4_V1 0x05c4
+#define DS_PRODUCT_DS4_V2 0x09cc
 
 /* Battery moves slowly, so the hidraw reads are cached; a pad that connects
  * mid-stream shows up as soon as the cache turns over. */
@@ -41,8 +49,9 @@
  * started again by the next call. */
 #define DS_WORKER_IDLE_EXIT_MS 20000
 
-static bool is_dualsense(uint16_t vendor, uint16_t product) {
-    return vendor == DS_VENDOR_SONY && (product == DS_PRODUCT_DS5 || product == DS_PRODUCT_EDGE);
+static bool has_known_battery_layout(uint16_t vendor, uint16_t product) {
+    return vendor == DS_VENDOR_SONY && (product == DS_PRODUCT_DS5 || product == DS_PRODUCT_EDGE ||
+                                        product == DS_PRODUCT_DS4_V1 || product == DS_PRODUCT_DS4_V2);
 }
 
 /* MACs reach us in two spellings — sysfs writes "aa:bb:…", SDL writes "aa-bb-…" —
@@ -118,13 +127,56 @@ static int ds_wanted_count = 0;
 static uint32_t ds_wanted_ms = 0;                        /* SDL_GetTicks of the last collect() */
 static bool ds_worker_live = false;
 
-/* The DualSense `status` byte sits at offset 52 of the common input-report struct.
- * The report is prefixed by the report id plus, over Bluetooth, a 1-byte seq tag:
- * +2 for BT report 0x31, +1 for USB report 0x01. Returns capacity 0..100 (and the
- * charging nibble), or -1 when the report id/length is not a full DualSense report.
- * The minimal 10-byte BT report (also id 0x01) carries no battery and is rejected
- * by the length check. */
+/* Battery out of one input report, for both pad families. The report id says
+ * which one is talking, so nothing has to be threaded in from the caller:
+ *
+ *   0x31  DualSense over BT   status at 2 + 52, DS5 nibble layout
+ *   0x01  DualSense over USB  status at 1 + 52, DS5 nibble layout
+ *   0x11  DualShock 4 over BT status at 3 + 29, DS4 flag layout
+ *
+ * The two layouts genuinely differ: on the DS5 the high nibble is a charging
+ * STATE (0 discharging, 1 charging, 2 full), on the DS4 it is a set of flags
+ * (cable 0x10, mic 0x20, headphones 0x40) and the level scale is one step
+ * shorter on battery than on the cable. Decoding a DS4 byte with the DS5 rules
+ * yields "state 4" for any pad with a headset plugged in, i.e. no reading.
+ *
+ * Known limit, deliberate: a DS4 over USB also uses report id 0x01 with the
+ * same 64-byte length as the DualSense, so id alone cannot separate them and
+ * 0x01 stays DualSense here. Every pad this app bridges is a BT pad
+ * (ctm_controller_ds4_ops.matches requires bus == "BT"), so the ambiguous case
+ * does not arise; if a USB DS4 ever needs this, the kind has to come from the
+ * caller's sysfs vid/pid rather than from the report.
+ *
+ * Returns capacity 0..100 (and the DS5-style charging code: 1 charging, 2 full),
+ * or -1 when the report id/length is not a full report. The minimal 10-byte BT
+ * report (also id 0x01) carries no battery and is rejected by the length check. */
 static int ds_parse_battery(const uint8_t *buf, int len, int *charging) {
+    if (buf[0] == 0x11) {
+        const int ds4_off = 3 + 29;
+        if (len <= ds4_off) {
+            return -1;
+        }
+        uint8_t status = buf[ds4_off];
+        int raw = status & 0x0f;
+        bool cabled = (status & 0x10) != 0;
+        int chg;
+        if (!cabled) {
+            chg = 0;
+            raw += 1; /* on battery the pad counts 0..9 */
+        } else if (raw > 10) {
+            chg = 0x02; /* charge complete */
+            raw = 10;
+        } else {
+            chg = 0x01;
+        }
+        if (charging) {
+            *charging = chg;
+        }
+        if (raw > 10) {
+            raw = 10;
+        }
+        return raw * 10;
+    }
     int off;
     if (buf[0] == 0x31) {
         off = 2 + 52; /* Bluetooth full report */
@@ -309,7 +361,7 @@ static void ds_scan(ds_snapshot_t *out, const char extra_paths[][DS_PATH_MAX], i
                 continue;
             }
             uint16_t product = (uint16_t) strtoul(value, NULL, 16);
-            if (!is_dualsense(vendor, product)) {
+            if (!has_known_battery_layout(vendor, product)) {
                 continue;
             }
 
@@ -407,7 +459,7 @@ typedef struct {
     char mac[20];
     uint16_t vendor, product;
     bool connected;
-    bool dualsense;
+    bool battery_readable;
 } bridged_device_t;
 
 /* Everything the passthrough manager is holding. `plugged` is only the user's
@@ -436,7 +488,7 @@ static int collect_bridged_devices(app_t *app, bridged_device_t *out, int max) {
         item->vendor = device.vendor_id;
         item->product = device.product_id;
         item->connected = device.connected;
-        item->dualsense = is_dualsense(device.vendor_id, device.product_id);
+        item->battery_readable = has_known_battery_layout(device.vendor_id, device.product_id);
     }
     return found;
 }
@@ -462,7 +514,7 @@ static void ds_request_and_snapshot(const bridged_device_t *bridged, int bridged
     pthread_mutex_lock(&ds_lock);
     ds_wanted_count = 0;
     for (int i = 0; i < bridged_count && ds_wanted_count < CONTROLLER_INFO_MAX; i++) {
-        if (bridged[i].dualsense && bridged[i].path[0]) {
+        if (bridged[i].battery_readable && bridged[i].path[0]) {
             /* The precision keeps gcc from assuming an unterminated source array;
              * collect_bridged_devices() always snprintf's this field. */
             snprintf(ds_wanted[ds_wanted_count++], DS_PATH_MAX, "%.*s", DS_PATH_MAX - 1,
@@ -607,7 +659,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
 
         listed_mac[found][0] = '\0';
         listed_id[found] = ((uint32_t) bridged[i].vendor << 16) | bridged[i].product;
-        if (bridged[i].dualsense) {
+        if (bridged[i].battery_readable) {
             const ds_node_t *node = ds_claim(&ds, bridged[i].path, NULL);
             if (node) {
                 power_set_exact(info, node->percent, node->charging);
@@ -660,7 +712,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
 
         bool exact = false;
 #if defined(TARGET_WEBOS)
-        if (is_dualsense(vendor, product)) {
+        if (has_known_battery_layout(vendor, product)) {
             const ds_node_t *node = ds_claim(&ds, NULL, mac);
             if (node) {
                 power_set_exact(info, node->percent, node->charging);

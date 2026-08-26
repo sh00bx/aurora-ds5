@@ -110,6 +110,9 @@ bool hid_pt_model_battery_text(const hid_pt_model_t *model, char *buf, size_t le
 /* ---- what the selection is --------------------------------------------- */
 
 bool hid_pt_model_selected_is_ds5(const hid_pt_model_t *model);
+
+/** True for any bridged pad that reports a battery (DS5 family and DS4). */
+bool hid_pt_model_selected_has_battery(const hid_pt_model_t *model);
 bool hid_pt_model_selected_is_flydigi(const hid_pt_model_t *model);
 /** Bridged right now, i.e. the state the device's rail and the footer report. */
 bool hid_pt_model_selected_is_plugged(const hid_pt_model_t *model);

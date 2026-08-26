@@ -180,6 +180,9 @@ bool ctm_controller_finished(ctm_controller_t *c);
 int  ctm_controller_write_feature(ctm_controller_t *c, const uint8_t *feature, size_t len);
 void ctm_controller_update_battery(ctm_controller_t *c, uint8_t level, uint8_t status);
 void ctm_controller_update_battery_raw(ctm_controller_t *c, uint8_t raw);
+
+/** DS4 flavour of the above: same 0..10 level, different byte layout. */
+void ctm_controller_update_battery_ds4(ctm_controller_t *c, uint8_t raw);
 void ctm_controller_destroy(ctm_controller_t *c);
 
 /* Register a sink for controller log lines (e.g. the app's on-screen console).

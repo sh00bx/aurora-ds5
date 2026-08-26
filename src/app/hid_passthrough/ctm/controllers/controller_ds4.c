@@ -15,6 +15,11 @@
 
 #include <string.h>
 
+/* Status byte inside the BT 0x11 input report: common block starts at 3, the
+ * byte sits at common offset 29. Battery level in the low nibble, cable state
+ * 0x10, mic 0x20, headphones 0x40. */
+#define DS4_BT_STATUS_OFFSET 32
+
 /* matches: claim the DualShock 4 (either PID) over BT. When: classification. */
 static bool ds4_matches(const ctm_controller_dev_t *dev)
 {
@@ -76,7 +81,17 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 
     if (data[0] == 0x12 || data[0] == 0x14 || data[0] == 0x17) {
         uint8_t route = ds4_route_for_mode(settings->audio_mode);
-        if (route != 0x01 && data[5] != route) {
+        /* 0x00 from the host is not a destination the user's mode overrides --
+         * it is the host disarming the audio plane at the end of a stream
+         * (Vibepollo ds4_audio.cpp STOP_REPORTS). The DS4 otherwise LOOPS the
+         * last effect forever once the 0x17 stream stops, with the app closed
+         * and a silence tail already written; only "no target" ends it.
+         * Forcing a route back onto those reports re-arms the plane and the
+         * loop survives. The host never sends 0x00 as a steady value, so this
+         * cannot silence a live stream -- but it does mean a NEW client needs a
+         * host from 2026-08-26 or later (an older one used 0x00 for
+         * auto-without-jack). */
+        if (route != 0x01 && data[5] != 0x00 && data[5] != route) {
             data[5] = route;
             patched = 1;
         }
@@ -106,6 +121,26 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     return 0;
 }
 
+/* on_input_report: read-only observer of what the pad sends us.
+ *
+ * The battery byte is the same one the host reads for the audio jack bit --
+ * common offset 29, i.e. data[32] in the BT 0x11 report (data[30] over USB;
+ * hid-sony calls it "byte 30, or 32 for BT"). Low nibble is the level, bit 4
+ * the cable state, bits 0x20/0x40 mic/headphones. Decoding lives in
+ * ctm_controller_update_battery_ds4(), which is deliberately NOT the DS5's
+ * _raw() variant: that one reads the high nibble as a charging state and
+ * discards anything above 2, so a DS4 with a headset plugged in (0x40) would
+ * report no battery at all -- which is exactly what happened before this hook
+ * existed, in both the panel and the stats overlay.
+ * When: every inbound report, from the pump. */
+static void ds4_on_input_report(ctm_controller_t *c, const uint8_t *data, size_t len)
+{
+    if (!c || !data || len < (size_t) (DS4_BT_STATUS_OFFSET + 1) || data[0] != 0x11) {
+        return;
+    }
+    ctm_controller_update_battery_ds4(c, data[DS4_BT_STATUS_OFFSET]);
+}
+
 /* Pump policy. The DS4 shares the DS5's BT premise — a connected pad streams
  * input continuously, and the jail hidraw node never signals the drop — so it
  * gets the same 2 s liveness watchdog. Identical consecutive 0x11 effect
@@ -131,4 +166,5 @@ const ctm_controller_ops_t ctm_controller_ds4_ops = {
     .on_plug_init = NULL,
     .patch_output = ds4_patch_output,
     .set_settings = NULL,   /* live values read via get_settings in patch_output */
+    .on_input_report = ds4_on_input_report,
 };

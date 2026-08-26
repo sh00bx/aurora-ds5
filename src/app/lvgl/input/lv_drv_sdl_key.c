@@ -15,6 +15,7 @@
 #include "util/bus.h"
 #include "lv_drv_sdl_key.h"
 #include "stream/session_events.h"
+#include "logging.h"
 
 #if TARGET_WEBOS
 
@@ -56,9 +57,15 @@ void lv_sdl_key_input_release_key(lv_indev_t *indev) {
     state->state = LV_INDEV_STATE_RELEASED;
 }
 
-/* A gap between two reads longer than this means the main loop stalled rather
- * than the user holding a key. Well above a normal frame, well below LVGL's
- * 400ms long_press_time, so a genuine hold is never mistaken for a stall. */
+/* A gap between two reads longer than this counts as a main-loop stall rather
+ * than time the user spent holding a key: LV_INDEV_DEF_READ_PERIOD is 1 ms, so
+ * this is a hundredfold overrun, well below LVGL's 400 ms long_press_time.
+ *
+ * Trade-off, stated because it is a real one: while the loop keeps stalling at
+ * this rate the long-press clock keeps being pushed back, so a deliberate hold
+ * takes longer to register. That is the cheaper failure -- a UI that answers
+ * late beats a UI that drops every other click, which is what suppressing the
+ * press outright did. */
 #define KEY_STALL_THRESHOLD_MS 100
 
 static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
@@ -67,36 +74,47 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     lv_drv_sdl_key_t *state = (lv_drv_sdl_key_t *) drv;
     SDL_Event e;
 
-    /* A key held across a main-loop stall must not turn into a repeat. LVGL derives
-     * long press purely from wall-clock time, so a stall longer than long_press_time
-     * makes a tap indistinguishable from a hold. This must run before the stalled
-     * read is processed: indev_keypad_proc() evaluates long press immediately after
-     * this callback returns, within the same lv_timer_handler pass.
+    /* A key held across a main-loop stall must not turn into a long press or a
+     * repeat. LVGL derives both purely from wall-clock time, so a stall longer
+     * than long_press_time makes a tap indistinguishable from a hold. This must
+     * run before the stalled read is processed: indev_keypad_proc() evaluates
+     * long press immediately after this callback returns, within the same
+     * lv_timer_handler pass.
      *
-     * Parking the press with lv_indev_wait_release() rather than merely discounting
-     * the stalled time is deliberate: the UI is frozen and unresponsive during the
-     * stall, so users keep holding, and any duration-based compensation eventually
-     * loses to a long enough hold. LVGL clears the flag and resets its press state
-     * on release, so the next deliberate press behaves normally. */
-    if (state->last_read_tick != 0 && state->state == LV_INDEV_STATE_PRESSED &&
-        input->key.indev != NULL && lv_tick_elaps(state->last_read_tick) >= KEY_STALL_THRESHOLD_MS) {
-        lv_indev_wait_release(input->key.indev);
-        /* Parking swallows the release as well: LVGL forces its last_state to
-         * RELEASED, so the release branch that would send LV_EVENT_RELEASED
-         * never runs. A widget that took the ENTER press already wears
-         * LV_STATE_PRESSED, which only RELEASED or PRESS_LOST ever clears, so
-         * it would sit there looking held down -- and a button matrix would go
-         * on drawing every key the cursor visits as pressed -- until the next
-         * full press and release. Take the state off by hand instead: sending
-         * LV_EVENT_RELEASED would fire the click the parking exists to
-         * suppress, and LV_EVENT_PRESS_LOST is pointer-shaped, lv_btnmatrix
-         * answers it by dropping btn_id_sel, which on a keypad is not the press
-         * target but the cursor -- the soft keyboard would lose its place. */
-        lv_group_t *group = input->key.indev->group;
-        lv_obj_t *pressed = group != NULL ? lv_group_get_focused(group) : NULL;
-        if (pressed != NULL) {
-            lv_obj_clear_state(pressed, LV_STATE_PRESSED);
+     * The stalled time is DISCOUNTED off the long-press clock; the press itself
+     * is left alone. Parking it with lv_indev_wait_release() was the original
+     * shape of this guard and it costs the click: LVGL ignores every PRESSED
+     * read while wait_until_release is set and then clears last_state on the
+     * first RELEASED one "to skip the processing of release"
+     * (lv_indev.c:398-405), so exactly one press disappears without a trace and
+     * the user presses again. With LV_INDEV_DEF_READ_PERIOD at 1 ms a 100 ms
+     * read gap is a hundredfold stall, and on a TV that is decoding 4K while the
+     * overlay redraws, gaps that size are routine -- so the guard was firing on
+     * ordinary presses, which is what "every second press does nothing" was.
+     *
+     * Moving the timestamps forward instead keeps press and click alive while
+     * the long-press clock counts only the time the UI was actually able to
+     * respond: release right after the stall gives the short click the user
+     * asked for, keeping the key down gives a long press 400 ms after the
+     * recovery. This also covers the case the parking was written for -- an SDL
+     * main thread blocked for seconds -- because the clock restarts there too,
+     * instead of the press being thrown away. */
+    uint32_t stalled = state->last_read_tick != 0 ? lv_tick_elaps(state->last_read_tick) : 0;
+    if (stalled >= KEY_STALL_THRESHOLD_MS && state->state == LV_INDEV_STATE_PRESSED &&
+        input->key.indev != NULL) {
+        _lv_indev_proc_t *proc = &input->key.indev->proc;
+        /* Zero means "not pressed as far as LVGL is concerned" and is also its
+         * reset value, so it must stay zero rather than become `stalled`. */
+        if (proc->pr_timestamp != 0) {
+            proc->pr_timestamp += stalled;
         }
+        if (proc->longpr_rep_timestamp != 0) {
+            proc->longpr_rep_timestamp += stalled;
+        }
+        /* Loud on purpose: this is the only evidence that the UI thread stalled
+         * with a key down, and the whole reason the guard exists. */
+        commons_log_warn("UI", "Input stall: %u ms with a key held; long-press clock discounted",
+                         (unsigned) stalled);
     }
     state->last_read_tick = lv_tick_get();
     if (state->text_remain > 0) {
