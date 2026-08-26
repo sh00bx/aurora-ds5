@@ -64,12 +64,16 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                     false);
 
 #if TARGET_WEBOS
-    pref_checkbox(view, locstr("Smooth frame pacing (host PTS)"), &app_configuration->smooth_frame_pacing, false);
+    lv_obj_t *pacing_checkbox = pref_checkbox(view, locstr("Smooth frame pacing (host PTS)"),
+                                              &app_configuration->smooth_frame_pacing, false);
+    lv_obj_add_event_cb(pacing_checkbox, reconnect_cb, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view, locstr("Pace video presentation from the host capture clock instead of packet "
                                  "arrival time. Takes effect on the next stream."),
                     false);
 
-    pref_checkbox(view, locstr("Soft recovery (4K)"), &app_configuration->soft_recovery, false);
+    lv_obj_t *recovery_checkbox = pref_checkbox(view, locstr("Soft recovery (4K)"),
+                                                &app_configuration->soft_recovery, false);
+    lv_obj_add_event_cb(recovery_checkbox, reconnect_cb, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view, locstr("When decode backlog builds on 4K streams, temporarily lower the bitrate "
                                  "so video and input catch up, instead of a hard refresh."),
                     false);

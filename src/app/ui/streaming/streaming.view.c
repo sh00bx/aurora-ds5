@@ -29,6 +29,8 @@ static lv_obj_t *overlay_title(lv_obj_t *parent, const char *title, streaming_co
 
 static lv_obj_t *panel_row(lv_obj_t *parent);
 
+static lv_obj_t *metric_tile(streaming_controller_t *controller, lv_obj_t *parent, const char *caption);
+
 static lv_obj_t *panel_text(streaming_controller_t *controller, lv_obj_t *parent, lv_opa_t opa);
 
 static lv_obj_t *section_header(streaming_controller_t *controller, lv_obj_t *parent, const char *title,
@@ -235,6 +237,17 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
         memset(&controller->stats_items, 0, sizeof(controller->stats_items));
         controller->stats_items.title = overlay_title(stats, locstr("Performance"), controller);
 
+        /* The glanceable numbers first (the shape upstream's v1.2.5 GFN-style
+         * card leads with): what gets checked mid-game, before the sections
+         * that get read. The middle tile IS latency_total — refresh keeps
+         * writing the total there and colouring it by the same thresholds as
+         * the compact bar's dot. */
+        lv_obj_t *metrics = panel_row(stats);
+        lv_obj_set_style_pad_top(metrics, LV_DPX(4), 0);
+        controller->stats_items.metric_fps = metric_tile(controller, metrics, "FPS");
+        controller->stats_items.latency_total = metric_tile(controller, metrics, "LATENCY");
+        controller->stats_items.metric_ping = metric_tile(controller, metrics, "PING");
+
         /* Stream identity. Resolution, codec and decoder name say what they are on
          * their own, so they get no label column — unlike the rows further down,
          * which are numbers that need naming. */
@@ -243,8 +256,7 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
         lv_obj_t *audio_row = panel_row(stats);
         controller->stats_items.audio = panel_text(controller, audio_row, LV_OPA_70);
 
-        controller->stats_items.sections[0] =
-                section_header(controller, stats, "Latency", &controller->stats_items.latency_total);
+        controller->stats_items.sections[0] = section_header(controller, stats, "Latency", NULL);
         latency_chain(stats, controller);
 
         controller->stats_items.sections[1] = section_header(controller, stats, "Throughput", NULL);
@@ -476,6 +488,35 @@ static lv_obj_t *stat_label(streaming_controller_t *controller, lv_obj_t *parent
 
 /* Every row shares one side padding, so labels and values line up down the panel
  * no matter what a given row is built from. */
+/* One glanceable number in a quiet slab: big value over a small tracked caption.
+ * Returns the value label. */
+static lv_obj_t *metric_tile(streaming_controller_t *controller, lv_obj_t *parent, const char *caption) {
+    lv_obj_t *tile = lv_obj_create(parent);
+    lv_obj_remove_style_all(tile);
+    lv_obj_set_flex_grow(tile, 1);
+    lv_obj_set_height(tile, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_10, 0);
+    lv_obj_set_style_radius(tile, LV_DPX(4), 0);
+    lv_obj_set_style_pad_ver(tile, LV_DPX(6), 0);
+    lv_obj_set_style_pad_gap(tile, LV_DPX(2), 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *value = lv_label_create(tile);
+    lv_obj_set_style_text_font(value, lv_theme_get_font_normal(tile), 0);
+    lv_label_set_text(value, "-");
+
+    lv_obj_t *cap = lv_label_create(tile);
+    lv_obj_set_style_text_font(cap, lv_theme_get_font_small(tile), 0);
+    lv_obj_set_style_text_letter_space(cap, LV_DPX(1), 0);
+    lv_obj_set_style_text_opa(cap, LV_OPA_60, 0);
+    register_dim(controller, cap, LV_OPA_60);
+    lv_label_set_text_static(cap, caption);
+    return value;
+}
+
 static lv_obj_t *panel_row(lv_obj_t *parent) {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);

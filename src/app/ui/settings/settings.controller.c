@@ -1373,10 +1373,10 @@ static void embed_footer_update(settings_controller_t *c) {
             return;
         }
         if (focused != NULL && lv_obj_has_class(focused, &lv_slider_class)) {
-            lv_label_set_text(c->embed_hint, locstr("LEFT/RIGHT  adjust        UP/DOWN  setting        BACK  categories"));
+            lv_label_set_text(c->embed_hint, locstr("LEFT/RIGHT adjusts the value. BACK returns to the categories."));
             return;
         }
-        lv_label_set_text(c->embed_hint, locstr("UP/DOWN  setting        OK  change        BACK  categories"));
+        lv_label_set_text(c->embed_hint, locstr("OK changes the setting. BACK returns to the categories."));
         return;
     }
     if (c->embed_active >= 0 && c->embed_active < entries_len && entries[c->embed_active].desc != NULL &&
@@ -1384,7 +1384,7 @@ static void embed_footer_update(settings_controller_t *c) {
         lv_label_set_text(c->embed_hint, locstr(entries[c->embed_active].desc));
         return;
     }
-    lv_label_set_text(c->embed_hint, locstr("UP/DOWN  category        OK  edit        BACK  close"));
+    lv_label_set_text(c->embed_hint, locstr("OK edits the category. BACK closes the settings."));
 }
 
 /* Inline descriptions come back for controls the cursor cannot reach: a
@@ -1898,19 +1898,31 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_bg_color(scroll, ml_color_hex(ML_COLOR_TEXT), LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(scroll, 60, LV_PART_SCROLLBAR);
 
-    /* Footer: the descriptions moved here from the settings column (they made
-     * every pane a long scroll). It renders the focused setting's description,
-     * the category summary on the rail, or a key legend. */
-    lv_obj_t *footer = embed_bar(panel, LV_DPX(56), LV_BORDER_SIDE_TOP);
-    lv_obj_t *hint = lv_label_create(footer);
-    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(footer), 0);
+    /* The descriptions live in the rail's dead space, not in a footer bar: the
+     * category slabs fill barely half the column, and a full-width footer cost
+     * every pane a settings row. The card floats at the bottom of the rail
+     * (FLOATING = out of the flex layout, pinned against scrolling) and renders
+     * the focused setting's description, the category summary, or a legend. */
+    lv_obj_t *card = lv_obj_create(nav);
+    lv_obj_remove_style_all(card);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(card, LV_PCT(55), 0);
+    lv_obj_align(card, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(card, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(card, ml_color_hex(ML_COLOR_BORDER), 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_top(card, LV_DPX(10), 0);
+    lv_obj_set_style_pad_hor(card, LV_DPX(2), 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *hint = lv_label_create(card);
+    lv_obj_set_width(hint, LV_PCT(100));
+    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(card), 0);
     lv_obj_set_style_text_color(hint, ml_color_hex(ML_COLOR_TEXT), 0);
     lv_obj_set_style_text_opa(hint, OVERLAY_OPA_MUTED, 0);
-    lv_obj_set_flex_grow(hint, 1);
-    /* The label clips to its own area: a description that would run past the
-     * bar is cut instead of painting over the settings above it. */
-    lv_obj_set_height(hint, LV_PCT(100));
-    lv_obj_set_style_pad_ver(hint, LV_DPX(8), 0);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_label_set_text_static(hint, "");
     c->embed_hint = hint;
