@@ -189,7 +189,7 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->hid_passthrough_autoplug = true;
     config->webos_game_mode = true;
     config->ds5_touchpad_mouse = 1;
-    config->controller_idle_off_sec = 300;   /* 5 min, as a PlayStation does */
+    config->controller_idle_off_min = 5;   /* as a PlayStation does */
 
 #if defined(TARGET_WEBOS)
     config->soft_recovery = true;
@@ -277,7 +277,7 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "hid_passthrough_autoplug", config->hid_passthrough_autoplug);
     ini_write_bool(fp, "webos_game_mode", config->webos_game_mode);
     ini_write_int(fp, "ds5_touchpad_mouse", config->ds5_touchpad_mouse);
-    ini_write_int(fp, "controller_idle_off_sec", config->controller_idle_off_sec);
+    ini_write_int(fp, "controller_idle_off_min", config->controller_idle_off_min);
 
     ini_write_section(fp, "video");
     ini_write_string(fp, "decoder", config->decoder);
@@ -506,14 +506,21 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->hid_passthrough_autoplug = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("webos_game_mode")) {
         config->webos_game_mode = INI_IS_TRUE(value);
+    } else if (INI_NAME_MATCH("controller_idle_off_min")) {
+        set_int(&config->controller_idle_off_min, value);
+        /* The slider's own range. Out-of-range can only come from a hand-edited
+         * config; snap back rather than hand the daemon something it refuses. */
+        if (config->controller_idle_off_min < 1 || config->controller_idle_off_min > 30) {
+            config->controller_idle_off_min = 5;
+        }
     } else if (INI_NAME_MATCH("controller_idle_off_sec")) {
-        set_int(&config->controller_idle_off_sec, value);
-        /* Same range the daemon accepts: off, or at least 30s. A shorter value
-         * could only come from a hand-edited config, and would drop the pad out
-         * from under someone mid-game. */
-        if (config->controller_idle_off_sec != 0 &&
-            (config->controller_idle_off_sec < 30 || config->controller_idle_off_sec > 86400)) {
-            config->controller_idle_off_sec = 300;
+        /* Superseded by the minutes key (1.6.4 shipped seconds for one build).
+         * Read once so an existing config keeps the user's choice instead of
+         * silently snapping back to the default; never written again. */
+        int sec = 0;
+        set_int(&sec, value);
+        if (sec >= 60) {
+            config->controller_idle_off_min = sec / 60 > 30 ? 30 : sec / 60;
         }
     } else if (INI_NAME_MATCH("ds5_touchpad_mouse")) {
         set_int(&config->ds5_touchpad_mouse, value);

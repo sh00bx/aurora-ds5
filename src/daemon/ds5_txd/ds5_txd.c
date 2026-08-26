@@ -2393,14 +2393,36 @@ static long idle_load_persisted(void){
     return idle_clamp_ms(sec*1000L);
 }
 
+/* Persist is DEBOUNCED, the value itself is not.
+ *
+ * The setting is a slider, so dragging it across its range delivers a datagram
+ * per step -- writing the file on each one would put ~30 flash writes behind
+ * one gesture. Debouncing in the daemon rather than in the UI covers any client
+ * and any input method (a d-pad walks the slider the same way), and costs one
+ * comparison on a tick that already runs twice a second.
+ *
+ * The in-memory value still applies immediately: it is what the watchdog reads,
+ * and nothing about it needs to touch storage to take effect. */
+#define IDLE_PERSIST_DEBOUNCE_MS 2000
+static uint32_t g_idle_persist_sec = 0;   /* value waiting to be written */
+static uint64_t g_idle_persist_due = 0;   /* 0 = nothing pending */
+
 /* The app's settings screen changed the timeout. */
 static void idle_set_timeout_sec(unsigned sec){
     long ms=idle_clamp_ms((long)sec*1000L);
     if(ms<0){ fprintf(stderr,"[txd] idle: refusing timeout %us (0 or 30..86400)\n",sec); return; }
     if((uint32_t)ms==g_idle_dc_ms) return;
     g_idle_dc_ms=(uint32_t)ms;
-    idle_persist(sec);
+    g_idle_persist_sec=sec;
+    g_idle_persist_due=now_ms()+IDLE_PERSIST_DEBOUNCE_MS;
     fprintf(stderr,"[txd] idle: timeout set to %us by the app\n",sec);
+}
+
+/* Called from the watchdog tick; writes at most one file per settled value. */
+static void idle_persist_tick(void){
+    if(!g_idle_persist_due || now_ms()<g_idle_persist_due) return;
+    g_idle_persist_due=0;
+    idle_persist(g_idle_persist_sec);
 }
 
 static int idle_bit(const unsigned long *bits, int nr){
@@ -2694,6 +2716,8 @@ static void *idle_thread(void *arg){
         int pr=(nfd>0)?poll(pf,nfd,500):0;
         if(pr<0 && errno!=EINTR){ usleep(200000); continue; }
         if(nfd==0) usleep(500000);
+
+        idle_persist_tick();   /* debounced write of a settled slider value */
 
         pthread_mutex_lock(&g_idle_mtx);
         for(int i=0;i<pr && pr>0;i++){

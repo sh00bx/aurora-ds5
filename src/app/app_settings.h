@@ -59,10 +59,12 @@ typedef struct app_settings_t {
     /* DS5 touchpad as desktop mouse on the host: 0=off, 1=auto (only while no
      * game runs), 2=always. Sent to the host bridge on every session. */
     int ds5_touchpad_mouse;
-    /** Seconds a connected controller may sit idle before its BT link is
-     * dropped (which powers the pad off); 0 = never. Enforced by ds5_txd, which
-     * is why it also applies to pads that are merely paired to the TV. */
-    int controller_idle_off_sec;
+    /** Minutes a connected controller may sit idle before its BT link is
+     * dropped (which powers the pad off). Enforced by ds5_txd, which is why it
+     * also applies to pads merely paired with the TV. Minutes rather than
+     * seconds because that is the unit the settings slider works in; the wire
+     * format to the daemon stays seconds. */
+    int controller_idle_off_min;
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     /**
      * Ask for a Main10 bitstream even with the HDR option off. The panel is 10-bit either way,

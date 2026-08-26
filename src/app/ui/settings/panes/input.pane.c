@@ -15,6 +15,8 @@ typedef struct input_pane_t {
     lv_obj_t *absmouse_hint;
     lv_obj_t *deadzone_label;
     lv_obj_t *deadzone_slider;
+    lv_obj_t *idle_off_label;
+    lv_obj_t *idle_off_slider;
     lv_obj_t *swap_abxy_toggle;
 } input_pane_t;
 
@@ -35,6 +37,8 @@ static void on_deadzone_changed(lv_event_t *e);
 static void on_hid_passthrough_changed(lv_event_t *e);
 
 static void hid_passthrough_ui_update(input_pane_t *pane);
+
+static void update_idle_off_label(input_pane_t *pane);
 
 static void on_controller_idle_changed(lv_event_t *e);
 
@@ -103,19 +107,10 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     pref_desc_label(view, locstr("Move the PC mouse with the DualSense touchpad. \"Desktop only\" hands the "
                                  "touchpad back to any running game."), false);
 
-    /* Values are seconds; the daemon rejects anything below 30 (see
-     * idle_clamp_ms), so every entry here is either 0 or well above it. */
-    static const pref_dropdown_int_entry_t idle_off_entries[] = {
-            {"After 5 minutes", 300, true},
-            {"After 1 minute", 60, false},
-            {"After 10 minutes", 600, false},
-            {"After 30 minutes", 1800, false},
-            {"Never", 0, false},
-    };
-    pref_title_label(view, locstr("Turn idle controllers off"));
-    lv_obj_t *idle_dd = pref_dropdown_int(view, idle_off_entries, 5,
-                                          &app_configuration->controller_idle_off_sec, NULL);
-    lv_obj_add_event_cb(idle_dd, on_controller_idle_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    pane->idle_off_label = pref_title_label(view, locstr("Turn idle controllers off"));
+    pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 1, 30, 1);
+    lv_obj_set_width(pane->idle_off_slider, LV_PCT(100));
+    lv_obj_add_event_cb(pane->idle_off_slider, on_controller_idle_changed, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view, locstr("Disconnect a controller that has not been used for this long, which powers "
                                  "it off instead of letting it drain on the couch. Applies to any controller "
                                  "paired with the TV, not only while streaming."), false);
@@ -148,6 +143,7 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 #endif
     hid_passthrough_ui_update(pane);
     update_deadzone_label(pane);
+    update_idle_off_label(pane);
     return view;
 }
 
@@ -173,9 +169,19 @@ static void hwmouse_state_update(input_pane_t *pane) {
  * at the next app start. The daemon persists what it receives, so nothing has
  * to re-send this later; if it is not running there is nothing to configure and
  * it will read its own stored value when it next comes up. */
+static void update_idle_off_label(input_pane_t *pane) {
+    lv_label_set_text_fmt(pane->idle_off_label, "%s - %d min", locstr("Turn idle controllers off"),
+                          app_configuration->controller_idle_off_min);
+}
+
 static void on_controller_idle_changed(lv_event_t *e) {
-    (void) e;
-    ds5_acl_send_idle_timeout(app_configuration->controller_idle_off_sec);
+    input_pane_t *pane = (input_pane_t *) lv_event_get_user_data(e);
+    update_idle_off_label(pane);
+    /* Push straight to the daemon so it takes effect now rather than at the next
+     * app start. The daemon persists what it receives; if it is not running
+     * there is nothing to configure and it reads its stored value when it next
+     * comes up. Wire unit is seconds -- the slider is the only thing in minutes. */
+    ds5_acl_send_idle_timeout(app_configuration->controller_idle_off_min * 60);
 }
 
 static void update_deadzone_label(input_pane_t *pane) {
