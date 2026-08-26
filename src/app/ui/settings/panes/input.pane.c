@@ -108,12 +108,14 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                  "touchpad back to any running game."), false);
 
     pane->idle_off_label = pref_title_label(view, locstr("Turn idle controllers off"));
-    pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 1, 30, 1);
+    /* Starts at 0 = never, so the feature can be turned off from here. */
+    pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 0, 30, 1);
     lv_obj_set_width(pane->idle_off_slider, LV_PCT(100));
     lv_obj_add_event_cb(pane->idle_off_slider, on_controller_idle_changed, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view, locstr("Disconnect a controller that has not been used for this long, which powers "
                                  "it off instead of letting it drain on the couch. Applies to any controller "
-                                 "paired with the TV, not only while streaming."), false);
+                                 "paired with the TV, not only while streaming. Leftmost position is Never."),
+                    false);
 
     pane->deadzone_label = pref_title_label(view, locstr("Analog stick deadzone"));
     pane->deadzone_slider = pref_slider(view, &app_configuration->stick_deadzone, 0, 20, 1);
@@ -170,8 +172,13 @@ static void hwmouse_state_update(input_pane_t *pane) {
  * to re-send this later; if it is not running there is nothing to configure and
  * it will read its own stored value when it next comes up. */
 static void update_idle_off_label(input_pane_t *pane) {
-    lv_label_set_text_fmt(pane->idle_off_label, "%s - %d min", locstr("Turn idle controllers off"),
-                          app_configuration->controller_idle_off_min);
+    if (app_configuration->controller_idle_off_min <= 0) {
+        lv_label_set_text_fmt(pane->idle_off_label, "%s - %s", locstr("Turn idle controllers off"),
+                              locstr("Never"));
+    } else {
+        lv_label_set_text_fmt(pane->idle_off_label, "%s - %d min", locstr("Turn idle controllers off"),
+                              app_configuration->controller_idle_off_min);
+    }
 }
 
 static void on_controller_idle_changed(lv_event_t *e) {

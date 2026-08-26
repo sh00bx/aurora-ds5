@@ -508,18 +508,21 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->webos_game_mode = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("controller_idle_off_min")) {
         set_int(&config->controller_idle_off_min, value);
-        /* The slider's own range. Out-of-range can only come from a hand-edited
-         * config; snap back rather than hand the daemon something it refuses. */
-        if (config->controller_idle_off_min < 1 || config->controller_idle_off_min > 30) {
+        /* The slider's own range, 0 = never. Out-of-range can only come from a
+         * hand-edited config; snap back rather than hand the daemon something
+         * it refuses. */
+        if (config->controller_idle_off_min < 0 || config->controller_idle_off_min > 30) {
             config->controller_idle_off_min = 5;
         }
     } else if (INI_NAME_MATCH("controller_idle_off_sec")) {
         /* Superseded by the minutes key (1.6.4 shipped seconds for one build).
          * Read once so an existing config keeps the user's choice instead of
          * silently snapping back to the default; never written again. */
-        int sec = 0;
+        int sec = -1;
         set_int(&sec, value);
-        if (sec >= 60) {
+        if (sec == 0) {
+            config->controller_idle_off_min = 0;   /* never, as chosen back then */
+        } else if (sec >= 60) {
             config->controller_idle_off_min = sec / 60 > 30 ? 30 : sec / 60;
         }
     } else if (INI_NAME_MATCH("ds5_touchpad_mouse")) {

@@ -60,10 +60,10 @@ typedef struct app_settings_t {
      * game runs), 2=always. Sent to the host bridge on every session. */
     int ds5_touchpad_mouse;
     /** Minutes a connected controller may sit idle before its BT link is
-     * dropped (which powers the pad off). Enforced by ds5_txd, which is why it
-     * also applies to pads merely paired with the TV. Minutes rather than
-     * seconds because that is the unit the settings slider works in; the wire
-     * format to the daemon stays seconds. */
+     * dropped (which powers the pad off); 0 = never. Enforced by ds5_txd, which
+     * is why it also applies to pads merely paired with the TV. Minutes rather
+     * than seconds because that is the unit the settings slider works in; the
+     * wire format to the daemon stays seconds. */
     int controller_idle_off_min;
     bool hdr;   /* HDR10 (PQ) over HEVC Main10 or AV1 Main10 when host and decoder support it */
     /**
