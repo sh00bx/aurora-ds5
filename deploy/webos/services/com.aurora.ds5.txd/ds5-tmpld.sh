@@ -126,14 +126,28 @@ done
 # no cross-process preemption. The earlier "inject -5 out-prioritizes input" concern
 # was refuted on this hardware; -5 is correct and kept (still under input).
 #
-# main is deniced ONCE (denice_main): `renice -n` is RELATIVE on busybox/toybox, so
-# re-running `renice -n -5` would drive -5 -> -10 -> -15 -> -20 and TIE the input
-# thread (reintroducing the aussetzer). The main thread always exists at startup, so
-# one call is correct. Workers are re-asserted (reassert_workers): they may not be
-# visible at the first pass (created just after the socket binds), and nice clamps at
-# +19 so relative-renice cannot compound them.
-denice_main() {
+# The two halves of "denice" have OPPOSITE repeat semantics, which is why they are
+# split:
+#
+#   chrt -o -p 0   ABSOLUTE and idempotent -> safe to re-assert, and it MUST be.
+#   renice -n -5   RELATIVE on busybox/toybox -> re-running it would drive
+#                  -5 -> -10 -> -15 -> -20 and TIE the input thread, reintroducing
+#                  the very aussetzer this exists to prevent. Exactly once.
+#
+# Why chrt must be re-asserted (2026-08-26): the wait below breaks as soon as $SOCK
+# exists -- but a RESTART finds the previous instance's socket node still on disk, so
+# it breaks immediately and denice_main can run BEFORE the new ds5_txd has even
+# reached its own sched_setscheduler() call. The daemon then sets SCHED_FIFO 14 a
+# moment later and, with main deniced only once, stays there for its whole life. That
+# is not theoretical: it was measured 35s after the supervisor had already logged
+# "-> SCHED_OTHER", with nice=-5 applied (renice won the race) and the policy still
+# FIFO (chrt lost it). Re-asserting inside the existing worker loop costs nothing --
+# the loop already runs a bounded handful of times.
+chrt_main() {
   chrt -o -p 0 "$1" 2>/dev/null
+}
+denice_main() {
+  chrt_main "$1"
   renice -n -5 -p "$1" >/dev/null 2>&1
 }
 reassert_workers() {
@@ -211,6 +225,7 @@ while true; do
   # never spawns threads after startup, and +19 clamps so this can't compound.
   n=0
   while [ $n -lt 5 ]; do
+    chrt_main "$TXD"          # absolute + idempotent; wins back a lost start race
     reassert_workers "$TXD"
     n=$((n+1))
     kill -0 "$TXD" 2>/dev/null || break
