@@ -1926,6 +1926,63 @@ static uint8_t  g_scan_sent = 0xff;  /* mode we last wrote; 0xff = unknown (forc
 static uint64_t g_scan_tx   = 0;     /* last scan write time (the shared limiter) */
 static volatile int g_scan_restore = 0; /* main-thread invalidations request a mode-2 restore
                                            here; the capture thread owns the send machinery */
+/* Breadcrumb for "we left the controller's scan suppressed".
+ *
+ * Scan-off is the one piece of TV state this daemon changes that does NOT heal
+ * on its own: the webOS stack never learns about it (we write the HCI command
+ * behind its back), so its own adapter status keeps cheerfully reporting
+ * discoverable=true while the controller answers no page at all. Die in that
+ * state -- SIGKILL, a crash, a mid-session restart for a deploy -- and the TV
+ * stops accepting ANY bluetooth connection until something happens to write
+ * Write_Scan_Enable again. Nothing in the system points at the cause; the pad
+ * just blinks and gives up, which reads exactly like a flat battery.
+ *
+ * Observed for real 2026-08-26: a deploy restart mid-session left the TV
+ * unconnectable, and it took the rotated log's last line ("scan_enable=0 (off
+ * for session)") to tell what had happened.
+ *
+ * So: leave a file behind whenever scan is suppressed, remove it when it is
+ * restored, and have the next instance restore on sight. /tmp is cleared on
+ * boot, which is right -- a fresh controller starts with its own scan state and
+ * a stale marker must not make us touch it. */
+#define SCAN_OFF_MARKER "/tmp/ds5_scan_off"
+
+/* Prebuilt so the signal handler below only has to write() it: building a frame
+ * in a handler would mean calling into non-async-signal-safe territory. */
+static const uint8_t SCAN_RESTORE_CMD[5] = {
+    0x01, OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, 2 };
+
+static void scan_marker(int suppressed){
+    if(suppressed){
+        int fd=open(SCAN_OFF_MARKER,O_WRONLY|O_CREAT|O_TRUNC,0644);
+        if(fd>=0) close(fd);
+    } else {
+        unlink(SCAN_OFF_MARKER);
+    }
+}
+
+/* Restore scan on the way out. Only write(), unlink() and _exit() are used, all
+ * async-signal-safe; cmd_send()'s queue/guard bookkeeping is deliberately
+ * bypassed because none of it outlives this call anyway. Covers SIGTERM (the
+ * supervisor, a deploy) and SIGINT; a SIGKILL or a hard crash cannot be covered
+ * from in here, which is what the marker file is for. */
+static void on_term_restore_scan(int sig){
+    if(g_rawfd>=0 && g_scan_sent==0){
+        ssize_t w=write(g_rawfd,SCAN_RESTORE_CMD,sizeof SCAN_RESTORE_CMD);
+        /* Only clear the breadcrumb if the restore actually went out; a failed
+         * write must leave it for the next instance to act on. */
+        if(w==(ssize_t)sizeof SCAN_RESTORE_CMD) unlink(SCAN_OFF_MARKER);
+    }
+    /* Deliberately NOT unlinked otherwise. g_scan_sent==0xff means "this
+     * instance never touched scan" -- and a marker present in that state
+     * belongs to a PREDECESSOR whose suppression is still in force. Clearing it
+     * here (as the first version did) threw away the only evidence that the
+     * controller is still refusing pages, and nothing would ever have restored
+     * it. Found by testing the restore path 2026-08-26: the marker vanished on
+     * the outgoing daemon instead of being read by the incoming one. */
+    _exit(sig==SIGTERM?0:128+sig);
+}
+
 static void scan_reconcile(void){
     if(g_scan_want==0xff || g_scan_want==g_scan_sent) return;
     uint64_t t=now_ms();
@@ -1934,6 +1991,7 @@ static void scan_reconcile(void){
         OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, g_scan_want };
     if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0,0)==0){
         g_scan_tx=t; g_scan_sent=g_scan_want;
+        scan_marker(g_scan_want==0);
         fprintf(stderr,"[txd] scan_enable=%u (%s)\n",g_scan_want,
                 g_scan_want?"restored":"off for session");
     }
@@ -3864,6 +3922,8 @@ int main(int argc,char**argv){
      * inherited from the launcher either: libuv's uv__process_child_init resets
      * every disposition to SIG_DFL before exec. */
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, on_term_restore_scan);
+    signal(SIGINT,  on_term_restore_scan);
 
     const char *sock_path = argc>1?argv[1]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock";
     g_tmpl_path           = argc>2?argv[2]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl";
@@ -3968,6 +4028,16 @@ int main(int argc,char**argv){
     if(bind(rawfd,(struct sockaddr*)&ra,sizeof ra)<0){ perror("[txd] bind raw"); return 1; }
     int fl=fcntl(rawfd,F_GETFL,0); if(fl>=0) fcntl(rawfd,F_SETFL,fl|O_NONBLOCK);
     g_rawfd=rawfd;   /* published before the capture thread starts (policy writes) */
+    /* A previous instance died with scan suppressed (see SCAN_OFF_MARKER): the
+     * controller is still refusing pages and nothing else will ever put that
+     * right. This is the ONE case where we form an opinion about the TV's scan
+     * state without having bound a link first -- justified because the state we
+     * are correcting is our own leftover, not the TV's. */
+    if(access(SCAN_OFF_MARKER,F_OK)==0){
+        g_scan_want=2;
+        fprintf(stderr,"[txd] scan: %s present -> a previous instance left scan off, restoring connectable\n",
+                SCAN_OFF_MARKER);
+    }
 
     /* AF_UNIX datagram socket the jailed app sends reports to (non-blocking, 1MB
      * recv buffer, SO_PASSCRED — see bind_unix_dgram). Self-healed across remounts.
