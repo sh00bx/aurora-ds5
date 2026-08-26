@@ -189,6 +189,7 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->hid_passthrough_autoplug = true;
     config->webos_game_mode = true;
     config->ds5_touchpad_mouse = 1;
+    config->controller_idle_off_sec = 300;   /* 5 min, as a PlayStation does */
 
 #if defined(TARGET_WEBOS)
     config->soft_recovery = true;
@@ -276,6 +277,7 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "hid_passthrough_autoplug", config->hid_passthrough_autoplug);
     ini_write_bool(fp, "webos_game_mode", config->webos_game_mode);
     ini_write_int(fp, "ds5_touchpad_mouse", config->ds5_touchpad_mouse);
+    ini_write_int(fp, "controller_idle_off_sec", config->controller_idle_off_sec);
 
     ini_write_section(fp, "video");
     ini_write_string(fp, "decoder", config->decoder);
@@ -504,6 +506,15 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->hid_passthrough_autoplug = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("webos_game_mode")) {
         config->webos_game_mode = INI_IS_TRUE(value);
+    } else if (INI_NAME_MATCH("controller_idle_off_sec")) {
+        set_int(&config->controller_idle_off_sec, value);
+        /* Same range the daemon accepts: off, or at least 30s. A shorter value
+         * could only come from a hand-edited config, and would drop the pad out
+         * from under someone mid-game. */
+        if (config->controller_idle_off_sec != 0 &&
+            (config->controller_idle_off_sec < 30 || config->controller_idle_off_sec > 86400)) {
+            config->controller_idle_off_sec = 300;
+        }
     } else if (INI_NAME_MATCH("ds5_touchpad_mouse")) {
         set_int(&config->ds5_touchpad_mouse, value);
         if (config->ds5_touchpad_mouse < 0 || config->ds5_touchpad_mouse > 2) {

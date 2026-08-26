@@ -271,6 +271,23 @@ static const unsigned GAPGE_EDGE[GAPGE_N] =
  * probe veto every expiry -- exactly the case where the timeout is most
  * wanted. The claim says "my silence means silence". */
 #define ACL_CTRL_PAD_IDLE_CLAIM 0x05
+
+/* Code 0x06 = the idle timeout the user picked in the app's settings,
+ * [A5][5C][06][seconds LE16]. 0 disables the feature.
+ *
+ * Sent whenever the setting changes, and NOT tied to a streaming session: the
+ * timeout governs pads that are merely connected to the TV, so it has to be
+ * settable while nothing is being bridged at all.
+ *
+ * The value is persisted here rather than only held in memory, because this
+ * daemon outlives the app but is also respawned without it (supervisor restart
+ * after a crash, and the app is what starts us in the first place). Keeping it
+ * app-side only would silently revert to the built-in default every time that
+ * happened, with the settings screen still showing the user's choice. */
+#define ACL_CTRL_IDLE_TIMEOUT   0x06
+/* Deliberately not /tmp: this one must survive a reboot, unlike SCAN_OFF_MARKER
+ * whose whole correctness depends on NOT surviving one. */
+#define IDLE_PERSIST_PATH "/var/lib/webosbrew/ds5_idle_sec"
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -2343,6 +2360,49 @@ static struct idle_pad g_idle_pads[IDLE_DC_MAX_PADS];
 static pthread_mutex_t g_idle_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_idle_dc_ms = IDLE_DC_DEFAULT_MS;
 
+/* One place for the accepted range, shared by the env var, the persisted file
+ * and the app's setting: 0 = off, otherwise at least 30s. Anything shorter is
+ * indistinguishable from a pause in play and would drop the pad out from under
+ * the user; the ceiling is a day. Returns -1 if the value is not acceptable. */
+static long idle_clamp_ms(long ms){
+    if(ms==0) return 0;
+    if(ms<30000 || ms>86400000L) return -1;
+    return ms;
+}
+
+static void idle_persist(uint32_t sec){
+    char buf[24];
+    int n=snprintf(buf,sizeof buf,"%u\n",sec);
+    if(n<=0) return;
+    int fd=open(IDLE_PERSIST_PATH,O_WRONLY|O_CREAT|O_TRUNC,0644);
+    if(fd<0){ fprintf(stderr,"[txd] idle: cannot persist timeout to %s: %s\n",
+                      IDLE_PERSIST_PATH,strerror(errno)); return; }
+    ssize_t w=write(fd,buf,(size_t)n); (void)w;
+    close(fd);
+}
+
+/* Returns the persisted timeout in ms, or -1 when there is none to apply. */
+static long idle_load_persisted(void){
+    int fd=open(IDLE_PERSIST_PATH,O_RDONLY);
+    if(fd<0) return -1;
+    char buf[24]; ssize_t r=read(fd,buf,sizeof buf-1); close(fd);
+    if(r<=0) return -1;
+    buf[r]='\0';
+    char *end=NULL; long sec=strtol(buf,&end,10);
+    if(end==buf || sec<0) return -1;
+    return idle_clamp_ms(sec*1000L);
+}
+
+/* The app's settings screen changed the timeout. */
+static void idle_set_timeout_sec(unsigned sec){
+    long ms=idle_clamp_ms((long)sec*1000L);
+    if(ms<0){ fprintf(stderr,"[txd] idle: refusing timeout %us (0 or 30..86400)\n",sec); return; }
+    if((uint32_t)ms==g_idle_dc_ms) return;
+    g_idle_dc_ms=(uint32_t)ms;
+    idle_persist(sec);
+    fprintf(stderr,"[txd] idle: timeout set to %us by the app\n",sec);
+}
+
 static int idle_bit(const unsigned long *bits, int nr){
     return (bits[nr/(8*sizeof(long))] >> (nr%(8*sizeof(long)))) & 1ul;
 }
@@ -4109,15 +4169,27 @@ int main(int argc,char**argv){
                    else fprintf(stderr,"[txd] DS5_IDLE_LIGHTBAR='%s' not RRGGBB hex -> keeping %06x\n",e,g_idle_lb_boot); }
         }
     }
-    {   /* Idle auto-disconnect: DS5_IDLE_DISCONNECT_MS in ms, "0"/"off" disables.
-         * Clamped below at 30s -- anything shorter is indistinguishable from a
-         * pause in play and would drop the pad out from under the user. */
+    {   /* Idle auto-disconnect, in precedence order: DS5_IDLE_DISCONNECT_MS (an
+         * operator override, "0"/"off" disables), else whatever the app last
+         * set through the settings screen, else the built-in default. The env
+         * var wins so a debug run can pin a value without stamping on the
+         * user's choice -- it is deliberately NOT persisted. */
         const char *e=getenv("DS5_IDLE_DISCONNECT_MS");
         if(e && *e){
-            if(!strcasecmp(e,"off")) g_idle_dc_ms=0;
-            else { char *end=NULL; unsigned long v=strtoul(e,&end,10);
-                   if(end && *end=='\0' && v<=86400000ul && (v==0 || v>=30000ul)) g_idle_dc_ms=(uint32_t)v;
-                   else fprintf(stderr,"[txd] DS5_IDLE_DISCONNECT_MS='%s' not 0/off or 30000..86400000 -> keeping %u\n",e,g_idle_dc_ms); }
+            long v;
+            if(!strcasecmp(e,"off")) v=0;
+            else { char *end=NULL; v=strtol(e,&end,10); if(!end || *end!='\0') v=-1; }
+            v = (v<0) ? -1 : idle_clamp_ms(v);
+            if(v>=0) g_idle_dc_ms=(uint32_t)v;
+            else fprintf(stderr,"[txd] DS5_IDLE_DISCONNECT_MS='%s' not 0/off or 30000..86400000 -> keeping %u\n",
+                         e,g_idle_dc_ms);
+        } else {
+            long v=idle_load_persisted();
+            if(v>=0){
+                g_idle_dc_ms=(uint32_t)v;
+                fprintf(stderr,"[txd] idle: timeout %us restored from %s\n",
+                        g_idle_dc_ms/1000u,IDLE_PERSIST_PATH);
+            }
         }
     }
     pthread_t idl; pthread_create(&idl,NULL,idle_thread,NULL);
@@ -4418,6 +4490,8 @@ int main(int argc,char**argv){
                         idle_note_activity_addr(&rep[3]);
                     } else if(rep[2]==ACL_CTRL_PAD_IDLE_CLAIM && n>=9){
                         idle_note_claim_addr(&rep[3]);
+                    } else if(rep[2]==ACL_CTRL_IDLE_TIMEOUT && n>=5){
+                        idle_set_timeout_sec((unsigned)rep[3] | ((unsigned)rep[4]<<8));
                     } else if(rep[2]==ACL_CTRL_IDLE_LB_CLEAR){
                         /* Drop the app selection; the boot default paints again.
                          * The client sends this for "connected, unused" instead of

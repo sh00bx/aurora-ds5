@@ -79,6 +79,15 @@ void ds5_acl_tx_note_pad_activity(ds5_acl_tx_t *t);
  * which is precisely the session that should time out. Timer-neutral, so the
  * caller can repeat it on a heartbeat to survive a daemon restart. */
 void ds5_acl_tx_claim_pad_idle(ds5_acl_tx_t *t);
+
+/* Push the user's idle-timeout setting (seconds, 0 = never) to the daemon.
+ *
+ * Deliberately NOT a method on ds5_acl_tx_t: the timeout governs any pad merely
+ * connected to the TV, including when nothing is being bridged and no transport
+ * exists, so it must be settable without a session. Fire-and-forget on the
+ * daemon's control socket -- if the daemon is not running there is nothing to
+ * configure, and it reloads its own persisted value when it next starts. */
+void ds5_acl_send_idle_timeout(int seconds);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 
 /* Daemon inject-queue telemetry (v9 "<tmpl>.st" record): the session loop

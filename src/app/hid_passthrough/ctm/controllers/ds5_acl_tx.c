@@ -38,6 +38,7 @@
 #define ACL_CTRL_FIFO_DEPTH 0x01
 #define ACL_CTRL_PAD_ACTIVITY 0x04   /* [A5][5C][04][addr 6 LSB-first] */
 #define ACL_CTRL_PAD_IDLE_CLAIM 0x05 /* [A5][5C][05][addr 6 LSB-first], timer-neutral */
+#define ACL_CTRL_IDLE_TIMEOUT   0x06 /* [A5][5C][06][seconds LE16] */
 #define ACL_TAG_LEN     8
 
 struct ds5_acl_tx {
@@ -301,6 +302,33 @@ static void acl_tx_send_pad_ctrl(ds5_acl_tx_t *t, uint8_t code)
     memcpy(msg + 3, t->tag + 2, 6);   /* same LSB-first address as every tag */
     (void)sendto(t->unixfd, msg, sizeof msg, 0,
                  (struct sockaddr *)&t->daddr, sizeof t->daddr);
+}
+
+/* Resolve the daemon's control socket the same way ds5_acl_tx_start does, so a
+ * DS5_ACL_SOCK override keeps working for both. */
+static const char *acl_ctrl_sock_path(void)
+{
+    const char *sp = getenv("DS5_ACL_SOCK");
+    return (sp && sp[0]) ? sp : "/tmp/ds5_acl.sock";
+}
+
+void ds5_acl_send_idle_timeout(int seconds)
+{
+    if (seconds < 0 || seconds > 0xFFFF) {
+        return;
+    }
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", acl_ctrl_sock_path());
+    uint8_t msg[5] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_IDLE_TIMEOUT,
+                       (uint8_t) (seconds & 0xff), (uint8_t) ((seconds >> 8) & 0xff) };
+    (void) sendto(fd, msg, sizeof msg, 0, (struct sockaddr *) &addr, sizeof addr);
+    close(fd);
 }
 
 void ds5_acl_tx_claim_pad_idle(ds5_acl_tx_t *t)
