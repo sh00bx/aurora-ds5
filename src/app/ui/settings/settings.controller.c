@@ -1367,7 +1367,7 @@ static bool embed_collect_desc(lv_obj_t *focused, char *buf, size_t buflen) {
  * backdrop's last child, so it wins the z-order against everything the sheet
  * draws). Any movement hides it and restarts the clock — the professional
  * hover-tooltip pattern, driven by focus instead of a pointer. */
-#define EMBED_TOOLTIP_DELAY_MS 1000
+#define EMBED_TOOLTIP_DELAY_MS 1500
 #define EMBED_TOOLTIP_MAX_W LV_DPX(430)
 
 static void embed_tooltip_hide(settings_controller_t *c) {
