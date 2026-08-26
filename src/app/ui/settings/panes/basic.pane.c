@@ -23,8 +23,6 @@ typedef struct {
     lv_obj_t *bitrate_slider;
     lv_obj_t *bitrate_warning;
     lv_obj_t *profile_dropdown;
-    lv_obj_t *abr_checkbox;
-    lv_obj_t *abr_mode_dropdown;
 
     pref_dropdown_string_entry_t *lang_entries;
     int lang_entries_len;
@@ -54,12 +52,6 @@ static void on_profile_changed(lv_event_t *e);
 
 static void on_save_profile_clicked(lv_event_t *e);
 
-static void on_abr_changed(lv_event_t *e);
-
-static void on_abr_mode_changed(lv_event_t *e);
-
-static void on_ntsc_refresh_changed(lv_event_t *e);
-
 static void refresh_profile_dropdown(basic_pane_t *pane);
 
 static void on_new_profile_clicked(lv_event_t *e);
@@ -76,7 +68,8 @@ const lv_fragment_class_t settings_pane_basic_cls = {
     .create_obj_cb = create_obj,
     .instance_size = sizeof(basic_pane_t),
 };
-#define BITRATE_STEP 1000
+/* 5 Mbps per d-pad press: 59 stops across 5-300 Mbps instead of 295. */
+#define BITRATE_STEP 5000
 
 static void pane_ctor(lv_fragment_t *self, void *args) {
     basic_pane_t *pane = (basic_pane_t *) self;
@@ -100,16 +93,6 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *view = pref_pane_container(container);
     lv_obj_set_layout(view, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(view, LV_FLEX_FLOW_ROW_WRAP);
-
-    pane->abr_checkbox = pref_checkbox(view, locstr("Adaptive bitrate"), &app_configuration->auto_adjust_bitrate, false);
-    lv_obj_add_event_cb(pane->abr_checkbox, on_abr_changed, LV_EVENT_VALUE_CHANGED, self);
-
-    pref_title_label(view, locstr("ABR mode"));
-    pane->abr_mode_dropdown = lv_dropdown_create(view);
-    lv_dropdown_set_options(pane->abr_mode_dropdown, "Balanced\nQuality\nLow latency");
-    lv_dropdown_set_selected(pane->abr_mode_dropdown, app_configuration->abr_mode);
-    lv_obj_set_width(pane->abr_mode_dropdown, LV_PCT(100));
-    lv_obj_add_event_cb(pane->abr_mode_dropdown, on_abr_mode_changed, LV_EVENT_VALUE_CHANGED, self);
 
     pref_title_label(view, locstr("Resolution and FPS"));
 
@@ -148,20 +131,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_set_flex_grow(fps_dropdown, 1);
     lv_obj_add_event_cb(fps_dropdown, on_res_fps_updated, LV_EVENT_VALUE_CHANGED, self);
 
-    lv_obj_t *ntsc_checkbox = pref_checkbox(view, locstr("Use NTSC refresh (59.94 / 119.88 Hz)"),
-                                            &app_configuration->use_ntsc_refresh, false);
-    lv_obj_add_event_cb(ntsc_checkbox, on_ntsc_refresh_changed, LV_EVENT_VALUE_CHANGED, self);
-    pref_desc_label(view,
-                    locstr("When enabled, 60/120 FPS presets use fractional NTSC pacing (59.94/119.88). "
-                           "When disabled, presets use integer 60/120 like Moonlight mobile. "
-                           "At 4K the host virtual-display mode stays integer (120) to avoid a black "
-                           "screen on some webOS TVs; NTSC is still sent as clientRefreshRateX100 for "
-                           "encode pacing. Custom FPS still allows any fractional rate."),
-                    false);
-
-    pref_desc_label(view,
-                    locstr("Tip: choose Custom FPS to enter a fractional refresh rate (e.g. 119.94 for VRR game "
-                           "mode). The exact value is sent to the host for frame pacing."),
+    pref_desc_label(view, locstr("Choose Custom FPS to enter a fractional refresh rate (e.g. 119.94). "
+                                 "The exact value is sent to the host for frame pacing."),
                     false);
 
     pane->res_warning = lv_label_create(view);
@@ -199,20 +170,18 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 
     lv_obj_t *show_stats_checkbox = pref_checkbox(view, locstr("Show performance stats on stream start"),
                                                    &app_configuration->show_stats_on_start, false);
-    pref_desc_label(view, locstr("Start streaming with performance overlay visible and pinned."), false);
+    pref_desc_label(view, locstr("Start streams with the performance overlay pinned. Hold Select/Back for 4 seconds during a stream to pin or unpin it anytime."), false);
 
     lv_obj_t *show_stats_compact_checkbox = pref_checkbox(view, locstr("Compact performance stats (single line)"),
                                                           &app_configuration->show_stats_compact, false);
-    pref_desc_label(view, locstr("Show minimalist one-line stats like Moonlight Android (FPS, RTT, bitrate)."), false);
+    pref_desc_label(view, locstr("One-line stats bar (FPS, RTT, bitrate) instead of the full panel."), false);
 
 #if TARGET_WEBOS
     pref_checkbox(view, locstr("TV game mode while streaming"), &app_configuration->webos_game_mode, false);
     pref_desc_label(view,
-                    locstr("Switch the TV to its game picture preset, keep discovery and casting "
-                           "services off the radio, pin the CPU cores, and raise the kernel's network "
-                           "receive buffers so a burst of video isn't dropped before Moonlight reads it "
-                           "-- for as long as a stream runs, then put everything back. Needs a rooted TV "
-                           "with Homebrew Channel."),
+                    locstr("Game picture preset, quieted background services and larger network "
+                           "buffers while a stream runs; everything is restored afterwards. "
+                           "Needs a rooted TV."),
                     false);
 #endif
 
@@ -258,12 +227,6 @@ static void on_res_fps_updated(lv_event_t *e) {
     }
     update_bitrate_label(pane);
     update_bitrate_hint(pane);
-}
-
-static void on_ntsc_refresh_changed(lv_event_t *e) {
-    basic_pane_t *pane = lv_event_get_user_data(e);
-    pane->parent->needs_stream_reconnect = true;
-    settings_apply_ntsc_preset_refresh(app_configuration, app_configuration->stream.fps);
 }
 
 static void on_fullscreen_updated(lv_event_t *e) {
@@ -388,6 +351,10 @@ static void on_profile_changed(lv_event_t *e) {
     }
     profile_manager_set_active(profile->id);
     profile_manager_apply_to_settings(app_configuration);
+    /* Move the knob too: the slider widget does not read the config back, and a
+     * stale knob position would be written over the profile's bitrate on the
+     * next LEFT/RIGHT press. */
+    lv_slider_set_value(pane->bitrate_slider, app_configuration->stream.bitrate / BITRATE_STEP, LV_ANIM_OFF);
     lv_event_send(pane->bitrate_slider, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
@@ -398,18 +365,6 @@ static void on_save_profile_clicked(lv_event_t *e) {
     profile_manager_save_from_settings(app_configuration, active->id);
   }
   (void) pane;
-}
-
-static void on_abr_changed(lv_event_t *e) {
-    (void) e;
-}
-
-static void on_abr_mode_changed(lv_event_t *e) {
-    basic_pane_t *pane = lv_event_get_user_data(e);
-    app_configuration->abr_mode = (int) lv_dropdown_get_selected(pane->abr_mode_dropdown);
-    if (app_configuration->abr_mode < 0 || app_configuration->abr_mode > 2) {
-        app_configuration->abr_mode = 0;
-    }
 }
 
 static void on_new_profile_clicked(lv_event_t *e) {
@@ -445,6 +400,7 @@ static void on_delete_profile_clicked(lv_event_t *e) {
     if (profile_manager_delete(active->id)) {
         profile_manager_apply_to_settings(app_configuration);
         refresh_profile_dropdown(pane);
+        lv_slider_set_value(pane->bitrate_slider, app_configuration->stream.bitrate / BITRATE_STEP, LV_ANIM_OFF);
         lv_event_send(pane->bitrate_slider, LV_EVENT_VALUE_CHANGED, NULL);
     }
 }

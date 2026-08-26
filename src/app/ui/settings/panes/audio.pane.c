@@ -107,13 +107,12 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *conflict_hint = pref_desc_label(view, NULL, false);
     controller->conflict_hint = conflict_hint;
 
-    pref_header(view, locstr("Audio Settings"));
-
-    pref_title_label(view, locstr("Sound Channels (Experimental)"));
+    pref_title_label(view, locstr("Sound channels"));
 
     lv_obj_t *ch_dropdown = pref_dropdown_int(view, controller->surround_entries, controller->surround_entries_len,
                                               &app_configuration->stream.audioConfiguration, NULL);
     lv_obj_set_width(ch_dropdown, LV_PCT(100));
+    pref_desc_label(view, locstr("Surround (5.1) is experimental; stereo is the safe choice."), false);
 
     lv_obj_add_event_cb(adec_dropdown, module_changed_cb, LV_EVENT_VALUE_CHANGED, controller);
 

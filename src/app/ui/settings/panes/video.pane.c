@@ -20,11 +20,6 @@ typedef struct video_pane_t {
     lv_obj_t *hdr_hint;
     lv_obj_t *force_10bit_checkbox;
     lv_obj_t *force_10bit_hint;
-    lv_obj_t *idr_refresh_checkbox;
-    lv_obj_t *idr_refresh_slider;
-    lv_obj_t *idr_refresh_hint;
-    int idr_refresh_slider_value;
-    bool idr_refresh_on;
 
     pref_dropdown_string_entry_t *vdec_entries;
     int vdec_entries_len;
@@ -42,19 +37,7 @@ static void module_changed_cb(lv_event_t *e);
 
 static void hdr_state_update_cb(lv_event_t *e);
 
-static void hdr_more_click_cb(lv_event_t *e);
-
 static void hdr_state_update(video_pane_t *controller);
-
-static void idr_refresh_state_update(video_pane_t *controller);
-
-static void idr_refresh_checkbox_cb(lv_event_t *e);
-
-static void idr_checkbox_activate(lv_event_t *e);
-
-static void idr_refresh_hevc_cb(lv_event_t *e);
-
-static void idr_refresh_slider_cb(lv_event_t *e);
 
 const lv_fragment_class_t settings_pane_video_cls = {
         .constructor_cb = pane_ctor,
@@ -109,7 +92,7 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *conflict_hint = pref_desc_label(view, NULL, false);
     controller->conflict_hint = conflict_hint;
 
-    pref_header(view, locstr("Video Settings"));
+    pref_header(view, locstr("Codec"));
 
     lv_obj_t *hevc_checkbox = pref_checkbox(view, locstr("Use H265 when possible"), &app_configuration->hevc, false);
     lv_obj_t *hevc_hint = pref_desc_label(view, NULL, false);
@@ -138,10 +121,6 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     controller->hdr_checkbox = hdr_checkbox;
     controller->hdr_hint = hdr_hint;
 
-    lv_obj_t *hdr_more = pref_desc_label(view, locstr("Learn more about HDR feature."), true);
-    lv_obj_set_style_text_color(hdr_more, lv_theme_get_color_primary(hdr_more), 0);
-    lv_obj_add_flag(hdr_more, LV_OBJ_FLAG_CLICKABLE);
-
     lv_obj_t *force_10bit_checkbox = pref_checkbox(view, locstr("Request 10-bit video (Main10)"),
                                                    &app_configuration->force_10bit, false);
     controller->force_10bit_checkbox = force_10bit_checkbox;
@@ -154,54 +133,6 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_add_event_cb(hevc_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(av1_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hdr_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
-    lv_obj_add_event_cb(hdr_more, hdr_more_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *idr_checkbox = lv_checkbox_create(view);
-    lv_checkbox_set_text(idr_checkbox, locstr("Periodic decoder refresh (HEVC)"));
-    if (app_configuration->idr_refresh_interval_ms >= 500) {
-        lv_obj_add_state(idr_checkbox, LV_STATE_CHECKED);
-    }
-    controller->idr_refresh_checkbox = idr_checkbox;
-    controller->idr_refresh_slider_value = app_configuration->idr_refresh_interval_ms >= 500
-            ? app_configuration->idr_refresh_interval_ms
-            : 10000;
-    pref_checkbox_prepare_for_dpad(idr_checkbox);
-    lv_obj_t *idr_slider = pref_slider(view, &controller->idr_refresh_slider_value, 500, 60000, 500);
-    controller->idr_refresh_slider = idr_slider;
-    lv_obj_t *idr_hint = pref_desc_label(view,
-        locstr("Request a keyframe every N seconds during HEVC streams to reduce long-session artifact drift. "
-               "Off by default; use 10–30 s if you see blockiness or color smearing. Minimum 0.5 s."),
-        false);
-    controller->idr_refresh_hint = idr_hint;
-    /* LVGL already synthesizes a CLICKED event for a focused object on ENTER
-     * key release (see indev_keypad_proc in lv_indev.c), so also listening on
-     * LV_EVENT_KEY here double-fires the toggle for one remote OK press. */
-    lv_obj_add_event_cb(idr_checkbox, idr_checkbox_activate, LV_EVENT_CLICKED, controller);
-    lv_obj_add_event_cb(idr_slider, idr_refresh_slider_cb, LV_EVENT_VALUE_CHANGED, controller);
-    lv_obj_add_event_cb(hevc_checkbox, idr_refresh_hevc_cb, LV_EVENT_VALUE_CHANGED, controller);
-    idr_refresh_state_update(controller);
-
-#if TARGET_WEBOS
-    pref_checkbox(view, locstr("Smooth frame pacing (host PTS)"), &app_configuration->smooth_frame_pacing, false);
-    pref_desc_label(view,
-                    locstr("Pace video presentation from the host capture clock instead of packet "
-                           "arrival time. Experimental A/B test; takes effect on the next stream."),
-                    false);
-    pref_checkbox(view, locstr("Soft recovery (4K)"), &app_configuration->soft_recovery, false);
-    pref_desc_label(view,
-                    locstr("When decode backlog builds on 4K streams, temporarily lower bitrate so "
-                           "video/input can catch up (no Flush+IDR). Leave enabled for C5 testing; "
-                           "disable to compare."),
-                    false);
-#endif
-
-    pref_header(view, locstr("Color"));
-    pref_checkbox(view, locstr("Full range YUV (SDR only)"), &app_configuration->force_full_color_range, false);
-    pref_desc_label(view,
-                    locstr("Request full-range (0-255) color from the host for SDR streams. "
-                           "Has no effect when HDR is enabled — HDR always uses limited range "
-                           "(SMPTE ST 2084 standard). Disable if SDR colors look washed out."),
-                    false);
 
     return view;
 }
@@ -260,91 +191,8 @@ static void hdr_state_update(video_pane_t *controller) {
     } else {
         lv_obj_clear_state(controller->force_10bit_checkbox, LV_STATE_DISABLED);
         lv_label_set_text(controller->force_10bit_hint,
-                          locstr("Offer the host a Main10 bitstream with HDR off, against banding in dark "
-                                 "SDR gradients. A 10-bit offer is also this protocol's HDR request, so a "
-                                 "Sunshine-family host that has HDR available may answer with PQ instead. "
-                                 "It also turns every reconnect to a running app into a full launch "
-                                 "(30 s timeout) rather than a resume."));
+                          locstr("10-bit (Main10) video with HDR off, against banding in dark SDR "
+                                 "gradients. A host with HDR available may answer with HDR instead."));
     }
 }
 
-static void hdr_more_click_cb(lv_event_t *e) {
-    (void) e;
-    app_open_url("https://github.com/mariotaku/moonlight-tv/wiki/HDR-Support");
-}
-
-static void idr_refresh_state_update(video_pane_t *controller) {
-    app_t *app = controller->parent->app;
-    const bool hevc_capable = (app->ss4s.video_cap.codecs & SS4S_VIDEO_H265) != 0;
-    const bool hevc_on = app_configuration->hevc && hevc_capable;
-    const bool refresh_on = app_configuration->idr_refresh_interval_ms >= 500;
-    controller->idr_refresh_on = refresh_on;
-    if (refresh_on) {
-        lv_obj_add_state(controller->idr_refresh_checkbox, LV_STATE_CHECKED);
-    } else {
-        lv_obj_clear_state(controller->idr_refresh_checkbox, LV_STATE_CHECKED);
-    }
-    if (!hevc_on) {
-        lv_obj_add_state(controller->idr_refresh_checkbox, LV_STATE_DISABLED);
-        lv_obj_add_state(controller->idr_refresh_slider, LV_STATE_DISABLED);
-        lv_label_set_text(controller->idr_refresh_hint,
-                          locstr("Enable H265 to use periodic decoder refresh."));
-    } else {
-        lv_obj_clear_state(controller->idr_refresh_checkbox, LV_STATE_DISABLED);
-        if (refresh_on) {
-            lv_obj_clear_state(controller->idr_refresh_slider, LV_STATE_DISABLED);
-            lv_label_set_text_fmt(controller->idr_refresh_hint,
-                                  locstr("Request a keyframe every %.1f seconds during HEVC streams."),
-                                  app_configuration->idr_refresh_interval_ms / 1000.0);
-        } else {
-            lv_obj_add_state(controller->idr_refresh_slider, LV_STATE_DISABLED);
-            lv_label_set_text(controller->idr_refresh_hint,
-                              locstr("Request a keyframe every N seconds during HEVC streams to reduce "
-                                     "long-session artifact drift. Off by default (0.5–60 s when enabled)."));
-        }
-    }
-}
-
-static void idr_checkbox_activate(lv_event_t *e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
-        return;
-    }
-    lv_obj_t *cb = lv_event_get_current_target(e);
-    if (lv_obj_has_state(cb, LV_STATE_DISABLED)) {
-        return;
-    }
-    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
-        lv_obj_clear_state(cb, LV_STATE_CHECKED);
-    } else {
-        lv_obj_add_state(cb, LV_STATE_CHECKED);
-    }
-    idr_refresh_checkbox_cb(e);
-}
-
-static void idr_refresh_checkbox_cb(lv_event_t *e) {
-    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
-    lv_obj_t *cb = lv_event_get_target(e);
-    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
-        if (controller->idr_refresh_slider_value < 500) {
-            controller->idr_refresh_slider_value = 10000;
-        }
-        app_configuration->idr_refresh_interval_ms = controller->idr_refresh_slider_value;
-    } else {
-        app_configuration->idr_refresh_interval_ms = 0;
-    }
-    idr_refresh_state_update(controller);
-}
-
-static void idr_refresh_slider_cb(lv_event_t *e) {
-    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
-    if (app_configuration->idr_refresh_interval_ms >= 500) {
-        app_configuration->idr_refresh_interval_ms = controller->idr_refresh_slider_value;
-    }
-    idr_refresh_state_update(controller);
-}
-
-static void idr_refresh_hevc_cb(lv_event_t *e) {
-    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
-    hdr_state_update(controller);
-    idr_refresh_state_update(controller);
-}

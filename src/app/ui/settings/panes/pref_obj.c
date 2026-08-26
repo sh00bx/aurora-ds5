@@ -226,6 +226,10 @@ lv_obj_t *pref_desc_label(lv_obj_t *parent, const char *title, bool focusable) {
         lv_obj_class_init_obj(label);
     } else {
         label = lv_label_create(parent);
+        /* Marks plain description labels so the embedded settings sheet can
+         * fold them into its footer: shown there for the focused control,
+         * hidden inline (unless the control is disabled and unreachable). */
+        lv_obj_add_flag(label, LV_OBJ_FLAG_USER_1);
     }
     lv_obj_set_width(label, LV_PCT(100));
     lv_obj_add_flag(label, LV_OBJ_FLAG_SCROLL_ON_FOCUS);

@@ -67,6 +67,9 @@ lv_obj_t *settings_win_create(lv_fragment_t *self, lv_obj_t *parent) {
         lv_obj_set_grid_cell(nav, LV_GRID_ALIGN_STRETCH, 0, 1, LV_GRID_ALIGN_STRETCH, 0, 1);
 
         lv_obj_t *detail = lv_obj_create(content);
+        /* Arrow keys move the focus; letting them ALSO scroll this container
+         * made one press act twice (value change + pan). */
+        lv_obj_clear_flag(detail, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
         lv_obj_set_layout(detail, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(detail, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(detail, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

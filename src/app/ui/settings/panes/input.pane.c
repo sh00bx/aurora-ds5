@@ -63,12 +63,12 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     pref_desc_label(view, locstr("Don't send mouse, keyboard or gamepad input to host computer."), false);
 
     pref_checkbox(view, locstr("Capture system keys"), &app_configuration->syskey_capture, false);
-    pref_desc_label(view, locstr("Capture and send system keys (e.g. Meta/Win key) to host computer."), false);
+    pref_desc_label(view, locstr("Send system keys (e.g. Meta/Win) to the host computer."), false);
 
 #if FEATURE_INPUT_EVKBD
     pref_checkbox(view, locstr("Use keyboard hardware"), &app_configuration->keyboard_capture, false);
     pref_desc_label(view, locstr("Take exclusive control of a plugged keyboard while streaming, so every key "
-                                 "reaches the host. Without it the TV keeps keys like F12 for volume."), false);
+                                 "reaches the host (the TV otherwise keeps keys like F12 for volume)."), false);
 #endif
 
     pref_header(view, locstr("Mouse"));
@@ -77,8 +77,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_t *hwmouse_toggle = pref_checkbox(view, locstr("Use mouse hardware"),
                                              &app_configuration->hardware_mouse, false);
     lv_obj_add_event_cb(hwmouse_toggle, hwmouse_state_update_cb, LV_EVENT_VALUE_CHANGED, pane);
-    pref_desc_label(view, locstr("Use plugged mouse device only when streaming. "
-                                 "This will have better performance, but absolute mouse mode will not be enabled."),
+    pref_desc_label(view, locstr("Use a plugged mouse directly while streaming. Better performance, "
+                                 "but absolute mouse mode is unavailable."),
                     false);
 #endif
 
@@ -93,8 +93,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                             &app_configuration->hid_passthrough, false);
     lv_obj_add_event_cb(hid_pt_toggle, on_hid_passthrough_changed, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view,
-                    locstr("Bridge selected controllers to the PC as native HID devices. "
-                           "Other controllers keep using standard Moonlight emulation."),
+                    locstr("Bridge selected controllers to the PC as native HID devices; others keep "
+                           "standard Moonlight emulation."),
                     false);
 
     static const pref_dropdown_int_entry_t tpmouse_entries[] = {
@@ -112,9 +112,9 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 0, 30, 1);
     lv_obj_set_width(pane->idle_off_slider, LV_PCT(100));
     lv_obj_add_event_cb(pane->idle_off_slider, on_controller_idle_changed, LV_EVENT_VALUE_CHANGED, pane);
-    pref_desc_label(view, locstr("Disconnect a controller that has not been used for this long, which powers "
-                                 "it off instead of letting it drain on the couch. Applies to any controller "
-                                 "paired with the TV, not only while streaming. Leftmost position is Never."),
+    pref_desc_label(view, locstr("Power a controller off after this long without input, instead of letting "
+                                 "it drain on the couch. Applies whenever it is paired with the TV. "
+                                 "Leftmost position is Never."),
                     false);
 
     pane->deadzone_label = pref_title_label(view, locstr("Analog stick deadzone"));
@@ -126,18 +126,13 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                     false);
 
     pref_checkbox(view, locstr("Virtual mouse"), &app_configuration->virtual_mouse, false);
-    pref_desc_label(view, locstr("When enabled, virtual mouse starts active at the beginning of a stream. "
-                                 "Toggle anytime from the stream overlay Virtual Mouse button. "
-                                 "Right stick moves the cursor, left stick scrolls, LT/RT are left/right mouse buttons."),
+    pref_desc_label(view, locstr("Start streams with the virtual mouse active: right stick moves, left stick "
+                                 "scrolls, LT/RT click, Y opens the on-screen keyboard. Toggle anytime from "
+                                 "the stream overlay."),
                     false);
 
     pane->swap_abxy_toggle = pref_checkbox(view, locstr("Swap ABXY buttons"), &app_configuration->swap_abxy, false);
-    pref_desc_label(view, locstr("Swap A/B and X/Y gamepad buttons. Useful when you prefer Nintendo-like layouts."),
-                    false);
-
-    pref_desc_label(view, locstr("Hold Select/Back for 4 seconds during streaming to pin or unpin performance stats. "
-                                 "Open the on-screen keyboard from the stream overlay, Magic Remote BLUE, "
-                                 "or gamepad Y while virtual mouse is active."),
+    pref_desc_label(view, locstr("Swap A/B and X/Y gamepad buttons, for Nintendo-style layouts."),
                     false);
 
 #if FEATURE_INPUT_EVMOUSE

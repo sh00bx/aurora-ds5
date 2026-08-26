@@ -1,6 +1,7 @@
 #include "settings.controller.h"
 #include "profile/profile_manager.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "ui/root.h"
@@ -23,15 +24,30 @@
 typedef struct {
     const char *icon;
     const char *name;
+    /** One line for the footer while the category itself is focused. */
+    const char *desc;
     const lv_fragment_class_t *cls;
 } settings_entry_t;
 
 static const settings_entry_t entries[] = {
-        {MAT_SYMBOL_SETTINGS,        translatable("Basic Settings"), &settings_pane_basic_cls},
-        {MAT_SYMBOL_DESKTOP_WINDOWS, translatable("Host Settings"),  &settings_pane_host_cls},
-        {MAT_SYMBOL_SPORTS_ESPORTS,  translatable("Input Settings"), &settings_pane_input_cls},
-        {MAT_SYMBOL_VOLUME_UP,       translatable("Audio Settings"), &settings_pane_audio_cls},
-        {MAT_SYMBOL_VIDEO_SETTINGS,  translatable("Video Settings"), &settings_pane_video_cls},
+        {MAT_SYMBOL_SETTINGS,        translatable("Streaming"),
+                translatable("Resolution, FPS, bitrate, stats overlay and profiles"),
+                &settings_pane_basic_cls},
+        {MAT_SYMBOL_DESKTOP_WINDOWS, translatable("Host"),
+                translatable("What the host computer does when a stream starts"),
+                &settings_pane_host_cls},
+        {MAT_SYMBOL_SPORTS_ESPORTS,  translatable("Input"),
+                translatable("Mouse, keyboard and controller options"),
+                &settings_pane_input_cls},
+        {MAT_SYMBOL_VOLUME_UP,       translatable("Audio"),
+                translatable("Audio backend and sound channels"),
+                &settings_pane_audio_cls},
+        {MAT_SYMBOL_VIDEO_SETTINGS,  translatable("Video"),
+                translatable("Codec, HDR and decoder options"),
+                &settings_pane_video_cls},
+        {MAT_SYMBOL_TUNE,            translatable("Experimental"),
+                translatable("Pacing, recovery and other experiments"),
+                &settings_pane_experimental_cls},
 };
 static const int entries_len = sizeof(entries) / sizeof(settings_entry_t);
 
@@ -69,6 +85,8 @@ static void detail_defocus(settings_controller_t *controller, lv_event_t *e);
 
 static bool detail_item_needs_lrkey(lv_obj_t *obj);
 
+static void detail_focus_prev(settings_controller_t *c, lv_group_t *group);
+
 static void show_pane(settings_controller_t *controller, const lv_fragment_class_t *cls);
 
 static void settings_close(lv_event_t *e);
@@ -88,6 +106,10 @@ static void pane_child_added(lv_event_t *e);
 static void settings_launcher_detach(settings_controller_t *fragment);
 
 static void embed_leave_detail(settings_controller_t *c);
+
+static void embed_leave_detail_to(settings_controller_t *c, lv_obj_t *target);
+
+static void embed_footer_update(settings_controller_t *c);
 
 static void settings_close_pane_popup(settings_controller_t *c);
 
@@ -193,6 +215,7 @@ static void on_view_created(lv_fragment_t *self, lv_obj_t *view) {
             lv_group_t *tab_group = lv_group_create();
             controller->tab_groups[i] = tab_group;
             lv_obj_t *page = lv_tabview_add_tab(controller->tabview, entry.icon);
+            lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
             lv_obj_add_event_cb(page, cb_child_group_add, LV_EVENT_CHILD_CREATED, tab_group);
             lv_obj_add_event_cb(page, pane_child_added, LV_EVENT_CHILD_CREATED, controller);
             lv_fragment_t *pane = lv_fragment_create(entry.cls, controller);
@@ -245,6 +268,16 @@ static void on_will_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     LV_UNUSED(view);
     if (!controller->launcher_host) {
         return;
+    }
+    /* The focus callbacks render into embed_hint, and deleting the view tree
+     * removes objects from their groups, which refocuses and would fire them
+     * against half-freed widgets. Disarm before anything dies. */
+    controller->embed_hint = NULL;
+    if (controller->detail_group) {
+        lv_group_set_focus_cb(controller->detail_group, NULL);
+    }
+    if (controller->nav_group) {
+        lv_group_set_focus_cb(controller->nav_group, NULL);
     }
     settings_close_pane_popup(controller);
     if (controller->detail) {
@@ -510,7 +543,7 @@ static void on_detail_key(lv_event_t *e) {
                 lv_event_stop_bubbling(e);
                 return;
             }
-            lv_group_focus_prev(nav_detail);
+            detail_focus_prev(controller, nav_detail);
             break;
         }
         case LV_KEY_DOWN: {
@@ -679,6 +712,17 @@ static bool detail_item_needs_lrkey(lv_obj_t *obj) {
     return false;
 }
 
+/* UP in the settings column: one step up, and past the top it continues to the
+ * Close button -- the same stop UP from the top category reaches on the rail. */
+static void detail_focus_prev(settings_controller_t *c, lv_group_t *group) {
+    lv_obj_t *before = lv_group_get_focused(group);
+    lv_group_focus_prev(group);
+    if (c->launcher_host && c->embed_in_detail && c->pane_popup_group == NULL &&
+        c->close_btn != NULL && lv_group_get_focused(group) == before) {
+        embed_leave_detail_to(c, c->close_btn);
+    }
+}
+
 static void detail_defocus(settings_controller_t *controller, lv_event_t *e) {
     (void) e;
     if (controller->launcher_host) {
@@ -796,6 +840,9 @@ static void pane_child_attach_handlers(settings_controller_t *controller, lv_obj
         return;
     }
     lv_obj_add_flag(child, LV_OBJ_FLAG_EVENT_BUBBLE);
+    /* Focus moves must bring the row into view in every mode; arrow-key
+     * scrolling of the containers is disabled (it double-acted with focus). */
+    lv_obj_add_flag(child, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
     lv_obj_add_event_cb(child, on_detail_key, LV_EVENT_KEY, controller);
     if (lv_obj_has_class(child, &lv_dropdown_class)) {
         lv_obj_add_event_cb(child, on_dropdown_clicked, LV_EVENT_CLICKED, controller);
@@ -928,7 +975,7 @@ static void settings_dropdown_arrow_preprocess_cb(lv_event_t *e) {
 
     switch (key) {
         case LV_KEY_UP:
-            lv_group_focus_prev(nav_detail);
+            detail_focus_prev(c, nav_detail);
             lv_event_stop_processing(e);
             break;
         case LV_KEY_DOWN:
@@ -1275,15 +1322,114 @@ static bool embed_button_mode(settings_controller_t *c) {
     return (app_ui_get_input_mode(&c->app->ui.input) & UI_INPUT_MODE_BUTTON_FLAG) != 0;
 }
 
-/* The footer names the keys for where the cursor is, exactly like the HID
- * sheet's footer does in-game. Two lines total; no legend on any control. */
-static void embed_update_hint(settings_controller_t *c) {
+/* The pane descriptions live in the footer, not inline: pref_desc_label marks
+ * every plain description (LV_OBJ_FLAG_USER_1), the sheet hides the inline
+ * copy, and this collects the marked labels that follow @p focused among its
+ * siblings — the description(s) of exactly that control. */
+static bool embed_collect_desc(lv_obj_t *focused, char *buf, size_t buflen) {
+    if (focused == NULL || buflen == 0) {
+        return false;
+    }
+    lv_obj_t *parent = lv_obj_get_parent(focused);
+    if (parent == NULL) {
+        return false;
+    }
+    uint32_t idx = lv_obj_get_index(focused);
+    uint32_t n = lv_obj_get_child_cnt(parent);
+    size_t off = 0;
+    buf[0] = '\0';
+    for (uint32_t i = idx + 1; i < n; i++) {
+        lv_obj_t *sib = lv_obj_get_child(parent, i);
+        if (!lv_obj_has_flag(sib, LV_OBJ_FLAG_USER_1)) {
+            break;
+        }
+        const char *text = lv_label_get_text(sib);
+        if (text == NULL || text[0] == '\0') {
+            continue;
+        }
+        int written = snprintf(buf + off, buflen - off, "%s%s", off > 0 ? "  " : "", text);
+        if (written < 0) {
+            break;
+        }
+        off += (size_t) written;
+        if (off >= buflen - 1) {
+            break;
+        }
+    }
+    return off > 0;
+}
+
+/* The footer explains where the cursor is: the focused setting's description
+ * when it has one, the category's summary on the rail, a key legend otherwise. */
+static void embed_footer_update(settings_controller_t *c) {
     if (!c->embed_hint) {
         return;
     }
-    lv_label_set_text(c->embed_hint, c->embed_in_detail
-            ? locstr("UP/DOWN  setting        BACK/LEFT  categories")
-            : locstr("UP/DOWN  category        OK  edit        BACK  close"));
+    if (c->embed_in_detail && c->detail_group) {
+        char buf[1024];
+        lv_obj_t *focused = lv_group_get_focused(c->detail_group);
+        if (embed_collect_desc(focused, buf, sizeof(buf))) {
+            lv_label_set_text(c->embed_hint, buf);
+            return;
+        }
+        if (focused != NULL && lv_obj_has_class(focused, &lv_slider_class)) {
+            lv_label_set_text(c->embed_hint, locstr("LEFT/RIGHT  adjust        UP/DOWN  setting        BACK  categories"));
+            return;
+        }
+        lv_label_set_text(c->embed_hint, locstr("UP/DOWN  setting        OK  change        BACK  categories"));
+        return;
+    }
+    if (c->embed_active >= 0 && c->embed_active < entries_len && entries[c->embed_active].desc != NULL &&
+        c->nav_group && lv_group_get_focused(c->nav_group) != c->close_btn) {
+        lv_label_set_text(c->embed_hint, locstr(entries[c->embed_active].desc));
+        return;
+    }
+    lv_label_set_text(c->embed_hint, locstr("UP/DOWN  category        OK  edit        BACK  close"));
+}
+
+/* Inline descriptions come back for controls the cursor cannot reach: a
+ * DISABLED control is skipped by focus_next/prev, so its description (usually
+ * the reason it is off) would otherwise be unreadable. */
+static void embed_refresh_desc_visibility(lv_obj_t *parent) {
+    uint32_t n = lv_obj_get_child_cnt(parent);
+    lv_obj_t *owner = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *child = lv_obj_get_child(parent, i);
+        if (lv_obj_has_flag(child, LV_OBJ_FLAG_USER_1)) {
+            if (owner != NULL && !lv_obj_has_state(owner, LV_STATE_DISABLED)) {
+                lv_obj_add_flag(child, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_clear_flag(child, LV_OBJ_FLAG_HIDDEN);
+            }
+            continue;
+        }
+        if (lv_obj_is_group_def(child)) {
+            owner = child;
+        }
+        embed_refresh_desc_visibility(child);
+    }
+}
+
+static void embed_sections_refresh_desc_visibility(settings_controller_t *c) {
+    for (int i = 0; i < entries_len && i < SETTINGS_EMBED_MAX_SECTIONS; i++) {
+        if (c->embed_sections[i]) {
+            embed_refresh_desc_visibility(c->embed_sections[i]);
+        }
+    }
+}
+
+/* A control changed: disabled states and hint texts may have moved with it. */
+static void embed_value_changed_cb(lv_event_t *e) {
+    settings_controller_t *c = lv_event_get_user_data(e);
+    embed_sections_refresh_desc_visibility(c);
+    embed_footer_update(c);
+}
+
+static void embed_detail_focus_cb(lv_group_t *group) {
+    settings_controller_t *c = group->user_data;
+    if (c != NULL) {
+        embed_footer_update(c);
+    }
 }
 
 /**
@@ -1341,6 +1487,7 @@ static void embed_set_active(settings_controller_t *c, int index) {
         }
     }
     lv_obj_scroll_to_y(c->detail, 0, LV_ANIM_OFF);
+    embed_footer_update(c);
 }
 
 static void embed_enter_detail(settings_controller_t *c) {
@@ -1357,10 +1504,10 @@ static void embed_enter_detail(settings_controller_t *c) {
     if (embed_button_mode(c)) {
         lv_obj_add_state(first, LV_STATE_FOCUS_KEY);
     }
-    embed_update_hint(c);
+    embed_footer_update(c);
 }
 
-static void embed_leave_detail(settings_controller_t *c) {
+static void embed_leave_detail_to(settings_controller_t *c, lv_obj_t *target) {
     if (!c->embed_in_detail) {
         return;
     }
@@ -1373,13 +1520,21 @@ static void embed_leave_detail(settings_controller_t *c) {
         lv_obj_clear_state(focused, LV_STATE_FOCUS_KEY);
     }
     app_input_remove_modal_group(&c->app->ui.input, c->detail_group);
-    if (c->embed_active >= 0 && c->embed_nav_items[c->embed_active]) {
-        lv_group_focus_obj(c->embed_nav_items[c->embed_active]);
+    if (target) {
+        lv_group_focus_obj(target);
         if (embed_button_mode(c)) {
-            lv_obj_add_state(c->embed_nav_items[c->embed_active], LV_STATE_FOCUS_KEY);
+            lv_obj_add_state(target, LV_STATE_FOCUS_KEY);
         }
     }
-    embed_update_hint(c);
+    embed_footer_update(c);
+}
+
+static void embed_leave_detail(settings_controller_t *c) {
+    lv_obj_t *target = NULL;
+    if (c->embed_active >= 0 && c->embed_active < entries_len) {
+        target = c->embed_nav_items[c->embed_active];
+    }
+    embed_leave_detail_to(c, target);
 }
 
 static void embed_nav_focused(lv_event_t *e) {
@@ -1420,7 +1575,12 @@ static void embed_nav_key(lv_event_t *e) {
 static void embed_close_key(lv_event_t *e) {
     settings_controller_t *c = lv_event_get_user_data(e);
     if (lv_event_get_key(e) == LV_KEY_DOWN) {
-        lv_group_focus_next(c->nav_group);
+        /* Back to where the user was: the active category, not always the top. */
+        if (c->embed_active >= 0 && c->embed_active < entries_len && c->embed_nav_items[c->embed_active]) {
+            lv_group_focus_obj(c->embed_nav_items[c->embed_active]);
+        } else {
+            lv_group_focus_next(c->nav_group);
+        }
     }
 }
 
@@ -1454,8 +1614,17 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
     lv_group_set_editing(controller->detail_group, false);
     controller->embed_active = -1;
     controller->embed_in_detail = false;
+    /* The footer follows the cursor: every focus move in either group re-renders
+     * it (the focused setting's description, or the rail's category summary). */
+    controller->detail_group->user_data = controller;
+    lv_group_set_focus_cb(controller->detail_group, embed_detail_focus_cb);
+    controller->nav_group->user_data = controller;
+    lv_group_set_focus_cb(controller->nav_group, embed_detail_focus_cb);
 
     lv_obj_add_event_cb(controller->detail, on_back_request, LV_EVENT_CANCEL, controller);
+    /* Hint texts and disabled states move with the values (e.g. HDR follows
+     * H265): re-fold the inline descriptions and re-render the footer. */
+    lv_obj_add_event_cb(controller->detail, embed_value_changed_cb, LV_EVENT_VALUE_CHANGED, controller);
     /* No KEY handler on the detail container itself: every focusable widget
      * already carries on_detail_key (pane_child_attach_handlers) and bubbles,
      * so a second registration here would run each key press twice. */
@@ -1554,6 +1723,8 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
         lv_obj_set_user_data(section, pane);
     }
 
+    embed_sections_refresh_desc_visibility(controller);
+
     app_input_push_modal_group(&controller->app->ui.input, controller->nav_group);
     embed_set_active(controller, 0);
     if (controller->embed_nav_items[0]) {
@@ -1562,7 +1733,7 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
             lv_obj_add_state(controller->embed_nav_items[0], LV_STATE_FOCUS_KEY);
         }
     }
-    embed_update_hint(controller);
+    embed_footer_update(controller);
 }
 
 /** An all-caps, tracked, muted line — the overlay's second voice. */
@@ -1635,14 +1806,8 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_t *bar = embed_bar(panel, LV_DPX(52), LV_BORDER_SIDE_BOTTOM);
     c->embed_appbar = bar;
 
-    lv_obj_t *title_block = lv_obj_create(bar);
-    lv_obj_remove_style_all(title_block);
-    lv_obj_set_size(title_block, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(title_block, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(title_block, LV_DPX(2), 0);
-    lv_obj_clear_flag(title_block, LV_OBJ_FLAG_SCROLLABLE);
-    embed_eyebrow(title_block, "AURORA");
-    lv_obj_t *title = lv_label_create(title_block);
+    /* Just "Settings": the launcher bar right above already says AURORA. */
+    lv_obj_t *title = lv_label_create(bar);
     lv_obj_set_style_text_font(title, lv_theme_get_font_large(bar), 0);
     lv_obj_set_style_text_color(title, ml_color_hex(ML_COLOR_TEXT), 0);
     lv_label_set_text(title, locstr("Settings"));
@@ -1702,6 +1867,11 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(nav, LV_DPX(6), 0);
     lv_obj_add_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+    /* Arrow keys move the FOCUS; without this, a key bubbling out of a slider
+     * or checkbox also pans the container by a quarter page (lv_obj_event's
+     * SCROLL_WITH_ARROW handling), so one press acted twice. Scrolling is done
+     * by SCROLL_ON_FOCUS on the rows instead. */
+    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
     lv_obj_set_scrollbar_mode(nav, LV_SCROLLBAR_MODE_AUTO);
 
     lv_obj_t *scroll = lv_obj_create(body_row);
@@ -1718,6 +1888,8 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_pad_gap(scroll, LV_DPX(8), 0);
     lv_obj_set_style_bg_opa(scroll, LV_OPA_TRANSP, 0);
     lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
+    /* Same as the nav rail: focus moves, arrow keys must never ALSO scroll. */
+    lv_obj_clear_flag(scroll, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
     lv_obj_set_scrollbar_mode(scroll, LV_SCROLLBAR_MODE_AUTO);
     /* lv_obj_remove_style_all() strips the scrollbar part too; give it the
      * hairline thumb the HID sheet's panes use. */
@@ -1726,10 +1898,22 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_bg_color(scroll, ml_color_hex(ML_COLOR_TEXT), LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(scroll, 60, LV_PART_SCROLLBAR);
 
-    /* No footer key-hint bar: the sheet reads cleaner without it, and the
-     * remote's behaviour is discoverable enough. embed_hint stays NULL, which
-     * embed_update_hint() already tolerates. */
-    c->embed_hint = NULL;
+    /* Footer: the descriptions moved here from the settings column (they made
+     * every pane a long scroll). It renders the focused setting's description,
+     * the category summary on the rail, or a key legend. */
+    lv_obj_t *footer = embed_bar(panel, LV_DPX(56), LV_BORDER_SIDE_TOP);
+    lv_obj_t *hint = lv_label_create(footer);
+    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(footer), 0);
+    lv_obj_set_style_text_color(hint, ml_color_hex(ML_COLOR_TEXT), 0);
+    lv_obj_set_style_text_opa(hint, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_flex_grow(hint, 1);
+    /* The label clips to its own area: a description that would run past the
+     * bar is cut instead of painting over the settings above it. */
+    lv_obj_set_height(hint, LV_PCT(100));
+    lv_obj_set_style_pad_ver(hint, LV_DPX(8), 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_label_set_text_static(hint, "");
+    c->embed_hint = hint;
 
     return backdrop;
 }

@@ -92,3 +92,4 @@ extern const lv_fragment_class_t settings_pane_host_cls;
 extern const lv_fragment_class_t settings_pane_input_cls;
 extern const lv_fragment_class_t settings_pane_audio_cls;
 extern const lv_fragment_class_t settings_pane_video_cls;
+extern const lv_fragment_class_t settings_pane_experimental_cls;
