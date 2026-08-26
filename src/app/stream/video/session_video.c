@@ -626,8 +626,12 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
      * SS4S_PlayerGetVideoLatency only reads ss4s' own stats counter, so it is cheap
      * and — unlike the render-queue depth, which is Starfish/SMP-only — available
      * on our NDL decoder. */
+    /* 2 s window (= the full stats ring at fps×2 entries): the per-frame samples are
+     * queue-depth quantized, so a 1 s window still lands on 1×/2× frame time whenever
+     * the depth holds for a second. The wider window mixes both depths into the
+     * fractional occupancy the overlay is meant to show. */
     int latencyUs = 0;
-    if (vs.player != NULL && SS4S_PlayerGetVideoLatency(vs.player, 0, &latencyUs)) {
+    if (vs.player != NULL && SS4S_PlayerGetVideoLatency(vs.player, 2000000, &latencyUs)) {
         dst->avgDecoderLatency = (float) latencyUs / 1000.0f;
         vdec_stream_info.has_decoder_latency = true;
     } else {
