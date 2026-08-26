@@ -109,7 +109,11 @@ static void embed_leave_detail(settings_controller_t *c);
 
 static void embed_leave_detail_to(settings_controller_t *c, lv_obj_t *target);
 
-static void embed_footer_update(settings_controller_t *c);
+static void embed_tooltip_hide(settings_controller_t *c);
+
+static void embed_tooltip_schedule(settings_controller_t *c);
+
+static void embed_tooltip_show(settings_controller_t *c);
 
 static void settings_close_pane_popup(settings_controller_t *c);
 
@@ -175,6 +179,9 @@ static void settings_controller_ctor(lv_fragment_t *self, void *args) {
     fragment->pane_popup_group = NULL;
     fragment->embed_root = NULL;
     fragment->embed_appbar = NULL;
+    fragment->embed_hint = NULL;
+    fragment->embed_tooltip = NULL;
+    fragment->embed_tooltip_timer = NULL;
     fragment->needs_stream_reconnect = false;
     fragment->needs_locale_reapply = false;
     fragment->mini = fragment->pending_mini = UI_IS_MINI(fragment->app->ui.width);
@@ -269,9 +276,14 @@ static void on_will_destroy_view(lv_fragment_t *self, lv_obj_t *view) {
     if (!controller->launcher_host) {
         return;
     }
-    /* The focus callbacks render into embed_hint, and deleting the view tree
-     * removes objects from their groups, which refocuses and would fire them
-     * against half-freed widgets. Disarm before anything dies. */
+    /* The focus callbacks and the tooltip timer render into the view tree, and
+     * deleting it removes objects from their groups, which refocuses and would
+     * fire them against half-freed widgets. Disarm before anything dies. */
+    if (controller->embed_tooltip_timer) {
+        lv_timer_del(controller->embed_tooltip_timer);
+        controller->embed_tooltip_timer = NULL;
+    }
+    controller->embed_tooltip = NULL;
     controller->embed_hint = NULL;
     if (controller->detail_group) {
         lv_group_set_focus_cb(controller->detail_group, NULL);
@@ -748,8 +760,11 @@ static void on_dropdown_clicked(lv_event_t *event) {
     lv_obj_t *target = lv_event_get_target(event);
     if (lv_obj_has_state(target, LV_STATE_CHECKED)) {
         controller->active_dropdown = target;
+        /* The list opens over exactly the spot the bubble uses. */
+        embed_tooltip_hide(controller);
     } else {
         controller->active_dropdown = NULL;
+        embed_tooltip_schedule(controller);
     }
 }
 
@@ -1060,6 +1075,7 @@ static void settings_embed_refocus_after_popup(settings_controller_t *c) {
     if (embed_button_mode(c)) {
         lv_obj_add_state(obj, LV_STATE_FOCUS_KEY);
     }
+    embed_tooltip_schedule(c);
 }
 
 static void settings_launcher_detach(settings_controller_t *fragment) {
@@ -1218,6 +1234,7 @@ static void settings_style_pane_msgbox_amoled(lv_obj_t *mbox) {
 
 static void settings_show_pane_popup(settings_controller_t *c, const lv_fragment_class_t *cls) {
     settings_close_pane_popup(c);
+    embed_tooltip_hide(c);
 
     const char *title = locstr("Settings");
     for (int i = 0; i < entries_len; i++) {
@@ -1359,32 +1376,107 @@ static bool embed_collect_desc(lv_obj_t *focused, char *buf, size_t buflen) {
     return off > 0;
 }
 
-/* The footer explains where the cursor is: the focused setting's description
- * when it has one, the category's summary on the rail, a key legend otherwise. */
-static void embed_footer_update(settings_controller_t *c) {
-    if (!c->embed_hint) {
+/* The descriptions pop up as a tooltip: the cursor rests somewhere for a
+ * moment, and the bubble appears NEXT TO it, painted over the sheet (it is the
+ * backdrop's last child, so it wins the z-order against everything the sheet
+ * draws). Any movement hides it and restarts the clock — the professional
+ * hover-tooltip pattern, driven by focus instead of a pointer. */
+#define EMBED_TOOLTIP_DELAY_MS 600
+#define EMBED_TOOLTIP_MAX_W LV_DPX(430)
+
+static void embed_tooltip_hide(settings_controller_t *c) {
+    if (c->embed_tooltip_timer) {
+        lv_timer_pause(c->embed_tooltip_timer);
+    }
+    if (c->embed_tooltip) {
+        lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Hide now, pop after the delay (the timer stays paused between uses). */
+static void embed_tooltip_schedule(settings_controller_t *c) {
+    if (c->embed_tooltip == NULL || c->embed_tooltip_timer == NULL) {
         return;
     }
+    lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_reset(c->embed_tooltip_timer);
+    lv_timer_resume(c->embed_tooltip_timer);
+}
+
+static void embed_tooltip_place(settings_controller_t *c, lv_obj_t *anchor, bool rail) {
+    lv_area_t aa, ra;
+    lv_obj_get_coords(anchor, &aa);
+    lv_obj_get_coords(c->embed_root, &ra);
+    lv_coord_t tw = lv_obj_get_width(c->embed_tooltip);
+    lv_coord_t th = lv_obj_get_height(c->embed_tooltip);
+    lv_coord_t margin = LV_DPX(10);
+    lv_coord_t x, y;
+    if (rail) {
+        /* Beside the category slab, pointing into the sheet. */
+        x = aa.x2 + margin;
+        y = aa.y1 + (lv_area_get_height(&aa) - th) / 2;
+    } else {
+        /* Under the focused row — over whatever comes next, never over the row
+         * itself — and above it when the bottom of the sheet is too close. */
+        x = aa.x1;
+        y = aa.y2 + margin;
+        if (y + th > ra.y2 - margin) {
+            y = aa.y1 - margin - th;
+        }
+    }
+    if (x + tw > ra.x2 - margin) { x = ra.x2 - margin - tw; }
+    if (x < ra.x1 + margin) { x = ra.x1 + margin; }
+    if (y + th > ra.y2 - margin) { y = ra.y2 - margin - th; }
+    if (y < ra.y1 + margin) { y = ra.y1 + margin; }
+    lv_obj_set_pos(c->embed_tooltip, x - ra.x1, y - ra.y1);
+}
+
+/* Fill, size and reveal — from the timer, or directly to refresh a bubble that
+ * is already showing (hint texts move with the values). */
+static void embed_tooltip_show(settings_controller_t *c) {
+    if (c->embed_tooltip == NULL || c->embed_hint == NULL || c->embed_root == NULL) {
+        return;
+    }
+    /* Never over an open dropdown list or a modal popup. */
+    if (c->active_dropdown != NULL || c->pane_popup_group != NULL || c->pane_mbox != NULL) {
+        lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_t *anchor = NULL;
+    const char *text = NULL;
+    char buf[1024];
+    bool rail = !c->embed_in_detail;
     if (c->embed_in_detail && c->detail_group) {
-        char buf[1024];
-        lv_obj_t *focused = lv_group_get_focused(c->detail_group);
-        if (embed_collect_desc(focused, buf, sizeof(buf))) {
-            lv_label_set_text(c->embed_hint, buf);
-            return;
+        anchor = lv_group_get_focused(c->detail_group);
+        if (embed_collect_desc(anchor, buf, sizeof(buf))) {
+            text = buf;
         }
-        if (focused != NULL && lv_obj_has_class(focused, &lv_slider_class)) {
-            lv_label_set_text(c->embed_hint, locstr("LEFT/RIGHT adjusts the value. BACK returns to the categories."));
-            return;
+    } else if (c->nav_group) {
+        anchor = lv_group_get_focused(c->nav_group);
+        if (anchor != c->close_btn && c->embed_active >= 0 && c->embed_active < entries_len &&
+            entries[c->embed_active].desc != NULL) {
+            text = locstr(entries[c->embed_active].desc);
         }
-        lv_label_set_text(c->embed_hint, locstr("OK changes the setting. BACK returns to the categories."));
+    }
+    if (anchor == NULL || text == NULL || text[0] == '\0') {
+        lv_obj_add_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    if (c->embed_active >= 0 && c->embed_active < entries_len && entries[c->embed_active].desc != NULL &&
-        c->nav_group && lv_group_get_focused(c->nav_group) != c->close_btn) {
-        lv_label_set_text(c->embed_hint, locstr(entries[c->embed_active].desc));
-        return;
-    }
-    lv_label_set_text(c->embed_hint, locstr("OK edits the category. BACK closes the settings."));
+    /* Wrap width from the text itself, so one short sentence gets a snug bubble
+     * instead of a full-width plate with air on the right. */
+    const lv_font_t *font = lv_obj_get_style_text_font(c->embed_hint, 0);
+    lv_point_t sz;
+    lv_txt_get_size(&sz, text, font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_obj_set_width(c->embed_hint, LV_MIN(sz.x, EMBED_TOOLTIP_MAX_W));
+    lv_label_set_text(c->embed_hint, text);
+    lv_obj_clear_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(c->embed_tooltip);
+    embed_tooltip_place(c, anchor, rail);
+}
+
+static void embed_tooltip_show_cb(lv_timer_t *timer) {
+    lv_timer_pause(timer);
+    embed_tooltip_show(timer->user_data);
 }
 
 /* Inline descriptions come back for controls the cursor cannot reach: a
@@ -1418,17 +1510,21 @@ static void embed_sections_refresh_desc_visibility(settings_controller_t *c) {
     }
 }
 
-/* A control changed: disabled states and hint texts may have moved with it. */
+/* A control changed: disabled states and hint texts may have moved with it. A
+ * bubble already on screen refreshes in place (no flicker while a slider is
+ * being held); a pending one keeps its clock. */
 static void embed_value_changed_cb(lv_event_t *e) {
     settings_controller_t *c = lv_event_get_user_data(e);
     embed_sections_refresh_desc_visibility(c);
-    embed_footer_update(c);
+    if (c->embed_tooltip && !lv_obj_has_flag(c->embed_tooltip, LV_OBJ_FLAG_HIDDEN)) {
+        embed_tooltip_show(c);
+    }
 }
 
 static void embed_detail_focus_cb(lv_group_t *group) {
     settings_controller_t *c = group->user_data;
     if (c != NULL) {
-        embed_footer_update(c);
+        embed_tooltip_schedule(c);
     }
 }
 
@@ -1487,7 +1583,7 @@ static void embed_set_active(settings_controller_t *c, int index) {
         }
     }
     lv_obj_scroll_to_y(c->detail, 0, LV_ANIM_OFF);
-    embed_footer_update(c);
+    embed_tooltip_schedule(c);
 }
 
 static void embed_enter_detail(settings_controller_t *c) {
@@ -1504,7 +1600,7 @@ static void embed_enter_detail(settings_controller_t *c) {
     if (embed_button_mode(c)) {
         lv_obj_add_state(first, LV_STATE_FOCUS_KEY);
     }
-    embed_footer_update(c);
+    embed_tooltip_schedule(c);
 }
 
 static void embed_leave_detail_to(settings_controller_t *c, lv_obj_t *target) {
@@ -1526,7 +1622,7 @@ static void embed_leave_detail_to(settings_controller_t *c, lv_obj_t *target) {
             lv_obj_add_state(target, LV_STATE_FOCUS_KEY);
         }
     }
-    embed_footer_update(c);
+    embed_tooltip_schedule(c);
 }
 
 static void embed_leave_detail(settings_controller_t *c) {
@@ -1620,6 +1716,8 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
     lv_group_set_focus_cb(controller->detail_group, embed_detail_focus_cb);
     controller->nav_group->user_data = controller;
     lv_group_set_focus_cb(controller->nav_group, embed_detail_focus_cb);
+    controller->embed_tooltip_timer = lv_timer_create(embed_tooltip_show_cb, EMBED_TOOLTIP_DELAY_MS, controller);
+    lv_timer_pause(controller->embed_tooltip_timer);
 
     lv_obj_add_event_cb(controller->detail, on_back_request, LV_EVENT_CANCEL, controller);
     /* Hint texts and disabled states move with the values (e.g. HDR follows
@@ -1733,7 +1831,7 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
             lv_obj_add_state(controller->embed_nav_items[0], LV_STATE_FOCUS_KEY);
         }
     }
-    embed_footer_update(controller);
+    embed_tooltip_schedule(controller);
 }
 
 /** An all-caps, tracked, muted line — the overlay's second voice. */
@@ -1898,31 +1996,30 @@ lv_obj_t *settings_launcher_embedded_create(lv_fragment_t *self, lv_obj_t *paren
     lv_obj_set_style_bg_color(scroll, ml_color_hex(ML_COLOR_TEXT), LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(scroll, 60, LV_PART_SCROLLBAR);
 
-    /* The descriptions live in the rail's dead space, not in a footer bar: the
-     * category slabs fill barely half the column, and a full-width footer cost
-     * every pane a settings row. The card floats at the bottom of the rail
-     * (FLOATING = out of the flex layout, pinned against scrolling) and renders
-     * the focused setting's description, the category summary, or a legend. */
-    lv_obj_t *card = lv_obj_create(nav);
-    lv_obj_remove_style_all(card);
-    lv_obj_add_flag(card, LV_OBJ_FLAG_FLOATING);
-    lv_obj_set_width(card, LV_PCT(100));
-    lv_obj_set_height(card, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_height(card, LV_PCT(55), 0);
-    lv_obj_align(card, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_border_width(card, LV_DPX(1), 0);
-    lv_obj_set_style_border_color(card, ml_color_hex(ML_COLOR_BORDER), 0);
-    lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_top(card, LV_DPX(10), 0);
-    lv_obj_set_style_pad_hor(card, LV_DPX(2), 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_t *hint = lv_label_create(card);
-    lv_obj_set_width(hint, LV_PCT(100));
-    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(card), 0);
+    /* The tooltip bubble: created LAST on the backdrop, so it paints over the
+     * whole sheet. Hidden until the cursor rests somewhere that has a
+     * description; the embed_tooltip_* engine does the rest. */
+    lv_obj_t *tip = lv_obj_create(backdrop);
+    c->embed_tooltip = tip;
+    lv_obj_remove_style_all(tip);
+    lv_obj_add_flag(tip, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(tip, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(tip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(tip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(tip, ml_color_hex(ML_COLOR_SURFACE_ALT), 0);
+    lv_obj_set_style_bg_opa(tip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(tip, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(tip, ml_color_hex(ML_COLOR_BORDER), 0);
+    lv_obj_set_style_border_opa(tip, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(tip, LV_DPX(8), 0);
+    lv_obj_set_style_shadow_width(tip, LV_DPX(24), 0);
+    lv_obj_set_style_shadow_color(tip, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(tip, LV_OPA_60, 0);
+    lv_obj_set_style_pad_hor(tip, LV_DPX(12), 0);
+    lv_obj_set_style_pad_ver(tip, LV_DPX(9), 0);
+    lv_obj_t *hint = lv_label_create(tip);
+    lv_obj_set_style_text_font(hint, lv_theme_get_font_small(tip), 0);
     lv_obj_set_style_text_color(hint, ml_color_hex(ML_COLOR_TEXT), 0);
-    lv_obj_set_style_text_opa(hint, OVERLAY_OPA_MUTED, 0);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_label_set_text_static(hint, "");
     c->embed_hint = hint;

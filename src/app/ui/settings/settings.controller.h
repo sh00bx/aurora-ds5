@@ -58,7 +58,11 @@ typedef struct {
     lv_obj_t *embed_nav_items[SETTINGS_EMBED_MAX_SECTIONS];
     lv_obj_t *embed_nav_rails[SETTINGS_EMBED_MAX_SECTIONS];
     lv_obj_t *embed_sections[SETTINGS_EMBED_MAX_SECTIONS];
+    /** Label inside the tooltip bubble. */
     lv_obj_t *embed_hint;
+    /** Delayed tooltip bubble: last child of the backdrop, painted over the sheet. */
+    lv_obj_t *embed_tooltip;
+    lv_timer_t *embed_tooltip_timer;
     int embed_active;
     /** True while the cursor is in the settings column (detail_group pushed). */
     bool embed_in_detail;

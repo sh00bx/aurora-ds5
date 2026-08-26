@@ -49,13 +49,10 @@ typedef struct {
         struct {
             lv_obj_t *obj;
             lv_opa_t base_opa;
-        } dim[40];
+        } dim[32];
         uint8_t dim_count;
         lv_obj_t *stream;
         lv_obj_t *audio;
-        /** Tile row values (GFN-style glance metrics); latency_total is the middle tile. */
-        lv_obj_t *metric_fps;
-        lv_obj_t *metric_ping;
         lv_obj_t *latency_total;
         lv_obj_t *chain_bar;
         lv_obj_t *chain[4];

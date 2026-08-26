@@ -514,10 +514,6 @@ bool streaming_refresh_stats() {
 
     streaming_refresh_latency(controller, dst);
 
-    /* The outer tiles; the middle one (total latency) is filled just above. */
-    lv_label_set_text_fmt(controller->stats_items.metric_fps, "%.0f", dst->decodedFps);
-    lv_label_set_text_fmt(controller->stats_items.metric_ping, "%u ms", (unsigned) dst->rtt);
-
     lv_label_set_text_fmt(controller->stats_items.net_fps, "%.1f FPS", dst->receivedFps);
     /* Frames decoded and waiting for the panel. A steady 0-1 is a pipeline presenting
      * as fast as we feed it; a number that climbs and stays up is the decoder running
