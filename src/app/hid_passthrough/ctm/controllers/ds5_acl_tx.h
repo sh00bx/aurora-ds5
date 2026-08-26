@@ -59,6 +59,16 @@ void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready
  * daemon side; -1 clears the override). Send 10 only when the host advertised
  * CTMB_HOSTCFG_PACE_FEEDBACK; the rate servo is what bounds the parked latency. */
 void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth);
+/* Tell the daemon a human just did something on this pad.
+ *
+ * The daemon disconnects a pad that has been idle for DS5_IDLE_DISCONNECT_MS so
+ * it powers off instead of draining its cell on the couch. It measures idleness
+ * from evdev -- but a streaming session EVIOCGRABs this pad's evdev nodes, and a
+ * grabbed node delivers only to its grabber, so for the length of a session the
+ * daemon is blind and we are the only one who can see the input. Best-effort and
+ * rate-limited by the caller; the daemon also probes the grab before acting, so
+ * a missed report costs nothing worse than a pad that stays on. */
+void ds5_acl_tx_note_pad_activity(ds5_acl_tx_t *t);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 
 /* Daemon inject-queue telemetry (v9 "<tmpl>.st" record): the session loop

@@ -49,6 +49,7 @@
 
 #ifdef __linux__
 #include <linux/hidraw.h>
+#include <linux/input.h>   /* evdev: feeding the daemon's idle-disconnect timer */
 #endif
 
 #ifndef HIDIOCGRAWINFO
@@ -70,7 +71,16 @@ struct hidraw_devinfo { unsigned int bustype; short vendor; short product; };
 #define BUS_BLUETOOTH 0x05
 #define BUS_USB 0x03
 
-typedef struct { int fd; char path[64]; } evdev_grab_t;
+/* ref/thr back the idle-activity filter below: the last value seen per axis and
+ * the deadband it has to clear. Sized for every axis the kernel can report so a
+ * pad's touchpad node (MT axes, way above the stick codes) is covered too. */
+#define CTM_IDLE_ABS_SLOTS   (ABS_MAX + 1)
+typedef struct {
+    int fd;
+    char path[64];
+    int32_t ref[CTM_IDLE_ABS_SLOTS];
+    int32_t thr[CTM_IDLE_ABS_SLOTS];   /* -1 = axis absent on this node */
+} evdev_grab_t;
 
 /* The bridging counters the UI status panel shows.
  *
@@ -214,6 +224,7 @@ struct ctm_controller {
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
     int evdev_grab_count;
+    uint64_t evdev_tick_us;        /* last evdev_activity_tick() sweep */
 
     FILE *log;
 
@@ -757,6 +768,90 @@ static int open_device_any_tier(ctm_controller_t *c, ctmb_device_caps_t *caps,
     return fd;
 }
 
+/* Axis deadband for the idle filter: range/32, at least 4 raw units. A resting
+ * stick jitters a couple of LSB and the input core forwards each one as a real
+ * event, so an ungated EV_ABS would report "the user is playing" forever. */
+#define CTM_IDLE_ABS_DIVISOR 32
+#define CTM_IDLE_ABS_MIN      4
+#define CTM_IDLE_TICK_MS    250
+
+/* Record each axis' resting value and deadband, so the first real push is a
+ * delta from where the stick actually sits rather than from zero. */
+static void seed_evdev_deadbands(evdev_grab_t *g)
+{
+    unsigned long absbits[(ABS_MAX / (8 * sizeof(long))) + 1];
+    memset(absbits, 0, sizeof(absbits));
+    int have = ioctl(g->fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) >= 0;
+    for (int a = 0; a < CTM_IDLE_ABS_SLOTS; ++a) {
+        g->thr[a] = -1;
+        if (!have) continue;
+        if (!((absbits[a / (8 * sizeof(long))] >> (a % (8 * sizeof(long)))) & 1ul)) continue;
+        struct input_absinfo ai;
+        if (ioctl(g->fd, EVIOCGABS(a), &ai) < 0) continue;
+        int32_t range = ai.maximum - ai.minimum;
+        if (range < 0) range = 0;
+        int32_t t = range / CTM_IDLE_ABS_DIVISOR;
+        if (t < CTM_IDLE_ABS_MIN) t = CTM_IDLE_ABS_MIN;
+        g->thr[a] = t;
+        g->ref[a] = ai.value;
+    }
+}
+
+/* Drain the nodes this session grabbed, and tell the daemon when a human was
+ * behind what came out.
+ *
+ * The daemon powers an idle pad off after DS5_IDLE_DISCONNECT_MS, measured from
+ * evdev. Our own EVIOCGRAB is what makes it blind: a grabbed node delivers to
+ * the grabber alone, so for the length of a session we are the only reader that
+ * can see this pad at all. Without this the daemon would either drop a pad being
+ * played with, or (via its grab probe) never time one out during a session.
+ *
+ * Draining is worth something on its own: nothing else reads these fds, so their
+ * event queues just fill and overflow in the kernel for the whole session.
+ *
+ * Called from the input pump, which turns over at least every 250ms. */
+static void evdev_activity_tick(ctm_controller_t *c)
+{
+    if (!c->acl_tx || c->evdev_grab_count == 0) {
+        return;
+    }
+    uint64_t now = ctm_now_us();
+    if (c->evdev_tick_us && now - c->evdev_tick_us < (uint64_t) CTM_IDLE_TICK_MS * 1000ull) {
+        return;
+    }
+    c->evdev_tick_us = now;
+
+    int active = 0;
+    for (int i = 0; i < c->evdev_grab_count; ++i) {
+        evdev_grab_t *g = &c->evdev_grabs[i];
+        if (g->fd < 0) continue;
+        for (;;) {
+            struct input_event ev[16];
+            ssize_t r = read(g->fd, ev, sizeof(ev));   /* fd is O_NONBLOCK */
+            if (r <= 0) break;
+            size_t cnt = (size_t) r / sizeof(ev[0]);
+            for (size_t k = 0; k < cnt; ++k) {
+                if (ev[k].type == EV_KEY) {
+                    /* 2 = autorepeat, which the kernel generates on its own. */
+                    if (ev[k].value != 2) active = 1;
+                } else if (ev[k].type == EV_ABS && ev[k].code < CTM_IDLE_ABS_SLOTS) {
+                    int32_t t = g->thr[ev[k].code];
+                    if (t < 0) continue;
+                    int32_t d = ev[k].value - g->ref[ev[k].code];
+                    if (d < 0) d = -d;
+                    if (d > t) active = 1;
+                    /* Tracked unconditionally so slow drift accumulates in the
+                     * reference instead of eventually crossing as one big jump. */
+                    g->ref[ev[k].code] = ev[k].value;
+                }
+            }
+        }
+    }
+    if (active) {
+        ds5_acl_tx_note_pad_activity(c->acl_tx);
+    }
+}
+
 /* EVIOCGRAB the device's evdev nodes so webOS doesn't double-consume input.
  * When: at session start, BT/DS only (gated by ops->grab_evdev). */
 static void grab_matching_evdev(ctm_controller_t *c)
@@ -789,8 +884,15 @@ static void grab_matching_evdev(ctm_controller_t *c)
                 int idx = c->evdev_grab_count++;
                 c->evdev_grabs[idx].fd = fd;
                 snprintf(c->evdev_grabs[idx].path, sizeof(c->evdev_grabs[idx].path), "%s", dev_path);
+                seed_evdev_deadbands(&c->evdev_grabs[idx]);
                 ctm_ctl_log(c, "grabbed %s", dev_path);
             } else {
+                /* Not fatal, but never silent: webOS grabs the DS4/DS5 touchpad
+                 * node itself (it becomes the system "ClickableMouse" cursor),
+                 * and a node we failed to take keeps driving the TV's own
+                 * pointer while the pad is bridged. Without this line the only
+                 * evidence was a node missing from the "grabbed" list. */
+                ctm_ctl_log(c, "could not grab %s: %s (webOS may hold it)", dev_path, strerror(errno));
                 close(fd);
             }
         }
@@ -937,6 +1039,9 @@ static void *input_thread_main(void *arg)
          * wakeups/s; 250ms keeps a safety poll without the idle spin. */
         int pr = poll(pfds, 2, 250);
         if (pr < 0) { if (errno == EINTR) continue; break; }
+        /* Keep the daemon's idle-disconnect timer alive while a human is playing:
+         * our grab is what hides this pad's input from it. Self-rate-limited. */
+        evdev_activity_tick(c);
         if (pr == 0) {
             if (__atomic_exchange_n(&c->rx_tick, 0u, __ATOMIC_RELAXED)) {
                 /* A sibling interface or the xpad feeder forwarded something

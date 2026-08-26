@@ -99,6 +99,9 @@
 #include <sys/eventfd.h>    /* NOCP->main-loop kick: drain held audio the moment credits free */
 #include <time.h>
 #include <dirent.h>
+#include <sys/wait.h>     /* waitpid: reap the forked luna-send (idle disconnect) */
+#include <linux/input.h>    /* evdev: the idle watchdog's activity source */
+#include <limits.h>         /* NAME_MAX: dirent-sized path buffer in the idle scan */
 
 #ifndef AF_BLUETOOTH
 #define AF_BLUETOOTH 31
@@ -248,6 +251,14 @@ static const unsigned GAPGE_EDGE[GAPGE_N] =
  * the APP SELECTION; the client sends 0x03 for "connected, unused" so the boot
  * default comes back instead of the app echoing a literal colour. */
 #define ACL_CTRL_IDLE_LB_CLEAR 0x03
+/* Code 0x04 = the app reporting real user input on a pad, [A5][5C][04][addr 6
+ * LSB-first]. The idle watchdog reads evdev, but a streaming session EVIOCGRABs
+ * the pad's nodes (so webOS does not double-consume the input), and a grabbed
+ * node delivers its events to the grabber alone -- from here the pad then looks
+ * motionless for as long as the session lasts. Without this the watchdog would
+ * disconnect a pad that is being played with. The app rate-limits these; one per
+ * second is enough to hold a five-minute timer open. */
+#define ACL_CTRL_PAD_ACTIVITY  0x04
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -2171,14 +2182,428 @@ static const struct { uint16_t vid, pid; } PAD_ALLOW[] = {
     {0x057e,  0x2009},  /* Nintendo Switch Pro Controller */
     {0x2dc8,  0x0000},  /* 8BitDo (controllers only as a vendor) */
 };
-static int is_allowed_pad_hidraw(int fd){
-    struct hidraw_devinfo info;
-    if(ioctl(fd,HIDIOCGRAWINFO,&info)<0) return 0;
-    uint16_t v=(uint16_t)info.vendor, p=(uint16_t)info.product;
+/* The allowlist test on a bare VID/PID pair. Split out of is_allowed_pad_hidraw
+ * because the idle watchdog needs the same verdict from an evdev node's
+ * EVIOCGID, where there is no hidraw_devinfo to pass. One list, two callers:
+ * a pad that may not be handed into the jail must not be auto-disconnected
+ * either, and the Magic Remote (an LG VID, deliberately absent here) must never
+ * match on either path -- powering the TV's own remote off would be unrecoverable
+ * from the couch. */
+static int pad_vid_pid_allowed(uint16_t v, uint16_t p){
     for(size_t i=0;i<sizeof PAD_ALLOW/sizeof PAD_ALLOW[0];++i)
         if(PAD_ALLOW[i].vid==v && (PAD_ALLOW[i].pid==p || PAD_ALLOW[i].pid==0)) return 1;
     return 0;
 }
+static int is_allowed_pad_hidraw(int fd){
+    struct hidraw_devinfo info;
+    if(ioctl(fd,HIDIOCGRAWINFO,&info)<0) return 0;
+    return pad_vid_pid_allowed((uint16_t)info.vendor,(uint16_t)info.product);
+}
+/* ---- idle auto-disconnect ------------------------------------------------ *
+ * A BT pad that nobody is using stays powered on forever: unlike a PlayStation,
+ * neither webOS nor the pad itself has an idle timeout, so a DualSense left on
+ * the couch holds its link (and drains its cell) until the battery dies. This
+ * watchdog is the missing console behaviour -- after DS5_IDLE_DISCONNECT_MS of
+ * no real input, the pad's HID link is dropped and the pad powers itself off.
+ *
+ * Why here and not in the app: the app is only one of three ways a pad ends up
+ * connected (aurora foreground / aurora streaming / plain webOS UI, where no app
+ * of ours runs at all). This daemon outlives every app session -- service.js
+ * spawns the supervisor DETACHED precisely so the transport survives an idle
+ * ls-hubd reap -- so it is the one place that sees all three.
+ *
+ * Activity, not traffic. A DS5 streams ~334 input reports/s whether or not
+ * anybody is holding it, so "a report arrived" is useless as an idle signal.
+ * evdev is the cheap way to the right answer: the input core only emits a value
+ * that CHANGED, so we get edges rather than a carrier. What is left is stick
+ * noise, which the per-axis threshold below filters.
+ *
+ * How the disconnect is done: luna hid/disconnect, NOT an HCI_Disconnect on our
+ * raw socket. Verified 2026-08-26 on the DS4: the luna path tears the link down
+ * through webos-bluetooth-service (which owns it), the pad powers OFF, and it
+ * does NOT page its way back in -- exactly the PS5 behaviour. Going behind the
+ * BT stack's back with a raw HCI frame would leave its own bookkeeping claiming
+ * a link that no longer exists.
+ *
+ * Fail-open everywhere: any node we cannot read, identify or classify simply
+ * stops contributing a timer. The failure mode of this feature must be "the pad
+ * stays on", never "the pad dies mid-game".
+ */
+#define IDLE_DC_DEFAULT_MS  300000u  /* 5 min, the PS5 default. 0 = feature off. */
+#define IDLE_DC_SCAN_MS       2000   /* rescan /dev/input for pads appearing/leaving */
+#define IDLE_DC_RETRY_MS     60000   /* re-attempt gap if a pad survives a disconnect */
+#define IDLE_DC_MAX_TRIES        3   /* then give up until it shows real input again */
+#define IDLE_DC_MAX_PADS         4
+#define IDLE_DC_MAX_NODES        4   /* per pad: buttons/sticks, touchpad, spares */
+#define IDLE_ABS_SLOTS   (ABS_MAX+1)
+
+/* Axis deadband: range/32 (>=4 raw units). A DS4/DS5 stick at rest jitters by a
+ * couple of LSB and the input core forwards every one of those as a real event,
+ * so an ungated EV_ABS would keep the pad awake forever from across the room. */
+#define IDLE_ABS_DIVISOR        32
+#define IDLE_ABS_MIN_DELTA       4
+
+struct idle_node {
+    int      fd;
+    char     path[32];
+    int32_t  ref[IDLE_ABS_SLOTS];   /* last seen value per axis */
+    int32_t  thr[IDLE_ABS_SLOTS];   /* deadband, -1 = axis not present */
+};
+struct idle_pad {
+    int      used;
+    char     mac[18];               /* "aa:bb:cc:dd:ee:ff", from EVIOCGUNIQ */
+    uint16_t vid, pid;
+    struct idle_node n[IDLE_DC_MAX_NODES];
+    int      nn;
+    uint64_t last_act;              /* now_ms() of the last input that counted */
+    uint64_t last_try;
+    int      tries;
+};
+static struct idle_pad g_idle_pads[IDLE_DC_MAX_PADS];
+/* Guards g_idle_pads. The watchdog thread owns the table, but the main loop
+ * writes last_act into it when the app reports activity for a pad whose evdev
+ * nodes it has grabbed away from us (ACL_CTRL_PAD_ACTIVITY). */
+static pthread_mutex_t g_idle_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_idle_dc_ms = IDLE_DC_DEFAULT_MS;
+
+static int idle_bit(const unsigned long *bits, int nr){
+    return (bits[nr/(8*sizeof(long))] >> (nr%(8*sizeof(long)))) & 1ul;
+}
+
+/* Strict, because this string is about to be interpolated into a JSON payload
+ * that we hand to execl(). It comes from the kernel, not from the wire, but a
+ * value that reaches an exec deserves the check regardless. */
+static int idle_valid_mac(const char *s){
+    if(strlen(s)!=17) return 0;
+    for(int i=0;i<17;i++){
+        if(i%3==2){ if(s[i]!=':') return 0; continue; }
+        if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')||(s[i]>='A'&&s[i]<='F'))) return 0;
+    }
+    return 1;
+}
+
+/* Drop one pad's BT HID link. Forked rather than linked against luna: this
+ * daemon must never block on (or take a library dependency from) the bus, and
+ * the call happens at most once per pad per minute. */
+static void idle_disconnect(const char *mac){
+    char payload[64];
+    snprintf(payload,sizeof payload,"{\"address\":\"%s\"}",mac);
+    pid_t p=fork();
+    if(p<0){ fprintf(stderr,"[txd] idle: fork failed errno=%d -> %s stays connected\n",errno,mac); return; }
+    if(p==0){
+        /* Child: stdout/stderr would interleave luna-send's reply into the
+         * daemon log for no benefit -- the exit status is what we act on. */
+        int devnull=open("/dev/null",O_WRONLY);
+        if(devnull>=0){ dup2(devnull,1); dup2(devnull,2); if(devnull>2) close(devnull); }
+        execl("/usr/bin/luna-send","luna-send","-n","1","-w","5000",
+              "luna://com.webos.service.bluetooth2/hid/disconnect",payload,(char*)NULL);
+        execlp("luna-send","luna-send","-n","1","-w","5000",
+               "luna://com.webos.service.bluetooth2/hid/disconnect",payload,(char*)NULL);
+        _exit(127);
+    }
+    /* Reap with a ceiling. luna-send has its own -w timeout, so a wait that
+     * outlasts it means the bus itself is wedged; leaving the zombie is far
+     * better than parking the watchdog thread on it forever. */
+    for(int i=0;i<70;i++){
+        int st=0; pid_t r=waitpid(p,&st,WNOHANG);
+        if(r==p){
+            if(WIFEXITED(st) && WEXITSTATUS(st)==0)
+                fprintf(stderr,"[txd] idle: disconnected %s after %us without input\n",mac,g_idle_dc_ms/1000u);
+            else
+                fprintf(stderr,"[txd] idle: luna-send hid/disconnect %s failed (status %d)\n",mac,st);
+            return;
+        }
+        if(r<0){ if(errno==ECHILD) return; break; }   /* ECHILD: reaped elsewhere, fine */
+        usleep(100000);
+    }
+    fprintf(stderr,"[txd] idle: luna-send for %s did not exit in 7s (bus wedged?)\n",mac);
+}
+
+/* Find (or create) the per-pad slot for a MAC. Called with g_idle_mtx held. */
+static struct idle_pad *idle_pad_for(const char *mac, int create){
+    for(int i=0;i<IDLE_DC_MAX_PADS;i++)
+        if(g_idle_pads[i].used && !strcmp(g_idle_pads[i].mac,mac)) return &g_idle_pads[i];
+    if(!create) return NULL;
+    for(int i=0;i<IDLE_DC_MAX_PADS;i++){
+        if(g_idle_pads[i].used) continue;
+        struct idle_pad *P=&g_idle_pads[i];
+        memset(P,0,sizeof *P);
+        P->used=1;
+        snprintf(P->mac,sizeof P->mac,"%s",mac);
+        for(int k=0;k<IDLE_DC_MAX_NODES;k++) P->n[k].fd=-1;
+        return P;
+    }
+    return NULL;
+}
+
+/* The app's activity report for a pad it holds an EVIOCGRAB on. Address arrives
+ * LSB-first, as in every other tagged datagram on this socket. */
+static void idle_note_activity_addr(const uint8_t a[6]){
+    char mac[18];
+    snprintf(mac,sizeof mac,"%02x:%02x:%02x:%02x:%02x:%02x",a[5],a[4],a[3],a[2],a[1],a[0]);
+    pthread_mutex_lock(&g_idle_mtx);
+    struct idle_pad *P=idle_pad_for(mac,0);
+    if(P){ P->last_act=now_ms(); P->tries=0; }
+    pthread_mutex_unlock(&g_idle_mtx);
+}
+
+/* Open one /dev/input/eventN if it belongs to an allowlisted BT pad. Returns 0
+ * when the node was adopted. */
+static int idle_try_adopt(const char *path){
+    /* Re-checked here (the scanner tests it too) so the copy into idle_node.path
+     * below is provably bounded at this call site as well. */
+    if(strlen(path)>=sizeof g_idle_pads[0].n[0].path) return -1;
+    int fd=open(path,O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+    if(fd<0) return -1;
+
+    struct input_id id;
+    if(ioctl(fd,EVIOCGID,&id)<0){ close(fd); return -1; }
+    /* BUS_BLUETOOTH only. A USB pad cannot be powered off by dropping a link,
+     * and "disconnecting" a wired controller would be pure damage. */
+    if(id.bustype!=BUS_BLUETOOTH || !pad_vid_pid_allowed(id.vendor,id.product)){ close(fd); return -1; }
+
+    /* A pad exposes several nodes; the motion-sensor one carries EV_ABS only and
+     * never stops moving (gravity is an axis reading), so it must not be a
+     * liveness source. Requiring at least one key bit selects the button/stick
+     * node and the touchpad, and drops the accelerometer. */
+    unsigned long keybits[(KEY_MAX/(8*sizeof(long)))+1];
+    memset(keybits,0,sizeof keybits);
+    if(ioctl(fd,EVIOCGBIT(EV_KEY,sizeof keybits),keybits)<0){ close(fd); return -1; }
+    int haskey=0;
+    for(size_t i=0;i<sizeof keybits/sizeof keybits[0];i++) if(keybits[i]){ haskey=1; break; }
+    if(!haskey){ close(fd); return -1; }
+
+    char uniq[32]; memset(uniq,0,sizeof uniq);
+    if(ioctl(fd,EVIOCGUNIQ(sizeof uniq-1),uniq)<0 || !idle_valid_mac(uniq)){ close(fd); return -1; }
+    for(char *c=uniq; *c; ++c) if(*c>='A'&&*c<='F') *c=(char)(*c-'A'+'a');
+
+    pthread_mutex_lock(&g_idle_mtx);
+    struct idle_pad *P=idle_pad_for(uniq,1);
+    if(!P || P->nn>=IDLE_DC_MAX_NODES){ pthread_mutex_unlock(&g_idle_mtx); close(fd); return -1; }
+    struct idle_node *N=&P->n[P->nn];
+    memset(N,0,sizeof *N);
+    N->fd=fd;
+    snprintf(N->path,sizeof N->path,"%s",path);
+
+    /* Seed the deadbands from the axes this node actually has. A resting stick
+     * reads its centre here, so the first real push is a delta from rest rather
+     * than from zero. */
+    unsigned long absbits[(ABS_MAX/(8*sizeof(long)))+1];
+    memset(absbits,0,sizeof absbits);
+    int have_abs = ioctl(fd,EVIOCGBIT(EV_ABS,sizeof absbits),absbits)>=0;
+    for(int c=0;c<IDLE_ABS_SLOTS;c++){
+        N->thr[c]=-1;
+        if(!have_abs || !idle_bit(absbits,c)) continue;
+        struct input_absinfo ai;
+        if(ioctl(fd,EVIOCGABS(c),&ai)<0) continue;
+        int32_t range=ai.maximum-ai.minimum; if(range<0) range=0;
+        int32_t t=range/IDLE_ABS_DIVISOR;
+        if(t<IDLE_ABS_MIN_DELTA) t=IDLE_ABS_MIN_DELTA;
+        N->thr[c]=t; N->ref[c]=ai.value;
+    }
+    P->nn++;
+    if(P->nn==1){ P->last_act=now_ms(); P->vid=id.vendor; P->pid=id.product; }
+    int nn=P->nn;
+    pthread_mutex_unlock(&g_idle_mtx);
+    fprintf(stderr,"[txd] idle: watching %s (%s %04x:%04x, node %d)\n",path,uniq,id.vendor,id.product,nn);
+    return 0;
+}
+
+/* Drain one node; returns 1 if anything on it counted as real input, and -1 if
+ * the node died (pad disconnected) and must be dropped. Caller holds the mutex. */
+static int idle_drain_node(struct idle_node *N){
+    int act=0;
+    for(;;){
+        struct input_event ev[16];
+        ssize_t r=read(N->fd,ev,sizeof ev);
+        if(r<0){
+            if(errno==EAGAIN||errno==EWOULDBLOCK) return act;
+            if(errno==EINTR) continue;
+            return -1;                       /* ENODEV: the pad went away */
+        }
+        if(r==0) return act;
+        size_t cnt=(size_t)r/sizeof ev[0];
+        for(size_t i=0;i<cnt;i++){
+            if(ev[i].type==EV_KEY){
+                /* value 2 is autorepeat -- the kernel generating it does not mean
+                 * a human is still pressing anything new, but the initial press
+                 * (1) and the release (0) both do. */
+                if(ev[i].value!=2) act=1;
+            } else if(ev[i].type==EV_ABS && ev[i].code<IDLE_ABS_SLOTS){
+                int32_t t=N->thr[ev[i].code];
+                if(t>=0){
+                    int32_t d=ev[i].value-N->ref[ev[i].code];
+                    if(d<0) d=-d;
+                    if(d>t) act=1;
+                    /* Track unconditionally: a slow drift then accumulates in the
+                     * reference rather than eventually crossing the deadband as
+                     * one large jump and reading as a deliberate push. */
+                    N->ref[ev[i].code]=ev[i].value;
+                }
+            }
+            /* EV_SYN/EV_MSC/EV_LED/EV_FF carry no user intent. */
+        }
+    }
+}
+
+/* Is somebody else consuming this node's events exclusively?
+ *
+ * A streaming session EVIOCGRABs the pad (so webOS does not double-consume the
+ * input), and a grabbed node delivers only to its grabber -- from out here the
+ * pad then looks perfectly still while it is being played with. Disconnecting on
+ * that silence would drop the pad mid-game, which is the one failure this
+ * feature must never have.
+ *
+ * There is no read-only way to ask "is this grabbed", so we ask by trying: a
+ * second EVIOCGRAB returns EBUSY iff another fd holds one. On success we held it
+ * for the length of one ioctl pair and hand it straight back; the window is far
+ * too short to swallow a keypress, and it only ever opens on a pad that has
+ * already been silent for the whole idle period.
+ *
+ * Deliberately asked ONLY at expiry, never on the 2s scan: at 0.5 Hz the same
+ * probe would be a needless steady drip of grab/ungrab against whatever else is
+ * reading the node.
+ *
+ * Fail-closed on an unexpected errno (returns 1 = "assume grabbed"): an
+ * unreadable answer must leave the pad on, not disconnect it on a guess. */
+static int idle_node_grabbed(struct idle_node *N){
+    if(N->fd<0) return 1;
+    if(ioctl(N->fd,EVIOCGRAB,1)==0){ ioctl(N->fd,EVIOCGRAB,0); return 0; }
+    if(errno!=EBUSY)
+        fprintf(stderr,"[txd] idle: grab probe on %s failed errno=%d -> treating as in use\n",N->path,errno);
+    return 1;
+}
+
+static void idle_close_node(struct idle_node *N){
+    if(N->fd>=0) close(N->fd);
+    N->fd=-1; N->path[0]='\0';
+}
+
+static void *idle_thread(void *arg){
+    (void)arg;
+    prctl(PR_SET_NAME,(unsigned long)"ds5-idle",0,0,0);
+    for(int i=0;i<IDLE_DC_MAX_PADS;i++)
+        for(int k=0;k<IDLE_DC_MAX_NODES;k++) g_idle_pads[i].n[k].fd=-1;
+
+    uint64_t last_scan=0;
+    for(;;){
+        uint64_t nowm=now_ms();
+
+        if(nowm-last_scan>=IDLE_DC_SCAN_MS){
+            last_scan=nowm;
+            DIR *d=opendir("/dev/input");
+            if(d){
+                struct dirent *e;
+                while((e=readdir(d))!=NULL){
+                    if(strncmp(e->d_name,"event",5)!=0) continue;
+                    /* Sized for any dirent; a name that would not fit the node's
+                     * own path field is simply not trackable, so skip it rather
+                     * than storing a truncated path we could never match again. */
+                    char path[NAME_MAX+16];
+                    if(snprintf(path,sizeof path,"/dev/input/%s",e->d_name)
+                       >= (int)sizeof g_idle_pads[0].n[0].path) continue;
+                    int known=0;
+                    pthread_mutex_lock(&g_idle_mtx);
+                    for(int i=0;i<IDLE_DC_MAX_PADS && !known;i++){
+                        if(!g_idle_pads[i].used) continue;
+                        for(int k=0;k<g_idle_pads[i].nn;k++)
+                            if(g_idle_pads[i].n[k].fd>=0 && !strcmp(g_idle_pads[i].n[k].path,path)){ known=1; break; }
+                    }
+                    pthread_mutex_unlock(&g_idle_mtx);
+                    if(!known) idle_try_adopt(path);
+                }
+                closedir(d);
+            }
+        }
+
+        /* Collect the fds under the lock, then poll outside it: a poll holding
+         * the mutex would block the main loop's activity reports for its whole
+         * timeout. */
+        struct pollfd pf[IDLE_DC_MAX_PADS*IDLE_DC_MAX_NODES];
+        int map_pad[IDLE_DC_MAX_PADS*IDLE_DC_MAX_NODES], map_node[IDLE_DC_MAX_PADS*IDLE_DC_MAX_NODES];
+        int nfd=0;
+        pthread_mutex_lock(&g_idle_mtx);
+        for(int i=0;i<IDLE_DC_MAX_PADS;i++){
+            if(!g_idle_pads[i].used) continue;
+            for(int k=0;k<g_idle_pads[i].nn;k++){
+                if(g_idle_pads[i].n[k].fd<0) continue;
+                pf[nfd].fd=g_idle_pads[i].n[k].fd; pf[nfd].events=POLLIN; pf[nfd].revents=0;
+                map_pad[nfd]=i; map_node[nfd]=k; nfd++;
+            }
+        }
+        pthread_mutex_unlock(&g_idle_mtx);
+
+        int pr=(nfd>0)?poll(pf,nfd,500):0;
+        if(pr<0 && errno!=EINTR){ usleep(200000); continue; }
+        if(nfd==0) usleep(500000);
+
+        pthread_mutex_lock(&g_idle_mtx);
+        for(int i=0;i<pr && pr>0;i++){
+            if(!pf[i].revents) continue;
+            struct idle_pad *P=&g_idle_pads[map_pad[i]];
+            struct idle_node *N=&P->n[map_node[i]];
+            if(N->fd<0) continue;
+            int r=idle_drain_node(N);
+            if(r<0){ idle_close_node(N); continue; }
+            if(r>0){ P->last_act=now_ms(); P->tries=0; }
+        }
+
+        /* Compact: a pad whose nodes have all gone is disconnected -- forget it
+         * so a later reconnect starts a fresh timer instead of inheriting an
+         * expired one and being dropped the instant it comes back. */
+        for(int i=0;i<IDLE_DC_MAX_PADS;i++){
+            struct idle_pad *P=&g_idle_pads[i];
+            if(!P->used) continue;
+            int live=0, w=0;
+            for(int k=0;k<P->nn;k++){
+                if(P->n[k].fd<0) continue;
+                if(w!=k) P->n[w]=P->n[k];
+                w++; live++;
+            }
+            P->nn=w;
+            if(!live){
+                fprintf(stderr,"[txd] idle: %s gone, no longer watched\n",P->mac);
+                memset(P,0,sizeof *P);
+                for(int k=0;k<IDLE_DC_MAX_NODES;k++) P->n[k].fd=-1;
+                continue;
+            }
+            if(!g_idle_dc_ms) continue;                      /* feature disabled */
+            if(P->tries>=IDLE_DC_MAX_TRIES) continue;        /* gave up until real input */
+            uint64_t nm=now_ms();
+            if(nm-P->last_act < g_idle_dc_ms) continue;
+            if(P->last_try && nm-P->last_try < IDLE_DC_RETRY_MS) continue;
+            /* Expired -- but only trust that silence if we are actually the one
+             * seeing this pad's events. An app holding a grab feeds the timer
+             * through ACL_CTRL_PAD_ACTIVITY instead; if it does not (an older
+             * app in the same IPK, or one that never got the report out), the
+             * pad simply stays connected. */
+            int grabbed=0;
+            for(int k=0;k<P->nn && !grabbed;k++)
+                if(P->n[k].fd>=0 && idle_node_grabbed(&P->n[k])) grabbed=1;
+            if(grabbed){
+                /* Re-arm rather than retry in a tight loop: the next check is one
+                 * full idle period away, and it costs one probe per pad per period. */
+                P->last_act=nm;
+                fprintf(stderr,"[txd] idle: %s expired but its evdev is grabbed (session active) -> keeping it\n",P->mac);
+                continue;
+            }
+            char mac[18]; snprintf(mac,sizeof mac,"%s",P->mac);
+            P->last_try=nm; P->tries++;
+            int tries=P->tries;
+            /* Unlock across the fork/exec: it can take seconds and must not stall
+             * an activity report that would have saved this pad. Losing that race
+             * is harmless -- the pad reconnects with one button press. */
+            pthread_mutex_unlock(&g_idle_mtx);
+            fprintf(stderr,"[txd] idle: %s idle for %llums -> disconnect (attempt %d/%d)\n",
+                    mac,(unsigned long long)(nm-P->last_act),tries,IDLE_DC_MAX_TRIES);
+            idle_disconnect(mac);
+            pthread_mutex_lock(&g_idle_mtx);
+        }
+        pthread_mutex_unlock(&g_idle_mtx);
+    }
+    return NULL;
+}
+
 
 /* The jail uid we accept, set once from argv[4] before any thread starts (see
  * main()); read-only afterwards, so the sockets' threads need no synchronisation. */
@@ -3573,7 +3998,19 @@ int main(int argc,char**argv){
                    else fprintf(stderr,"[txd] DS5_IDLE_LIGHTBAR='%s' not RRGGBB hex -> keeping %06x\n",e,g_idle_lb_boot); }
         }
     }
-    fprintf(stderr,"[txd] forwarder up (cmdguard, %d links): unix=%s tmpl=%s hidfd=%s idle_lb=%06x\n",MAX_LINKS,sock_path,g_tmpl_path,hidfd_path,g_idle_lb_boot);
+    {   /* Idle auto-disconnect: DS5_IDLE_DISCONNECT_MS in ms, "0"/"off" disables.
+         * Clamped below at 30s -- anything shorter is indistinguishable from a
+         * pause in play and would drop the pad out from under the user. */
+        const char *e=getenv("DS5_IDLE_DISCONNECT_MS");
+        if(e && *e){
+            if(!strcasecmp(e,"off")) g_idle_dc_ms=0;
+            else { char *end=NULL; unsigned long v=strtoul(e,&end,10);
+                   if(end && *end=='\0' && v<=86400000ul && (v==0 || v>=30000ul)) g_idle_dc_ms=(uint32_t)v;
+                   else fprintf(stderr,"[txd] DS5_IDLE_DISCONNECT_MS='%s' not 0/off or 30000..86400000 -> keeping %u\n",e,g_idle_dc_ms); }
+        }
+    }
+    pthread_t idl; pthread_create(&idl,NULL,idle_thread,NULL);
+    fprintf(stderr,"[txd] forwarder up (cmdguard, %d links): unix=%s tmpl=%s hidfd=%s idle_lb=%06x idle_dc=%ums\n",MAX_LINKS,sock_path,g_tmpl_path,hidfd_path,g_idle_lb_boot,g_idle_dc_ms);
 
     /* Event loop: wait on forwarded reports (ufd) AND mount-table changes (minfo)
      * at once, on a 500ms tick.
@@ -3866,6 +4303,8 @@ int main(int argc,char**argv){
                                 for(int i=0;i<MAX_LINKS;i++){ g_links[i].lb_paints=0; g_links[i].lb_last_paint=0; }
                             fprintf(stderr,"[txd] ctrl: idle lightbar app selection -> %06x (effective %06x)\n",nv,eff);
                         }
+                    } else if(rep[2]==ACL_CTRL_PAD_ACTIVITY && n>=9){
+                        idle_note_activity_addr(&rep[3]);
                     } else if(rep[2]==ACL_CTRL_IDLE_LB_CLEAR){
                         /* Drop the app selection; the boot default paints again.
                          * The client sends this for "connected, unused" instead of

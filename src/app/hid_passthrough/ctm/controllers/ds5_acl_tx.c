@@ -36,6 +36,7 @@
 #define ACL_TAG_ASSERT  0x5B
 #define ACL_TAG_CTRL    0x5C   /* [A5][5C][code][value] — daemon control */
 #define ACL_CTRL_FIFO_DEPTH 0x01
+#define ACL_CTRL_PAD_ACTIVITY 0x04   /* [A5][5C][04][addr 6 LSB-first] */
 #define ACL_TAG_LEN     8
 
 struct ds5_acl_tx {
@@ -287,6 +288,20 @@ void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth)
     (void)sendto(t->unixfd, msg, sizeof msg, 0,
                  (struct sockaddr *)&t->daddr, sizeof t->daddr);
     acl_log(t, "ctrl: audio-FIFO depth -> %d", depth);
+}
+
+void ds5_acl_tx_note_pad_activity(ds5_acl_tx_t *t)
+{
+    /* Untagged (legacy single-pad) sessions carry no address, and the daemon
+     * keys its idle table by address -- nothing useful to send. */
+    if (!t || t->unixfd < 0 || !t->tagged) {
+        return;
+    }
+    uint8_t msg[3 + 6] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_PAD_ACTIVITY };
+    memcpy(msg + 3, t->tag + 2, 6);   /* same LSB-first address as every tag */
+    (void)sendto(t->unixfd, msg, sizeof msg, 0,
+                 (struct sockaddr *)&t->daddr, sizeof t->daddr);
+    /* Not logged: this fires up to once a second for a whole session. */
 }
 
 int ds5_acl_tx_send(ds5_acl_tx_t *t, const uint8_t *report, size_t len)
