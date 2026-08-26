@@ -250,7 +250,15 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
         controller->stats_items.sections[1] = section_header(controller, stats, "Throughput", NULL);
         throughput_columns(controller, stats);
 
-        controller->stats_items.sections[2] = section_header(controller, stats, "Controllers", NULL);
+        /* The TV's own load. It belongs to neither of the sections around it: the
+         * stream can be healthy on every counter above while the box itself is out
+         * of memory, and that is exactly the case this row exists to show. */
+        controller->stats_items.sections[2] = section_header(controller, stats, "Device", NULL);
+        lv_obj_t *device = panel_row(stats);
+        controller->stats_items.device_row = device;
+        controller->stats_items.cpu_ram = stat_label(controller, device, "CPU / RAM", 0);
+
+        controller->stats_items.sections[3] = section_header(controller, stats, "Controllers", NULL);
         pad_rows(stats, controller);
     }
 
@@ -395,12 +403,13 @@ void streaming_stats_set_pinned_look(streaming_controller_t *controller, bool pi
     /* Without the title the first line would otherwise sit on the panel edge. */
     lv_obj_set_style_pad_top(controller->stats, pinned ? LV_DPX(10) : 0, 0);
 
-    /* "Throughput" and "Controllers" name a grouping the eye already sees, and the
+    /* "Throughput", "Device" and "Controllers" name a grouping the eye already sees, and the
      * rows under them carry their own labels. Pinned they are the least legible
      * thing on screen over game content, so they go and hand their spacing to the
      * group below. "Latency" stays — it carries the total on its right. */
-    lv_obj_t *labelled[2] = {controller->stats_items.throughput_row, controller->stats_items.pads_block};
-    for (int i = 0; i < 2; i++) {
+    lv_obj_t *labelled[3] = {controller->stats_items.throughput_row, controller->stats_items.device_row,
+                             controller->stats_items.pads_block};
+    for (int i = 0; i < 3; i++) {
         lv_obj_t *heading = controller->stats_items.sections[i + 1];
         if (heading) {
             if (pinned) {
@@ -413,7 +422,7 @@ void streaming_stats_set_pinned_look(streaming_controller_t *controller, bool pi
             lv_obj_set_style_pad_top(labelled[i], pinned ? section_pad : 0, 0);
         }
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         if (controller->stats_items.sections[i]) {
             lv_obj_set_style_pad_top(controller->stats_items.sections[i], section_pad, 0);
         }
@@ -586,7 +595,11 @@ static void throughput_columns(streaming_controller_t *controller, lv_obj_t *par
     lv_obj_t *left = controller->stats_items.throughput_cols[0];
     lv_obj_t *right = controller->stats_items.throughput_cols[1];
     controller->stats_items.net_fps = stat_label(controller, left, "Received", 0);
-    controller->stats_items.render_fps = stat_label(controller, left, "Rendered", 0);
+    /* Queue depth, not a rate. The old "Rendered" row showed submitted frames per
+     * second clamped to the panel refresh — a number that reads as presentation but
+     * is really our own feed rate, and that therefore cannot fall when the pipeline
+     * presents at half the requested rate. This one is measured on the panel side. */
+    controller->stats_items.render_queue = stat_label(controller, left, "Render queue", 0);
     controller->stats_items.bitrate = stat_label(controller, right, "Bitrate", 0);
     controller->stats_items.drop_rate = stat_label(controller, right, "Frame drop", 0);
 }

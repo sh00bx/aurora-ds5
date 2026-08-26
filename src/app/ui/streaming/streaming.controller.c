@@ -92,21 +92,62 @@ static const char *streaming_codec_compact_text(const char *fmt) {
     return fmt;
 }
 
-static float streaming_render_fps(float decodedFps) {
-    float renderFps = decodedFps;
-#if defined(TARGET_WEBOS)
-    int displayRate = 60;
-    if (SDL_webOSGetRefreshRate(&displayRate) && displayRate > 0 && renderFps > (float) displayRate) {
-        renderFps = (float) displayRate;
+/* Device load, read off /proc at the stats cadence (~1 Hz while the overlay is up).
+ * Two small reads, no thread. CPU is a delta between calls, so the first sample only
+ * lays down the baseline the next one subtracts from — it stays unknown for one tick
+ * rather than reporting the average since boot as if it were the current load. */
+static int sys_cpu_pct = -1;
+static unsigned sys_ram_used_mb = 0;
+static unsigned sys_ram_total_mb = 0;
+static unsigned long long sys_cpu_idle = 0;
+static unsigned long long sys_cpu_total = 0;
+
+static void streaming_sample_device_load(void) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (f != NULL) {
+        unsigned long long user, nice, sys, idle, iowait, irq, softirq, steal;
+        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) == 8) {
+            /* iowait counts as idle: the CPU was not the thing holding anything up. */
+            unsigned long long idle_all = idle + iowait;
+            unsigned long long total = user + nice + sys + idle_all + irq + softirq + steal;
+            if (sys_cpu_total > 0 && total > sys_cpu_total) {
+                unsigned long long dt = total - sys_cpu_total;
+                unsigned long long di = idle_all >= sys_cpu_idle ? idle_all - sys_cpu_idle : 0;
+                /* A counter that went backwards (CPU offlined between samples) would
+                 * otherwise underflow into a nonsense percentage. */
+                if (di > dt) {
+                    di = dt;
+                }
+                sys_cpu_pct = (int) ((dt - di) * 100 / dt);
+            }
+            sys_cpu_idle = idle_all;
+            sys_cpu_total = total;
+        }
+        fclose(f);
     }
-#else
-    SDL_DisplayMode mode;
-    if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.refresh_rate > 0
-        && renderFps > (float) mode.refresh_rate) {
-        renderFps = (float) mode.refresh_rate;
+
+    f = fopen("/proc/meminfo", "r");
+    if (f != NULL) {
+        char line[128];
+        unsigned long long mem_total = 0, mem_avail = 0;
+        while ((mem_total == 0 || mem_avail == 0) && fgets(line, sizeof(line), f) != NULL) {
+            if (mem_total == 0) {
+                sscanf(line, "MemTotal: %llu kB", &mem_total);
+            }
+            if (mem_avail == 0) {
+                sscanf(line, "MemAvailable: %llu kB", &mem_avail);
+            }
+        }
+        fclose(f);
+        /* MemAvailable, not MemFree: the page cache this TV fills is reclaimable, and
+         * counting it as used would show the box permanently out of memory. */
+        if (mem_total > 0 && mem_avail > 0 && mem_avail <= mem_total) {
+            unsigned long long used = mem_total - mem_avail;
+            sys_ram_total_mb = (unsigned) ((mem_total + 512) / 1024);
+            sys_ram_used_mb = (unsigned) ((used + 512) / 1024);
+        }
     }
-#endif
-    return renderFps;
 }
 
 static void network_test_timer_cb(lv_timer_t *timer) {
@@ -382,7 +423,13 @@ bool streaming_refresh_stats() {
         const char *hdr_suffix = app_configuration->hdr ? " HDR" : "";
         int w = info->width > 0 ? info->width : 0;
         int h = info->height > 0 ? info->height : 0;
-        float renderFps = streaming_render_fps(dst->decodedFps);
+        char queue_text[12];
+        if (info->has_render_queue && dst->videoRenderQueue >= 0) {
+            snprintf(queue_text, sizeof(queue_text), "%d", dst->videoRenderQueue);
+        } else {
+            queue_text[0] = '-';
+            queue_text[1] = '\0';
+        }
         float lossPct = (dst->totalFrames > 0)
             ? (float) dst->networkDroppedFrames / (float) dst->totalFrames * 100.0f
             : 0.0f;
@@ -409,10 +456,10 @@ bool streaming_refresh_stats() {
         float totalMs = (float) dst->rtt + hostMs + submitMs + decOnlyMs;
 
         int len = snprintf(stats_line, sizeof(stats_line),
-                           "%dx%d %s%s FPS %.1f Rx \xb7 %.1f De \xb7 %.1f Rd "
+                           "%dx%d %s%s FPS %.1f Rx \xb7 %.1f De \xb7 Q %s "
                            "N %u \xb1 %ums FD %.2f%% BW %.2f Mbps",
                            w, h, codec, hdr_suffix,
-                           dst->receivedFps, dst->decodedFps, renderFps,
+                           dst->receivedFps, dst->decodedFps, queue_text,
                            (unsigned) dst->rtt, (unsigned) dst->rttVariance,
                            lossPct, bitrateMbps);
         if (len > 0 && (size_t) len < sizeof(stats_line) && (have_render || have_decode || have_encode)) {
@@ -468,8 +515,16 @@ bool streaming_refresh_stats() {
     streaming_refresh_latency(controller, dst);
 
     lv_label_set_text_fmt(controller->stats_items.net_fps, "%.1f FPS", dst->receivedFps);
-    float renderFps = streaming_render_fps(dst->decodedFps);
-    lv_label_set_text_fmt(controller->stats_items.render_fps, "%.1f FPS", renderFps);
+    /* Frames decoded and waiting for the panel. A steady 0-1 is a pipeline presenting
+     * as fast as we feed it; a number that climbs and stays up is the decoder running
+     * ahead of the display, which is what a halved presentation rate looks like from
+     * here. "-" means the video driver does not answer the query at all. */
+    if (info->has_render_queue && dst->videoRenderQueue >= 0) {
+        lv_label_set_text_fmt(controller->stats_items.render_queue, "%d",
+                              dst->videoRenderQueue);
+    } else {
+        lv_label_set_text(controller->stats_items.render_queue, "-");
+    }
     lv_label_set_text_fmt(controller->stats_items.bitrate, "%.1f Mbps",
                           (float) dst->currentBitrateKbps / 1000000.0f);
     if (dst->totalFrames > 0) {
@@ -477,6 +532,17 @@ bool streaming_refresh_stats() {
                               (float) dst->networkDroppedFrames / (float) dst->totalFrames * 100);
     } else {
         lv_label_set_text(controller->stats_items.drop_rate, "-");
+    }
+
+    streaming_sample_device_load();
+    if (sys_cpu_pct >= 0 && sys_ram_total_mb > 0) {
+        lv_label_set_text_fmt(controller->stats_items.cpu_ram, "%d %%  \u00b7  %u / %u MB",
+                              sys_cpu_pct, sys_ram_used_mb, sys_ram_total_mb);
+    } else if (sys_ram_total_mb > 0) {
+        lv_label_set_text_fmt(controller->stats_items.cpu_ram, "-  \u00b7  %u / %u MB",
+                              sys_ram_used_mb, sys_ram_total_mb);
+    } else {
+        lv_label_set_text(controller->stats_items.cpu_ram, "-");
     }
 
     streaming_refresh_controllers(controller);

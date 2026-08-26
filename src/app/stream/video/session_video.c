@@ -152,11 +152,12 @@ static bool soft_recovery_is_4k(void) {
 }
 
 static bool soft_recovery_pressure(const struct VIDEO_STATS *dst) {
-    /* Upstream's fastest signal is the render-queue depth, but that comes from
-     * SS4S_PlayerGetVideoRenderQueueLength, which is Starfish/SMP-only and does not
-     * exist in our ss4s at all — we decode via NDL. So pressure is detected from the
-     * two signals that do carry data here: frames arriving but not decoding, and the
-     * decoder latency ss4s computes itself. */
+    /* Upstream's fastest signal is the render-queue depth. Our NDL driver now reports it
+     * too (see vdec_stat_submit), but soft recovery deliberately does not consume it yet:
+     * the threshold that separates "deep queue" from "healthy buffer" on this pipeline has
+     * never been measured, and guessing one here would trade a known-conservative trigger
+     * for an unknown one. Pressure stays detected from the two signals with established
+     * thresholds: frames arriving but not decoding, and the decoder latency ss4s computes. */
     float target = (float) vs.target_fps;
     if (target < 1.0f) {
         target = 60.0f;
@@ -632,12 +633,20 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     } else {
         dst->avgDecoderLatency = 0;
     }
-    /* Upstream samples the render-queue depth here via SS4S_PlayerGetVideoRenderQueueLength.
-     * That entry point is Starfish/SMP-only and does not exist in our ss4s fork at all — we
-     * decode through NDL, where the queue depth is never exposed. Sampling it would mean
-     * carrying a submodule bump for a value that is structurally always absent, so the flag
-     * simply stays false and soft recovery relies on decoder latency + the fps gap instead. */
-    vdec_stream_info.has_render_queue = false;
+    /* Render-queue depth: how many decoded frames are waiting to be shown. Only the
+     * NDL driver answers here — SMP has its own implementation, but `auto` never picks
+     * it on this hardware. Unlike the submitted-frame counters this measures the panel
+     * side of the decoder, so it is the one number that can show frames arriving and
+     * decoding on time while presentation falls behind. Left at -1 when the driver
+     * declines, so a missing value is never read as an empty queue. */
+    int renderQueue = 0;
+    if (vs.player != NULL && SS4S_PlayerGetVideoRenderQueueLength(vs.player, &renderQueue)) {
+        dst->videoRenderQueue = renderQueue;
+        vdec_stream_info.has_render_queue = true;
+    } else {
+        dst->videoRenderQueue = -1;
+        vdec_stream_info.has_render_queue = false;
+    }
     vdec_stats_write_end();
 
 #if defined(TARGET_WEBOS)

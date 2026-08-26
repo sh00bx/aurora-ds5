@@ -40,15 +40,16 @@ typedef struct {
          * used, so the pieces that carry either are kept at hand. `dim` holds every
          * label that renders below full opacity, with the value it uses unpinned. */
         lv_obj_t *title;
-        lv_obj_t *sections[3];
+        lv_obj_t *sections[4];
         lv_obj_t *chain_row;
         lv_obj_t *throughput_row;
         lv_obj_t *throughput_cols[2];
+        lv_obj_t *device_row;
         lv_obj_t *pads_block;
         struct {
             lv_obj_t *obj;
             lv_opa_t base_opa;
-        } dim[16];
+        } dim[32];
         uint8_t dim_count;
         lv_obj_t *stream;
         lv_obj_t *audio;
@@ -57,9 +58,11 @@ typedef struct {
         lv_obj_t *chain[4];
         lv_obj_t *chain_legend;
         lv_obj_t *net_fps;
-        lv_obj_t *render_fps;
+        /** Decoded frames still waiting to be shown, not a frame rate. */
+        lv_obj_t *render_queue;
         lv_obj_t *drop_rate;
         lv_obj_t *bitrate;
+        lv_obj_t *cpu_ram;
         struct {
             lv_obj_t *row;
             lv_obj_t *name;
