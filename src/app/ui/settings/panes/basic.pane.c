@@ -22,6 +22,9 @@ typedef struct {
     lv_obj_t *bitrate_label;
     lv_obj_t *bitrate_slider;
     lv_obj_t *bitrate_warning;
+    /* Last committed config value; VALUE_CHANGED alone is no proof of a change
+     * (the slider class fires it for UP/DOWN too, which pref_obj reverts). */
+    int bitrate_committed;
     lv_obj_t *profile_dropdown;
 
     pref_dropdown_string_entry_t *lang_entries;
@@ -148,6 +151,7 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     unsigned int max = 300000;
     lv_obj_t *bitrate_slider = pref_slider(view, &app_configuration->stream.bitrate, 5000, (int) max, BITRATE_STEP);
     lv_obj_set_width(bitrate_slider, LV_PCT(100));
+    pane->bitrate_committed = app_configuration->stream.bitrate;
     lv_obj_add_event_cb(bitrate_slider, on_bitrate_changed, LV_EVENT_VALUE_CHANGED, self);
     pane->bitrate_slider = bitrate_slider;
 
@@ -204,7 +208,10 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 
 static void on_bitrate_changed(lv_event_t *e) {
     basic_pane_t *pane = lv_event_get_user_data(e);
-    pane->parent->needs_stream_reconnect = true;
+    if (app_configuration->stream.bitrate != pane->bitrate_committed) {
+        pane->bitrate_committed = app_configuration->stream.bitrate;
+        pane->parent->needs_stream_reconnect = true;
+    }
     update_bitrate_label(pane);
     update_bitrate_hint(pane);
 }
@@ -351,6 +358,9 @@ static void on_profile_changed(lv_event_t *e) {
     }
     profile_manager_set_active(profile->id);
     profile_manager_apply_to_settings(app_configuration);
+    /* The profile may change more stream params than the bitrate, which is all
+     * the slider event below would flag. */
+    pane->parent->needs_stream_reconnect = true;
     /* Move the knob too: the slider widget does not read the config back, and a
      * stale knob position would be written over the profile's bitrate on the
      * next LEFT/RIGHT press. */
@@ -399,6 +409,9 @@ static void on_delete_profile_clicked(lv_event_t *e) {
     }
     if (profile_manager_delete(active->id)) {
         profile_manager_apply_to_settings(app_configuration);
+        /* The fallback profile may change more stream params than the bitrate,
+         * which is all the slider event below would flag. */
+        pane->parent->needs_stream_reconnect = true;
         refresh_profile_dropdown(pane);
         lv_slider_set_value(pane->bitrate_slider, app_configuration->stream.bitrate / BITRATE_STEP, LV_ANIM_OFF);
         lv_event_send(pane->bitrate_slider, LV_EVENT_VALUE_CHANGED, NULL);

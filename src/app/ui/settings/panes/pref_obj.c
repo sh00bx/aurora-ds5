@@ -227,8 +227,9 @@ lv_obj_t *pref_desc_label(lv_obj_t *parent, const char *title, bool focusable) {
     } else {
         label = lv_label_create(parent);
         /* Marks plain description labels so the embedded settings sheet can
-         * fold them into its footer: shown there for the focused control,
-         * hidden inline (unless the control is disabled and unreachable). */
+         * hide them inline and surface their text in the delayed tooltip
+         * bubble of the focused control (disabled controls keep theirs
+         * inline — focus can't reach them, so the bubble never would). */
         lv_obj_add_flag(label, LV_OBJ_FLAG_USER_1);
     }
     lv_obj_set_width(label, LV_PCT(100));

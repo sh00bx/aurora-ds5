@@ -51,10 +51,9 @@ typedef struct {
 
 /** Room for every category the nav can carry; entries_len is the live count. */
 #define SETTINGS_EMBED_MAX_SECTIONS 8
-    /* The embedded sheet: a category rail on the left, ONE category's settings
-     * on the right, and a footer naming the keys — the same three-part shape
-     * as the in-game HID sheet, instead of five panes stacked into one long
-     * scroll. */
+    /* The embedded sheet: a category rail on the left and ONE category's
+     * settings on the right, instead of five panes stacked into one long
+     * scroll. Control descriptions surface in the delayed tooltip bubble. */
     lv_obj_t *embed_nav_items[SETTINGS_EMBED_MAX_SECTIONS];
     lv_obj_t *embed_nav_rails[SETTINGS_EMBED_MAX_SECTIONS];
     lv_obj_t *embed_sections[SETTINGS_EMBED_MAX_SECTIONS];
@@ -76,6 +75,11 @@ typedef struct {
     os_info_t os_info;
     /** Video/audio/streaming params: prompt reconnect if a session is active. */
     bool needs_stream_reconnect;
+    /** Registered by the experimental pane while its view exists: re-evaluates
+     * the decoder-refresh HEVC gate. The video pane invokes it when the H265
+     * checkbox flips, so the gate tracks a toggle within one settings visit. */
+    void (*idr_gate_refresh)(void *ctx);
+    void *idr_gate_refresh_ctx;
     /** Language changed: apply locale on close (no app quit). */
     bool needs_locale_reapply;
 #if TARGET_WEBOS

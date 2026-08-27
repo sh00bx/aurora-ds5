@@ -38,9 +38,14 @@ static void idr_checkbox_activate(lv_event_t *e);
 
 static void idr_refresh_slider_cb(lv_event_t *e);
 
+static void idr_gate_refresh_hook(void *ctx);
+
+static void obj_deleted(lv_fragment_t *self, lv_obj_t *obj);
+
 const lv_fragment_class_t settings_pane_experimental_cls = {
         .constructor_cb = pane_ctor,
         .create_obj_cb = create_obj,
+        .obj_deleted_cb = obj_deleted,
         .instance_size = sizeof(experimental_pane_t),
 };
 
@@ -96,6 +101,11 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_add_event_cb(idr_checkbox, idr_checkbox_activate, LV_EVENT_CLICKED, pane);
     lv_obj_add_event_cb(idr_slider, idr_refresh_slider_cb, LV_EVENT_VALUE_CHANGED, pane);
     idr_refresh_state_update(pane);
+    /* Both panes exist for the whole sheet visit; the video pane pokes this
+     * hook when the H265 checkbox flips, so the gate above doesn't stay stale
+     * until the sheet is reopened. */
+    pane->parent->idr_gate_refresh = idr_gate_refresh_hook;
+    pane->parent->idr_gate_refresh_ctx = pane;
 
     lv_obj_t *full_range = pref_checkbox(view, locstr("Full range YUV (SDR only)"),
                                          &app_configuration->force_full_color_range, false);
@@ -151,14 +161,29 @@ static void on_abr_changed(lv_event_t *e) {
 }
 
 static void idr_refresh_state_update(experimental_pane_t *pane) {
+    app_t *app = pane->parent->app;
+    const bool hevc_capable = (app->ss4s.video_cap.codecs & SS4S_VIDEO_H265) != 0;
+    const bool hevc_on = app_configuration->hevc && hevc_capable;
     const bool refresh_on = app_configuration->idr_refresh_interval_ms >= 500;
     if (refresh_on) {
         lv_obj_add_state(pane->idr_checkbox, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(pane->idr_checkbox, LV_STATE_CHECKED);
+    }
+    if (!hevc_on) {
+        /* The stream-side gate (session_video.c) only arms the refresh on HEVC
+         * streams; an operable switch here would silently do nothing. */
+        lv_obj_add_state(pane->idr_checkbox, LV_STATE_DISABLED);
+        lv_obj_add_state(pane->idr_slider, LV_STATE_DISABLED);
+        lv_label_set_text(pane->idr_label, locstr("Enable H265 to use periodic decoder refresh."));
+        return;
+    }
+    lv_obj_clear_state(pane->idr_checkbox, LV_STATE_DISABLED);
+    if (refresh_on) {
         lv_obj_clear_state(pane->idr_slider, LV_STATE_DISABLED);
         lv_label_set_text_fmt(pane->idr_label, locstr("Refresh interval - %.1f s"),
                               app_configuration->idr_refresh_interval_ms / 1000.0);
     } else {
-        lv_obj_clear_state(pane->idr_checkbox, LV_STATE_CHECKED);
         lv_obj_add_state(pane->idr_slider, LV_STATE_DISABLED);
         lv_label_set_text_fmt(pane->idr_label, locstr("Refresh interval - %s"), locstr("Off"));
     }
@@ -183,7 +208,7 @@ static void idr_checkbox_activate(lv_event_t *e) {
     }
     idr_refresh_state_update(pane);
     /* Announce the flip (CHECKABLE is off, so LVGL won't): the sheet re-folds
-     * descriptions and re-renders its footer on this. */
+     * descriptions and refreshes a visible tooltip bubble on this. */
     lv_event_send(cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
@@ -193,4 +218,17 @@ static void idr_refresh_slider_cb(lv_event_t *e) {
         app_configuration->idr_refresh_interval_ms = pane->idr_refresh_slider_value;
     }
     idr_refresh_state_update(pane);
+}
+
+static void idr_gate_refresh_hook(void *ctx) {
+    idr_refresh_state_update((experimental_pane_t *) ctx);
+}
+
+static void obj_deleted(lv_fragment_t *self, lv_obj_t *obj) {
+    LV_UNUSED(obj);
+    experimental_pane_t *pane = (experimental_pane_t *) self;
+    if (pane->parent->idr_gate_refresh_ctx == pane) {
+        pane->parent->idr_gate_refresh = NULL;
+        pane->parent->idr_gate_refresh_ctx = NULL;
+    }
 }

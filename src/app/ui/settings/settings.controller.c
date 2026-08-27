@@ -1325,10 +1325,10 @@ static bool embed_button_mode(settings_controller_t *c) {
     return (app_ui_get_input_mode(&c->app->ui.input) & UI_INPUT_MODE_BUTTON_FLAG) != 0;
 }
 
-/* The pane descriptions live in the footer, not inline: pref_desc_label marks
- * every plain description (LV_OBJ_FLAG_USER_1), the sheet hides the inline
- * copy, and this collects the marked labels that follow @p focused among its
- * siblings — the description(s) of exactly that control. */
+/* The pane descriptions live in the tooltip bubble, not inline: pref_desc_label
+ * marks every plain description (LV_OBJ_FLAG_USER_1), the sheet hides the
+ * inline copy, and this collects the marked labels that follow @p focused among
+ * its siblings — the description(s) of exactly that control. */
 static bool embed_collect_desc(lv_obj_t *focused, char *buf, size_t buflen) {
     if (focused == NULL || buflen == 0) {
         return false;
@@ -1682,8 +1682,9 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
     lv_group_set_editing(controller->detail_group, false);
     controller->embed_active = -1;
     controller->embed_in_detail = false;
-    /* The footer follows the cursor: every focus move in either group re-renders
-     * it (the focused setting's description, or the rail's category summary). */
+    /* The tooltip bubble follows the cursor: every focus move in either group
+     * restarts its delay timer; embed_tooltip_show then decides whether it may
+     * appear (settings column only, never over a dropdown list or popup). */
     controller->detail_group->user_data = controller;
     lv_group_set_focus_cb(controller->detail_group, embed_detail_focus_cb);
     controller->nav_group->user_data = controller;
@@ -1693,7 +1694,8 @@ static void on_launcher_embedded_view_created(settings_controller_t *controller)
 
     lv_obj_add_event_cb(controller->detail, on_back_request, LV_EVENT_CANCEL, controller);
     /* Hint texts and disabled states move with the values (e.g. HDR follows
-     * H265): re-fold the inline descriptions and re-render the footer. */
+     * H265): re-fold the inline descriptions and refresh an already-visible
+     * tooltip bubble in place. */
     lv_obj_add_event_cb(controller->detail, embed_value_changed_cb, LV_EVENT_VALUE_CHANGED, controller);
     /* No KEY handler on the detail container itself: every focusable widget
      * already carries on_detail_key (pane_child_attach_handlers) and bubbles,
@@ -1819,8 +1821,8 @@ static lv_obj_t *embed_eyebrow(lv_obj_t *parent, const char *text) {
     return label;
 }
 
-/** Header and footer are a wash of chalk over the ink, split off by a seam —
- * the same construction as the HID sheet's bars. */
+/** The header bar is a wash of chalk over the ink, split off by a seam — the
+ * same construction as the HID sheet's bars. */
 static lv_obj_t *embed_bar(lv_obj_t *parent, lv_coord_t height, lv_border_side_t seam_side) {
     lv_obj_t *bar = lv_obj_create(parent);
     lv_obj_remove_style_all(bar);

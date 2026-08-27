@@ -623,9 +623,7 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     }
     /* Sample the decoder latency unconditionally: soft recovery needs it even while
      * the stats overlay is closed, so the old !show_stats early-return is gone.
-     * SS4S_PlayerGetVideoLatency only reads ss4s' own stats counter, so it is cheap
-     * and — unlike the render-queue depth, which is Starfish/SMP-only — available
-     * on our NDL decoder. */
+     * SS4S_PlayerGetVideoLatency only reads ss4s' own stats counter, so it is cheap. */
     /* 2 s window (= the full stats ring at fps×2 entries): the per-frame samples are
      * queue-depth quantized, so a 1 s window still lands on 1×/2× frame time whenever
      * the depth holds for a second. The wider window mixes both depths into the

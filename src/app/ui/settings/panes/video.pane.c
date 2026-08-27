@@ -37,6 +37,8 @@ static void module_changed_cb(lv_event_t *e);
 
 static void hdr_state_update_cb(lv_event_t *e);
 
+static void idr_gate_notify_cb(lv_event_t *e);
+
 static void hdr_state_update(video_pane_t *controller);
 
 const lv_fragment_class_t settings_pane_video_cls = {
@@ -131,6 +133,9 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
 
     lv_obj_add_event_cb(vdec_dropdown, module_changed_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hevc_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
+    /* The decoder-refresh gate lives in the experimental pane and depends on
+     * app_configuration->hevc — poke it so a toggle here shows there at once. */
+    lv_obj_add_event_cb(hevc_checkbox, idr_gate_notify_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(av1_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
     lv_obj_add_event_cb(hdr_checkbox, hdr_state_update_cb, LV_EVENT_VALUE_CHANGED, controller);
 
@@ -152,6 +157,14 @@ static void module_changed_cb(lv_event_t *e) {
 static void hdr_state_update_cb(lv_event_t *e) {
     video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
     hdr_state_update(controller);
+}
+
+static void idr_gate_notify_cb(lv_event_t *e) {
+    video_pane_t *controller = (video_pane_t *) lv_event_get_user_data(e);
+    settings_controller_t *parent = controller->parent;
+    if (parent->idr_gate_refresh != NULL) {
+        parent->idr_gate_refresh(parent->idr_gate_refresh_ctx);
+    }
 }
 
 static void hdr_state_update(video_pane_t *controller) {

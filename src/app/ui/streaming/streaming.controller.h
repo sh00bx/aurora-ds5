@@ -38,7 +38,9 @@ typedef struct {
     struct {
         /* Density/contrast are switched at runtime between the two ways the panel is
          * used, so the pieces that carry either are kept at hand. `dim` holds every
-         * label that renders below full opacity, with the value it uses unpinned. */
+         * label that renders below full opacity, with the value it uses unpinned —
+         * ~12 entries at runtime (pad-row labels render at LV_OPA_COVER and never
+         * register); [32] is plain headroom, the old [16] never overflowed. */
         lv_obj_t *title;
         lv_obj_t *sections[4];
         lv_obj_t *chain_row;

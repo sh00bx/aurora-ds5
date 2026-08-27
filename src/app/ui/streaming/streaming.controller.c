@@ -102,6 +102,15 @@ static unsigned sys_ram_total_mb = 0;
 static unsigned long long sys_cpu_idle = 0;
 static unsigned long long sys_cpu_total = 0;
 
+/* Called when the overlay becomes visible: a baseline left over from the last
+ * time it was open would make the first tick report the average since then
+ * (potentially hours) as the current load. Dropped, the first tick shows '-'. */
+static void streaming_device_load_reset(void) {
+    sys_cpu_pct = -1;
+    sys_cpu_idle = 0;
+    sys_cpu_total = 0;
+}
+
 static void streaming_sample_device_load(void) {
     FILE *f = fopen("/proc/stat", "r");
     if (f != NULL) {
@@ -902,6 +911,9 @@ bool show_overlay(streaming_controller_t *controller) {
     lv_area_t coords = controller->video->coords;
     streaming_enter_overlay(controller->global->session, coords.x1, coords.y1, lv_area_get_width(&coords),
                             lv_area_get_height(&coords));
+    if (!overlay_pinned) {
+        streaming_device_load_reset();
+    }
     streaming_refresh_stats();
 
     app_stop_text_input(&controller->global->ui.input);
@@ -1009,6 +1021,9 @@ static void streaming_set_stats_pinned(streaming_controller_t *controller, bool 
     }
     overlay_pinned = pinned;
     if (pinned) {
+        if (!overlay_showing) {
+            streaming_device_load_reset();
+        }
         lv_obj_clear_flag(stats, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_parent(stats, lv_layer_top());
         if (app_configuration->show_stats_compact) {
