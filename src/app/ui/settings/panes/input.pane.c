@@ -162,10 +162,6 @@ static void hwmouse_state_update(input_pane_t *pane) {
 }
 #endif
 
-/* Push the new value straight to the daemon so it takes effect now rather than
- * at the next app start. The daemon persists what it receives, so nothing has
- * to re-send this later; if it is not running there is nothing to configure and
- * it will read its own stored value when it next comes up. */
 static void update_idle_off_label(input_pane_t *pane) {
     if (app_configuration->controller_idle_off_min <= 0) {
         lv_label_set_text_fmt(pane->idle_off_label, "%s - %s", locstr("Turn idle controllers off"),
@@ -180,9 +176,11 @@ static void on_controller_idle_changed(lv_event_t *e) {
     input_pane_t *pane = (input_pane_t *) lv_event_get_user_data(e);
     update_idle_off_label(pane);
     /* Push straight to the daemon so it takes effect now rather than at the next
-     * app start. The daemon persists what it receives; if it is not running
-     * there is nothing to configure and it reads its stored value when it next
-     * comes up. Wire unit is seconds -- the slider is the only thing in minutes. */
+     * app start. Best-effort: a daemon that is dead or respawning right now
+     * misses the datagram and comes back on its old persisted value — session
+     * start re-sends this setting when the ACL channel comes up
+     * (controller_common.c), so the two converge again at the latest then.
+     * Wire unit is seconds -- the slider is the only thing in minutes. */
     ds5_acl_send_idle_timeout(app_configuration->controller_idle_off_min * 60);
 }
 

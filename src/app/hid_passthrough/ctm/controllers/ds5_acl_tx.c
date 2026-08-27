@@ -317,7 +317,12 @@ void ds5_acl_send_idle_timeout(int seconds)
     if (seconds < 0 || seconds > 0xFFFF) {
         return;
     }
-    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    /* Non-blocking like the session socket in ds5_acl_tx_start: the settings
+     * callback runs on the LVGL thread, and a wedged daemon (alive, not
+     * reading) with a full receive buffer would otherwise block it. A dropped
+     * datagram is recoverable — session start re-sends the configured value
+     * (controller_common.c). */
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         return;
     }

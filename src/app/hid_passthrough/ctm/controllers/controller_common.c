@@ -2055,6 +2055,15 @@ static void *session_main(void *arg)
             ctm_ctl_log(c, "raw-ACL output %s%s%s", c->acl_tx ? "enabled" : "unavailable (hidraw)",
                     (c->acl_tx && c->dev.mac[0]) ? " mac=" : "",
                     (c->acl_tx && c->dev.mac[0]) ? c->dev.mac : "");
+            if (c->acl_tx && app_configuration != NULL) {
+                /* Re-send the configured idle timeout now that the daemon's
+                 * control socket is in use again: the settings pane sends it
+                 * only on slider change, so a daemon that died or respawned
+                 * since then is running its old persisted value. Best-effort
+                 * non-blocking datagram; the daemon dedupes an unchanged
+                 * value. */
+                ds5_acl_send_idle_timeout(app_configuration->controller_idle_off_min * 60);
+            }
         } else {
             ctm_ctl_log(c, "raw-ACL output disabled by CTM_RAW_ACL=0 (daemon-free hidraw path; "
                        "needs 0x39 host audio)");

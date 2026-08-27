@@ -226,6 +226,22 @@ int hid_pt_model_default_latency_ms(const hid_pt_model_t *model)
 
 /* ---- settings ----------------------------------------------------------- */
 
+/* The DS4 has no speaker-only route: "Controller speaker" and "Speaker + jack"
+ * would both be the 0xDF split route (probed bitmask, see controller_ds4.c
+ * ds4_route_for_mode), so the two dropdown items would be indistinguishable —
+ * and "Controller speaker" would not keep a plugged headset quiet. Collapsing
+ * SPEAKER onto BOTH at this boundary makes the dropdown settle on the label
+ * that says what actually happens. The DS5 keeps the distinction: its 0x93 is
+ * a real speaker-only route. */
+static unsigned collapse_ds4_audio_mode(const hid_pt_model_t *model, unsigned mode)
+{
+    const char *kind = selected_kind(model);
+    if (mode == (unsigned) TV_BRIDGE_AUDIO_SPEAKER && kind && strcmp(kind, "ds4") == 0) {
+        return (unsigned) TV_BRIDGE_AUDIO_BOTH;
+    }
+    return mode;
+}
+
 bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *out)
 {
     const logical_device_t *item = selected_item(model);
@@ -234,7 +250,7 @@ bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *
         return false;
     }
     out->latency_ms = settings->latency_ms;
-    out->audio_mode = (unsigned) settings->audio_mode;
+    out->audio_mode = collapse_ds4_audio_mode(model, (unsigned) settings->audio_mode);
     out->speaker_volume_percent = settings->speaker_volume_percent;
     out->headset_volume_percent = settings->headset_volume_percent;
     out->haptics_gain_centi = settings->haptics_gain_centi;
@@ -251,7 +267,7 @@ bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_contr
         return false;
     }
     settings->latency_ms = in->latency_ms;
-    settings->audio_mode = (tv_bridge_audio_mode_t) in->audio_mode;
+    settings->audio_mode = (tv_bridge_audio_mode_t) collapse_ds4_audio_mode(model, in->audio_mode);
     settings->speaker_volume_percent = in->speaker_volume_percent;
     settings->headset_volume_percent = in->headset_volume_percent;
     if (hid_pt_model_selected_is_ds5(model)) {

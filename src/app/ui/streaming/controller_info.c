@@ -127,12 +127,12 @@ static int ds_wanted_count = 0;
 static uint32_t ds_wanted_ms = 0;                        /* SDL_GetTicks of the last collect() */
 static bool ds_worker_live = false;
 
-/* Battery out of one input report, for both pad families. The report id says
- * which one is talking, so nothing has to be threaded in from the caller:
+/* Battery out of one input report, for both pad families:
  *
- *   0x31  DualSense over BT   status at 2 + 52, DS5 nibble layout
- *   0x01  DualSense over USB  status at 1 + 52, DS5 nibble layout
- *   0x11  DualShock 4 over BT status at 3 + 29, DS4 flag layout
+ *   0x31  DualSense over BT    status at 2 + 52, DS5 nibble layout
+ *   0x01  DualSense over USB   status at 1 + 52, DS5 nibble layout
+ *   0x11  DualShock 4 over BT  status at 3 + 29, DS4 flag layout
+ *   0x01  DualShock 4 over USB status at 1 + 29, DS4 flag layout
  *
  * The two layouts genuinely differ: on the DS5 the high nibble is a charging
  * STATE (0 discharging, 1 charging, 2 full), on the DS4 it is a set of flags
@@ -140,19 +140,20 @@ static bool ds_worker_live = false;
  * shorter on battery than on the cable. Decoding a DS4 byte with the DS5 rules
  * yields "state 4" for any pad with a headset plugged in, i.e. no reading.
  *
- * Known limit, deliberate: a DS4 over USB also uses report id 0x01 with the
- * same 64-byte length as the DualSense, so id alone cannot separate them and
- * 0x01 stays DualSense here. Every pad this app bridges is a BT pad
- * (ctm_controller_ds4_ops.matches requires bus == "BT"), so the ambiguous case
- * does not arise; if a USB DS4 ever needs this, the kind has to come from the
- * caller's sysfs vid/pid rather than from the report.
+ * A DS4 over USB (charging on the TV's port) uses report id 0x01 with the same
+ * 64-byte length as the DualSense, so the id alone cannot separate them:
+ * `is_ds4` carries the kind in from the caller's sysfs vid/pid. Reading a DS4
+ * 0x01 with the DS5 rules would land in the DS4's touchpad block and render as
+ * a confident wrong percentage. The bridged extra_paths probes pass false --
+ * bridging is BT-only (ctm_controller_ds4_ops.matches requires bus == "BT"),
+ * where the ids 0x11/0x31 are unambiguous on their own.
  *
  * Returns capacity 0..100 (and the DS5-style charging code: 1 charging, 2 full),
  * or -1 when the report id/length is not a full report. The minimal 10-byte BT
  * report (also id 0x01) carries no battery and is rejected by the length check. */
-static int ds_parse_battery(const uint8_t *buf, int len, int *charging) {
-    if (buf[0] == 0x11) {
-        const int ds4_off = 3 + 29;
+static int ds_parse_battery(const uint8_t *buf, int len, bool is_ds4, int *charging) {
+    if (buf[0] == 0x11 || (is_ds4 && buf[0] == 0x01)) {
+        const int ds4_off = (buf[0] == 0x11 ? 3 : 1) + 29;
         if (len <= ds4_off) {
             return -1;
         }
@@ -231,7 +232,7 @@ static int ds_open_node(const char *node) {
 /* Read one input report off a DualSense hidraw node and decode its battery. The
  * kernel fans each hidraw report out to every open fd, so this read steals nothing
  * from the usbip passthrough or SDL's HIDAPI driver holding the same node open. */
-static int ds_read_battery_node(const char *node, int *charging) {
+static int ds_read_battery_node(const char *node, bool is_ds4, int *charging) {
     int fd = ds_open_node(node);
     if (fd < 0) {
         return -1;
@@ -252,7 +253,7 @@ static int ds_read_battery_node(const char *node, int *charging) {
         if (n <= 0) {
             continue;
         }
-        result = ds_parse_battery(buf, n, charging);
+        result = ds_parse_battery(buf, n, is_ds4, charging);
     }
     close(fd);
     return result;
@@ -305,7 +306,7 @@ static bool input_hidraw_node(const char *input_name, char *out, size_t outlen) 
  * failed probe parked in the node list would render as a confident "0%" on a pad
  * that is actually full. */
 static void ds_probe_once(ds_snapshot_t *out, char probed[][DS_PATH_MAX], int *probed_count,
-                          const char *dev_path, const char *mac) {
+                          const char *dev_path, const char *mac, bool is_ds4) {
     for (int i = 0; i < *probed_count; i++) {
         if (strcmp(probed[i], dev_path) == 0) {
             return; /* one physical pad, several input devices */
@@ -316,7 +317,7 @@ static void ds_probe_once(ds_snapshot_t *out, char probed[][DS_PATH_MAX], int *p
     }
     snprintf(probed[(*probed_count)++], DS_PATH_MAX, "%s", dev_path);
     int chg = 0;
-    int pct = ds_read_battery_node(dev_path, &chg);
+    int pct = ds_read_battery_node(dev_path, is_ds4, &chg);
     if (pct < 0) {
         return;
     }
@@ -376,13 +377,16 @@ static void ds_scan(ds_snapshot_t *out, const char extra_paths[][DS_PATH_MAX], i
             }
             char dev_path[DS_PATH_MAX];
             snprintf(dev_path, sizeof(dev_path), "/dev/%s", node_name);
-            ds_probe_once(out, probed, &probed_count, dev_path, mac);
+            ds_probe_once(out, probed, &probed_count, dev_path, mac,
+                          product == DS_PRODUCT_DS4_V1 || product == DS_PRODUCT_DS4_V2);
         }
         closedir(dir);
     }
 
     for (int i = 0; i < extra_count; i++) {
-        ds_probe_once(out, probed, &probed_count, extra_paths[i], NULL);
+        /* Bridged pads are BT-only, so their reports (0x11/0x31) name the pad
+         * kind on their own -- see ds_parse_battery. */
+        ds_probe_once(out, probed, &probed_count, extra_paths[i], NULL, false);
     }
 }
 

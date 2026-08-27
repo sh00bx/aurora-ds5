@@ -85,8 +85,9 @@ void ds5_acl_tx_claim_pad_idle(ds5_acl_tx_t *t);
  * Deliberately NOT a method on ds5_acl_tx_t: the timeout governs any pad merely
  * connected to the TV, including when nothing is being bridged and no transport
  * exists, so it must be settable without a session. Fire-and-forget on the
- * daemon's control socket -- if the daemon is not running there is nothing to
- * configure, and it reloads its own persisted value when it next starts. */
+ * daemon's control socket -- a daemon that is dead or wedged right now misses
+ * the datagram and comes back up on its own persisted value, which is why
+ * session start re-sends the configured value (controller_common.c). */
 void ds5_acl_send_idle_timeout(int seconds);
 void ds5_acl_tx_stop(ds5_acl_tx_t *t);
 

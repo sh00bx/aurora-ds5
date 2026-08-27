@@ -40,7 +40,9 @@ static uint8_t ds4_route_for_mode(tv_bridge_audio_mode_t mode)
     switch (mode) {
         case TV_BRIDGE_AUDIO_HEADSET: return 0xff;  /* stereo headphones */
         case TV_BRIDGE_AUDIO_BOTH: return 0xdf;     /* split: speaker + headphone-L */
-        case TV_BRIDGE_AUDIO_SPEAKER: return 0xdf;
+        case TV_BRIDGE_AUDIO_SPEAKER: return 0xdf;  /* the panel model collapses this
+                                                     * onto BOTH for the DS4; kept for
+                                                     * values persisted before that */
         case TV_BRIDGE_AUDIO_OFF: return 0x00;
         case TV_BRIDGE_AUDIO_AUTO:
         default: return 0x01;
@@ -141,6 +143,39 @@ static void ds4_on_input_report(ctm_controller_t *c, const uint8_t *data, size_t
     ctm_controller_update_battery_ds4(c, data[DS4_BT_STATUS_OFFSET]);
 }
 
+static void ds4_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
+{
+    /* Offsets per Linux hid-sony/hid-playstation dualshock4_input_report
+     * (common block at buf+3 for BT 0x11): sticks 0-3, buttons[3] at 4-6 (dpad
+     * hat + face, shoulders/PS/touch-click, with the report counter in 6's
+     * high bits), triggers 7-8, gyro 12-17, accel 18-23, status 29-30; the
+     * touch-frame count sits at 32, each frame 9 bytes (timestamp + two 4-byte
+     * contacts, bit7 of a contact byte = finger up). Accel, timestamps,
+     * counter and battery stay real so the game sees a live but untouched pad.
+     * The stale BT CRC follows the DS5 hook's precedent: the host repacks the
+     * payload into the virtual pad's own report instead of forwarding these
+     * bytes. */
+    (void) c;
+    if (!buf || len < 36 || buf[0] != 0x11) {
+        return;
+    }
+    uint8_t *p = buf + 3;
+    p[0] = p[1] = p[2] = p[3] = 0x80; /* LX LY RX RY centered */
+    p[4] = 0x08;                      /* dpad neutral, face buttons clear */
+    p[5] = 0;                         /* L1 R1 L2 R2 share options L3 R3 */
+    p[6] &= 0xfc;                     /* PS + touchpad click; counter bits stay */
+    p[7] = p[8] = 0;                  /* L2 R2 released */
+    memset(&p[12], 0, 6);             /* gyro: no rotation (accel keeps gravity) */
+    unsigned frames = p[32] > 4 ? 4 : p[32]; /* the BT report carries at most 4 */
+    for (unsigned m = 0; m < frames; m++) {
+        size_t contact0 = 33u + m * 9u + 1u;
+        if (3u + contact0 + 4u < len) {
+            p[contact0] |= 0x80;      /* touch finger 1 up */
+            p[contact0 + 4] |= 0x80;  /* touch finger 2 up */
+        }
+    }
+}
+
 /* Pump policy. The DS4 shares the DS5's BT premise — a connected pad streams
  * input continuously, and the jail hidraw node never signals the drop — so it
  * gets the same 2 s liveness watchdog. Identical consecutive 0x11 effect
@@ -167,4 +202,5 @@ const ctm_controller_ops_t ctm_controller_ds4_ops = {
     .patch_output = ds4_patch_output,
     .set_settings = NULL,   /* live values read via get_settings in patch_output */
     .on_input_report = ds4_on_input_report,
+    .neutralize_input = ds4_neutralize_input,
 };

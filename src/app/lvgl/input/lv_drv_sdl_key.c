@@ -104,12 +104,19 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         input->key.indev != NULL) {
         _lv_indev_proc_t *proc = &input->key.indev->proc;
         /* Zero means "not pressed as far as LVGL is concerned" and is also its
-         * reset value, so it must stay zero rather than become `stalled`. */
+         * reset value, so it must stay zero rather than become `stalled`.
+         *
+         * The clamp to `now` is a robustness bound, not part of the discount:
+         * LVGL stamps these timestamps later in a pass than last_read_tick, so
+         * adding the full gap measured from last_read_tick could push a stamp
+         * past the current tick -- and lv_tick_elaps() reads a future stamp as
+         * a tick wrap, i.e. an instant long press. */
+        uint32_t now = lv_tick_get();
         if (proc->pr_timestamp != 0) {
-            proc->pr_timestamp += stalled;
+            proc->pr_timestamp = LV_MIN(proc->pr_timestamp + stalled, now);
         }
         if (proc->longpr_rep_timestamp != 0) {
-            proc->longpr_rep_timestamp += stalled;
+            proc->longpr_rep_timestamp = LV_MIN(proc->longpr_rep_timestamp + stalled, now);
         }
         /* Loud on purpose: this is the only evidence that the UI thread stalled
          * with a key down, and the whole reason the guard exists. */

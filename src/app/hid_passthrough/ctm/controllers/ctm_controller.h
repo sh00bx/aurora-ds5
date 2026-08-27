@@ -136,9 +136,11 @@ typedef struct {
      * streaming overlay owns the controller so UI navigation stops leaking
      * into the game. Reports keep flowing at the native rate (battery, seq and
      * timestamps stay live), which avoids stuck-input edge cases that dropping
-     * reports would create. NULL => reports forward unmodified (types without
-     * a known input layout keep today's leaky behavior on purpose: a wrongly
-     * guessed offset or a dropped release event is worse than the leak). */
+     * reports would create. Both DS pads implement this (their input layouts
+     * are known from hid-sony/hid-playstation). NULL => reports forward
+     * unmodified — the remaining types without a known input layout keep the
+     * leaky behavior on purpose: a wrongly guessed offset or a dropped release
+     * event is worse than the leak. */
     void (*neutralize_input)(ctm_controller_t *c, uint8_t *buf, size_t len);
 } ctm_controller_ops_t;
 
