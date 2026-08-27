@@ -312,11 +312,17 @@ struct hci_conn_list_req { uint16_t dev_id, conn_num; struct hci_conn_info ci[16
 
 /* DS5 output family (0x31/0x32 effects, 0x36/0x39 audio) plus the DS4's
  * Layout-B family (0x11 effects, 0x14/0x17 SBC audio). Same L2CAP HID-
- * interrupt transport, same 0xA2 prefix, same CRC scheme — the daemon is
- * report-agnostic beyond this list and the audio classification below. */
+ * interrupt transport, same 0xA2 prefix, same CRC scheme — beyond this list
+ * the daemon only cares about the audio classification below and the pad
+ * family (ds4_report: the idle-lightbar painter must skip DS4 links). */
 static int injectable(uint8_t id){
     return id==0x31 || id==0x32 || id==0x36 || id==0x39 ||
            id==0x11 || id==0x14 || id==0x17;
+}
+/* DS4 half of the family above: a link whose on-air output reports come from
+ * this list is a DualShock 4 and does not understand DS5 report 0x31. */
+static int ds4_report(uint8_t id){
+    return id==0x11 || id==0x14 || id==0x17;
 }
 
 /* --- idle lightbar -------------------------------------------------------
@@ -739,6 +745,9 @@ struct ds5_link {
     uint8_t  bound_addr[6];  /* device identity captured with the template (LSB-first) */
     int      bound_known;    /* bound_addr is valid */
     int      ever_bound;     /* bound_addr is meaningful for the per-address file path */
+    uint8_t  is_ds4;         /* pad family, from the on-air output reports this link's
+                              * template rides on (ds4_report) — gates the idle-lightbar
+                              * painter, which has no DS4 equivalent of report 0x31 */
     int      assert_learned; /* identity came from a JAIL-supplied assert, not a kernel
                               * event (no CONN_COMPLETE at restart). Such a binding is
                               * NOT trusted to survive a later kernel connect on its
@@ -953,8 +962,8 @@ static const char *g_tmpl_path;
  * handle was REUSED for another device: the kernel routes our inject purely by
  * that handle, write() still succeeds (handle valid, wrong device), so the old
  * EBADF guard never tripped. We close it by binding each template to the BD_ADDR it
- * was captured on (guaranteed to be a DualSense — only a DualSense receives an 0xA2
- * 0x31/0x32/0x36 HID output) and refusing to inject the instant that handle's
+ * was captured on (guaranteed to be a DualSense or DualShock 4 — only they receive
+ * an 0xA2 output of the injectable() family) and refusing to inject the instant that handle's
  * bdaddr stops matching. handle->bdaddr is learned from CONN_COMPLETE /
  * (Enhanced)LE_CONN_COMPLETE / DISCONN_COMPLETE events on the SAME monitor socket
  * we already hold, seeded by HCIGETCONNLIST. No address is hardcoded — the binding
@@ -2018,9 +2027,17 @@ static void scan_reconcile(void){
     if(g_scan_tx && t-g_scan_tx<SCAN_MIN_GAP_MS) return;
     uint8_t cmd[5]={ 0x01,
         OP_WRITE_SCAN_ENABLE&0xff, OP_WRITE_SCAN_ENABLE>>8, 1, g_scan_want };
+    /* Suppress direction: breadcrumb BEFORE the command goes out. Dying between
+     * a successful send and the bookkeeping must leave the marker behind — a
+     * stale marker only costs the next instance one idempotent mode-2 restore,
+     * an unmarked scan-off is the "TV accepts no BT" state. A failed send also
+     * keeps the marker (want!=sent retries, and the restore stays idempotent).
+     * Restore direction keeps the opposite order: unlink only after the
+     * restore actually went out. */
+    if(g_scan_want==0) scan_marker(1);
     if(cmd_send(cmd,sizeof cmd,OP_WRITE_SCAN_ENABLE,0,0)==0){
         g_scan_tx=t; g_scan_sent=g_scan_want;
-        scan_marker(g_scan_want==0);
+        if(g_scan_want!=0) scan_marker(0);
         fprintf(stderr,"[txd] scan_enable=%u (%s)\n",g_scan_want,
                 g_scan_want?"restored":"off for session");
     }
@@ -2330,6 +2347,10 @@ static int is_allowed_pad_hidraw(int fd){
 #define IDLE_ABS_DIVISOR        32
 #define IDLE_ABS_MIN_DELTA       4
 
+/* Claim-heartbeat freshness window: three missed 30s heartbeats mean the app
+ * is gone and its old pings stop counting (the grab probe takes over again). */
+#define IDLE_APP_PING_FRESH_MS  90000
+
 struct idle_node {
     int      fd;
     char     path[32];
@@ -2350,8 +2371,13 @@ struct idle_pad {
      * have to treat a grabbed node as "cannot tell" and can time the pad out
      * during a session like anywhere else. Without this the grab probe vetoes
      * every expiry while a session holds the pad, and the timeout simply does
-     * not exist for the one case where a pad is most likely to be left on. */
+     * not exist for the one case where a pad is most likely to be left on.
+     * Only a FRESH ping counts (IDLE_APP_PING_FRESH_MS): the claim heartbeat
+     * renews every 30s, and once the app is gone the grab probe must be back
+     * in charge — webOS itself grabs the touchpad node, and a latched ping
+     * would disconnect a pad driven through that grab. */
     int      saw_app_ping;
+    uint64_t last_app_ping;         /* now_ms() of the newest claim/activity datagram */
 };
 static struct idle_pad g_idle_pads[IDLE_DC_MAX_PADS];
 /* Guards g_idle_pads. The watchdog thread owns the table, but the main loop
@@ -2411,18 +2437,31 @@ static uint64_t g_idle_persist_due = 0;   /* 0 = nothing pending */
 static void idle_set_timeout_sec(unsigned sec){
     long ms=idle_clamp_ms((long)sec*1000L);
     if(ms<0){ fprintf(stderr,"[txd] idle: refusing timeout %us (0 or 30..86400)\n",sec); return; }
-    if((uint32_t)ms==g_idle_dc_ms) return;
+    /* Main thread writes, the watchdog tick reads-and-clears: value and
+     * due-stamp travel as a pair, so both sides take g_idle_mtx (on ARM the
+     * two bare stores could become visible in either order, and the tick then
+     * persisted the PREVIOUS value while clearing the pending for the new). */
+    pthread_mutex_lock(&g_idle_mtx);
+    if((uint32_t)ms==g_idle_dc_ms){ pthread_mutex_unlock(&g_idle_mtx); return; }
     g_idle_dc_ms=(uint32_t)ms;
     g_idle_persist_sec=sec;
     g_idle_persist_due=now_ms()+IDLE_PERSIST_DEBOUNCE_MS;
+    pthread_mutex_unlock(&g_idle_mtx);
     fprintf(stderr,"[txd] idle: timeout set to %us by the app\n",sec);
 }
 
-/* Called from the watchdog tick; writes at most one file per settled value. */
+/* Called from the watchdog tick; writes at most one file per settled value.
+ * The file write itself happens outside the lock. */
 static void idle_persist_tick(void){
-    if(!g_idle_persist_due || now_ms()<g_idle_persist_due) return;
+    pthread_mutex_lock(&g_idle_mtx);
+    if(!g_idle_persist_due || now_ms()<g_idle_persist_due){
+        pthread_mutex_unlock(&g_idle_mtx);
+        return;
+    }
     g_idle_persist_due=0;
-    idle_persist(g_idle_persist_sec);
+    uint32_t sec=g_idle_persist_sec;
+    pthread_mutex_unlock(&g_idle_mtx);
+    idle_persist(sec);
 }
 
 static int idle_bit(const unsigned long *bits, int nr){
@@ -2504,9 +2543,12 @@ static void idle_note_claim_addr(const uint8_t a[6]){
     char mac[18]; idle_fmt_mac(mac,a);
     pthread_mutex_lock(&g_idle_mtx);
     struct idle_pad *P=idle_pad_for(mac,0);
-    if(P && !P->saw_app_ping){
-        P->saw_app_ping=1;
-        fprintf(stderr,"[txd] idle: %s claimed by the app -> its silence counts\n",mac);
+    if(P){
+        P->last_app_ping=now_ms();
+        if(!P->saw_app_ping){
+            P->saw_app_ping=1;
+            fprintf(stderr,"[txd] idle: %s claimed by the app -> its silence counts\n",mac);
+        }
     }
     pthread_mutex_unlock(&g_idle_mtx);
 }
@@ -2519,6 +2561,7 @@ static void idle_note_activity_addr(const uint8_t a[6]){
     struct idle_pad *P=idle_pad_for(mac,0);
     if(P){
         P->last_act=now_ms(); P->tries=0;
+        P->last_app_ping=P->last_act;
         if(!P->saw_app_ping){
             P->saw_app_ping=1;
             fprintf(stderr,"[txd] idle: %s reports activity -> its silence counts\n",mac);
@@ -2720,7 +2763,9 @@ static void *idle_thread(void *arg){
         idle_persist_tick();   /* debounced write of a settled slider value */
 
         pthread_mutex_lock(&g_idle_mtx);
-        for(int i=0;i<pr && pr>0;i++){
+        /* pr only gates the pass: poll() returns HOW MANY fds are ready, not
+         * where they sit, so the scan must cover all nfd entries. */
+        for(int i=0;pr>0 && i<nfd;i++){
             if(!pf[i].revents) continue;
             struct idle_pad *P=&g_idle_pads[map_pad[i]];
             struct idle_node *N=&P->n[map_node[i]];
@@ -2758,9 +2803,11 @@ static void *idle_thread(void *arg){
              * seeing this pad's events. An app holding a grab feeds the timer
              * through ACL_CTRL_PAD_ACTIVITY instead; if it does not (an older
              * app in the same IPK, or one that never got the report out), the
-             * pad simply stays connected. */
+             * pad simply stays connected. The app's word only counts while its
+             * 30s claim heartbeat is still fresh. */
             int grabbed=0;
-            if(!P->saw_app_ping)
+            int app_fresh = P->saw_app_ping && nm-P->last_app_ping<IDLE_APP_PING_FRESH_MS;
+            if(!app_fresh)
                 for(int k=0;k<P->nn && !grabbed;k++)
                     if(P->n[k].fd>=0 && idle_node_grabbed(&P->n[k])) grabbed=1;
             if(grabbed){
@@ -3905,9 +3952,9 @@ static void *capture_thread(void *arg){
                 did_capture=1; slot=(int)(L-g_links); cid=(unsigned)(d[6]|(d[7]<<8)); nonce=L->nonce;
             }
         } else if(g_htab[hh].known){
-            /* Identity confirmed: bind the DS5 on this handle to a slot and go VALID.
-             * By the 0xA2 + 0x31/0x32/0x36 content filter above, that device IS a
-             * DualSense, so any later reassignment of this handle to a different
+            /* Identity confirmed: bind the pad on this handle to a slot and go VALID.
+             * By the 0xA2 + injectable() content filter above, that device IS a
+             * DualSense or DualShock 4, so any later reassignment of this handle to a different
              * bdaddr is a contamination event we reject (event handlers + inject_one). */
             L=slot_for_addr(g_htab[hh].addr);  /* same device / prior slot / free slot */
             if(L){
@@ -3955,6 +4002,9 @@ static void *capture_thread(void *arg){
                 need_learn=1;
             }
         }
+        /* Pad family rides on every on-air output report, so a rebind or a
+         * reused handle re-learns it together with the template. */
+        if(L) L->is_ds4=(uint8_t)ds4_report(d[9]);
         pthread_mutex_unlock(&g_lock);
         if(did_capture){
             publish_all();
@@ -4286,7 +4336,7 @@ int main(int argc,char**argv){
         uint16_t link_nonce[MAX_LINKS];
         {
             struct { int have, qd; uint64_t ln, ld, ss; uint16_t nonce; uint64_t rx; uint8_t addr[6];
-                     int rst; long r30,r50,r80; } sn[MAX_LINKS];
+                     uint8_t ds4; int rst; long r30,r50,r80; } sn[MAX_LINKS];
             uint64_t nowm=now_ms(), other_now;
             pthread_mutex_lock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
@@ -4295,6 +4345,7 @@ int main(int argc,char**argv){
                 sn[i].rx=g_links[i].rx_pkts; sn[i].ld=g_links[i].last_demand;
                 sn[i].ss=g_links[i].session_seen;   /* painter hidraw-quiet gate */
                 memcpy(sn[i].addr,g_links[i].bound_addr,6);
+                sn[i].ds4=g_links[i].is_ds4;
                 /* Per-binding telemetry: a rebind (nonce bump) starts a FRESH gap
                  * histogram so the 10s status line measures THIS binding, not the
                  * slot's whole lifetime — cumulative counts across rebinds/address
@@ -4378,7 +4429,9 @@ int main(int argc,char**argv){
                  * snapshot, so guard the unsigned subtraction against a
                  * session_seen the capture thread stamped in between. */
                 uint32_t lbrgb=idle_lb_effective();
-                if(lbrgb && sn[i].have && !tx_demand &&
+                /* Never paint a DS4 link: ds5_build_lightbar() is a DS5 0x31
+                 * frame and there is no DualShock-4 counterpart here. */
+                if(lbrgb && sn[i].have && !sn[i].ds4 && !tx_demand &&
                    nowm>sn[i].ss && nowm-sn[i].ss>=IDLE_LB_HIDRAW_QUIET_MS){
                     if(L->lb_idle_gen!=sn[i].nonce){   /* fresh binding -> fresh burst */
                         L->lb_idle_gen=sn[i].nonce; L->lb_paints=0; L->lb_last_paint=0;
@@ -4611,12 +4664,13 @@ int main(int argc,char**argv){
                     if(!prev || dnow-prev>=DEMAND_IDLE_MS)
                         __atomic_store_n(&L->demand_since,dnow,__ATOMIC_RELAXED);
                     __atomic_store_n(&L->last_demand,dnow,__ATOMIC_RELAXED);
-                    /* Audio recency is tracked separately: only 0x36/0x39 carry
-                     * pad audio, and only audio can arm the gap histogram (see
+                    /* Audio recency is tracked separately: only the audio-class
+                     * reports (DS5 0x36/0x39, DS4 0x14/0x17) carry pad audio,
+                     * and only audio can arm the gap histogram (see
                      * AUDIO_IDLE_MS — keepalives kept the demand gate open
                      * through game-silence pauses and silence was binned as
                      * link blackouts). */
-                    if(report[0]==0x36 || report[0]==0x39){
+                    if(is_audio_report(report[0])){
                         uint64_t pa=__atomic_load_n(&L->last_audio,__ATOMIC_RELAXED);
                         if(!pa || dnow-pa>=AUDIO_IDLE_MS)
                             __atomic_store_n(&L->audio_since,dnow,__ATOMIC_RELAXED);
