@@ -168,7 +168,22 @@ set(BUILD_SHARED_CORE_LIBS OFF)
 
 if (TARGET_WEBOS)
     set(CMAKE_INSTALL_LIBDIR lib/backports)
-    set(SDL2_BACKPORT_RELEASE "release-2.30.12-webos.5")
+    # Opt-in: build SDL-webOS from a local clone instead of the release tarball.
+    # The default revision is branch aurora/webos.5-uevent: webos.5 plus the
+    # netlink uevent hotplug (upstream 469fb008/829ba140/f7cb0867 and the
+    # uevent fixes from webOS-2.30.x), without webos.6 acad5508, which leaves
+    # every wl_webos_input_manager opcode at -1 in the non-ABI build and so
+    # silently kills SDL_webOSCursorVisibility().
+    set(AURORA_SDL2_LOCAL_REPO "" CACHE PATH "Local SDL-webOS git clone to build instead of the release tarball")
+    set(AURORA_SDL2_LOCAL_REVISION "74b8a735575c0006950837da62bb1219dcf4aa4f" CACHE STRING
+            "Revision of AURORA_SDL2_LOCAL_REPO to build")
+    if (AURORA_SDL2_LOCAL_REPO)
+        message(STATUS "SDL2 backport: ${AURORA_SDL2_LOCAL_REPO} @ ${AURORA_SDL2_LOCAL_REVISION}")
+        set(SDL2_BACKPORT_GIT_REPOSITORY "${AURORA_SDL2_LOCAL_REPO}")
+        set(SDL2_BACKPORT_REVISION "${AURORA_SDL2_LOCAL_REVISION}")
+    else ()
+        set(SDL2_BACKPORT_RELEASE "release-2.30.12-webos.5")
+    endif ()
     include(ExternalSDL2BackportForWebOS)
     unset(CMAKE_INSTALL_LIBDIR)
 else ()
