@@ -69,6 +69,7 @@ RIG=/tmp/ds5_synth_audio
 [ -x "$RIG" ] || { echo "REFUSING: $RIG missing"; exit 1; }
 
 LOAD_URL="${LOAD_URL:-http://192.168.0.218:8001/ds5_loadtest.bin}"
+BASE=""   # a lever file armed in BOTH arms (the baseline its TOG is judged against)
 case "$LEVER" in
     ptype) TOG=/tmp/ds5_ptype;  ON_VALUE=1 ;;
     wifi)  TOG=""; ON_VALUE="" ;;
@@ -94,15 +95,21 @@ case "$LEVER" in
     # on shared fixed-ms bins: a lever that changes the send cadence moves the
     # bins by construction (the Amendment-7 standing rule).
     r36)   TOG=/tmp/ds5_r36; ON_VALUE=1 ;;
+    # Short packet (port plan W2-02): ON = 0x35 with a 96 kbit Opus frame, OFF =
+    # 0x36. /tmp/ds5_r35 wins over /tmp/ds5_r36 in the rig, so the 0x36 file is
+    # the baseline held in BOTH arms and the lever moves only packet length and
+    # codec bitrate, at the same single-frame cadence. Only after the pad was
+    # heard to play 0x35 at all.
+    r35)   TOG=/tmp/ds5_r35; ON_VALUE=1; BASE=/tmp/ds5_r36 ;;
     none)  TOG=""; ON_VALUE="" ;;
-    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|r36|none)"; exit 1 ;;
+    *) echo "unknown lever '$LEVER' (ptype|wifi|cores|cpu|feed|burst|cotraf|r36|r35|none)"; exit 1 ;;
 esac
 
 # Every toggle file a lever can arm — the daemon reads ptype, the rig reads the
 # other four. The burst arm writes TWO of them (its TOG plus period_us), so
 # "remove $TOG" was never the whole cleanup: a knob that survives the run
 # silently redefines the next run's baseline in BOTH arms.
-LEVER_FILES="/tmp/ds5_ptype /tmp/ds5_period_us /tmp/ds5_burst /tmp/ds5_cotraffic /tmp/ds5_r36"
+LEVER_FILES="/tmp/ds5_ptype /tmp/ds5_period_us /tmp/ds5_burst /tmp/ds5_cotraffic /tmp/ds5_r36 /tmp/ds5_r35"
 
 CPU_N="${CPU_N:-2}"          # busy loops on the ON arm of lever=cpu
 CPU_PIDS=/tmp/ds5_autorun_cpu.pids
@@ -282,6 +289,8 @@ cleanup(){
     say "cleanup: lever disarmed, load stopped, cores released, rig+ledger stopped"
 }
 trap 'cleanup; exit 130' INT TERM
+# After the trap, so an interrupted run disarms the baseline with the rest.
+[ -n "$BASE" ] && { echo 1 > "$BASE"; say "baseline: $BASE armed in BOTH arms"; }
 
 [ "$BG_LOAD" = "1" ] && { load_start; say "background: wlan0 load held up in BOTH arms"; }
 [ "$BG_PIN" = "1" ]  && { cores_pin;  say "background: cpu1-3 pinned online in BOTH arms"; }

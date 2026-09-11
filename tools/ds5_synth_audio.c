@@ -127,6 +127,7 @@ static int g_r36 = 0;
  * packet length and codec bitrate. */
 static int g_r35 = 0;
 static int g_r35_opus_bytes = 120;  /* --bitrate / 800 */
+static const char *fmt_name(void) { return g_r35 ? "0x35" : (g_r36 ? "0x36" : "0x39"); }
 /* Ticks per second the audio loop actually runs at right now. Both inputs are
  * declared levers that move under a running rig — the 0x36 format puts one frame
  * per report and so halves the period, the feed lever changes the period itself
@@ -174,10 +175,10 @@ static void cotraffic_poll(void) {
 static void r36_poll(void) {
     int v = (access("/tmp/ds5_r36", F_OK) == 0);
     if (v != g_r36) {
-        printf("[synth] report format -> %s\n",
-               v ? "0x36 single-frame (10.67 ms cadence)" : "0x39 batched (21.33 ms cadence)");
-        fflush(stdout);
         g_r36 = v;
+        printf("[synth] report format -> %s%s\n", fmt_name(),
+               g_r35 ? " (/tmp/ds5_r35 still wins)" : (v ? " single-frame (10.67 ms cadence)" : " batched (21.33 ms cadence)"));
+        fflush(stdout);
     }
 }
 
@@ -191,7 +192,6 @@ static void r35_poll(void) {
         g_r35 = v;
     }
 }
-static const char *fmt_name(void) { return g_r35 ? "0x35" : (g_r36 ? "0x36" : "0x39"); }
 
 static void burst_poll(void) {
     FILE *f = fopen("/tmp/ds5_burst", "r");
@@ -450,7 +450,8 @@ static int build_0x36(struct builder *B, OpusEncoder *enc, struct tone *t) {
     return 0;
 }
 
-/* One 0x35 = one fresh frame through its OWN encoder (different bitrate). */
+/* One 0x35 = one fresh frame through the SAME encoder, re-targeted to the 0x35
+ * bitrate by the loop (CBR: the next frame already comes out at that size). */
 static int build_0x35(struct builder *B, OpusEncoder *enc, struct tone *t) {
     float pcm[OPUS_FRAME * 2];
     tone_fill(t, pcm);
@@ -715,7 +716,8 @@ static void usage(void) {
         "                  the boot default of 3 is NOT what production runs)\n"
         "  --complexity <n> Opus complexity 0..10 (default 10, as the host uses)\n"
         "  --bitrate <bps> Opus CBR for the 0x35 arm (default 96000 = 120 B/frame,\n"
-        "                  32000..148800); the 0x36/0x39 arms stay at 160000.\n"
+        "                  32000..148800); the 0x36/0x39 arms stay at 160000 (one\n"
+        "                  encoder, re-targeted when the format lever flips).\n"
         "                  Formats are file levers so arms can interleave: /tmp/ds5_r35\n"
         "                  (0x35, wins), /tmp/ds5_r36 (0x36), neither = 0x39\n"
         "  --mac <addr>    pad to drive (default: the only DualSense present)\n"
@@ -797,8 +799,7 @@ int main(int argc, char **argv) {
     const char *opuslib = NULL;
     OpusEncoder *enc = opus_setup(complexity, 160000, &opuslib);
     if (!enc) return 1;
-    OpusEncoder *enc35 = opus_setup(complexity, bitrate35, &opuslib);
-    if (!enc35) return 1;
+    int enc_bitrate = 160000;   /* re-targeted per tick for the 0x35 arm */
 
     /* Addressed per datagram, never connect()ed. The daemon unlinks and re-binds
      * its socket on every start, so a connected fd would keep pointing at a
@@ -891,10 +892,21 @@ int main(int argc, char **argv) {
 
         int r35_now = g_r35;
         int r36_now = g_r36 || r35_now;   /* one read per tick: format and period must agree */
+        /* ONE stateful encoder across the arms, re-targeted on a switch: two
+         * encoders would hand the pad's single decoder a stream from an encoder
+         * with stale CELT state (energy prediction, prefilter) at every arm
+         * change -- a click in exactly the comparison being listened to. */
+        {
+            int want = r35_now ? bitrate35 : 160000;
+            if (want != enc_bitrate) {
+                p_opus_ctl(enc, OPUS_SET_BITRATE_REQUEST, want);
+                enc_bitrate = want;
+            }
+        }
         int sent_now = 0;      /* did an audio report actually go out this tick? */
         if (!burst_silent(now_us() - t0)) {
             if (r35_now) {
-                if (build_0x35(&B, enc35, &tone) < 0) {
+                if (build_0x35(&B, enc, &tone) < 0) {
                     printf("[synth] STOPPING: could not build a 0x35 report (opus encode failed) at %.1fs\n",
                            (double) (now_us() - t0) / 1e6);
                     fflush(stdout);

@@ -44,7 +44,7 @@ fi
 # one that dies mid-block turns every later block into a silent instrument.
 TOTAL=$(( BLOCKS * (BLOCK + GUARD + 10) + 60 ))
 say "pinning cores, arming gaplog, starting rig for ${TOTAL}s"
-ssh $SSHO "$TV" 'echo 0 > /proc/lg/pm/mp_enable; for c in 1 2 3; do echo 1 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done; echo 10 > /tmp/ds5_inject_fifo; echo 1 > /tmp/ds5_gaplog; rm -f /tmp/ds5_r36 /tmp/ds5_ptype /tmp/ds5_linkq_ms /tmp/ds5_gaps.snap.*; : > /tmp/ds5_gaps.log'
+ssh $SSHO "$TV" 'echo 0 > /proc/lg/pm/mp_enable; for c in 1 2 3; do echo 1 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done; echo 10 > /tmp/ds5_inject_fifo; echo 1 > /tmp/ds5_gaplog; rm -f /tmp/ds5_r36 /tmp/ds5_r35 /tmp/ds5_ptype /tmp/ds5_linkq_ms /tmp/ds5_gaps.snap.*; : > /tmp/ds5_gaps.log'
 ssh $SSHO "$TV" "nohup /tmp/ds5_synth_audio --b 60 --seconds $TOTAL --stats 30 --mute >/tmp/rig_dscp.log 2>&1 &"
 sleep 15
 ssh $SSHO "$TV" 'tail -1 /tmp/rig_dscp.log'
