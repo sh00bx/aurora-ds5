@@ -6,6 +6,9 @@
 
 #include "lvgl/theme/lv_theme_moonlight_colors.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 typedef union pref_attrs_t {
     struct {
         bool *ref;
@@ -326,8 +329,12 @@ static void pref_dropdown_string_change_cb(lv_event_t *event) {
     pref_attrs_t *attrs = lv_event_get_user_data(event);
     int index = lv_dropdown_get_selected(lv_event_get_current_target(event));
     pref_dropdown_string_entry_t entry = attrs->dropdown_string.entries[index];
+    /* The referenced string is heap-owned (app_settings set_string -> strdup); overwriting it
+     * without freeing leaked the previous value on every dropdown change (upstream e40f510c). */
+    char *old = *attrs->dropdown_string.ref;
     char *new_value = entry.value ? strdup(entry.value) : NULL;
     *attrs->dropdown_string.ref = new_value;
+    free(old);
 }
 
 
