@@ -476,8 +476,44 @@ picture_on() {
 	# would fix -- the picture pipeline was the one this script had to reach.
 	# (picture_off still restores a sound.soundMode line from a state file
 	# written by an older build, so an interrupted upgrade puts it back.)
+	# What we do not know is whether the panel drags the sound preset along
+	# when WE switch the picture to game; sound_snapshot/sound_watch notice
+	# that and put it back at off, without ever choosing a sound preset.
+	sound_snapshot
 	pic_switch picture pictureMode
+	sound_watch
 	[ -s "$PIC_STATE" ] || log "picture: already in game mode, nothing to change"
+}
+
+# Port plan 2026-09-11 W2-13: does the G4 couple sound.soundMode to the picture
+# preset? Remember the sound preset from before our switch; if it has moved
+# afterwards, log it and record the old value like a picture bucket, so
+# picture_off restores it. Only a change we can pin on our own switch counts:
+# once a sound line is recorded the watch stops, and a snapshot is taken only
+# when this session had not switched the picture yet.
+SND_SNAP=$PIC_STATE.sound
+sound_now() {
+	json_field "$(ss_try getSystemSettings '"category":"sound","keys":["soundMode"]')" soundMode
+}
+sound_snapshot() {
+	[ -f "$SND_SNAP" ] && return 0
+	_snd=$(sound_now)
+	[ -n "$_snd" ] || return 0
+	printf '%s\n' "$_snd" >"$SND_SNAP" 2>/dev/null || true
+	log "sound: soundMode=$_snd before the picture switch"
+}
+sound_watch() {
+	[ -s "$SND_SNAP" ] || return 0
+	# Only once we switched the picture ourselves: a sound change in a session
+	# where the user was already in game mode is not ours to undo.
+	grep -q '^picture|pictureMode|' "$PIC_STATE" 2>/dev/null || return 0
+	grep -q '^sound|soundMode|' "$PIC_STATE" 2>/dev/null && return 0
+	_was=$(cat "$SND_SNAP" 2>/dev/null)
+	_snd=$(sound_now)
+	[ -n "$_snd" ] || return 0
+	[ "$_snd" = "$_was" ] && return 0
+	pic_record sound soundMode - "$_was" ""
+	log "sound: soundMode $_was -> $_snd after the picture switch (coupled); will restore $_was at off"
 }
 
 # Cheap re-assert: one read, and a write only on drift. This is what catches the
@@ -488,9 +524,14 @@ picture_enforce() {
 	# which the app reads as "root is gone" and stops the cycle over.
 	[ -f "$PIC_STATE" ] || return 0
 	pic_switch picture pictureMode
+	sound_watch
+	return 0
 }
 
 picture_off() {
+	# The sound snapshot belongs to one session; a stale one would make the
+	# next session compare against a preset from another evening.
+	rm -f "$SND_SNAP"
 	[ -f "$PIC_STATE" ] || return 0
 	# Restore each recorded bucket by name. If the TV refuses the named
 	# dimension, fall back to the live one -- putting the value back in the
