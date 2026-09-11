@@ -63,8 +63,9 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     settings.haptics_gain_centi = 100;
     /* PERCENT, not raw bytes. The values that once sat in the ds5 branch below
      * (0x4d/0x41) were raw bytes carried over verbatim from the tv_bridge_worker
-     * port, and because the DS5 raw volume range happens to be 0..0x64 they read
-     * as 77%/65% without anything looking wrong. */
+     * port, and because the DS5 headset byte then mapped percent 1:1 (0..0x64)
+     * they read as 77%/65% without anything looking wrong. The speaker byte is
+     * now spread over its audible 0x3d..0x64 (controller_ds5.c). */
     settings.headset_volume_percent = 95;
     settings.speaker_volume_percent = 95;
     settings.ds5_patch_high_nibble = 0xf;

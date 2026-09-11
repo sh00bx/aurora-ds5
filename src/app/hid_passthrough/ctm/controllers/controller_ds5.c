@@ -65,10 +65,24 @@ static double ds5_haptics_gain(unsigned int gain_centi)
     return 1.0 + pow((gain - 1.0) / 4.0, 1.35) * 4.0;
 }
 
-/* Clamp a volume percent to the DS5 raw byte range (0..0x64). */
-static uint8_t ds5_volume_raw_byte(unsigned int value)
+/* Slider percent -> DS5 speaker volume byte. The firmware's usable speaker
+ * range is 0x3d..0x64 (below 0x3d is inaudible), so a linear 0..0x64 put the
+ * lower ~60 % of the slider into silence. 0 stays 0 (= off); 1..100 spread
+ * over the audible range, and the 95 % default lands on 0x62 (was 0x5f). */
+static uint8_t ds5_speaker_volume_byte(unsigned int pct)
 {
-    return (uint8_t)(value > 0x64u ? 0x64u : value);
+    if (pct == 0) return 0;
+    if (pct > 100) pct = 100;
+    return (uint8_t)(0x3du + (pct * (0x64u - 0x3du) + 50u) / 100u);
+}
+
+/* Slider percent -> DS5 headphone volume byte, still the old linear 0..0x64.
+ * The field goes up to 0x7f, but spreading 0..100 % over it would put the 95 %
+ * default at 0x79, above anything selectable before, on a scale that is likely
+ * dB-stepped. That needs an ear check before it ships (port plan W1-06). */
+static uint8_t ds5_headset_volume_byte(unsigned int pct)
+{
+    return (uint8_t)(pct > 0x64u ? 0x64u : pct);
 }
 
 /* patch_output: rewrite a DS5 0x36/0x32 BT output report in place per the live
@@ -105,8 +119,8 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
         if (auto_lat_eff > 255) auto_lat_eff = 255;
         uint8_t auto_latency = (uint8_t)(auto_lat_eff < 1 ? 1 : auto_lat_eff);
         ctm_controller_note_b_eff(c, auto_latency, settings->latency_ms, auto_adapt);
-        uint8_t auto_headset = ds5_volume_raw_byte(settings->headset_volume_percent);
-        uint8_t auto_speaker = ds5_volume_raw_byte(settings->speaker_volume_percent);
+        uint8_t auto_headset = ds5_headset_volume_byte(settings->headset_volume_percent);
+        uint8_t auto_speaker = ds5_speaker_volume_byte(settings->speaker_volume_percent);
         while (pos + 2 <= limit) {
             uint8_t block_id = data[pos];
             size_t payload_len = data[pos + 1];
@@ -162,8 +176,8 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     if (lat_eff > 255) lat_eff = 255;
     uint8_t latency = (uint8_t)(lat_eff < 1 ? 1 : lat_eff);
     ctm_controller_note_b_eff(c, latency, settings->latency_ms, adapt_add);
-    uint8_t headset_volume = ds5_volume_raw_byte(settings->headset_volume_percent);
-    uint8_t speaker_volume = ds5_volume_raw_byte(settings->speaker_volume_percent);
+    uint8_t headset_volume = ds5_headset_volume_byte(settings->headset_volume_percent);
+    uint8_t speaker_volume = ds5_speaker_volume_byte(settings->speaker_volume_percent);
     uint8_t target_headset_volume = 0;
     uint8_t target_speaker_volume = 0;
     uint8_t target_audio_flags = 0;
@@ -212,8 +226,14 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
                 data[pos + 7] = target_speaker_volume;
                 patched = 1;
             }
-            if (data[pos + 9] != target_audio_flags) {
-                data[pos + 9] = target_audio_flags;
+            /* The route (0x30) is ours; the echo/noise-cancel bits (0x0C) stay
+             * whatever the host put there (ds5_native_audio_cancel_bits), so
+             * one host switch covers AUTO, SPEAKER and BOTH (HEADSET/OFF clear
+             * the byte as before). */
+            uint8_t audio_ctrl = target_audio_flags ? (uint8_t)(target_audio_flags | (data[pos + 9] & 0x0Cu))
+                                                    : target_audio_flags;
+            if (data[pos + 9] != audio_ctrl) {
+                data[pos + 9] = audio_ctrl;
                 patched = 1;
             }
         } else if ((block_base == 0x93 || block_base == 0x94 || block_base == 0x95 || block_base == 0x96) &&
