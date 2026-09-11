@@ -6,6 +6,7 @@
 #include "input/input_gamepad.h"
 #include "app.h"
 #include "stream/session_priv.h"
+#include "util/bus.h"
 
 static session_t *current_session = NULL;
 
@@ -43,15 +44,30 @@ static void connection_log_message(const char *format, ...) {
     va_end(arglist);
 }
 
+/* Runs on the UI thread (posted from connection_status_update). */
+static void notice_update_on_ui(void *poor) {
+    streaming_notice_show(poor ? locstr("Unstable connection.") : NULL);
+}
+
+/* moonlight-common-c calls this from its video receive thread
+ * (connectionSawFrame). The notice is an LVGL label, and LVGL is not
+ * thread-safe: setting it here freed/allocated label text and measured glyphs
+ * concurrently with the UI thread's render, which corrupted the heap and the
+ * freetype glyph cache once the status flapped often enough (two crashes on
+ * 2026-09-11, both with this thread inside LVGL/malloc). Post it instead. */
 static void connection_status_update(int status) {
     switch (status) {
         case CONN_STATUS_OKAY:
             commons_log_info("Session", "Connection is okay");
-            streaming_notice_show(NULL);
+            if (current_session) {
+                app_bus_post(current_session->app, notice_update_on_ui, NULL);
+            }
             break;
         case CONN_STATUS_POOR:
             commons_log_warn("Session", "Connection is poor");
-            streaming_notice_show(locstr("Unstable connection."));
+            if (current_session) {
+                app_bus_post(current_session->app, notice_update_on_ui, (void *) 1);
+            }
             break;
         default:
             break;
