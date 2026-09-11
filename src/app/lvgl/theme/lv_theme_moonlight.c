@@ -206,6 +206,17 @@ static void lv_start_text_input(lv_event_t *event) {
     lv_obj_t *target = lv_event_get_target(event);
     lv_theme_t *theme = lv_event_get_user_data(event);
     app_t *app = theme->user_data;
+    /* Starting text input is what makes webOS raise its own on-screen keyboard.
+     * A remote or a keyboard can drive that keyboard; a gamepad cannot -- it is
+     * a system surface of its own and our pad never reaches it, so for a
+     * controller user it is just an unusable panel dropped over the dialog.
+     * Fields that have to be editable from a pad carry their own controls
+     * instead (see ui/settings/panes/pref_fps.c), and a physical keyboard still
+     * types either way: LVGL gets those characters from the key path, with or
+     * without SDL text input (see text_key_fallback in lvgl/input/lv_drv_sdl_key.c). */
+    if (app_ui_get_input_mode(&app->ui.input) == UI_INPUT_MODE_GAMEPAD) {
+        return;
+    }
     lv_area_t *coords = &target->coords;
     lv_coord_t w = lv_area_get_width(coords), h = lv_area_get_height(coords);
     if (w <= 0 || h <= 0) {

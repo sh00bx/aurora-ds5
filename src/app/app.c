@@ -322,7 +322,11 @@ static int app_event_filter(void *userdata, SDL_Event *event) {
             if (event->type == SDL_MOUSEMOTION) {
                 bool updated = app_text_input_state_update(&app->ui.input);
                 if (updated && !app->ui.input.text_input_active && app->session != NULL) {
-                    session_screen_keyboard_closed(app->session);
+                    /* The system on-screen keyboard went away on its own. Only
+                     * reclaim the grabbed devices if no other in-app surface is
+                     * still up -- the overlay behind the keyboard needs them
+                     * just as much. */
+                    session_set_ui_owned_input(app->session, ui_should_block_input());
                 }
             }
             if (!app_ui_is_opened(&app->ui) && app->session != NULL) {

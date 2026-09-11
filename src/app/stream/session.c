@@ -241,12 +241,8 @@ void session_toggle_vmouse(session_t *session) {
     session_input_set_vmouse_active(&session->input.vmouse, value);
 }
 
-void session_screen_keyboard_opened(session_t *session) {
-    session_input_screen_keyboard_opened(&session->input);
-}
-
-void session_screen_keyboard_closed(session_t *session) {
-    session_input_screen_keyboard_closed(&session->input);
+void session_set_ui_owned_input(session_t *session, bool ui_owned) {
+    session_input_set_ui_owned(&session->input, ui_owned);
 }
 
 void streaming_display_size(session_t *session, short width, short height) {
@@ -433,11 +429,31 @@ void session_config_init(app_t *app, session_config_t *config, const SERVER_DATA
             config->stream.supportedVideoFormats |= VIDEO_FORMAT_H265_MAIN10;
         }
     }
-    if (app_config->av1 && video_cap.codecs & SS4S_VIDEO_AV1) {
+    /* AV1 only up to 60 fps. NDL follows the decoder clock for AV1 and presents
+     * at 60 Hz no matter what rate we ask for, while HEVC presents on arrival.
+     * Above 60 that turns every extra frame into cadence judder instead of
+     * motion: the source rate beats against a fixed 60 Hz presentation.
+     *
+     * Measured on the LG G4 2026-08-28, both ends sampled at once. Same 72 fps
+     * source, codec switched under it:
+     *   av1_nvenc  -> luna videooutput/getStatus frameRate = 60  (visible judder,
+     *                 6:5 beat = 12/s; at 90 fps it was 3:2 = 30/s)
+     *   hevc_nvenc -> frameRate = 72 (stable over five samples), judder gone
+     * Matches aurora-tv session.c:331 ("NDL AV1 presents at 60 Hz even when 120
+     * is requested. HEVC is required above 60."), now confirmed on our own panel.
+     *
+     * Dropping the format here rather than hiding the setting keeps a saved
+     * av1=true harmless: the host simply never offers AV1 for this session. */
+    const bool av1_rate_ok = config->stream.fps <= 60;
+    if (app_config->av1 && video_cap.codecs & SS4S_VIDEO_AV1 && av1_rate_ok) {
         config->stream.supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN8;
         if (want_10bit) {
             config->stream.supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN10;
         }
+    } else if (app_config->av1 && (video_cap.codecs & SS4S_VIDEO_AV1) && !av1_rate_ok) {
+        commons_log_info("Session", "AV1 disabled for this session: %d fps > 60, "
+                                    "NDL would present it at 60 Hz. Using HEVC/H.264.",
+                         config->stream.fps);
     }
     // If no video format is supported, default to H.264
     if (config->stream.supportedVideoFormats == 0) {

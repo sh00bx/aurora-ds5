@@ -35,6 +35,8 @@ static bool ui_modal_consumes_input(void) {
 
 static bool read_keyboard(app_ui_input_t *input, const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state);
 
+static bool text_key_fallback(app_ui_input_t *input, const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state);
+
 static bool read_event(const SDL_Event *event, lv_drv_sdl_key_t *state);
 
 static bool home_group_shortcut(const SDL_Event *event);
@@ -170,7 +172,7 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         } else if (!nav_to_lvgl && !back_closes_kbd && !ui_modal_consumes_input()) {
             /* Avoid switching input mode while soft keyboard is open – the remote can send both
              * key and gamepad events for the same press, causing KEY ↔ GAMEPAD oscillation. */
-            if (read_keyboard(input, &e.key, state)) {
+            if (read_keyboard(input, &e.key, state) || text_key_fallback(input, &e.key, state)) {
                 ui_set_input_mode(input, UI_INPUT_MODE_KEY);
             }
         } else if (nav_to_lvgl) {
@@ -287,6 +289,11 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         if (app->session != NULL && session_handle_input_event(app->session, &e)) {
             state->state = LV_INDEV_STATE_RELEASED;
         } else {
+            /* SDL produced text on its own, so it is doing its job and the
+             * fallback below must never second-guess it: drop the press it was
+             * holding and stand down permanently. */
+            state->sdl_text_input_works = true;
+            state->pending_text_char = 0;
             uint8_t size = _lv_txt_get_encoded_length(e.text.text);
             if (size > 0) {
                 state->text_len = strlen(e.text.text);
@@ -436,6 +443,124 @@ static bool read_keyboard(app_ui_input_t *input, const SDL_KeyboardEvent *event,
 #endif
     }
     state->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    return true;
+}
+
+/**
+ * US-layout shifted form of a printable key.
+ *
+ * webOS hardcodes xkb=us for physical keyboards -- the platform gives an app no
+ * way to change that, and the streaming on-screen keyboard already assumes the
+ * same layout (see ui/streaming/soft_keyboard.c) -- so this is the layout the TV
+ * actually has, not an assumption about the user's hardware. Unmapped keys keep
+ * their unshifted character rather than vanishing.
+ */
+static uint32_t shifted_us(uint32_t c) {
+    switch (c) {
+        case '1': return '!';
+        case '2': return '@';
+        case '3': return '#';
+        case '4': return '$';
+        case '5': return '%';
+        case '6': return '^';
+        case '7': return '&';
+        case '8': return '*';
+        case '9': return '(';
+        case '0': return ')';
+        case '-': return '_';
+        case '=': return '+';
+        case '[': return '{';
+        case ']': return '}';
+        case '\\': return '|';
+        case ';': return ':';
+        case '\'': return '"';
+        case ',': return '<';
+        case '.': return '>';
+        case '/': return '?';
+        case '`': return '~';
+        default: return c;
+    }
+}
+
+/** The character a key press stands for, or 0 if it does not stand for one. */
+static uint32_t text_char_from_key(const SDL_KeyboardEvent *event) {
+    const SDL_Keycode sym = event->keysym.sym;
+    const Uint16 mod = event->keysym.mod;
+    if (mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) {
+        /* A shortcut, not text. */
+        return 0;
+    }
+    if (sym >= SDLK_KP_1 && sym <= SDLK_KP_9) {
+        return (uint32_t) ('1' + (sym - SDLK_KP_1));
+    }
+    if (sym == SDLK_KP_0) {
+        return '0';
+    }
+    if (sym == SDLK_KP_PERIOD) {
+        return '.';
+    }
+    if (sym < 0x20 || sym > 0x7E) {
+        return 0;
+    }
+    const bool shift = (mod & KMOD_SHIFT) != 0;
+    if (sym >= 'a' && sym <= 'z') {
+        const bool upper = shift != ((mod & KMOD_CAPS) != 0);
+        return upper ? (uint32_t) (sym - 'a' + 'A') : (uint32_t) sym;
+    }
+    return shift ? shifted_us((uint32_t) sym) : (uint32_t) sym;
+}
+
+/**
+ * Type a printable key into a focused text field when SDL did not.
+ *
+ * LVGL learns characters only from SDL_TEXTINPUT: read_keyboard() above maps
+ * navigation keys and nothing else, so a build that never receives text events
+ * has text fields that cannot be typed into at all -- which is what a USB
+ * keyboard on the TV runs into, because webOS routes text through its own IME
+ * and a keyboard that never went through it produces key events only.
+ *
+ * The fallback is deliberately timid, because guessing wrong means doubled
+ * characters:
+ *   - it only runs while a text field actually has focus;
+ *   - it types on the key's RELEASE, not its press, so a SDL_TEXTINPUT for the
+ *     same press (which arrives while the key is still down) wins and clears
+ *     the pending character;
+ *   - the first text event SDL delivers latches sdl_text_input_works and
+ *     retires the fallback for the rest of the run.
+ * On a platform where SDL does deliver text this therefore does nothing at all.
+ *
+ * The character is fed through the same text queue SDL_TEXTINPUT uses, so LVGL
+ * sees an ordinary press/release pair rather than a key left down.
+ */
+static bool text_key_fallback(app_ui_input_t *input, const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state) {
+    if (state->sdl_text_input_works) {
+        return false;
+    }
+    lv_group_t *group = app_input_get_group(input);
+    lv_obj_t *focused = group != NULL ? lv_group_get_focused(group) : NULL;
+    if (focused == NULL || !lv_obj_check_type(focused, &lv_textarea_class)) {
+        state->pending_text_char = 0;
+        return false;
+    }
+    const uint32_t c = text_char_from_key(event);
+    if (c == 0) {
+        return false;
+    }
+    if (event->type == SDL_KEYDOWN) {
+        state->pending_text_char = c;
+        return false;
+    }
+    if (state->pending_text_char != c) {
+        return false;
+    }
+    state->pending_text_char = 0;
+    state->text[0] = (char) c;
+    state->text[1] = '\0';
+    state->text_len = 1;
+    state->text_remain = 1;
+    state->text_next = 0;
+    state->key = 0;
+    state->state = LV_INDEV_STATE_RELEASED;
     return true;
 }
 

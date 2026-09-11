@@ -113,40 +113,35 @@ void session_input_stopped(stream_input_t *input) {
     input->remoteOkModifiers = 0;
 }
 
-void session_input_screen_keyboard_opened(stream_input_t *input) {
+void session_input_set_ui_owned(stream_input_t *input, bool ui_owned) {
 #if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
     const session_config_t *config = &input->session->config;
 #endif
 #if FEATURE_INPUT_EVMOUSE
     if (config->hardware_mouse) {
-        session_evmouse_disable(&input->evmouse);
+        if (ui_owned) {
+            session_evmouse_disable(&input->evmouse);
+        } else {
+            session_evmouse_enable(&input->evmouse);
+        }
     }
 #endif
 #if FEATURE_INPUT_EVKBD
     if (config->keyboard_capture) {
-        /* Give the keyboard back to webOS while the on-screen keyboard is up, so
-         * the overlay can be driven the ordinary way. Release the keys we are
-         * holding first — a grabbed key that goes up after the ungrab would never
-         * produce a release for the host. */
+        if (ui_owned) {
+            /* Release the keys we are holding BEFORE the ungrab: a grabbed key
+             * that goes up after the ungrab never produces a release for the
+             * host, and the game is left with a key stuck down. */
+            stream_input_flush_pressed_keys(input);
+            session_evkbd_disable(&input->evkbd);
+        } else {
+            session_evkbd_enable(&input->evkbd);
+        }
+    }
+#endif
+    if (!ui_owned) {
+        /* Coming back from a UI surface: whatever the user pressed while it was
+         * up must not look like a key the game is still holding. */
         stream_input_flush_pressed_keys(input);
-        session_evkbd_disable(&input->evkbd);
     }
-#endif
-}
-
-void session_input_screen_keyboard_closed(stream_input_t *input) {
-#if FEATURE_INPUT_EVMOUSE || FEATURE_INPUT_EVKBD
-    const session_config_t *config = &input->session->config;
-#endif
-#if FEATURE_INPUT_EVMOUSE
-    if (config->hardware_mouse) {
-        session_evmouse_enable(&input->evmouse);
-    }
-#endif
-#if FEATURE_INPUT_EVKBD
-    if (config->keyboard_capture) {
-        session_evkbd_enable(&input->evkbd);
-    }
-#endif
-    stream_input_flush_pressed_keys(input);
 }

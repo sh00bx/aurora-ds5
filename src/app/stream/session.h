@@ -106,9 +106,12 @@ bool session_has_input(session_t *session);
 
 void session_toggle_vmouse(session_t *session);
 
-void session_screen_keyboard_opened(session_t *session);
-
-void session_screen_keyboard_closed(session_t *session);
+/**
+ * Publish "an in-app UI surface owns input" to the session, so the physically
+ * grabbed keyboard/mouse follow the same gate the UI publishes.
+ * See session_input_set_ui_owned() for why this exists.
+ */
+void session_set_ui_owned_input(session_t *session, bool ui_owned);
 
 bool session_accepting_input(session_t *session);
 

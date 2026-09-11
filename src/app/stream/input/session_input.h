@@ -85,9 +85,22 @@ void session_input_started(stream_input_t *input);
 
 void session_input_stopped(stream_input_t *input);
 
-void session_input_screen_keyboard_opened(stream_input_t *input);
-
-void session_input_screen_keyboard_closed(stream_input_t *input);
+/**
+ * Hand the locally grabbed input devices to the app UI, or take them back.
+ *
+ * While a session runs with keyboard/mouse capture on, the physical devices are
+ * EVIOCGRAB'd for the host: SDL -- and therefore LVGL -- never sees a key from
+ * them. That is right while the game owns the screen and wrong the moment any
+ * in-app surface opens on top of it (streaming overlay, HID sheet, soft
+ * keyboard), because the surface then has no way to be driven at all: the
+ * session-side listener drops the keys (the input gate is up) and the
+ * compositor never got them.
+ *
+ * `ui_owned` therefore follows the same gate the rest of the UI publishes --
+ * see streaming_publish_input_gate() in ui/streaming/streaming.controller.c,
+ * its only regular caller. Both directions are idempotent.
+ */
+void session_input_set_ui_owned(stream_input_t *input, bool ui_owned);
 
 /** Release any keys still marked down (host + local state). Call after soft keyboard closes to fix stuck input. */
 void stream_input_flush_pressed_keys(stream_input_t *input);

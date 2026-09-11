@@ -252,6 +252,13 @@ bool streaming_stats_shown() {
     return overlay_showing || overlay_pinned;
 }
 
+/* Held while a surface is mid-swap (overlay closing so the soft keyboard or the
+ * HID sheet can take its place). Without it the gate would dip to false between
+ * the two, and the grabbed keyboard would be taken back from the UI and handed
+ * to it again in the same event -- a pointless ungrab/regrab, and a window in
+ * which a keystroke would go to the game. */
+static int gate_hold = 0;
+
 /* Publish "a UI surface owns input" for the threads that cannot ask.
  *
  * The three predicates above answer the same question, but two of them chase
@@ -262,7 +269,7 @@ bool streaming_stats_shown() {
  * `overlay_showing`, `->soft_kbd`, `->hid_panel` or `current_controller` below
  * is therefore followed by a call to it. */
 static void streaming_publish_input_gate(void) {
-    bool blocked = overlay_showing;
+    bool blocked = overlay_showing || gate_hold > 0;
     if (current_controller != NULL) {
         blocked = blocked || current_controller->soft_kbd != NULL;
 #if defined(TARGET_WEBOS)
@@ -270,6 +277,17 @@ static void streaming_publish_input_gate(void) {
 #endif
     }
     ui_input_gate_publish(blocked);
+    /* The same gate decides who owns the physically grabbed keyboard and mouse.
+     * It has to: with capture on, the devices are EVIOCGRAB'd for the host, so
+     * SDL never sees them -- and an overlay that the session-side listener also
+     * refuses to forward (the gate is up) is an overlay no USB keyboard can
+     * drive at all. Handing them back for the duration is what makes the
+     * overlay, the HID sheet and the soft keyboard behave like the rest of the
+     * app's UI. */
+    app_t *app = current_controller != NULL ? current_controller->global : NULL;
+    if (app != NULL && app->session != NULL) {
+        session_set_ui_owned_input(app->session, blocked);
+    }
 }
 
 /* Quality colour for a total latency, matching the compact bar's thresholds. */
@@ -571,6 +589,10 @@ void streaming_notice_show(const char *message) {
 
 static void constructor(lv_fragment_t *self, void *args) {
     streaming_controller_t *controller = (streaming_controller_t *) self;
+    const streaming_scene_arg_t *arg = (streaming_scene_arg_t *) args;
+    /* Before the first publish: the gate now also reaches into the session
+     * through controller->global, so that pointer must already be valid. */
+    controller->global = arg->global;
     current_controller = controller;
 
     overlay_showing = false;
@@ -578,8 +600,6 @@ static void constructor(lv_fragment_t *self, void *args) {
 
     streaming_styles_init(controller);
 
-    const streaming_scene_arg_t *arg = (streaming_scene_arg_t *) args;
-    controller->global = arg->global;
     controller->network_test = arg->network_test;
     controller->network_test_duration = arg->network_test_duration ? arg->network_test_duration : 10;
     controller->network_test_timer = NULL;
@@ -704,13 +724,14 @@ static bool on_event(lv_fragment_t *self, int code, void *userdata) {
             if (controller->soft_kbd) {
                 return true;
             }
+            gate_hold++;
             hide_overlay_impl(controller);
-            session_screen_keyboard_opened(controller->global->session);
             controller->soft_kbd = soft_keyboard_create(
                 controller->detached_root,
                 controller->global->session,
                 soft_keyboard_close_cb,
                 controller);
+            gate_hold--;
             streaming_publish_input_gate();
             lv_group_t *kbd_group = soft_keyboard_get_group(controller->soft_kbd);
             if (kbd_group) {
@@ -817,24 +838,23 @@ static void soft_keyboard_close_cb(void *userdata) {
     streaming_publish_input_gate();
     app_input_set_group(&controller->global->ui.input, controller->group);
     app_set_mouse_grab(&controller->global->input, true);
-    if (controller->global->session) {
-        session_screen_keyboard_closed(controller->global->session);
-    }
     lv_obj_del(kbd_obj);
 }
 
 static void open_keyboard(lv_event_t *event) {
     streaming_controller_t *controller = lv_event_get_user_data(event);
+    gate_hold++;
     hide_overlay(event);
     if (controller->soft_kbd) {
+        gate_hold--;
         return; /* Already showing */
     }
-    session_screen_keyboard_opened(controller->global->session);
     controller->soft_kbd = soft_keyboard_create(
         lv_layer_top(),
         controller->global->session,
         soft_keyboard_close_cb,
         controller);
+    gate_hold--;
     streaming_publish_input_gate();
     lv_group_t *kbd_group = soft_keyboard_get_group(controller->soft_kbd);
     if (kbd_group) {
@@ -882,12 +902,14 @@ static void open_hid_devices(lv_event_t *event) {
     if (!controller->global->session || controller->hid_panel) {
         return;
     }
+    gate_hold++;
     hide_overlay_impl(controller);
     controller->hid_panel = hid_passthrough_panel_create(
             lv_layer_top(),
             controller->global->session,
             hid_panel_close_cb,
             controller);
+    gate_hold--;
     streaming_publish_input_gate();
     if (!controller->hid_panel) {
         return;

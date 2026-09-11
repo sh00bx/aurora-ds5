@@ -134,8 +134,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_set_flex_grow(fps_dropdown, 1);
     lv_obj_add_event_cb(fps_dropdown, on_res_fps_updated, LV_EVENT_VALUE_CHANGED, self);
 
-    pref_desc_label(view, locstr("Choose Custom FPS to enter a fractional refresh rate (e.g. 119.94). "
-                                 "The exact value is sent to the host for frame pacing."),
+    pref_desc_label(view, locstr("Choose Custom FPS to set any rate, including the fractional NTSC ones "
+                                 "(59.94, 119.88). The exact value is sent to the host for frame pacing."),
                     false);
 
     pane->res_warning = lv_label_create(view);
