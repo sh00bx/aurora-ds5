@@ -51,6 +51,7 @@
 #define R39_LEN        547
 #define R32_LEN        142
 #define R36_LEN        398
+#define R35_LEN        334          /* one size-ladder step below 0x36, see g_r35 */
 #define OPUS_BYTES     200
 #define OPUS_FRAME     480          /* samples per channel, 10 ms @ 48 kHz */
 #define HAPTIC_BYTES    64
@@ -112,6 +113,20 @@ static uint32_t g_cotraffic_hz = 0;
  * re-runs that question on the modern instrument. The daemon needs no change:
  * it reads exactly one byte of every report, the id. */
 static int g_r36 = 0;
+/* Short-packet lever (/tmp/ds5_r35 exists; wins over /tmp/ds5_r36). Port plan
+ * 2026-09-11 W2-02, a HYPOTHESIS: a shorter baseband packet is the same lever as
+ * the L18 packet-type clamp (halved 60-65 ms gaps, replicated three times), but
+ * without HCI. Bitrate alone changes nothing on air — 0x36 is fixed at 398 B by
+ * the descriptor and a smaller Opus frame is just zero-padded — so the frame has
+ * to shrink AND move one rung down the 0x31..0x39 size ladder. At 96 kbit/s CBR
+ * a 10 ms frame is 120 B, which fits 0x35 (334 B) with the same skeleton as the
+ * 0x36 (long 0x91 form, SetState inline, one coil block). Whether the pad
+ * accepts a 0x13 block inside a 0x35 at all is unknown, exactly as it was for
+ * 0x39 once: listen first (--amp audible, no --mute), measure second. Same
+ * single-frame cadence as the 0x36, so the A/B against /tmp/ds5_r36 changes only
+ * packet length and codec bitrate. */
+static int g_r35 = 0;
+static int g_r35_opus_bytes = 120;  /* --bitrate / 800 */
 /* Ticks per second the audio loop actually runs at right now. Both inputs are
  * declared levers that move under a running rig — the 0x36 format puts one frame
  * per report and so halves the period, the feed lever changes the period itself
@@ -129,7 +144,7 @@ static double tick_rate_hz(void) {
     if (p < 1) {
         p = 1;
     }
-    return 1e6 * (g_r36 ? 2.0 : 1.0) / (double) p;
+    return 1e6 * ((g_r36 || g_r35) ? 2.0 : 1.0) / (double) p;
 }
 
 static void cotraffic_poll(void) {
@@ -165,6 +180,18 @@ static void r36_poll(void) {
         g_r36 = v;
     }
 }
+
+static void r35_poll(void) {
+    int v = (access("/tmp/ds5_r35", F_OK) == 0);
+    if (v != g_r35) {
+        printf("[synth] report format -> %s\n",
+               v ? "0x35 single-frame short packet" : (g_r36 ? "0x36 single-frame (10.67 ms cadence)"
+                                                       : "0x39 batched (21.33 ms cadence)"));
+        fflush(stdout);
+        g_r35 = v;
+    }
+}
+static const char *fmt_name(void) { return g_r35 ? "0x35" : (g_r36 ? "0x36" : "0x39"); }
 
 static void burst_poll(void) {
     FILE *f = fopen("/tmp/ds5_burst", "r");
@@ -279,7 +306,7 @@ static const char *OPUS_CANDIDATES[] = {
     NULL
 };
 
-static OpusEncoder *opus_setup(int complexity, const char **which) {
+static OpusEncoder *opus_setup(int complexity, int bitrate, const char **which) {
     void *h = NULL;
     for (int i = 0; OPUS_CANDIDATES[i]; i++) {
         h = dlopen(OPUS_CANDIDATES[i], RTLD_NOW);
@@ -299,7 +326,7 @@ static OpusEncoder *opus_setup(int complexity, const char **which) {
     /* Production settings, byte for byte: 10 ms frames, 160 kbit CBR -> the 200 B
      * the 0x13/0xD3 sub-block declares. VBR would break the fixed geometry. */
     p_opus_ctl(e, OPUS_SET_EXPERT_FRAME_DURATION_REQ, OPUS_FRAMESIZE_10_MS);
-    p_opus_ctl(e, OPUS_SET_BITRATE_REQUEST, 160000);
+    p_opus_ctl(e, OPUS_SET_BITRATE_REQUEST, bitrate);
     p_opus_ctl(e, OPUS_SET_VBR_REQUEST, 0);
     p_opus_ctl(e, OPUS_SET_COMPLEXITY_REQUEST, complexity);
     return e;
@@ -328,6 +355,7 @@ static void tone_fill(struct tone *t, float *pcm /* OPUS_FRAME*2 */) {
 struct builder {
     uint8_t  r39[R39_LEN];
     uint8_t  r36[R36_LEN];
+    uint8_t  r35[R35_LEN];
     uint8_t  r32[R32_LEN];
     uint8_t  seq;          /* 4-bit sequence nibble, shared across report ids */
     uint8_t  pktctr;       /* audio counter, +1 per FRAME (so +2 per 0x39,
@@ -378,6 +406,11 @@ static void builder_init(struct builder *B, int b_ms) {
     u[77] = HAPTIC_BYTES;         /* zeroed coil: silent, same as the 0x39 arm */
     u[142] = 0x13 | 0x80;
     u[143] = OPUS_BYTES;
+
+    /* 0x35: the 0x36 skeleton with a shorter Opus block, one rung down. */
+    memcpy(B->r35, B->r36, R35_LEN);
+    B->r35[0]   = 0x35;
+    B->r35[143] = (uint8_t) g_r35_opus_bytes;
 }
 
 /* Fill one 0x39 with two freshly encoded frames. Both frames go through the SAME
@@ -414,6 +447,22 @@ static int build_0x36(struct builder *B, OpusEncoder *enc, struct tone *t) {
     B->r36[10] = B->pktctr;
     B->pktctr = (uint8_t) (B->pktctr + 1);
     sign_report(B->r36, R36_LEN);
+    return 0;
+}
+
+/* One 0x35 = one fresh frame through its OWN encoder (different bitrate). */
+static int build_0x35(struct builder *B, OpusEncoder *enc, struct tone *t) {
+    float pcm[OPUS_FRAME * 2];
+    tone_fill(t, pcm);
+    int32_t n = p_opus_encode_f(enc, pcm, OPUS_FRAME, B->r35 + OFF36_OPUS, g_r35_opus_bytes);
+    if (n != g_r35_opus_bytes) {
+        fprintf(stderr, "[synth] opus frame %d B (want %d)\n", (int) n, g_r35_opus_bytes);
+        return -1;
+    }
+    B->r35[1] = (uint8_t) ((B->seq++ & 0x0F) << 4);
+    B->r35[10] = B->pktctr;
+    B->pktctr = (uint8_t) (B->pktctr + 1);
+    sign_report(B->r35, R35_LEN);
     return 0;
 }
 
@@ -665,6 +714,10 @@ static void usage(void) {
         "                  which is what the app sets against a rate-servo host;\n"
         "                  the boot default of 3 is NOT what production runs)\n"
         "  --complexity <n> Opus complexity 0..10 (default 10, as the host uses)\n"
+        "  --bitrate <bps> Opus CBR for the 0x35 arm (default 96000 = 120 B/frame,\n"
+        "                  32000..148800); the 0x36/0x39 arms stay at 160000.\n"
+        "                  Formats are file levers so arms can interleave: /tmp/ds5_r35\n"
+        "                  (0x35, wins), /tmp/ds5_r36 (0x36), neither = 0x39\n"
         "  --mac <addr>    pad to drive (default: the only DualSense present)\n"
         "  --sock <path>   daemon socket (default: the com.aurora.ds5 jail)\n"
         "  --tmpl <path>   template path, for the .st telemetry sibling\n"
@@ -679,7 +732,7 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     int    b_ms = 60, seconds = 0, fifo_depth = 10, complexity = 10, stats_iv = 10, force = 0;
-    int    mute = 0, servo = 1;
+    int    mute = 0, servo = 1, bitrate35 = 96000;
     double freq = 400.0, amp_dbfs = -30.0;
     const char *mac_arg = NULL;
     const char *sock = "/var/palm/jail/com.aurora.ds5/tmp/ds5_acl.sock";
@@ -694,6 +747,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--amp") && !last)        amp_dbfs = atof(argv[++i]);
         else if (!strcmp(a, "--fifo") && !last)       fifo_depth = atoi(argv[++i]);
         else if (!strcmp(a, "--complexity") && !last) complexity = atoi(argv[++i]);
+        else if (!strcmp(a, "--bitrate") && !last)    bitrate35 = atoi(argv[++i]);
         else if (!strcmp(a, "--stats") && !last)      stats_iv = atoi(argv[++i]);
         else if (!strcmp(a, "--mac") && !last)        mac_arg = argv[++i];
         else if (!strcmp(a, "--sock") && !last)       sock = argv[++i];
@@ -708,6 +762,11 @@ int main(int argc, char **argv) {
      * ever send (Thrum declares the useful range as 16..127). */
     if (b_ms < 16 || b_ms > 127) { fprintf(stderr, "[synth] --b %d outside 16..127\n", b_ms); return 2; }
     if (amp_dbfs > 0)            { fprintf(stderr, "[synth] --amp must be <= 0 dBFS\n"); return 2; }
+    /* CBR bytes per 10 ms frame; the 0x35 has 334 - 4 (CRC) - 144 = 186 B of room. */
+    if (bitrate35 < 32000 || bitrate35 > 148800 || bitrate35 % 800) {
+        fprintf(stderr, "[synth] --bitrate %d: need 32000..148800 in steps of 800\n", bitrate35); return 2;
+    }
+    g_r35_opus_bytes = bitrate35 / 800;
 
     if (!force && app_is_running()) {
         fprintf(stderr, "[synth] REFUSING: an Aurora session is running. A synthetic load "
@@ -736,8 +795,10 @@ int main(int argc, char **argv) {
     snprintf(st_path, sizeof st_path, "%s.%s.st", tmpl, hex);
 
     const char *opuslib = NULL;
-    OpusEncoder *enc = opus_setup(complexity, &opuslib);
+    OpusEncoder *enc = opus_setup(complexity, 160000, &opuslib);
     if (!enc) return 1;
+    OpusEncoder *enc35 = opus_setup(complexity, bitrate35, &opuslib);
+    if (!enc35) return 1;
 
     /* Addressed per datagram, never connect()ed. The daemon unlinks and re-binds
      * its socket on every start, so a connected fd would keep pointing at a
@@ -785,6 +846,8 @@ int main(int argc, char **argv) {
          * format, which is the one thing a format lever must not do. */
         B.r36[OFF36_SETSTATE + 4] = 0x00;
         B.r36[OFF36_SETSTATE + 5] = 0x80;
+        B.r35[OFF36_SETSTATE + 4] = 0x00;   /* same inline copy in the 0x35 */
+        B.r35[OFF36_SETSTATE + 5] = 0x80;
     }
     struct tone tone;
     tone_init(&tone, freq, amp_dbfs);
@@ -826,10 +889,22 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         if (seconds > 0 && (int64_t) (now_us() - t0) >= (int64_t) seconds * 1000000) break;
 
-        int r36_now = g_r36;   /* one read per tick: format and period must agree */
+        int r35_now = g_r35;
+        int r36_now = g_r36 || r35_now;   /* one read per tick: format and period must agree */
         int sent_now = 0;      /* did an audio report actually go out this tick? */
         if (!burst_silent(now_us() - t0)) {
-            if (r36_now) {
+            if (r35_now) {
+                if (build_0x35(&B, enc35, &tone) < 0) {
+                    printf("[synth] STOPPING: could not build a 0x35 report (opus encode failed) at %.1fs\n",
+                           (double) (now_us() - t0) / 1e6);
+                    fflush(stdout);
+                    break;
+                }
+                memcpy(dg + ACL_TAG_LEN, B.r35, R35_LEN);
+                if (sendto(fd, dg, ACL_TAG_LEN + R35_LEN, MSG_DONTWAIT,
+                           (struct sockaddr *) &sa, sizeof sa) < 0) send_err++;
+                else { sent++; sent_now = 1; }
+            } else if (r36_now) {
                 if (build_0x36(&B, enc, &tone) < 0) {
                     /* Say it: leaving the loop in silence prints only DONE, and
                      * DONE without a reason reads downstream as "the run simply
@@ -921,6 +996,7 @@ int main(int argc, char **argv) {
             burst_poll();
             cotraffic_poll();
             r36_poll();
+            r35_poll();
             /* One 0x32 rides one audio tick, so the tick rate is the hard ceiling
              * on the co-traffic this rig can put on the link: 46.7/s batched at
              * the default period, half that if the feed lever doubles the period.
@@ -933,7 +1009,7 @@ int main(int argc, char **argv) {
                 printf("[synth] STOPPING: %u co-traffic reports/s asked for, but the audio loop "
                        "ticks %.1f times a second (%s at %u us) and one 0x32 rides one tick — "
                        "this arm cannot carry the load it declares\n",
-                       g_cotraffic_hz, tick_rate_hz(), g_r36 ? "0x36" : "0x39", g_period_us);
+                       g_cotraffic_hz, tick_rate_hz(), fmt_name(), g_period_us);
                 fflush(stdout);
                 g_stop = 1;
             }
@@ -1050,7 +1126,7 @@ int main(int argc, char **argv) {
             double secs = (double) (now - t0) / 1e6;
             printf("[synth] t=%.0fs%s sent=%llu rate=%.1f/s err=%llu late=%llu(max %llums) "
                    "adj=%dus | st: q=%d fifo=%d inj=%u drop=%u dage=%d dovf=%d g50=%d g80=%d\n",
-                   secs, r36_now ? " r36" : "",
+                   secs, r35_now ? " r35" : (r36_now ? " r36" : ""),
                    (unsigned long long) sent, (double) sent / (secs > 0 ? secs : 1),
                    (unsigned long long) send_err, (unsigned long long) late,
                    (unsigned long long) (late_us_max / 1000), g_adj_us,

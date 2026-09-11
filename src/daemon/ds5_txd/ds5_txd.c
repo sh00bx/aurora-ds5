@@ -316,7 +316,7 @@ struct hci_conn_list_req { uint16_t dev_id, conn_num; struct hci_conn_info ci[16
  * the daemon only cares about the audio classification below and the pad
  * family (ds4_report: the idle-lightbar painter must skip DS4 links). */
 static int injectable(uint8_t id){
-    return id==0x31 || id==0x32 || id==0x36 || id==0x39 ||
+    return id==0x31 || id==0x32 || id==0x35 || id==0x36 || id==0x39 ||
            id==0x11 || id==0x14 || id==0x17;
 }
 /* DS4 half of the family above: a link whose on-air output reports come from
@@ -416,7 +416,11 @@ static void ds5_build_lightbar(uint8_t out[DS5_BT_OUT_LEN], uint32_t rgb, uint8_
  * ACL/L2CAP lengths are recomputed per send, so the captured template serves
  * either. Everything else (0x31 rumble/trigger/LED, 0x32 SetState) is
  * state-class and keeps the rumble path's latest-wins semantics. */
-static int is_audio_report(uint8_t id){ return id==0x36 || id==0x39 || id==0x14 || id==0x17; }
+/* 0x35 (334 B): the same single-frame audio form one size-ladder rung below 0x36,
+ * with a 96 kbit Opus frame. Only tools/ds5_synth_audio.c emits it (port plan
+ * 2026-09-11 W2-02, short-packet hypothesis); accepted here so the rig can A/B it
+ * against 0x36 on the production transport. */
+static int is_audio_report(uint8_t id){ return id==0x35 || id==0x36 || id==0x39 || id==0x14 || id==0x17; }
 static uint64_t now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000ull+ts.tv_nsec/1000000ull; }
 static uint64_t now_us(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000ull+ts.tv_nsec/1000ull; }
 
