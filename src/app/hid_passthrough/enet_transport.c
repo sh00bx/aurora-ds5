@@ -181,8 +181,14 @@ static void enet_client_dispatch(ctm_enet_client_t *client, const ctm_enet_msg_t
         return;
     }
     size_t total = sizeof(ctmb_header_t) + msg->header.payload_len;
+    /* Input reports and microphone frames ride UNRELIABLE: both are a stream
+     * of fresh samples where a retransmitted stale one is worth less than the
+     * next fresh one, and a reliable 100/s stream would keep unacked data in
+     * flight forever (head-of-line blocking for control on the same channel).
+     * A lost mic frame is a 10 ms blip the host conceals. */
     enet_uint32 packet_flags =
-            (msg->header.type == CTMB_MSG_INPUT_REPORT) ? 0u : ENET_PACKET_FLAG_RELIABLE;
+            (msg->header.type == CTMB_MSG_INPUT_REPORT ||
+             msg->header.type == CTMB_MSG_DS5_MIC) ? 0u : ENET_PACKET_FLAG_RELIABLE;
     ENetPacket *packet = enet_packet_create(NULL, total, packet_flags);
     if (!packet) {
         return;

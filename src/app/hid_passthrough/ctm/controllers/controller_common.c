@@ -30,6 +30,7 @@
 #include "ctm_ds5_audio.h"
 #include "ds5_acl_tx.h"
 #include "ds5_hidfd.h"
+#include "ds5_mic_rx.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -130,6 +131,9 @@ struct ctm_controller {
     ctm_transport_t xport;
     ctm_enet_client_t *enet;        /* process-owned client; borrowed by xport */
     ds5_acl_tx_t *acl_tx;          /* DS5 raw-ACL forwarder (NULL = hidraw only) */
+    ds5_mic_rx_t *mic_rx;          /* DS5 mic uplink receiver, per session (W3-02);
+                                    * NULL unless the host advertised
+                                    * CTMB_HOSTCFG_DS5_MIC */
 
     /* --- the extracted subsystems, one opaque handle each ------------------
      * Created in ctm_controller_create, destroyed in ctm_controller_destroy;
@@ -1801,6 +1805,17 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     if (c->ops->composite && !c->flydigi_xinput_evdev_only) {
         ctm_composite_start_readers(c->comp);
     }
+    /* Microphone uplink (W3-02): only for a DS5 on the raw-ACL path (the
+     * daemon is where the frames come from) and only when THIS host asked for
+     * them -- a CTM host or a Vibepollo with ds5_native_mic off never sees
+     * the message type. The receiver binds a per-pad socket the daemon
+     * addresses; whether frames actually flow is the daemon's root-owned
+     * lever (/tmp/ds5_mic), and nothing in this app arms the microphone. */
+    c->mic_rx = NULL;
+    if ((host_cfg.reserved[0] & CTMB_HOSTCFG_DS5_MIC) &&
+        c->ops->raw_acl_output && c->ops->kind && strcmp(c->ops->kind, "ds5") == 0) {
+        c->mic_rx = ds5_mic_rx_start(c, c->dev.mac);
+    }
     ctm_ctl_log(c, "active host=%s port=%d path=%s product=%s transport=%s",
          c->host, c->port, c->dev.path, caps->product,
          c->xport.kind == CTM_TRANSPORT_ENET ? "ENet/UDP" : "TCP");
@@ -1912,6 +1927,11 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     if (c->input_thread_started) {
         pthread_join(c->input_thread, NULL);
         c->input_thread_started = 0;
+    }
+    /* Joined here, before the transport goes away: the receiver sends on it. */
+    if (c->mic_rx) {
+        ds5_mic_rx_stop(c->mic_rx);
+        c->mic_rx = NULL;
     }
     ctm_composite_shutdown(c->comp);
 }

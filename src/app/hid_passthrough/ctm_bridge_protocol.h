@@ -24,14 +24,20 @@ enum ctmb_message_type {
                                     Sent ONLY when HOST_CONFIG advertised
                                     CTMB_HOSTCFG_PACE_FEEDBACK, so a CTM host
                                     never sees the type. */
-    CTMB_MSG_TPMOUSE = 12        /* TV -> host: user preference for the host's
+    CTMB_MSG_TPMOUSE = 12,       /* TV -> host: user preference for the host's
                                     DS5 touchpad-mouse synthesis. Sent once after
                                     the HOST_CONFIG handshake; hosts that predate
                                     the type ignore it (default switch arm). */
+    CTMB_MSG_DS5_MIC = 13        /* TV -> host: one DS5 microphone Opus packet
+                                    (ctmb_ds5_mic_t + bytes). Sent ONLY when
+                                    HOST_CONFIG advertised CTMB_HOSTCFG_DS5_MIC
+                                    (port plan W3-02); see ds5_mic_rx.h. */
 };
 
 /* ctmb_host_config_t.reserved[0] capability bits (0 on a CTM host). */
 #define CTMB_HOSTCFG_PACE_FEEDBACK 0x01u
+/* Host decodes CTMB_MSG_DS5_MIC into its virtual pad's capture endpoint. */
+#define CTMB_HOSTCFG_DS5_MIC       0x02u
 
 /* ctmb_device_caps_t.flags capability bits (TV -> host, in HELLO).
  * Bit 0 is the pre-existing always-set "1".
@@ -102,6 +108,19 @@ typedef struct {
     uint32_t drop_total;
     uint8_t reserved[16];
 } ctmb_pace_feedback_t;
+
+/* CTMB_MSG_DS5_MIC payload header, followed by frame_len bytes of Opus.
+ * seq: per-session counter this app keeps for the mic stream (starts at 0,
+ * wraps at 16 bits) -- NOT the pad's 4-bit report sequence, which is shared
+ * with the pad-state reports. format 1 = the DualSense BT mic packet as
+ * captured: Opus, 48 kHz, stereo, 10 ms (480 samples), TOC 0xd4, 71 bytes. */
+#define CTMB_DS5_MIC_FORMAT_OPUS_48K_10MS 1u
+typedef struct {
+    uint16_t seq;
+    uint8_t format;
+    uint8_t frame_len;
+    uint32_t reserved;
+} ctmb_ds5_mic_t;
 
 /* CTMB_MSG_ENUM payload (puck composite): the device's OWN enumeration, read
  * from sysfs on the TV and forwarded verbatim. Windows replays it (no parsing

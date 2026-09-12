@@ -3532,6 +3532,103 @@ static void seed_conn_list(void){
                 chg[i].hh,a[5],a[4],a[3],a[2],a[1],a[0]); }
 }
 
+/* ---- W3-02: microphone uplink forward (capture thread) ---------------------
+ *
+ * With its microphone armed a DualSense sends its voice as Opus packets inside
+ * input report 0x31 (flag byte bit 1 set, 71 bytes from report byte 3). They
+ * pass through this thread anyway as inbound ACL on the bound handle:
+ *
+ *   d[0..1] handle  d[2..3] acl_len  d[4..5] l2_len  d[6..7] CID
+ *   d[8]=0xA1 (DATA|input)  d[9]=0x31  d[10]=flags  d[11]=ctr  d[12..82]=Opus  crc32
+ *
+ * Forwarded, NOT decoded and NOT armed: the daemon never writes anything to
+ * arm a microphone (that write is what walks the TV into a watchdog reboot
+ * while hid-playstation is bound -- see ha-voice/MIC-SAFE-DESIGN-2026-07-18.md);
+ * it only relays what is on the air, whichever way the pad was armed. Each
+ * packet goes as one datagram to the jailed app's per-pad socket
+ *   <jail tmp>/ds5_mic.<mac12hex>.sock
+ * (the app binds it for the length of a session -- ds5_mic_rx.c; the format
+ * below is defined there too and MUST stay byte-identical). An absent socket
+ * (no session, or a host that did not ask for the mic) is just a counted
+ * sendto failure; nothing is retried and nothing blocks the capture loop.
+ *
+ * Default OFF. Lever: `echo 1 > /tmp/ds5_mic` (root-owned regular file, the
+ * same read_root_int gate as every other tunable), cached ~1/s. OFF again on
+ * 0 or removal. Kept off by default so a pad that is streaming without anyone
+ * asking (a stale arming) does not also cost WiFi airtime. */
+#define MIC_LEVER_PATH   "/tmp/ds5_mic"
+#define MIC_DGRAM_HDR    16
+#define MIC_OPUS_MAX     200
+static char     g_mic_dir[72];         /* jail tmp dir = dirname(report socket); main() before threads.
+                                        * Sized so dir + "/ds5_mic.<12 hex>.sock" always fits sun_path (108). */
+static int      g_micfd=-1;            /* AF_UNIX DGRAM sender (capture thread only) */
+static int      g_mic_on=0;            /* lever, cached */
+static long     g_mic_fwd=0, g_mic_nolisten=0, g_mic_err=0;   /* capture thread only */
+static uint16_t g_mic_ctr[MAX_LINKS];  /* per-link datagram counter (telemetry) */
+
+static void mic_lever_tick(void){
+    static uint64_t last=0; static int warned=0;
+    uint64_t n=now_ms();
+    if(last && n-last<1000) return;
+    last=n;
+    int r=read_root_int(MIC_LEVER_PATH,&warned);
+    int want = (r==1) ? 1 : (r==RRI_BAD ? g_mic_on : 0);   /* a typo keeps the state */
+    if(want!=g_mic_on){
+        g_mic_on=want;
+        fprintf(stderr,"[txd] mic: forward %s (%s%s)\n", want?"ON":"OFF",
+                want?"lever ":"", want?MIC_LEVER_PATH:"lever absent/0");
+        if(!want && (g_mic_fwd||g_mic_nolisten||g_mic_err)){
+            fprintf(stderr,"[txd] mic: fwd=%ld nolisten=%ld err=%ld since ON\n",
+                    g_mic_fwd,g_mic_nolisten,g_mic_err);
+            g_mic_fwd=g_mic_nolisten=g_mic_err=0;
+        }
+    }
+    /* Counters every 30 s while on and anything moved -- never per packet. */
+    static uint64_t last_log=0;
+    if(g_mic_on && n-last_log>=30000){
+        if(g_mic_fwd||g_mic_nolisten||g_mic_err)
+            fprintf(stderr,"[txd] mic: 30s fwd=%ld nolisten=%ld err=%ld\n",
+                    g_mic_fwd,g_mic_nolisten,g_mic_err);
+        g_mic_fwd=g_mic_nolisten=g_mic_err=0;
+        last_log=n;
+    }
+}
+
+/* One inbound ACL packet from a bound link (slot, its LSB-first address): if it
+ * is a microphone report, relay the Opus bytes. Runs unlocked. */
+static void mic_forward(int slot, const uint8_t addr[6], const uint8_t *d, int dl){
+    if(dl<MIC_DGRAM_HDR-4) return;                 /* header + at least one byte */
+    uint8_t pb=(uint8_t)((d[1]>>4)&0x3); if(pb==1) return;   /* continuation fragment */
+    if(d[8]!=0xA1 || d[9]!=0x31) return;
+    if((d[10]&0x03)!=0x02) return;                 /* bit1 audio, bit0 (state) clear */
+    uint16_t acl_len=(uint16_t)(d[2]|(d[3]<<8)), l2_len=(uint16_t)(d[4]|(d[5]<<8));
+    if(acl_len!=(uint16_t)(dl-4) || l2_len!=(uint16_t)(acl_len-4)) return;
+    /* l2 payload = [A1][31][flags][ctr][opus][crc32]: 8 bytes around the packet */
+    if(l2_len<9) return;
+    int opus_len=(int)l2_len-8;
+    if(opus_len<1 || opus_len>MIC_OPUS_MAX || 12+opus_len>dl) return;
+    if(g_micfd<0){
+        g_micfd=socket(AF_UNIX,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
+        if(g_micfd<0){ g_mic_err++; return; }
+    }
+    uint8_t pkt[MIC_DGRAM_HDR+MIC_OPUS_MAX];
+    pkt[0]='D'; pkt[1]='S'; pkt[2]='5'; pkt[3]='M'; pkt[4]=1;
+    pkt[5]=d[10]; pkt[6]=d[11]; pkt[7]=(uint8_t)opus_len;
+    memcpy(pkt+8,addr,6);
+    uint16_t ctr=g_mic_ctr[slot]++;
+    pkt[14]=(uint8_t)(ctr&0xff); pkt[15]=(uint8_t)(ctr>>8);
+    memcpy(pkt+MIC_DGRAM_HDR,d+12,(size_t)opus_len);
+    struct sockaddr_un ua; memset(&ua,0,sizeof ua); ua.sun_family=AF_UNIX;
+    int pl=snprintf(ua.sun_path,sizeof ua.sun_path,"%s/ds5_mic.%02x%02x%02x%02x%02x%02x.sock",
+                    g_mic_dir,addr[5],addr[4],addr[3],addr[2],addr[1],addr[0]);
+    if(pl<0 || pl>=(int)sizeof ua.sun_path){ g_mic_err++; return; }   /* cannot happen with g_mic_dir's size */
+    ssize_t w=sendto(g_micfd,pkt,(size_t)(MIC_DGRAM_HDR+opus_len),MSG_DONTWAIT,
+                     (struct sockaddr*)&ua,sizeof ua);
+    if(w==(ssize_t)(MIC_DGRAM_HDR+opus_len)) g_mic_fwd++;
+    else if(errno==ENOENT || errno==ECONNREFUSED) g_mic_nolisten++;   /* no session listening */
+    else g_mic_err++;                                                 /* EAGAIN (app not draining) etc. */
+}
+
 /* Capture thread: watch HCI_CHANNEL_MONITOR (root) for our outgoing HID-output
  * and keep each connection's handle+CID published — but only ever publish
  * VALID once the bound handle's bdaddr is known (fail closed). */
@@ -3564,6 +3661,7 @@ static void *capture_thread(void *arg){
     uint16_t idle_lh[MAX_LINKS]; uint8_t idle_ok[MAX_LINKS];
     memset(idle_lh,0,sizeof idle_lh); memset(idle_ok,0,sizeof idle_ok);
     for(;;){
+        mic_lever_tick();   /* W3-02: /tmp/ds5_mic, cached ~1/s, default off */
         /* Idle backstop: evaluated EVERY wakeup (not only on recv-timeout) so it
          * still fires while other BT devices keep the monitor socket busy. After a
          * flap a DS5 stops emitting HID-output -> its last_seen ages out -> its link
@@ -3908,11 +4006,16 @@ static void *capture_thread(void *arg){
              * handlers and the identity re-bind path, same as for NOCP refresh. */
             if(dl>=2){
                 uint16_t hh=(uint16_t)((d[0]|(d[1]<<8))&0x0fff);
+                int mslot=-1; uint8_t maddr[6];
                 pthread_mutex_lock(&g_lock);
                 struct ds5_link *L=link_by_handle(hh);
-                if(L){ L->last_seen=now_ms(); L->rx_pkts++; }
+                if(L){ L->last_seen=now_ms(); L->rx_pkts++;
+                       /* W3-02: a bound link's inbound report may be the pad's
+                        * microphone; the relay itself runs after the unlock. */
+                       if(g_mic_on && L->bound_known){ mslot=(int)(L-g_links); memcpy(maddr,L->bound_addr,6); } }
                 else g_other_rx++;   /* foreign links (Magic-Remote LE etc.) — the coex canary */
                 pthread_mutex_unlock(&g_lock);
+                if(mslot>=0) mic_forward(mslot,maddr,d,dl);
             }
             continue;
         }
@@ -4234,6 +4337,17 @@ int main(int argc,char**argv){
     g_kickfd=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
     if(g_kickfd<0) fprintf(stderr,"[txd] eventfd failed errno=%d -> credit drain stays datagram-clocked\n",errno);
 
+    /* W3-02: the mic datagrams go to the jailed app's tmp, i.e. next to the
+     * report socket it already reaches us on. Settled before the capture thread
+     * exists (it is the only writer of that path). */
+    {   const char *sl=strrchr(sock_path,'/');
+        if(sl && sl>sock_path && (size_t)(sl-sock_path)<sizeof g_mic_dir){
+            memcpy(g_mic_dir,sock_path,(size_t)(sl-sock_path)); g_mic_dir[sl-sock_path]='\0';
+        } else {
+            snprintf(g_mic_dir,sizeof g_mic_dir,"/tmp");
+            if(sl) fprintf(stderr,"[txd] mic: report-socket dir too long for a mic socket path, using /tmp\n");
+        }
+    }
     pthread_t cap; pthread_create(&cap,NULL,capture_thread,NULL);
     pthread_t brk; pthread_create(&brk,NULL,broker_thread,(void*)hidfd_path);
     {   /* Idle lightbar BOOT colour: DS5_IDLE_LIGHTBAR=RRGGBB (hex), "0"/"off"

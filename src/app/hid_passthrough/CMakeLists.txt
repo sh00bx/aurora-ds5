@@ -19,6 +19,7 @@ if (TARGET_WEBOS)
             ctm/controllers/ctm_xpad_evdev.c
             ctm/controllers/ctm_ds5_audio.c
             ctm/controllers/ds5_acl_tx.c
+            ctm/controllers/ds5_mic_rx.c
             ctm/controllers/ds5_hidfd.c
             ctm/controllers/controller_ds4.c
             ctm/controllers/controller_ds5.c
