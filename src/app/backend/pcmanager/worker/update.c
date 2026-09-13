@@ -11,11 +11,25 @@
 #include "ui/fatal_error.h"
 
 int worker_host_update(worker_context_t *context) {
-    const pclist_t *node = pcmanager_node(context->manager, &context->uuid);
-    if (node == NULL) {
+    pcmanager_t *manager = context->manager;
+    /* Invariant: a worker never holds a pointer into a pclist node (or its SERVER_DATA) across a
+     * blocking call. A parallel upsert from the discovery thread frees the old SERVER_DATA in
+     * pclist_node_apply, so the address string has to be copied under the manager lock. */
+    char *ip = NULL;
+    uint16_t port = 0;
+    pcmanager_lock(manager);
+    const pclist_t *node = pcmanager_node(manager, &context->uuid);
+    if (node != NULL && node->server != NULL && node->server->serverInfo.address != NULL) {
+        ip = strdup(node->server->serverInfo.address);
+        port = node->server->extPort;
+    }
+    pcmanager_unlock(manager);
+    if (ip == NULL) {
         return GS_FAILED;
     }
-    return pcmanager_update_by_host(context, node->server->serverInfo.address, node->server->extPort, true);
+    int ret = pcmanager_update_by_host(context, ip, port, true);
+    free(ip);
+    return ret;
 }
 
 int pcmanager_update_by_host(worker_context_t *context, const char *ip, uint16_t port, bool force) {

@@ -63,9 +63,12 @@ bool pcmanager_select(pcmanager_t *manager, const uuidstr_t *uuid);
 bool pcmanager_forget(pcmanager_t *manager, const uuidstr_t *uuid);
 
 /**
- * Whether a host is allowed to be removed from the known hosts list. This is the case when the host can't be
- * reached, or when another known host has taken over its identity (same address and port, or same MAC). The
- * latter happens when the host software is reinstalled, as that assigns the server a brand new UUID.
+ * Whether a host is allowed to be removed from the known hosts list. This is the case when the last query for
+ * the host failed (offline or error), or when another known host that is currently online has taken over its
+ * identity (same address and port, or same MAC). The latter happens when the host software is reinstalled, as
+ * that assigns the server a brand new UUID. A host that has not been queried yet in this session
+ * (SERVER_STATE_NONE) and a host that is online are never forgettable, because forgetting drops its favorites
+ * and hidden apps for good.
  * @param manager
  * @param uuid
  * @return true if the host can be forgotten

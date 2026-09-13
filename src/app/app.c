@@ -49,7 +49,7 @@ int app_init(app_t *app, app_settings_loader *settings_loader, int argc, char *a
     SDL_LogSetOutputFunction(commons_sdl_log, NULL);
     SDL_SetAssertionHandler(app_assertion_handler_abort, NULL);
     SDL_Init(0);
-    commons_log_info("APP", "Start Aurora. Version %s", APP_VERSION);
+    commons_log_info("APP", "Start Aurora. Version %s (SDL2 %s)", APP_VERSION, AURORA_SDL2_VARIANT);
     settings_loader(&app->settings);
     profile_manager_init(app->settings.conf_dir, &app->settings);
     app->main_thread_id = SDL_ThreadID();

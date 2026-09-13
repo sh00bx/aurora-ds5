@@ -217,6 +217,14 @@ static void upsert_perform(pclist_update_context_t *context) {
     pclist_t *node = pclist_ll_find_by(manager->servers, &context->uuid, pclist_ll_compare_uuid);
     bool updated = node != NULL;
     if (!node) {
+        if (context->server == NULL) {
+            /* Invariant: every node in the list owns a SERVER_DATA - all uuid/ip lookups rely on it
+             * (SDL_assert_release(other->server) below). A state-only upsert whose host is gone (e.g.
+             * a failed update racing pcmanager_forget) has nothing left to update, so drop it instead
+             * of inserting a node without server. */
+            pcmanager_unlock(manager);
+            return;
+        }
         node = pclist_ll_new();
         manager->servers = pclist_ll_append(manager->servers, node);
     }

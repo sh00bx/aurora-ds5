@@ -119,7 +119,17 @@ bool pcmanager_forget(pcmanager_t *manager, const uuidstr_t *uuid) {
         return false;
     }
     pclist_remove(manager, uuid);
+    pcmanager_save_known_hosts(manager);
     return true;
+}
+
+/**
+ * Whether the last query for this host found it online. SERVER_STATE_NONE means "not queried yet in this
+ * session" (pclist_insert_known sets it for every host loaded from known_hosts), which is neither online
+ * nor a proven failure, so it must not be treated like either.
+ */
+static bool server_state_is_online(const SERVER_STATE *state) {
+    return (state->code & SERVER_STATE_ONLINE) == SERVER_STATE_ONLINE;
 }
 
 bool pcmanager_can_forget(pcmanager_t *manager, const uuidstr_t *uuid) {
@@ -130,14 +140,19 @@ bool pcmanager_can_forget(pcmanager_t *manager, const uuidstr_t *uuid) {
         goto unlock;
     }
     switch (node->state.code) {
-        case SERVER_STATE_NONE:
         case SERVER_STATE_OFFLINE:
         case SERVER_STATE_ERROR:
-            /* Never reached, or not reachable anymore */
+            /* Queried and not reachable anymore */
             result = true;
             goto unlock;
         default:
             break;
+    }
+    if (server_state_is_online(&node->state)) {
+        /* Reachable right now: neither unreachable nor the stale half of an identity takeover.
+         * Forgetting it would drop its favorites and hidden apps, and the discovery would add it
+         * back seconds later without them. */
+        goto unlock;
     }
     if (node->server == NULL) {
         result = true;
@@ -145,6 +160,10 @@ bool pcmanager_can_forget(pcmanager_t *manager, const uuidstr_t *uuid) {
     }
     for (const pclist_t *cur = manager->servers; cur != NULL; cur = cur->next) {
         if (cur == node || cur->server == NULL) {
+            continue;
+        }
+        if (!server_state_is_online(&cur->state)) {
+            /* Only a host that actually answers can have taken the identity over */
             continue;
         }
         if (server_identity_equals(node->server, cur->server)) {

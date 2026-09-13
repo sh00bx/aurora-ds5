@@ -50,9 +50,13 @@ static uint8_t ds4_route_for_mode(tv_bridge_audio_mode_t mode)
 }
 
 /* Scale a volume percent onto the DS4 raw byte range (0..0x4F firmware ceiling
- * per the controller wiki). Unlike the DS5 (raw 0..0x64 = percent 1:1) the DS4
- * ceiling is 79, so clamping percent instead of scaling would make every
- * slider value >=79% identical (max) and skew everything below it. */
+ * per the controller wiki): the ceiling is 79, so clamping percent instead of
+ * scaling would make every slider value >=79% identical (max) and skew
+ * everything below it. Both pads share speaker_volume_percent, but the DS5
+ * speaker is no longer linear (ds5_speaker_volume_byte spreads 1..100% over the
+ * audible 0x3d..0x64; only the DS5 headset path is still 1:1), so the same
+ * slider value sounds different here. The DS4 audible threshold has not been
+ * measured yet - this curve stays linear until it has. */
 static uint8_t ds4_volume_raw_byte(unsigned int value)
 {
     if (value > 100u) value = 100u;
