@@ -1812,10 +1812,12 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
      * addresses; whether frames actually flow is the daemon's root-owned
      * lever (/tmp/ds5_mic), and nothing in this app arms the microphone.
      *
-     * c->acl_tx (set in session_main, before we get here) is the gate, not just
-     * the ops capability: without an established forwarder there is no daemon on
-     * the other end, so a socket bound there would only make the log promise a
-     * lever nobody pulls. */
+     * c->acl_tx (set in session_main, before we get here) gates this on top of
+     * the ops capability: it means the raw-ACL path was REQUESTED for this
+     * session (CTM_RAW_ACL on), not that ds5_txd is up -- the forwarder starts
+     * inert and only becomes live once the daemon publishes its readiness
+     * template. The hidraw-only fallback (acl_tx == NULL) binds no socket; with
+     * a forwarder the log below says under which conditions frames arrive. */
     c->mic_rx = NULL;
     if ((host_cfg.reserved[0] & CTMB_HOSTCFG_DS5_MIC) && c->acl_tx != NULL &&
         c->ops->raw_acl_output && c->ops->kind && strcmp(c->ops->kind, "ds5") == 0) {

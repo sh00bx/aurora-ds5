@@ -191,7 +191,7 @@ ds5_mic_rx_t *ds5_mic_rx_start(ctm_controller_t *c, const char *bt_mac)
         goto fail;
     }
     r->thread_started = 1;
-    ctm_ctl_log(c, "mic uplink: listening on %s (daemon lever /tmp/ds5_mic decides whether frames come)",
+    ctm_ctl_log(c, "mic uplink: listening on %s (frames arrive only while ds5_txd runs and its lever /tmp/ds5_mic is on)",
                 r->path);
     return r;
 

@@ -222,8 +222,18 @@ static void lv_start_text_input(lv_event_t *event) {
      * have their own pad controls stay usable without it (panes/pref_fps.c).
      * A physical keyboard types either way: LVGL gets those characters from the
      * key path, with or without SDL text input (see text_key_fallback in
-     * lvgl/input/lv_drv_sdl_key.c). */
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED &&
+     * lvgl/input/lv_drv_sdl_key.c).
+     *
+     * The FIRST A/ENTER on a focused textarea does not produce CLICKED at all:
+     * LVGL spends it on switching the group into edit mode (lv_indev.c, keypad
+     * release path) and re-sends FOCUSED from lv_group_set_editing instead.
+     * That FOCUSED is the pad user asking for the field, so it counts like a
+     * click: only a FOCUSED with the group still in navigate mode is "just
+     * passing by". */
+    lv_event_code_t code = lv_event_get_code(event);
+    lv_group_t *group = lv_obj_get_group(target);
+    bool entering_edit = group != NULL && lv_group_get_editing(group);
+    if (code != LV_EVENT_CLICKED && !entering_edit &&
         app_ui_get_input_mode(&app->ui.input) == UI_INPUT_MODE_GAMEPAD) {
         return;
     }
