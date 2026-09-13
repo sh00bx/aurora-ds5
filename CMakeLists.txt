@@ -168,13 +168,16 @@ set(BUILD_SHARED_CORE_LIBS OFF)
 
 if (TARGET_WEBOS)
     set(CMAKE_INSTALL_LIBDIR lib/backports)
-    # Opt-in: build SDL-webOS from a local clone instead of the release tarball.
-    # The default revision is branch aurora/webos.5-uevent: webos.5 plus the
-    # netlink uevent hotplug (upstream 469fb008/829ba140/f7cb0867 and the
-    # uevent fixes from webOS-2.30.x), without webos.6 acad5508, which leaves
-    # every wl_webos_input_manager opcode at -1 in the non-ABI build and so
-    # silently kills SDL_webOSCursorVisibility().
-    set(AURORA_SDL2_LOCAL_REPO "" CACHE PATH "Local SDL-webOS git clone to build instead of the release tarball")
+    # SDL-webOS is built from our fork by default (sh00bx/SDL-webOS, branch
+    # aurora/webos.5-uevent): webos.5 plus the netlink uevent joystick hotplug
+    # (upstream 469fb008/829ba140/f7cb0867 and the uevent fixes from
+    # webOS-2.30.x), without webos.6 acad5508, which leaves every
+    # wl_webos_input_manager opcode at -1 in the non-ABI build and so silently
+    # kills SDL_webOSCursorVisibility(). A local clone of that fork can be
+    # substituted (same revision); an EMPTY value falls back to the plain
+    # webos.5 release tarball, i.e. no hotplug in the app jail.
+    set(AURORA_SDL2_LOCAL_REPO "https://github.com/sh00bx/SDL-webOS.git" CACHE STRING
+            "Git repository (URL or local clone) SDL-webOS is built from; empty = webos.5 release tarball")
     set(AURORA_SDL2_LOCAL_REVISION "74b8a735575c0006950837da62bb1219dcf4aa4f" CACHE STRING
             "Revision of AURORA_SDL2_LOCAL_REPO to build")
     if (AURORA_SDL2_LOCAL_REPO)
@@ -182,7 +185,11 @@ if (TARGET_WEBOS)
         set(SDL2_BACKPORT_GIT_REPOSITORY "${AURORA_SDL2_LOCAL_REPO}")
         set(SDL2_BACKPORT_REVISION "${AURORA_SDL2_LOCAL_REVISION}")
         string(SUBSTRING "${AURORA_SDL2_LOCAL_REVISION}" 0 8 _aurora_sdl2_rev_short)
-        set(AURORA_SDL2_VARIANT "local-uevent@${_aurora_sdl2_rev_short}")
+        if (IS_DIRECTORY "${AURORA_SDL2_LOCAL_REPO}")
+            set(AURORA_SDL2_VARIANT "uevent@${_aurora_sdl2_rev_short}+local")
+        else ()
+            set(AURORA_SDL2_VARIANT "uevent@${_aurora_sdl2_rev_short}")
+        endif ()
     else ()
         set(SDL2_BACKPORT_RELEASE "release-2.30.12-webos.5")
         set(AURORA_SDL2_VARIANT "${SDL2_BACKPORT_RELEASE}")
