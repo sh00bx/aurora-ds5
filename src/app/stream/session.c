@@ -452,7 +452,18 @@ void session_config_init(app_t *app, session_config_t *config, const SERVER_DATA
         }
     } else if (app_config->av1 && (video_cap.codecs & SS4S_VIDEO_AV1) && !av1_rate_ok) {
         commons_log_info("Session", "AV1 disabled for this session: %d fps > 60, "
-                                    "NDL would present it at 60 Hz. Using HEVC/H.264.",
+                                    "NDL would present it at 60 Hz. HEVC carries this rate.",
+                         config->stream.fps);
+    }
+    /* H.264 is NOT a way out above 60 fps either: this sink never presents it
+     * above 60 (only HEVC does, see the AV1 note above). It stays offered
+     * because it is the protocol's only guaranteed format and the fallback
+     * below needs something, but it must not be advertised as a working
+     * fallback -- so when it is all that is left at a high rate, say what the
+     * user will actually see. */
+    if (config->stream.fps > 60 && !(config->stream.supportedVideoFormats & VIDEO_FORMAT_MASK_H265)) {
+        commons_log_warn("Session", "%d fps with no HEVC offered: only H.264 is left and this sink "
+                                    "presents it at 60 Hz - expect judder (enable HEVC or use <= 60 fps).",
                          config->stream.fps);
     }
     // If no video format is supported, default to H.264

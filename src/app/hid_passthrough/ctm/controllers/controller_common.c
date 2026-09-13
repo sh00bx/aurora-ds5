@@ -1810,9 +1810,14 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
      * them -- a CTM host or a Vibepollo with ds5_native_mic off never sees
      * the message type. The receiver binds a per-pad socket the daemon
      * addresses; whether frames actually flow is the daemon's root-owned
-     * lever (/tmp/ds5_mic), and nothing in this app arms the microphone. */
+     * lever (/tmp/ds5_mic), and nothing in this app arms the microphone.
+     *
+     * c->acl_tx (set in session_main, before we get here) is the gate, not just
+     * the ops capability: without an established forwarder there is no daemon on
+     * the other end, so a socket bound there would only make the log promise a
+     * lever nobody pulls. */
     c->mic_rx = NULL;
-    if ((host_cfg.reserved[0] & CTMB_HOSTCFG_DS5_MIC) &&
+    if ((host_cfg.reserved[0] & CTMB_HOSTCFG_DS5_MIC) && c->acl_tx != NULL &&
         c->ops->raw_acl_output && c->ops->kind && strcmp(c->ops->kind, "ds5") == 0) {
         c->mic_rx = ds5_mic_rx_start(c, c->dev.mac);
     }

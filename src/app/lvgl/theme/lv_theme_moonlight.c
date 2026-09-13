@@ -121,6 +121,9 @@ static void apply_cb(lv_theme_t *theme, lv_obj_t *obj) {
         lv_obj_set_style_border_width(obj, LV_DPX(1), 0);
         lv_obj_add_style(obj, &focus_chalk, LV_STATE_FOCUS_KEY);
         lv_obj_add_event_cb(obj, lv_start_text_input, LV_EVENT_FOCUSED, theme);
+        /* A/ENTER on a focused field asks for the keyboard explicitly, which is
+         * the only way in for a pad (see lv_start_text_input). */
+        lv_obj_add_event_cb(obj, lv_start_text_input, LV_EVENT_CLICKED, theme);
         lv_obj_add_event_cb(obj, lv_stop_text_input, LV_EVENT_DEFOCUSED, theme);
     } else if (lv_obj_check_type(obj, &lv_msgbox_class)) {
         if (lv_obj_get_width(lv_scr_act()) / 10 * 4 > LV_DPI_DEF * 2) {
@@ -210,11 +213,18 @@ static void lv_start_text_input(lv_event_t *event) {
      * A remote or a keyboard can drive that keyboard; a gamepad cannot -- it is
      * a system surface of its own and our pad never reaches it, so for a
      * controller user it is just an unusable panel dropped over the dialog.
-     * Fields that have to be editable from a pad carry their own controls
-     * instead (see ui/settings/panes/pref_fps.c), and a physical keyboard still
-     * types either way: LVGL gets those characters from the key path, with or
-     * without SDL text input (see text_key_fallback in lvgl/input/lv_drv_sdl_key.c). */
-    if (app_ui_get_input_mode(&app->ui.input) == UI_INPUT_MODE_GAMEPAD) {
+     *
+     * So in gamepad mode merely ARRIVING on a field (FOCUSED) does not raise it
+     * -- walking past an IP field must not drop a panel over the dialog -- while
+     * A/ENTER (CLICKED) does: that is the user asking for it, and it is the only
+     * way a pad user reaches a field with no stepper of its own (the IP field in
+     * ui/add.dialog.c, the custom resolution in panes/pref_res.c). Fields that
+     * have their own pad controls stay usable without it (panes/pref_fps.c).
+     * A physical keyboard types either way: LVGL gets those characters from the
+     * key path, with or without SDL text input (see text_key_fallback in
+     * lvgl/input/lv_drv_sdl_key.c). */
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED &&
+        app_ui_get_input_mode(&app->ui.input) == UI_INPUT_MODE_GAMEPAD) {
         return;
     }
     lv_area_t *coords = &target->coords;

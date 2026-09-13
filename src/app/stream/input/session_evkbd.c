@@ -256,6 +256,15 @@ SDL_bool session_evkbd_is_grabbing(session_evkbd_t *kbd) {
 static void set_dev(session_evkbd_t *kbd, evkbd_t *dev) {
     SDL_LockMutex(kbd->lock);
     kbd->dev = dev;
+    /* INVARIANT: grabbed if and only if !disabled. evkbd_open_default() grabs as
+     * it opens, but the gate may have closed (overlay, soft keyboard, HID sheet)
+     * while the worker was still enumerating /dev/input, and disable() could not
+     * reach a device that did not exist yet. Without this the keyboard stays
+     * grabbed while kbd_listener drops every key: dead for the UI that just
+     * opened AND dead for the game, until the next gate change. */
+    if (dev != NULL && kbd->disabled) {
+        evkbd_set_grab(dev, false);
+    }
     SDL_CondSignal(kbd->cond);
     SDL_UnlockMutex(kbd->lock);
 }

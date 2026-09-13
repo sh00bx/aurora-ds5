@@ -289,10 +289,19 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         if (app->session != NULL && session_handle_input_event(app->session, &e)) {
             state->state = LV_INDEV_STATE_RELEASED;
         } else {
-            /* SDL produced text on its own, so it is doing its job and the
-             * fallback below must never second-guess it: drop the press it was
-             * holding and stand down permanently. */
-            state->sdl_text_input_works = true;
+            /* SDL produced text, so the fallback below must not second-guess
+             * THIS press: drop the character it was holding.
+             *
+             * Standing down for the rest of the run is only right when the text
+             * did not come from the system IME we asked for ourselves. On webOS
+             * the on-screen keyboard (app_start_text_input -> text_input_active)
+             * is the one thing that delivers SDL_TEXTINPUT, while a USB keyboard
+             * stays on the key path -- latching on IME text would therefore mute
+             * the USB keyboard for good after the first character typed with the
+             * remote. */
+            if (!input->text_input_active) {
+                state->sdl_text_input_works = true;
+            }
             state->pending_text_char = 0;
             uint8_t size = _lv_txt_get_encoded_length(e.text.text);
             if (size > 0) {
@@ -525,9 +534,13 @@ static uint32_t text_char_from_key(const SDL_KeyboardEvent *event) {
  *   - it types on the key's RELEASE, not its press, so a SDL_TEXTINPUT for the
  *     same press (which arrives while the key is still down) wins and clears
  *     the pending character;
- *   - the first text event SDL delivers latches sdl_text_input_works and
- *     retires the fallback for the rest of the run.
- * On a platform where SDL does deliver text this therefore does nothing at all.
+ *   - the first text event SDL delivers OUTSIDE the system IME (that is, while
+ *     we did not ask for the on-screen keyboard) latches sdl_text_input_works
+ *     and retires the fallback for the rest of the run. Text that arrives while
+ *     the IME is up came from the on-screen keyboard, not from the USB one, so
+ *     it must not retire the fallback.
+ * On a platform where SDL delivers text by itself this therefore does nothing at
+ * all after the first character.
  *
  * The character is fed through the same text queue SDL_TEXTINPUT uses, so LVGL
  * sees an ordinary press/release pair rather than a key left down.

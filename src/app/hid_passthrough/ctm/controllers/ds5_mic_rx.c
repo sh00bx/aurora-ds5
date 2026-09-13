@@ -166,7 +166,14 @@ ds5_mic_rx_t *ds5_mic_rx_start(ctm_controller_t *c, const char *bt_mac)
     {
         int one = 1;
         (void)setsockopt(r->fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof one);
-        int rcv = 256 * 1024;   /* ~3 s of frames; the thread drains far faster */
+        /* Bytes only. For AF_UNIX SOCK_DGRAM the queue DEPTH is not SO_RCVBUF
+         * but net.unix.max_dgram_qlen datagrams (sk_max_ack_backlog): once that
+         * many mic frames are queued the daemon's non-blocking sendto() gets
+         * EAGAIN and drops the frame (it counts that as a mic error). So this
+         * rules out a byte-wise stall; the real reserve is that datagram count
+         * (kernel default 10, i.e. ~100 ms of 10 ms frames), and the thread
+         * drains far faster than that unless it is starved. */
+        int rcv = 256 * 1024;
         (void)setsockopt(r->fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
     }
     struct sockaddr_un ua;

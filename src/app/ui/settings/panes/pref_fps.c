@@ -523,6 +523,11 @@ static void fps_input_changed_cb(lv_event_t *e) {
 }
 
 static void fps_editor_save(pref_dropdown_fps_ctx_t *ctx) {
+    /* What the pane has to be told about is a CHANGE; Save on an unchanged value
+     * must stay silent, or the pane's VALUE_CHANGED handler arms
+     * needs_stream_reconnect and the user is offered a reconnect for nothing. */
+    const int prev_fps = *ctx->value_ref;
+    const int prev_rate_x100 = ctx->refresh_rate_x100_ref != NULL ? *ctx->refresh_rate_x100_ref : 0;
     fps_editor_set_x100(ctx, ctx->edit_x100);
     int x100 = ctx->edit_x100;
     int whole = fps_from_x100(x100);
@@ -549,10 +554,17 @@ static void fps_editor_save(pref_dropdown_fps_ctx_t *ctx) {
     ctx->selected_index = index;
 
     /* Let the pane recompute what depends on the rate (bitrate hint, warnings)
-     * without the echo being read as the user opening the editor again. */
-    ctx->suppress_open = true;
-    lv_event_send(ctx->dropdown, LV_EVENT_VALUE_CHANGED, NULL);
-    ctx->suppress_open = false;
+     * without the echo being read as the user opening the editor again. Only on
+     * a real difference: LVGL itself sends no VALUE_CHANGED for an unchanged
+     * selection, so this echo would be the only source of a phantom reconnect
+     * prompt. */
+    const bool rate_changed = *ctx->value_ref != prev_fps ||
+                              (ctx->refresh_rate_x100_ref != NULL && *ctx->refresh_rate_x100_ref != prev_rate_x100);
+    if (rate_changed) {
+        ctx->suppress_open = true;
+        lv_event_send(ctx->dropdown, LV_EVENT_VALUE_CHANGED, NULL);
+        ctx->suppress_open = false;
+    }
 
     fps_dropdown_refresh_label(ctx);
 }

@@ -458,27 +458,30 @@ int enet_client_send_msg(ctm_enet_client_t *client, uint16_t type, uint32_t flag
 
     pthread_mutex_lock(&client->out_mutex);
     if (client->out_count >= CTM_ENET_OUTBOX_CAP) {
-        /* Prefer dropping the oldest (stale) input report: the ring also holds
+        /* Prefer dropping the oldest stale SAMPLE -- an input report or a mic
+         * frame: both ride unreliable by design (see enet_client_dispatch) and a
+         * stale one is worth less than the next fresh one. The ring also holds
          * reliable control messages (FEATURE_REPORT replies) that must not be
-         * silently destroyed. Only drop the head if no input report is queued. */
+         * silently destroyed, so only a sample may be sacrificed. */
         int rel = 0;
         int found_input = 0;
         for (int i = 0; i < client->out_count; i++) {
             int probe = (client->out_head + i) % CTM_ENET_OUTBOX_CAP;
-            if (client->outbox[probe].header.type == CTMB_MSG_INPUT_REPORT) {
+            uint16_t queued = client->outbox[probe].header.type;
+            if (queued == CTMB_MSG_INPUT_REPORT || queued == CTMB_MSG_DS5_MIC) {
                 rel = i;
                 found_input = 1;
                 break;
             }
         }
         if (!found_input) {
-            /* Ring holds only reliable control traffic — there is no stale input
-             * report to sacrifice, and a reliable message must never be silently
+            /* Ring holds only reliable control traffic — there is no stale
+             * sample to sacrifice, and a reliable message must never be silently
              * destroyed. */
             pthread_mutex_unlock(&client->out_mutex);
             free(copy);
-            if (type == CTMB_MSG_INPUT_REPORT) {
-                /* Incoming is a (stale-in-milliseconds) input report: drop it and
+            if (type == CTMB_MSG_INPUT_REPORT || type == CTMB_MSG_DS5_MIC) {
+                /* Incoming is a (stale-in-milliseconds) sample: drop it and
                  * report success — the caller treats a send failure as link-down. */
                 return 0;
             }

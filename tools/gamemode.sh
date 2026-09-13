@@ -489,9 +489,14 @@ picture_on() {
 # preset? Remember the sound preset from before our switch; if it has moved
 # afterwards, log it and record the old value like a picture bucket, so
 # picture_off restores it. Only a change we can pin on our own switch counts:
-# once a sound line is recorded the watch stops, and a snapshot is taken only
-# when this session had not switched the picture yet.
+# once a sound line is recorded the watch stops, a snapshot is taken only when
+# this session had not switched the picture yet, and the watch looks only inside
+# SND_WATCH_SEC after that snapshot.
 SND_SNAP=$PIC_STATE.sound
+# The coupling, if it exists, happens in the same breath as our own switch. Look
+# for it only inside this window after the snapshot (the panel needs a moment to
+# settle, so a couple of guard ticks, not just the switch itself).
+SND_WATCH_SEC=15
 sound_now() {
 	json_field "$(ss_try getSystemSettings '"category":"sound","keys":["soundMode"]')" soundMode
 }
@@ -499,7 +504,10 @@ sound_snapshot() {
 	[ -f "$SND_SNAP" ] && return 0
 	_snd=$(sound_now)
 	[ -n "$_snd" ] || return 0
-	printf '%s\n' "$_snd" >"$SND_SNAP" 2>/dev/null || true
+	# Line 2 is the moment of the snapshot; sound_watch uses it to stay inside
+	# SND_WATCH_SEC, so a preset the USER picks later in the session is his.
+	_at=$(date +%s 2>/dev/null)
+	printf '%s\n%s\n' "$_snd" "$_at" >"$SND_SNAP" 2>/dev/null || true
 	log "sound: soundMode=$_snd before the picture switch"
 }
 sound_watch() {
@@ -508,7 +516,17 @@ sound_watch() {
 	# where the user was already in game mode is not ours to undo.
 	grep -q '^picture|pictureMode|' "$PIC_STATE" 2>/dev/null || return 0
 	grep -q '^sound|soundMode|' "$PIC_STATE" 2>/dev/null && return 0
-	_was=$(cat "$SND_SNAP" 2>/dev/null)
+	# INVARIANT: only a change inside SND_WATCH_SEC of our own switch may be
+	# recorded as coupled. picture_enforce calls this on EVERY guard tick, so
+	# without the window a preset the user picks mid-game would be filed as ours
+	# and silently undone by picture_off at the end of the session. No usable
+	# clock -> record nothing, the user's preset stays his.
+	_was=$(sed -n 1p "$SND_SNAP" 2>/dev/null)
+	_at=$(sed -n 2p "$SND_SNAP" 2>/dev/null)
+	_now=$(date +%s 2>/dev/null)
+	case $_at in '' | *[!0-9]*) return 0 ;; esac
+	case $_now in '' | *[!0-9]*) return 0 ;; esac
+	[ $((_now - _at)) -le "$SND_WATCH_SEC" ] || return 0
 	_snd=$(sound_now)
 	[ -n "$_snd" ] || return 0
 	[ "$_snd" = "$_was" ] && return 0
