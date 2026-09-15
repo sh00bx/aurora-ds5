@@ -104,6 +104,8 @@ struct vdec_stream_state {
      * first keyframe request. */
     unsigned long last_idr_request_ms;
     bool warned_near_buffer_limit;
+    /* First-packet receive time of the previous frame, for the arrival cadence stat. */
+    uint64_t lastReceiveTimeUs;
     struct VIDEO_STATS temp_stats;
 #if defined(TARGET_WEBOS)
     Uint32 soft_rec_high_since;
@@ -547,7 +549,27 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     vs.temp_stats.receivedBytes += (uint64_t) decodeUnit->fullLength;
 
     vs.temp_stats.totalCaptureLatency += decodeUnit->frameHostProcessingLatency;
-    vs.temp_stats.totalReassemblyTimeUs += (uint32_t) (decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs);
+    {
+        /* Reassembly = first packet of the frame in, last packet in. With a healthy
+         * link this is the host's pacing spread (frame bytes / pacing rate), so it is
+         * the number to watch when the pacer is tuned. Arrival cadence = gap between
+         * consecutive frames' first packets; its max is the client-side jitter the
+         * pacer exists to keep small. */
+        uint32_t reasm_us = (uint32_t) (decodeUnit->enqueueTimeUs - decodeUnit->receiveTimeUs);
+        vs.temp_stats.totalReassemblyTimeUs += reasm_us;
+        if (reasm_us > vs.temp_stats.maxReassemblyTimeUs) {
+            vs.temp_stats.maxReassemblyTimeUs = reasm_us;
+        }
+        if (vs.lastReceiveTimeUs != 0 && decodeUnit->receiveTimeUs > vs.lastReceiveTimeUs) {
+            uint32_t gap_us = (uint32_t) (decodeUnit->receiveTimeUs - vs.lastReceiveTimeUs);
+            vs.temp_stats.totalArrivalIntervalUs += gap_us;
+            vs.temp_stats.arrivalIntervals++;
+            if (gap_us > vs.temp_stats.maxArrivalIntervalUs) {
+                vs.temp_stats.maxArrivalIntervalUs = gap_us;
+            }
+        }
+        vs.lastReceiveTimeUs = decodeUnit->receiveTimeUs;
+    }
     vdec_stream_info.has_host_latency |= decodeUnit->frameHostProcessingLatency > 0;
     if (!vs.warned_near_buffer_limit && reasm.initial_size > 0 &&
         (size_t) decodeUnit->fullLength > (reasm.initial_size * 9 / 10)) {
@@ -650,6 +672,18 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
         vdec_stream_info.has_render_queue = false;
     }
     vdec_stats_write_end();
+
+    if (dst->receivedFrames > 0) {
+        /* One line per stats window so the pacing spread and arrival jitter can be
+         * read off pmlog without the overlay (host-side pacer tuning is judged here). */
+        commons_log_info("Session", "video window %lums: rx %u fps %.1f kbps %u reasm avg %.1f max %.1f ms arrival avg %.2f max %.1f ms (%u gaps) net-drop %u rq %d",
+                         delta, dst->receivedFrames, dst->receivedFps, dst->currentBitrateKbps,
+                         (float) dst->totalReassemblyTimeUs / (float) dst->receivedFrames / 1000.0f,
+                         (float) dst->maxReassemblyTimeUs / 1000.0f,
+                         dst->arrivalIntervals ? (float) dst->totalArrivalIntervalUs / (float) dst->arrivalIntervals / 1000.0f : 0.0f,
+                         (float) dst->maxArrivalIntervalUs / 1000.0f,
+                         dst->arrivalIntervals, dst->networkDroppedFrames, dst->videoRenderQueue);
+    }
 
 #if defined(TARGET_WEBOS)
     soft_recovery_tick(dst);

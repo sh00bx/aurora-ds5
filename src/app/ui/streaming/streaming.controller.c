@@ -376,6 +376,14 @@ static void streaming_refresh_latency(streaming_controller_t *controller, const 
         len += snprintf(legend + len, sizeof(legend) - (size_t) len, "%s#%06x %s %.1f#",
                         len ? "  " : "", colors[i], names[i], parts[i]);
     }
+    /* Reassembly (first packet of a frame in -> frame complete) is the host's pacing
+     * spread on a clean link. It is not a chain stage (the RTT already stands in for
+     * transit), so it only joins the legend: average / worst frame of the window. */
+    if (dst->receivedFrames > 0 && (size_t) len < sizeof(legend)) {
+        len += snprintf(legend + len, sizeof(legend) - (size_t) len, "  reasm %.1f/%.1f",
+                        (float) dst->totalReassemblyTimeUs / (float) dst->receivedFrames / 1000.0f,
+                        (float) dst->maxReassemblyTimeUs / 1000.0f);
+    }
     lv_label_set_text(controller->stats_items.chain_legend, legend);
 }
 

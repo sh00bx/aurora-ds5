@@ -31,6 +31,13 @@ typedef struct VIDEO_STATS {
     uint32_t networkDroppedFrames;
     uint32_t submittedFrames;
     uint32_t totalReassemblyTimeUs;
+    /** Longest first-packet-to-complete time of one frame in the window. */
+    uint32_t maxReassemblyTimeUs;
+    /** Frame arrival cadence: sum / max of the gap between consecutive frames'
+     *  first packets, and how many gaps were measured. */
+    uint32_t totalArrivalIntervalUs;
+    uint32_t maxArrivalIntervalUs;
+    uint32_t arrivalIntervals;
     uint32_t totalSubmitTimeUs;
     unsigned long measurementStartTimestamp;
     uint32_t totalCaptureLatency;
