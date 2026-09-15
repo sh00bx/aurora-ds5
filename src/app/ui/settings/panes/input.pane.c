@@ -107,6 +107,12 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     pref_desc_label(view, locstr("Move the PC mouse with the DualSense touchpad. \"Desktop only\" hands the "
                                  "touchpad back to any running game."), false);
 
+    pref_checkbox(view, locstr("Touchpad as mouse in Aurora's menus"),
+                  &app_configuration->touchpad_ui_mouse, false);
+    pref_desc_label(view, locstr("Move a cursor through Aurora's own screens with the controller touchpad, "
+                                 "the same way it moves the PC mouse. The stream is unaffected: the touchpad "
+                                 "only becomes a cursor here while a menu or the overlay is open."), false);
+
     pane->idle_off_label = pref_title_label(view, locstr("Turn idle controllers off"));
     /* Starts at 0 = never, so the feature can be turned off from here. */
     pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 0, 30, 1);

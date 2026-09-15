@@ -59,6 +59,9 @@ typedef struct app_settings_t {
     /* DS5 touchpad as desktop mouse on the host: 0=off, 1=auto (only while no
      * game runs), 2=always. Sent to the host bridge on every session. */
     int ds5_touchpad_mouse;
+    /* Controller touchpad as a mouse for Aurora's OWN menus. Independent of
+     * the setting above, which is about the host's desktop. */
+    bool touchpad_ui_mouse;
     /** Minutes a connected controller may sit idle before its BT link is
      * dropped (which powers the pad off); 0 = never. Enforced by ds5_txd, which
      * is why it also applies to pads merely paired with the TV. Minutes rather

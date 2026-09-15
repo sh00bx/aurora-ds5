@@ -2,6 +2,7 @@
 #include "root.h"
 #include "res.h"
 
+#include "lvgl/input/lv_tp_cursor.h"
 #include "lvgl/lv_disp_drv_app.h"
 #include "lvgl/theme/lv_theme_moonlight.h"
 #include "lvgl/theme/lv_theme_moonlight_colors.h"
@@ -315,7 +316,14 @@ bool ui_dispatch_userevent(app_t *app, int which, void *data1, void *data2) {
 static _Atomic bool ui_input_gate = false;
 
 void ui_input_gate_publish(bool blocked) {
-    atomic_store_explicit(&ui_input_gate, blocked, memory_order_relaxed);
+    bool was = atomic_exchange_explicit(&ui_input_gate, blocked, memory_order_relaxed);
+    if (was != blocked) {
+        /* Ownership of the touchpad just changed hands. Whatever gesture was in
+         * flight belongs to the other side now, and a press left down here
+         * would sit on an object that is about to go away. Only on the edge:
+         * the gate is republished for reasons that do not move it. */
+        lv_tp_cursor_cancel();
+    }
 }
 
 bool ui_should_block_input() {
@@ -334,6 +342,9 @@ void ui_display_size(app_ui_t *ui, int width, int height) {
         }
     }
     commons_log_info("UI", "Display size changed to %d x %d", width, height);
+    /* LVGL does not move the cursor when the display does; left alone it would
+     * sit off-canvas and the next stroke would start from nowhere. */
+    lv_tp_cursor_notify_resize(&ui->input);
 }
 
 bool ui_set_input_mode(app_ui_input_t *input, app_ui_input_mode_t mode) {

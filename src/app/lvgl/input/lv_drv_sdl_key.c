@@ -14,6 +14,7 @@
 #include "util/user_event.h"
 #include "util/bus.h"
 #include "lv_drv_sdl_key.h"
+#include "lv_tp_cursor.h"
 #include "stream/session_events.h"
 #include "logging.h"
 
@@ -28,6 +29,8 @@ static void webos_key_input_mode(app_ui_input_t *input, const SDL_KeyboardEvent 
 #endif
 
 static bool read_webos_channel_keys(const SDL_KeyboardEvent *event, lv_drv_sdl_key_t *state);
+
+static void read_touchpad(app_ui_input_t *input, const SDL_Event *event);
 
 static bool ui_modal_consumes_input(void) {
     return streaming_soft_keyboard_shown();
@@ -181,6 +184,20 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         data->continue_reading = true;
     } else if (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_CONTROLLERAXISMOTION, SDL_CONTROLLERDEVICEREMAPPED) > 0) {
         bool handled_modal = false;
+        /* The pad's touchpad click rides in the button range, not with the
+         * contacts below. It maps to no NAVKEY, so it is free to be the
+         * cursor's left button -- offered to the session first, like the
+         * contacts, so the game keeps it while the game owns the screen. */
+        if ((e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP)
+            && e.cbutton.button == SDL_CONTROLLER_BUTTON_TOUCHPAD) {
+            if (!(app->session != NULL && session_handle_input_event(app->session, &e))) {
+                read_touchpad(input, &e);
+            }
+            data->continue_reading = true;
+            data->key = state->key;
+            data->state = state->state;
+            return;
+        }
         /* LT edge while soft keyboard is open → toggle abc / &123 */
         static bool kbd_lt_held = false;
         if (!streaming_soft_keyboard_shown()) {
@@ -315,8 +332,16 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
         }
         data->continue_reading = true;
     } else if (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_CONTROLLERTOUCHPADDOWN, SDL_CONTROLLERSENSORUPDATE) > 0) {
-        if (app->session != NULL) {
-            session_handle_input_event(app->session, &e);
+        /* Session first, and what it refuses is ours. It refuses exactly when
+         * an in-app surface owns input or no stream is running, so the same
+         * swipe drives the host's desktop pointer during play and Aurora's own
+         * cursor in its menus -- with no mode to switch. */
+        bool taken = app->session != NULL && session_handle_input_event(app->session, &e);
+        if (taken) {
+            /* The host took the touchpad back mid-gesture. */
+            lv_tp_cursor_cancel();
+        } else {
+            read_touchpad(input, &e);
         }
         data->continue_reading = true;
     } else {
@@ -324,6 +349,41 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     }
     data->key = state->key;
     data->state = state->state;
+}
+
+/* SDL normalizes both pads' contacts to 0..1, which is exactly what the
+ * gesture engine wants, so a DualShock 4 needs no case of its own. Only the
+ * pad's first touchpad is read; none of ours has a second. */
+static void read_touchpad(app_ui_input_t *input, const SDL_Event *event) {
+    if (event->type == SDL_CONTROLLERBUTTONDOWN || event->type == SDL_CONTROLLERBUTTONUP) {
+        lv_tp_cursor_click(input, (uintptr_t) (event->cbutton.which + 1),
+                           event->cbutton.state == SDL_PRESSED);
+        return;
+    }
+    tp_touch_ev_t ev;
+    switch (event->type) {
+        case SDL_CONTROLLERTOUCHPADDOWN:
+            ev = TP_TOUCH_DOWN;
+            break;
+        case SDL_CONTROLLERTOUCHPADMOTION:
+            ev = TP_TOUCH_MOVE;
+            break;
+        case SDL_CONTROLLERTOUCHPADUP:
+            ev = TP_TOUCH_UP;
+            break;
+        default:
+            /* The peep range also covers SDL_CONTROLLERSENSORUPDATE, whose union
+             * member is a different shape -- decide on the type before reading
+             * anything else out of the event. */
+            return;
+    }
+    if (event->ctouchpad.touchpad != 0) {
+        return;
+    }
+    /* +1 so instance id 0 is not the engine's "no owner". */
+    lv_tp_cursor_touch(input, (uintptr_t) (event->ctouchpad.which + 1), ev,
+                       (uint32_t) event->ctouchpad.finger, event->ctouchpad.x,
+                       event->ctouchpad.y);
 }
 
 static bool read_event(const SDL_Event *event, lv_drv_sdl_key_t *state) {

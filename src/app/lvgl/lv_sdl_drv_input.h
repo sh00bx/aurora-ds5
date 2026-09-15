@@ -11,3 +11,5 @@ int lv_sdl_init_wheel(lv_indev_drv_t *drv, app_ui_input_t *input);
 
 int lv_sdl_init_button(lv_indev_drv_t *indev_drv, app_ui_input_t *input);
 
+bool lv_ui_scroll_at(lv_obj_t *target, int notches);
+

@@ -3,4 +3,5 @@ target_sources(moonlight-lib PRIVATE
         input_event.c
         input_gamepad.c
         input_gamepad_mapping.c
-        ds5_idle_lightbar.c)
+        ds5_idle_lightbar.c
+        tp_gesture.c)

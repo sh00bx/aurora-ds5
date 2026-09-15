@@ -1,6 +1,7 @@
 #include "root.h"
 #include "ui_input.h"
 #include "lvgl/input/lv_drv_sdl_key.h"
+#include "lvgl/input/lv_tp_cursor.h"
 #include "lvgl/lv_sdl_drv_input.h"
 #include "logging.h"
 
@@ -39,9 +40,25 @@ void app_ui_input_init(app_ui_input_t *input, app_ui_t *ui) {
     }
 
     lv_indev_set_button_points(input->button.indev, button_points_empty);
+
+    /* The UI is torn down and rebuilt on some display changes, and this struct
+     * outlives that -- start every generation from a known pointer state.
+     * Middle rather than 0,0: the touchpad moves the cursor in deltas, so its
+     * first stroke has to begin somewhere the user can see. */
+    lv_memset_00(&input->pointer_state, sizeof(input->pointer_state));
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp != NULL) {
+        input->pointer_state.point.x = lv_disp_get_hor_res(disp) / 2;
+        input->pointer_state.point.y = lv_disp_get_ver_res(disp) / 2;
+    }
+    input->pointer_state.state = LV_INDEV_STATE_RELEASED;
+    lv_tp_cursor_attach(input);
 }
 
 void app_ui_input_deinit(app_ui_input_t *input) {
+    /* Before the indev goes: the cursor hangs off the display's system layer,
+     * which app_ui_close() frees right after this. */
+    lv_tp_cursor_detach(input);
     lv_indev_delete(input->key.indev);
     lv_indev_delete(input->pointer.indev);
     lv_indev_delete(input->wheel.indev);

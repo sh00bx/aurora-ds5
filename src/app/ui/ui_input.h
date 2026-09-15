@@ -13,6 +13,32 @@ typedef struct app_ui_input_lv_pair_t {
     lv_indev_t *indev;
 } app_ui_input_lv_pair_t;
 
+typedef enum app_pointer_src_t {
+    APP_POINTER_SRC_NONE = 0,
+    APP_POINTER_SRC_MOUSE,    /**< a real mouse, or the TV's magic remote */
+    APP_POINTER_SRC_TOUCHPAD, /**< a controller touchpad, via lv_tp_cursor */
+} app_pointer_src_t;
+
+/**
+ * What the pointer indev reports, shared because two sources write it: the
+ * SDL mouse absolutely, the touchpad in deltas. One position between them is
+ * what makes the handover seamless -- neither source ever teleports the
+ * cursor away from where the other left it.
+ *
+ * It lives here, not in read_cb statics, because app_ui_close()/open() throws
+ * the display and every indev away: statics would survive with coordinates
+ * from the old window size.
+ */
+typedef struct app_ui_pointer_state_t {
+    lv_point_t point;
+    lv_indev_state_t state;
+    app_pointer_src_t src;
+    uint8_t press_pending; /**< taps seen but not yet pressed */
+    bool held;             /**< the pad is physically clicked */
+    bool synth_down;       /**< we are currently reporting PRESSED */
+    uint32_t synth_down_tick;
+} app_ui_pointer_state_t;
+
 enum app_ui_input_mode_t {
     UI_INPUT_MODE_POINTER_FLAG = 0x10,
     UI_INPUT_MODE_MOUSE = 0x11,
@@ -35,6 +61,8 @@ struct app_ui_input_t {
     app_ui_input_lv_pair_t button;
     app_ui_input_mode_t mode;
     bool text_input_active;
+    app_ui_pointer_state_t pointer_state;
+    lv_obj_t *cursor; /**< drawn for the touchpad only; see lv_tp_cursor.h */
 };
 
 void app_ui_input_init(app_ui_input_t *input, app_ui_t *ui);
