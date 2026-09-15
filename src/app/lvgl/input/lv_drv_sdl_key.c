@@ -190,7 +190,11 @@ static void sdl_input_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
          * contacts, so the game keeps it while the game owns the screen. */
         if ((e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP)
             && e.cbutton.button == SDL_CONTROLLER_BUTTON_TOUCHPAD) {
-            if (!(app->session != NULL && session_handle_input_event(app->session, &e))) {
+            if (app->session != NULL && session_handle_input_event(app->session, &e)) {
+                /* Same as the general session branch below: a button the stream
+                 * swallowed must not leave a key looking held to LVGL. */
+                state->state = LV_INDEV_STATE_RELEASED;
+            } else {
                 read_touchpad(input, &e);
             }
             data->continue_reading = true;
