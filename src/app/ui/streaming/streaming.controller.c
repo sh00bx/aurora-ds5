@@ -380,7 +380,10 @@ static void streaming_refresh_latency(streaming_controller_t *controller, const 
      * spread on a clean link. It is not a chain stage (the RTT already stands in for
      * transit), so it only joins the legend: average / worst frame of the window. */
     if (dst->receivedFrames > 0 && (size_t) len < sizeof(legend)) {
-        len += snprintf(legend + len, sizeof(legend) - (size_t) len, "  reasm %.1f/%.1f",
+        /* Its own line: the four stages already fill the panel's width, and a wrapped
+         * fifth entry would read as a stage that lost its colour. */
+        len += snprintf(legend + len, sizeof(legend) - (size_t) len, "%sreasm %.1f/%.1f ms",
+                        len ? "\n" : "",
                         (float) dst->totalReassemblyTimeUs / (float) dst->receivedFrames / 1000.0f,
                         (float) dst->maxReassemblyTimeUs / 1000.0f);
     }
@@ -936,6 +939,12 @@ bool show_overlay(streaming_controller_t *controller) {
     }
     overlay_showing = true;
     streaming_publish_input_gate();
+    /* The pinned look hides the panel's title, and the title carries the pin button.
+     * Re-applied here it comes back with the overlay, so what pinned the panel can
+     * unpin it again. */
+    if (overlay_pinned) {
+        streaming_stats_set_pinned_look(controller, true);
+    }
     lv_obj_clear_flag(controller->base.obj, LV_OBJ_FLAG_HIDDEN);
 
     lv_area_t coords = controller->video->coords;
@@ -975,6 +984,10 @@ static void hide_overlay_impl(streaming_controller_t *controller) {
     }
     overlay_showing = false;
     streaming_publish_input_gate();
+    /* Overlay gone, the pinned panel drops its title again. */
+    if (overlay_pinned) {
+        streaming_stats_set_pinned_look(controller, true);
+    }
     app_set_mouse_grab(&controller->global->input, true);
     streaming_enter_fullscreen(controller->global->session);
 }

@@ -380,13 +380,17 @@ void streaming_stats_set_pinned_look(streaming_controller_t *controller, bool pi
     lv_coord_t section_pad = pinned ? LV_DPX(6) : LV_DPX(12);
     lv_coord_t chain_pad = pinned ? LV_DPX(3) : LV_DPX(6);
     lv_opa_t lift = pinned ? 45 : 0;
+    /* The nameplate only goes while the panel rides alone over the game. With the
+     * overlay up it is back, because it carries the pin button — by hand, that is
+     * the only way back out of pinned. */
+    bool title_hidden = pinned && !streaming_overlay_shown();
 
     lv_obj_set_style_pad_gap(controller->stats, row_gap, 0);
     lv_obj_set_style_pad_bottom(controller->stats, bottom, 0);
     lv_obj_set_style_pad_ver(controller->stats_items.title, title_pad, 0);
     /* Pinned, the panel needs no nameplate — you put it there. The title carries the
      * pin button, though, so it comes back with the overlay, where it can be clicked. */
-    if (pinned) {
+    if (title_hidden) {
         lv_obj_add_flag(controller->stats_items.title, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(controller->stats_items.title, LV_OBJ_FLAG_HIDDEN);
@@ -401,7 +405,7 @@ void streaming_stats_set_pinned_look(streaming_controller_t *controller, bool pi
     }
 
     /* Without the title the first line would otherwise sit on the panel edge. */
-    lv_obj_set_style_pad_top(controller->stats, pinned ? LV_DPX(10) : 0, 0);
+    lv_obj_set_style_pad_top(controller->stats, title_hidden ? LV_DPX(10) : 0, 0);
 
     /* "Throughput", "Device" and "Controllers" name a grouping the eye already sees, and the
      * rows under them carry their own labels. Pinned they are the least legible
@@ -570,6 +574,11 @@ static void latency_chain(lv_obj_t *parent, streaming_controller_t *controller) 
     lv_obj_t *legend = panel_text(controller, legend_row, LV_OPA_90);
     /* Each stage's number is tinted like its segment, so the bar needs no key. */
     lv_label_set_recolor(legend, true);
+    /* A label sizes itself to its text, so a legend longer than the panel is drawn
+     * straight past its edge — which is what the fifth entry (reasm) made of it.
+     * Grown to the row, it has a width to wrap inside instead. */
+    lv_obj_set_flex_grow(legend, 1);
+    lv_label_set_long_mode(legend, LV_LABEL_LONG_WRAP);
     controller->stats_items.chain_legend = legend;
 }
 
