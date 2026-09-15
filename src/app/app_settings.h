@@ -65,7 +65,7 @@ typedef struct app_settings_t {
     /* Percent, 10..400, like the host's ds5_touchpad_mouse_speed. The two
      * cursors cannot be matched on paper (the host's pixels still go through
      * Windows' own pointer acceleration), so this is the knob that settles it. */
-    int touchpad_ui_mouse_speed;
+    int touchpad_ui_mouse_speed; /* default 125, see settings_initialize */
     /** Minutes a connected controller may sit idle before its BT link is
      * dropped (which powers the pad off); 0 = never. Enforced by ds5_txd, which
      * is why it also applies to pads merely paired with the TV. Minutes rather
