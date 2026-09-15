@@ -62,6 +62,10 @@ typedef struct app_settings_t {
     /* Controller touchpad as a mouse for Aurora's OWN menus. Independent of
      * the setting above, which is about the host's desktop. */
     bool touchpad_ui_mouse;
+    /* Percent, 10..400, like the host's ds5_touchpad_mouse_speed. The two
+     * cursors cannot be matched on paper (the host's pixels still go through
+     * Windows' own pointer acceleration), so this is the knob that settles it. */
+    int touchpad_ui_mouse_speed;
     /** Minutes a connected controller may sit idle before its BT link is
      * dropped (which powers the pad off); 0 = never. Enforced by ds5_txd, which
      * is why it also applies to pads merely paired with the TV. Minutes rather

@@ -6,6 +6,7 @@
 
 #include "app.h"
 #include "logging.h"
+#include "lv_gridview.h"
 #include "lvgl/lv_sdl_drv_input.h"
 #include "ui/root.h"
 #include "ui/ui_input.h"
@@ -133,24 +134,23 @@ static lv_obj_t *tp_cursor_create(lv_obj_t *parent) {
 }
 
 /**
- * How far one finger-millimetre should carry the cursor here.
+ * How far one finger-millimetre carries the cursor here.
  *
- * The host moves the Windows pointer in desktop pixels, and the TV scales that
- * desktop and this LVGL canvas onto the same panel. Equal travel on the GLASS
- * is what "the same as on the desktop" means, so the host's numbers are scaled
- * by canvas/stream. At the usual 1080p-into-1080p that is 1.0 and the feel is
- * the host's verbatim.
+ * This used to be canvas/stream, on the argument that the two are scaled onto
+ * the same panel so equal travel on the GLASS is equal feel. Geometrically true
+ * and wrong in practice: with a 4K stream on a 1080p canvas it halved every
+ * movement, and the host's pixels are not the end of ITS chain either -- they go
+ * to SendInput, where Windows adds its own pointer speed and Enhance Pointer
+ * Precision on top. There is no correction that makes the two identical on
+ * paper, so this is a plain user speed now, the same 10..400 percent knob the
+ * host exposes as ds5_touchpad_mouse_speed.
  */
 static void tp_apply_scale(void) {
-    lv_disp_t *disp = lv_disp_get_default();
-    double scale = 1.0;
-    if (disp != NULL && app_configuration != NULL && app_configuration->stream.width > 0 &&
-        app_configuration->stream.height > 0) {
-        double sx = (double) lv_disp_get_hor_res(disp) / (double) app_configuration->stream.width;
-        double sy = (double) lv_disp_get_ver_res(disp) / (double) app_configuration->stream.height;
-        scale = sx < sy ? sx : sy;
+    int speed = app_configuration != NULL ? app_configuration->touchpad_ui_mouse_speed : 100;
+    if (speed < 10 || speed > 400) {
+        speed = 100;
     }
-    tp_gesture_set_scale(&tp_gesture, scale);
+    tp_gesture_set_scale(&tp_gesture, (double) speed / 100.0);
 }
 
 static void tp_set_source_touchpad(app_ui_input_t *input) {
@@ -205,6 +205,35 @@ static lv_obj_t *tp_hit(lv_point_t point) {
 }
 
 /**
+ * The game grid keeps its own selection, which no lv_group knows about.
+ *
+ * lv_gridview is a single group member with a pool of recycled cells inside it,
+ * so focusing the grid the ordinary way lands on the grid and leaves the
+ * highlight wherever the D-pad last put it -- which is why hovering a game in
+ * the launcher did nothing at all. Its own index has to be moved, exactly as
+ * the launcher does it for the D-pad (gridview_focus_with_key_state).
+ *
+ * Only for a cell that is already fully visible: lv_gridview_focus() scrolls
+ * its target into view, and under a hover that is a loop -- the scroll slides a
+ * different cell under a cursor that never moved.
+ */
+static void tp_hover_focus_grid(lv_obj_t *grid, lv_obj_t *item) {
+    int pos = lv_gridview_get_item_data_index(grid, item);
+    if (pos < 0 || pos == lv_gridview_get_focused_index(grid)) {
+        return;
+    }
+    lv_area_t item_area, grid_area;
+    lv_obj_get_coords(item, &item_area);
+    lv_obj_get_content_coords(grid, &grid_area);
+    if (!_lv_area_is_in(&item_area, &grid_area, 0)) {
+        return;
+    }
+    if (lv_gridview_focus(grid, pos) && lv_obj_is_valid(item)) {
+        lv_obj_add_state(item, LV_STATE_FOCUS_KEY);
+    }
+}
+
+/**
  * Give the widget under the cursor the same focus the D-pad would give it, so
  * the two never drift apart: park the cursor on a button, press down on the
  * stick, and navigation continues from there rather than from wherever the
@@ -220,19 +249,37 @@ static void tp_hover_focus(app_ui_input_t *input) {
     }
     lv_obj_t *hit = tp_hit(input->pointer_state.point);
     lv_obj_t *target = NULL;
+    lv_obj_t *grid = NULL, *grid_item = NULL;
+    lv_obj_t *child = NULL;
     for (lv_obj_t *obj = hit; obj != NULL; obj = lv_obj_get_parent(obj)) {
+        if (grid == NULL && child != NULL && lv_obj_check_type(obj, &lv_gridview_class)) {
+            /* `child` is the cell we came up through. */
+            grid = obj;
+            grid_item = child;
+        }
         if ((lv_group_t *) lv_obj_get_group(obj) == group) {
             target = obj;
             break;
         }
+        child = obj;
     }
     /* Nothing focusable under the cursor: leave the focus where it is. Clearing
      * it would strand the D-pad with nothing selected. */
-    if (target == NULL || lv_group_get_focused(group) == target) {
+    if (target == NULL) {
+        return;
+    }
+    bool already_focused = lv_group_get_focused(group) == target;
+    if (already_focused && grid == NULL) {
         return;
     }
 
     tp_hover_busy = true;
+    if (already_focused) {
+        /* The grid already has group focus; only its own index has to move. */
+        tp_hover_focus_grid(grid, grid_item);
+        tp_hover_busy = false;
+        return;
+    }
     /* LV_EVENT_FOCUSED scrolls the target into view. Under a hover that is a
      * feedback loop: the scroll slides a different widget under a cursor that
      * never moved, which focuses, which scrolls. */
@@ -253,6 +300,9 @@ static void tp_hover_focus(app_ui_input_t *input) {
          * the point of the exercise -- so add it by hand. DEFOCUSED clears it
          * again on its own. */
         lv_obj_add_state(target, LV_STATE_FOCUS_KEY);
+        if (grid != NULL) {
+            tp_hover_focus_grid(grid, grid_item);
+        }
     }
     tp_hover_busy = false;
 }
@@ -273,6 +323,15 @@ void lv_tp_cursor_attach(app_ui_input_t *input) {
     tp_apply_scale();
 
     lv_disp_t *disp = lv_disp_get_default();
+    /* Logged because the canvas size is not obvious from anywhere else, and it
+     * is the number every "why does the cursor move like that" question starts
+     * with -- ours against the streamed desktop's. */
+    commons_log_info("Input", "touchpad cursor: canvas %dx%d, stream %dx%d, speed %d%%",
+                     disp != NULL ? lv_disp_get_hor_res(disp) : -1,
+                     disp != NULL ? lv_disp_get_ver_res(disp) : -1,
+                     app_configuration != NULL ? app_configuration->stream.width : -1,
+                     app_configuration != NULL ? app_configuration->stream.height : -1,
+                     app_configuration != NULL ? app_configuration->touchpad_ui_mouse_speed : -1);
     if (disp == NULL || input->pointer.indev == NULL) {
         return;
     }
@@ -306,6 +365,11 @@ void lv_tp_cursor_touch(app_ui_input_t *input, uintptr_t source, tp_touch_ev_t e
                         float x, float y) {
     if (!tp_enabled(input)) {
         return;
+    }
+    if (ev == TP_TOUCH_DOWN) {
+        /* Cheap, and it means a speed changed in Settings takes effect on the
+         * next stroke instead of the next launch. */
+        tp_apply_scale();
     }
     tp_gesture_feed_touch(&tp_gesture, source, ev, finger, x, y);
 }

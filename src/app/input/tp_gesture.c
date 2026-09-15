@@ -27,12 +27,22 @@
  * click-drag and click-to-press work here. The gesture logic is the original's,
  * unchanged -- it was always written for a click it just never received.
  *
- * DEVIATION-C 5 -- an output scale (ui_scale). The host moves the Windows
- * cursor in desktop pixels; we move a cursor on a 1920-wide LVGL canvas that
- * the TV scales to the same panel as the stream. Multiplying the gain by
- * canvas/stream is what makes an identical swipe cover an identical stretch of
- * glass. It is applied to `factor`, not to the integer output, so the
- * sub-pixel carry that carries the deceleration floor survives.
+ * DEVIATION-C 5 -- an output scale (ui_scale), fed from the user's menu-cursor
+ * speed. It stands where the host reads ds5_touchpad_mouse_speed and is applied
+ * to `factor`, not to the integer output, so the sub-pixel carry that carries
+ * the deceleration floor survives.
+ *
+ * DEVIATION-C 6 -- the arrival clock is trusted, so the smoothener is gone.
+ * The original substitutes a flat 10 ms for any interval below 50 ms on this
+ * path, because ITS normalized events crossed a network and their spacing said
+ * nothing about the pad. Ours have not moved: SDL reads the same hidraw node on
+ * the same device, which is exactly the measurement behind the original's own
+ * DEVIATION 1 ("the arrival spacing tracks the pad's own emission clock almost
+ * exactly"). Keeping the substitution here had the effect that comment warns
+ * about -- distance per report instead of speed, so the curve sat in its flat
+ * middle band and a flick accelerated no more than a drift. The interval is now
+ * the real one, inside the same sanity band the original puts on a device
+ * clock, and it still advances only on reports that moved.
  */
 #include "tp_gesture.h"
 
@@ -100,13 +110,16 @@ static void tp_move_pointer(tp_gesture_t *g, int dx, int dy) {
     // Ramp from DECEL_FLOOR at rest to BASELINE exactly at the limit, so the
     // deceleration meets the plateau without a step wherever the limit sits.
     const double DECEL_SLOPE = (BASELINE - DECEL_FLOOR) / DECEL_LIMIT_MM_S;
-    const double SMOOTH_THRESHOLD_US = 50000.0;
+    /* Faster than the pad can report, and beyond a second it is a pause whose
+     * speed no interval describes. Out of band, fall back to the tuned default
+     * rather than clamping a wrong-but-plausible number into range. */
+    const double DT_MIN_US = 400.0;
+    const double DT_MAX_US = 1000000.0;
     const double SMOOTH_VALUE_US = 10000.0;
     // Time constant of the velocity EMA; 1-exp(-4015/11000) = 0.30, the
     // per-event alpha the curve was tuned with at the pad's median cadence.
-    // Substituted intervals carry no time information, so they keep the tuned
-    // per-event blend instead -- this path (always substituted below 50 ms)
-    // would otherwise smooth 2.5x less than it was tuned to.
+    // Substituted intervals carry no time information, so they keep that tuned
+    // per-event blend instead of a time-weighted one.
     const double EMA_TAU_US = 11000.0;
     const double EMA_ALPHA_EVENT = 0.3;
 
@@ -116,11 +129,10 @@ static void tp_move_pointer(tp_gesture_t *g, int dx, int dy) {
     double dt_us = SMOOTH_VALUE_US;
     bool dt_substituted = true; /* until a real interval replaces the default */
     if (g->have_move_time) {
-        dt_us = (double) (now - g->last_move_us) + 1.0;
-        dt_substituted = false;
-        if (dt_us < SMOOTH_THRESHOLD_US) {
-            dt_us = SMOOTH_VALUE_US;
-            dt_substituted = true;
+        double us = (double) (now - g->last_move_us);
+        if (us >= DT_MIN_US && us <= DT_MAX_US) {
+            dt_us = us;
+            dt_substituted = false;
         }
     }
     g->last_move_us = now;
@@ -144,10 +156,8 @@ static void tp_move_pointer(tp_gesture_t *g, int dx, int dy) {
         double capped = speed_in < THRESHOLD_MM_S * 4.0 ? speed_in : THRESHOLD_MM_S * 4.0;
         factor = 0.0025 * (capped / THRESHOLD_MM_S) * (capped - THRESHOLD_MM_S) + BASELINE;
     }
-    /* The host also has a user speed here (ds5_touchpad_mouse_speed / 100); it
-     * is at its default on our host, so the TV carries no second knob for it. */
     factor *= TP_MAGIC_SLOWDOWN;
-    factor *= g->ui_scale; /* DEVIATION-C 5 */
+    factor *= g->ui_scale; /* DEVIATION-C 5: the user's speed, host's / 100 */
 
     g->acc_x += (float) ((double) dx * factor);
     g->acc_y += (float) (dys * factor);

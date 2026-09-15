@@ -113,6 +113,18 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                  "the same way it moves the PC mouse. The stream is unaffected: the touchpad "
                                  "only becomes a cursor here while a menu or the overlay is open."), false);
 
+    static const pref_dropdown_int_entry_t tpspeed_entries[] = {
+            {"100%", 100, true},
+            {"125%", 125, false},
+            {"150%", 150, false},
+            {"200%", 200, false},
+            {"75%",  75,  false},
+    };
+    pref_title_label(view, locstr("Menu cursor speed"));
+    pref_dropdown_int(view, tpspeed_entries, 5, &app_configuration->touchpad_ui_mouse_speed, NULL);
+    pref_desc_label(view, locstr("How far the cursor above travels for the same swipe. Takes effect on the "
+                                 "next stroke."), false);
+
     pane->idle_off_label = pref_title_label(view, locstr("Turn idle controllers off"));
     /* Starts at 0 = never, so the feature can be turned off from here. */
     pane->idle_off_slider = pref_slider(view, &app_configuration->controller_idle_off_min, 0, 30, 1);

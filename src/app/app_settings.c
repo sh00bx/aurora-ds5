@@ -190,6 +190,7 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->webos_game_mode = true;
     config->ds5_touchpad_mouse = 1;
     config->touchpad_ui_mouse = true;
+    config->touchpad_ui_mouse_speed = 100;
     config->controller_idle_off_min = 5;   /* as a PlayStation does */
 
 #if defined(TARGET_WEBOS)
@@ -279,6 +280,7 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "webos_game_mode", config->webos_game_mode);
     ini_write_int(fp, "ds5_touchpad_mouse", config->ds5_touchpad_mouse);
     ini_write_bool(fp, "touchpad_ui_mouse", config->touchpad_ui_mouse);
+    ini_write_int(fp, "touchpad_ui_mouse_speed", config->touchpad_ui_mouse_speed);
     ini_write_int(fp, "controller_idle_off_min", config->controller_idle_off_min);
 
     ini_write_section(fp, "video");
@@ -534,6 +536,11 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         }
     } else if (INI_NAME_MATCH("touchpad_ui_mouse")) {
         config->touchpad_ui_mouse = INI_IS_TRUE(value);
+    } else if (INI_NAME_MATCH("touchpad_ui_mouse_speed")) {
+        set_int(&config->touchpad_ui_mouse_speed, value);
+        if (config->touchpad_ui_mouse_speed < 10 || config->touchpad_ui_mouse_speed > 400) {
+            config->touchpad_ui_mouse_speed = 100;
+        }
     } else if (INI_NAME_MATCH("hid_passthrough_port")) {
         set_int(&config->hid_passthrough_port, value);
         if (config->hid_passthrough_port <= 0 || config->hid_passthrough_port > 65535) {
