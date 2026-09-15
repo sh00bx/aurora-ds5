@@ -116,8 +116,8 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     static const pref_dropdown_int_entry_t tpspeed_entries[] = {
             {"75%",  75,  false},
             {"100%", 100, false},
-            {"125%", 125, true},
-            {"150%", 150, false},
+            {"125%", 125, false},
+            {"150%", 150, true},
             {"200%", 200, false},
     };
     pref_title_label(view, locstr("Menu cursor speed"));
