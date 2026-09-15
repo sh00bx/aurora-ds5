@@ -91,6 +91,22 @@ app_launch_params_t *app_handle_launch(app_t *app, int argc, char *argv[]) {
 }
 
 void app_webos_open_ribbon() {
-    static const char *payload = "{\"id\":\"com.webos.app.home\",\"params\":{\"launchType\":\"homeKey\"}}";
-    HLunaServiceCallSync("luna://com.webos.applicationManager/launch", payload, true, NULL);
+    /* Ask SAM for whatever app owns the "home" category instead of naming LG's
+     * launcher directly. The id is not a constant: webOS resolves the category
+     * through the system profile (defaultApps.categories.home), so a device
+     * running a replacement home screen lands on that one, while a stock TV
+     * still ends up in com.webos.app.home. Hardcoding the id sent every such
+     * device to LG's launcher no matter what its HOME key does. */
+    char *reply = NULL;
+    bool ok = HLunaServiceCallSync("luna://com.webos.applicationManager/launchDefaultApp",
+                                   "{\"category\":\"home\"}", true, &reply) &&
+              reply != NULL && strstr(reply, "\"returnValue\":true") != NULL;
+    free(reply);
+    if (ok) {
+        return;
+    }
+    /* Older platforms without launchDefaultApp (or without a default for the
+     * category) keep the previous behaviour rather than no reaction at all. */
+    static const char *fallback = "{\"id\":\"com.webos.app.home\",\"params\":{\"launchType\":\"homeKey\"}}";
+    HLunaServiceCallSync("luna://com.webos.applicationManager/launch", fallback, true, NULL);
 }
