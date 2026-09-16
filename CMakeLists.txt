@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(MOONLIGHT_VERSION "1.7.23")
+set(MOONLIGHT_VERSION "1.7.24")
 
 project(moonlight VERSION ${MOONLIGHT_VERSION} LANGUAGES C CXX)
 
@@ -104,11 +104,12 @@ if (TARGET_WEBOS)
     set(WEBOS_APPINFO_ID "com.aurora.ds5")
     set(CMAKE_INSTALL_RPATH "$ORIGIN/lib/backports:$ORIGIN/../lib/backports:$ORIGIN")
 
-    # Hot-path performance flags. Target: LG G4 — 4x Cortex-A78 @ 1.4 GHz
-    # (CPU part 0xd41), single-cluster. webOS userspace is ARMv7, so -march
-    # stays armv7-a for the ABI; -mtune=cortex-a78 reflects the real pipeline.
-    # NEON-vfpv4 unlocks NEON-optimized libc memcpy/memset paths.
-    set(MOONLIGHT_WEBOS_PERF_FLAGS "-O3 -march=armv7-a -mtune=cortex-a78 -mfpu=neon-vfpv4 -fomit-frame-pointer")
+    # Hot-path performance flags. Tuned for the LG G4 (4x Cortex-A78), but the
+    # release reaches other TVs through the Homebrew Channel, so the instruction
+    # set stays at the SDK baseline (-mcpu=cortex-a9 -mfpu=neon-fp16). An
+    # -mfpu=neon-vfpv4 here let GCC emit fused multiply-add, which SIGILLs on
+    # Cortex-A9/VFPv3 TVs. -mtune only changes scheduling, never the ISA.
+    set(MOONLIGHT_WEBOS_PERF_FLAGS "-O3 -mtune=cortex-a78 -fomit-frame-pointer")
     set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${MOONLIGHT_WEBOS_PERF_FLAGS}")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} ${MOONLIGHT_WEBOS_PERF_FLAGS}")
 
