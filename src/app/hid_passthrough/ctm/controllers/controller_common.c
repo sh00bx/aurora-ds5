@@ -233,6 +233,15 @@ struct ctm_controller {
 
     pthread_mutex_t settings_mutex;
     tv_bridge_worker_settings_t settings;
+    /* ops->build_settings_report: the pad has not been told the current
+     * settings yet. Raised by ctm_controller_set_settings (LVGL thread) and at
+     * link-up, consumed by tick_settings_push on the session thread, which is
+     * the only thread allowed to write to the device. */
+    _Atomic(int) settings_push;
+    /* The last report tick_settings_push actually delivered, so an unchanged
+     * value sends nothing. Session thread only; cleared per session. */
+    uint8_t settings_last[80];
+    size_t settings_last_len;
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
     int evdev_grab_count;
@@ -1434,6 +1443,10 @@ static void session_state_reset(ctm_controller_t *c)
     c->st_net_skew_min = c->st_net_skew_max = c->st_net_skew_sum = 0;
     /* Re-announce the overlay gate state on the first burst of the session. */
     c->ui_gated_logged = 0;
+    /* A new link has heard nothing yet: push the settings report once the pump
+     * runs, even if it matches what the previous session sent. */
+    c->settings_last_len = 0;
+    if (c->ops && c->ops->build_settings_report) c->settings_push = 1;
 }
 
 /* --- the pump's periodic work -----------------------------------------------
@@ -1754,6 +1767,33 @@ static uint64_t tick_net_log(ctm_pump_t *p)
     return c->net_log_next_us;
 }
 
+/* Tell the pad the live settings in a report of our own (ops->
+ * build_settings_report) at link-up and after each settings change, instead of
+ * waiting for the host to send a report patch_output can stamp them into.
+ * Here rather than in set_settings because only this thread may write to the
+ * device (ctm_hid_io.h). A report identical to the last delivered one is not
+ * sent again. A failed write is not retried: the next change pushes again, and
+ * patch_output still stamps the values into every host report meanwhile. */
+static uint64_t tick_settings_push(ctm_pump_t *p)
+{
+    ctm_controller_t *c = p->c;
+    if (!c->ops->build_settings_report ||
+        !__atomic_exchange_n(&c->settings_push, 0, __ATOMIC_RELAXED)) {
+        return 0;
+    }
+    uint8_t rep[sizeof(c->settings_last)];
+    size_t n = c->ops->build_settings_report(c, rep, sizeof(rep));
+    if (n == 0 || n > sizeof(rep)) return 0;
+    if (n == c->settings_last_len && memcmp(rep, c->settings_last, n) == 0) return 0;
+    int rc = ctm_hid_io_write(c->io, rep, n);
+    if (rc == 0) {
+        memcpy(c->settings_last, rep, n);
+        c->settings_last_len = n;
+    }
+    ctm_ctl_log(c, "settings push: report 0x%02x len %zu rc=%d", rep[0], n, rc);
+    return 0;
+}
+
 /* Run one connected session: handshake, start the input thread (plus the
  * composite sibling readers and the xpad feeder where the type uses them), then
  * the output/feature receive loop + paced drain until the link drops or stop.
@@ -1855,6 +1895,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
         tick_plc_fill,
         tick_plc_log,
         tick_net_log,
+        tick_settings_push,
     };
 
     int link_alive = 1;
@@ -2363,6 +2404,7 @@ void ctm_controller_set_settings(ctm_controller_t *c, const tv_bridge_worker_set
     pthread_mutex_lock(&c->settings_mutex);
     c->settings = *s;
     pthread_mutex_unlock(&c->settings_mutex);
+    if (c->ops->build_settings_report) c->settings_push = 1;
     if (c->ops->set_settings) c->ops->set_settings(c, s);
 }
 

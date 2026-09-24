@@ -127,6 +127,38 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     return 0;
 }
 
+/* BT 0x11 effects report as the host frames it (Vibepollo ds4_reports.h):
+ * [0x11][0xC0 = HID + CRC, default poll rate][0x00][31-byte common][pad][crc32]. */
+#define DS4_BT_OUTPUT_LEN 78
+
+/* build_settings_report: a 0x11 that carries the volume sliders and nothing
+ * else. patch_output can only stamp them into 0x11 reports the host sends, and
+ * the host sends none while a game owns the lightbar and is quiet, or with the
+ * synthetic lightbar off -- a slider moved then did nothing until the game
+ * happened to write rumble or LED. BT[3] = 0xb0 claims only the volume fields
+ * (0x10/0x20 headphone L/R, 0x80 speaker); its low nibble (rumble, lightbar,
+ * flash valid) stays 0, so the pad keeps whatever rumble and colour it has and
+ * the zeroed bytes behind those flags are ignored. Volume bytes and CRC exactly
+ * as ds4_patch_output writes them, so the patch finds nothing to change.
+ * When: session thread, at link-up and after a settings change; the pump sends
+ * nothing when the result equals the last report it delivered. */
+static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
+{
+    if (!buf || cap < DS4_BT_OUTPUT_LEN) return 0;
+    tv_bridge_worker_settings_t s;
+    ctm_controller_get_settings(c, &s);
+    uint8_t headset_volume = ds4_volume_raw_byte(s.headset_volume_percent);
+    memset(buf, 0, DS4_BT_OUTPUT_LEN);
+    buf[0] = 0x11;
+    buf[1] = 0xc0;
+    buf[3] = 0xb0;
+    buf[21] = headset_volume;
+    buf[22] = headset_volume;
+    buf[24] = ds4_volume_raw_byte(s.speaker_volume_percent);
+    ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);
+    return DS4_BT_OUTPUT_LEN;
+}
+
 /* on_input_report: read-only observer of what the pad sends us.
  *
  * The battery byte is the same one the host reads for the audio jack bit --
@@ -204,7 +236,10 @@ const ctm_controller_ops_t ctm_controller_ds4_ops = {
     .select_node = NULL,
     .on_plug_init = NULL,
     .patch_output = ds4_patch_output,
-    .set_settings = NULL,   /* live values read via get_settings in patch_output */
+    .set_settings = NULL,   /* live values read via get_settings in patch_output;
+                             * the proactive send is build_settings_report, since
+                             * set_settings runs on the LVGL thread */
+    .build_settings_report = ds4_build_settings_report,
     .on_input_report = ds4_on_input_report,
     .neutralize_input = ds4_neutralize_input,
 };

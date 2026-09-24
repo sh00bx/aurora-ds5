@@ -118,8 +118,18 @@ typedef struct {
      * write), 0 to write `*len` bytes. NULL => verbatim forward. */
     int (*patch_output)(ctm_controller_t *c, uint8_t *buf, size_t *len);
 
-    /* Live UI settings update (DS sliders). NULL => ignored. */
+    /* Live UI settings update (DS sliders). NULL => ignored. Runs on the
+     * caller's (LVGL) thread, so it must not write to the device. */
     void (*set_settings)(ctm_controller_t *c, const tv_bridge_worker_settings_t *s);
+
+    /* Build one output report that applies the live settings by itself, for a
+     * setting that otherwise only reaches the pad inside a report the host
+     * happens to send (DS4 volume). Called from the session thread at link-up
+     * and after every settings change; the pump skips a report byte-identical
+     * to the last one it pushed, then writes it through the normal output path
+     * (patch_output included). Returns the report length, 0 = nothing to send.
+     * NULL => never. */
+    size_t (*build_settings_report)(ctm_controller_t *c, uint8_t *buf, size_t cap);
 
     /* Optional per-input-report hook (DS5 battery, etc.). NULL => none. */
     void (*on_input_report)(ctm_controller_t *c, const uint8_t *data, size_t len);
