@@ -381,21 +381,28 @@ static int app_input_gamepad_send_ps5_effect(app_input_t *input, unsigned short 
 
 void app_input_gamepad_set_adaptive_triggers(app_input_t *input, unsigned short controllerNumber, uint8_t eventFlags,
                                              uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right) {
-    uint8_t report[24] = {0x02, 0x04};
-    int offset = 2;
-    if (eventFlags & DS_EFFECT_LEFT_TRIGGER) {
-        report[offset++] = typeLeft;
-        memcpy(&report[offset], left, DS_EFFECT_PAYLOAD_SIZE);
-        offset += DS_EFFECT_PAYLOAD_SIZE;
+    /* SDL's PS5 driver copies this verbatim behind its own report header as
+     * the 47-byte DS5 output state (DS5EffectsState_t in SDL_hidapi_ps5.c):
+     * [0] valid_flag0, where 0x04 enables the right and 0x08 the left trigger
+     * effect -- the same bits as DS_EFFECT_RIGHT/LEFT_TRIGGER; [1] valid_flag1,
+     * left 0 because 0x04 there would commit the zeroed lightbar colour; right
+     * trigger mode + parameters at [10], left at [21]. Same layout as
+     * moonlight-qt's DualSenseOutputReport. */
+    uint8_t state[47] = {0};
+    uint8_t flags = eventFlags & (DS_EFFECT_RIGHT_TRIGGER | DS_EFFECT_LEFT_TRIGGER);
+    if (flags == 0) {
+        return;
     }
-    if (eventFlags & DS_EFFECT_RIGHT_TRIGGER) {
-        report[offset++] = typeRight;
-        memcpy(&report[offset], right, DS_EFFECT_PAYLOAD_SIZE);
-        offset += DS_EFFECT_PAYLOAD_SIZE;
+    state[0] = flags;
+    if (flags & DS_EFFECT_RIGHT_TRIGGER) {
+        state[10] = typeRight;
+        memcpy(&state[11], right, DS_EFFECT_PAYLOAD_SIZE);
     }
-    if (offset > 2) {
-        app_input_gamepad_send_ps5_effect(input, controllerNumber, report, offset);
+    if (flags & DS_EFFECT_LEFT_TRIGGER) {
+        state[21] = typeLeft;
+        memcpy(&state[22], left, DS_EFFECT_PAYLOAD_SIZE);
     }
+    app_input_gamepad_send_ps5_effect(input, controllerNumber, state, sizeof(state));
 }
 
 void app_input_gamepad_set_player_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledValue) {
