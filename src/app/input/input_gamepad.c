@@ -405,14 +405,21 @@ void app_input_gamepad_set_adaptive_triggers(app_input_t *input, unsigned short 
     app_input_gamepad_send_ps5_effect(input, controllerNumber, state, sizeof(state));
 }
 
+/* Same 47-byte state as the trigger effect above: [1] bit 0x10 takes the pad
+ * lights from [43] (0x20 = switch without the fade, as SDL does), bit 0x01 the
+ * mic LED mode from [8] (0 off, 1 on, 2 pulse). */
 void app_input_gamepad_set_player_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledValue) {
-    uint8_t report[2] = {0x05, ledValue};
-    app_input_gamepad_send_ps5_effect(input, controllerNumber, report, sizeof(report));
+    uint8_t state[47] = {0};
+    state[1] = 0x10;
+    state[43] = (uint8_t) ((ledValue & 0x1f) | 0x20);
+    app_input_gamepad_send_ps5_effect(input, controllerNumber, state, sizeof(state));
 }
 
 void app_input_gamepad_set_mic_led(app_input_t *input, unsigned short controllerNumber, uint8_t ledState) {
-    uint8_t report[2] = {0x06, ledState};
-    app_input_gamepad_send_ps5_effect(input, controllerNumber, report, sizeof(report));
+    uint8_t state[47] = {0};
+    state[1] = 0x01;
+    state[8] = ledState;
+    app_input_gamepad_send_ps5_effect(input, controllerNumber, state, sizeof(state));
 }
 
 int new_gamepad_state_index(app_input_t *input, SDL_GameController *controller) {
