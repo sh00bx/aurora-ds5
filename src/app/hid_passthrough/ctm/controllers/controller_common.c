@@ -242,6 +242,10 @@ struct ctm_controller {
      * value sends nothing. Session thread only; cleared per session. */
     uint8_t settings_last[80];
     size_t settings_last_len;
+    /* A failed push is retried at settings_retry_us (0 = none pending), at most
+     * SETTINGS_PUSH_RETRIES times per change. Session thread only. */
+    uint64_t settings_retry_us;
+    int settings_retries;
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
     int evdev_grab_count;
@@ -1446,6 +1450,8 @@ static void session_state_reset(ctm_controller_t *c)
     /* A new link has heard nothing yet: push the settings report once the pump
      * runs, even if it matches what the previous session sent. */
     c->settings_last_len = 0;
+    c->settings_retry_us = 0;
+    c->settings_retries = 0;
     if (c->ops && c->ops->build_settings_report) c->settings_push = 1;
 }
 
@@ -1772,15 +1778,25 @@ static uint64_t tick_net_log(ctm_pump_t *p)
  * waiting for the host to send a report patch_output can stamp them into.
  * Here rather than in set_settings because only this thread may write to the
  * device (ctm_hid_io.h). A report identical to the last delivered one is not
- * sent again. A failed write is not retried: the next change pushes again, and
- * patch_output still stamps the values into every host report meanwhile. */
+ * sent again. A failed write is retried every 200 ms, up to
+ * SETTINGS_PUSH_RETRIES times: the link-up push is the one that matters when a
+ * quiet game owns the lightbar, and nothing else would carry it. A report the
+ * daemon drops after accepting it is not seen here; patch_output still stamps
+ * the values into every host report. */
+#define SETTINGS_PUSH_RETRIES 5
 static uint64_t tick_settings_push(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->ops->build_settings_report ||
-        !__atomic_exchange_n(&c->settings_push, 0, __ATOMIC_RELAXED)) {
+    if (!c->ops->build_settings_report) return 0;
+    uint64_t nnow = ctm_now_us();
+    if (__atomic_exchange_n(&c->settings_push, 0, __ATOMIC_RELAXED)) {
+        c->settings_retries = 0;            /* a new change: fresh retry budget */
+    } else if (c->settings_retry_us == 0) {
         return 0;
+    } else if (nnow < c->settings_retry_us) {
+        return c->settings_retry_us;
     }
+    c->settings_retry_us = 0;
     uint8_t rep[sizeof(c->settings_last)];
     size_t n = c->ops->build_settings_report(c, rep, sizeof(rep));
     if (n == 0 || n > sizeof(rep)) return 0;
@@ -1789,9 +1805,12 @@ static uint64_t tick_settings_push(ctm_pump_t *p)
     if (rc == 0) {
         memcpy(c->settings_last, rep, n);
         c->settings_last_len = n;
+    } else if (c->settings_retries < SETTINGS_PUSH_RETRIES) {
+        c->settings_retries++;
+        c->settings_retry_us = nnow + 200000ull;
     }
     ctm_ctl_log(c, "settings push: report 0x%02x len %zu rc=%d", rep[0], n, rc);
-    return 0;
+    return c->settings_retry_us;
 }
 
 /* Run one connected session: handshake, start the input thread (plus the
