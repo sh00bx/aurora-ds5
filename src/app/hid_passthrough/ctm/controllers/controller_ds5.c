@@ -106,13 +106,19 @@ static uint8_t ds5_headset_volume_byte(unsigned int pct)
  * Only the trigger nibble is ours. A rumble reduction the game asked for
  * (flag already set) is kept; without the flag the low nibble never meant
  * anything, so it goes to 0 (no rumble reduction) rather than letting a stray
- * value become valid under our flag. level 0 leaves the report byte-identical.
- * Anything not framed like the host's 0x31 is left alone. */
+ * value become valid under our flag.
+ * level 0 still sends the flag with a zero trigger nibble unless the game set
+ * the flag itself: the pad keeps the last reduction it was given, so leaving
+ * the report alone would keep the triggers soft until the pad powers off.
+ * Anything not framed exactly like the host's 0x31 ([0x31][seq<<4][0x10],
+ * 78 bytes; SDL's [0x31][0x02] framing would put common[] one byte earlier)
+ * is left alone. */
 static int ds5_patch_trigger_reduce(uint8_t *data, size_t len, unsigned int level)
 {
-    if (level == 0 || len < 78 || data[0] != 0x31 || data[2] != 0x10) return 0;
+    if (len != 78 || data[0] != 0x31 || (data[1] & 0x0fu) || data[2] != 0x10) return 0;
     if (level > DS5_TRIGGER_REDUCE_MAX) level = DS5_TRIGGER_REDUCE_MAX;
     uint8_t *common = data + 3;
+    if (level == 0 && (common[1] & 0x40u)) return 0;   /* the game's own levels */
     uint8_t rumble = (common[1] & 0x40u) ? (uint8_t)(common[36] & 0x0fu) : 0u;
     uint8_t flag1 = (uint8_t)(common[1] | 0x40u);
     uint8_t power = (uint8_t)((level << 4) | rumble);

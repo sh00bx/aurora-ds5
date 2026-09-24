@@ -36,7 +36,7 @@ typedef struct {
     unsigned int ds5_patch2_high_nibble;
     unsigned int ds5_patch2_low_nibble;
     unsigned int ds5_trigger_reduce;  /* DS5 adaptive-trigger motor power reduction,
-                                       * 0 = off (reports untouched) .. 9 = weakest */
+                                       * 0 = off (the pad's own level) .. 9 = weakest */
     bool composite_passthrough;   /* Flydigi: forward full USB composite to host */
     bool block_bt_audio_sink;     /* prevent BlueZ from registering DS5 as A2DP sink */
     bool auto_plugin;             /* auto-bridge via HID passthrough on next stream start */
