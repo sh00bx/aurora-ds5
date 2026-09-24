@@ -21,6 +21,7 @@
 #define DS_LATENCY_MAX 200
 #define DS_VOLUME_MAX 100
 #define DS_HAPTICS_MAX 200
+#define DS_TRIGGER_REDUCE_MAX 9
 
 /** The controls the option column carries, in focus order. */
 typedef enum {
@@ -31,6 +32,7 @@ typedef enum {
     HID_PT_CTL_SPEAKER,
     HID_PT_CTL_HEADSET,
     HID_PT_CTL_HAPTICS,
+    HID_PT_CTL_TRIGGER_REDUCE,
     HID_PT_CTL_RESET,
     HID_PT_CTL_REFRESH,
     HID_PT_CTL_CLOSE,
@@ -127,6 +129,9 @@ typedef struct {
     lv_obj_t *haptics_row;
     lv_obj_t *haptics_value;
     lv_obj_t *haptics_slider;
+    lv_obj_t *trigger_row;
+    lv_obj_t *trigger_value;
+    lv_obj_t *trigger_slider;
     lv_obj_t *audio_warning_label;
     lv_obj_t *reset_settings_btn;
     lv_obj_t *refresh_btn;
@@ -246,6 +251,7 @@ void hid_pt_view_update_latency_label(hid_pt_view_t *view, int default_ms);
 void hid_pt_view_update_speaker_label(hid_pt_view_t *view);
 void hid_pt_view_update_headset_label(hid_pt_view_t *view);
 void hid_pt_view_update_haptics_label(hid_pt_view_t *view);
+void hid_pt_view_update_trigger_label(hid_pt_view_t *view);
 
 /**
  * Move a focused slider by one step of its own range.

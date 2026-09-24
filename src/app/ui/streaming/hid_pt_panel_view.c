@@ -388,7 +388,7 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
-#define OPTION_CHAIN_LEN 8
+#define OPTION_CHAIN_LEN 9
 
 /**
  * The option column, top to bottom, into @p out.
@@ -405,8 +405,9 @@ static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_L
     out[3] = view->speaker_slider;
     out[4] = view->headset_slider;
     out[5] = view->haptics_slider;
-    out[6] = view->latency_slider;
-    out[7] = view->reset_settings_btn;
+    out[6] = view->trigger_slider;
+    out[7] = view->latency_slider;
+    out[8] = view->reset_settings_btn;
 }
 
 /**
@@ -467,6 +468,7 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
             {&view->speaker_slider,     HID_PT_WK_SLIDER},
             {&view->headset_slider,     HID_PT_WK_SLIDER},
             {&view->haptics_slider,     HID_PT_WK_SLIDER},
+            {&view->trigger_slider,     HID_PT_WK_SLIDER},
             {&view->audio_dropdown,     HID_PT_WK_DROPDOWN},
             {&view->reset_settings_btn, HID_PT_WK_OPTION_BTN},
             {&view->refresh_btn,        HID_PT_WK_HEADER_BTN},
@@ -680,6 +682,19 @@ void hid_pt_view_update_haptics_label(hid_pt_view_t *view)
 {
     if (view) {
         set_percent(view->haptics_value, view->haptics_slider);
+    }
+}
+
+void hid_pt_view_update_trigger_label(hid_pt_view_t *view)
+{
+    if (!view || !view->trigger_value || !view->trigger_slider) {
+        return;
+    }
+    int level = (int) lv_slider_get_value(view->trigger_slider);
+    if (level == 0) {
+        lv_label_set_text(view->trigger_value, locstr("Off"));
+    } else {
+        lv_label_set_text_fmt(view->trigger_value, "%d", level);
     }
 }
 
@@ -1127,6 +1142,8 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
                                    HID_PT_CTL_HEADSET, &view->headset_slider, &view->headset_value, NULL);
     view->haptics_row = slider_row(view, right_pane, locstr("Haptics strength"), 0, DS_HAPTICS_MAX,
                                    HID_PT_CTL_HAPTICS, &view->haptics_slider, &view->haptics_value, NULL);
+    view->trigger_row = slider_row(view, right_pane, locstr("Soften triggers"), 0, DS_TRIGGER_REDUCE_MAX,
+                                   HID_PT_CTL_TRIGGER_REDUCE, &view->trigger_slider, &view->trigger_value, NULL);
     view->latency_row = slider_row(view, right_pane, locstr("Latency"), DS_LATENCY_MIN, DS_LATENCY_MAX,
                                    HID_PT_CTL_LATENCY, &view->latency_slider, &view->latency_value,
                                    &view->latency_label);

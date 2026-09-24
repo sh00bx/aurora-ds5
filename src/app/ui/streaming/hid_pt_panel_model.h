@@ -51,6 +51,7 @@ typedef struct {
     unsigned speaker_volume_percent;
     unsigned headset_volume_percent;
     unsigned haptics_gain_centi;
+    unsigned trigger_reduce;        /* DualSense trigger power reduction, 0 = off */
     bool auto_plugin;
     bool composite_passthrough;
 } hid_pt_controls_t;
@@ -141,7 +142,7 @@ bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *
 
 /**
  * Write the four audio/latency values back and push them at a live bridge.
- * The haptics gain is only written for a DualSense. False on the same
+ * The haptics gain and the trigger reduction are only written for a DualSense. False on the same
  * conditions as hid_pt_model_read_controls().
  */
 bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_controls_t *in);

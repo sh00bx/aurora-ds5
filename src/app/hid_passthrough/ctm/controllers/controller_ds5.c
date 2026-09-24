@@ -85,10 +85,48 @@ static uint8_t ds5_headset_volume_byte(unsigned int pct)
     return (uint8_t)(pct > 0x64u ? 0x64u : pct);
 }
 
+/* Highest trigger reduction the settings panel offers. */
+#define DS5_TRIGGER_REDUCE_MAX 9u
+
+/* Trigger-motor power reduction on a BT 0x31 effects report, so every
+ * adaptive-trigger effect -- the game's own included -- is played weaker by the
+ * pad itself instead of being reshaped. Returns 1 if the report changed.
+ *
+ * Layout: the 0x31 is [0x31][seq_tag][0x10 tag][47-byte common][...][crc32]
+ * (Linux hid-playstation dualsense_output_report_bt, Vibepollo
+ * ds5_reports.h usb_output_to_bt), so common[i] is data[3 + i]. Common byte 1
+ * is valid_flag1, whose bit 6 (0x40) is AllowMotorPowerLevel; common byte 36
+ * (just behind the 4-byte host timestamp at 32..35, before audio_control2 at
+ * 37) holds two reduction levels: HIGH nibble = trigger motors, LOW nibble =
+ * rumble. The nibble order is the one awalol's DS5Dongle 0.72 confirmed on
+ * hardware and artzox DS5Dongle-Studio 1.42.0 corrected its header to; the
+ * older struct listings (and artzox before that) have them swapped. Linux
+ * only knows the byte as reserved.
+ *
+ * Only the trigger nibble is ours. A rumble reduction the game asked for
+ * (flag already set) is kept; without the flag the low nibble never meant
+ * anything, so it goes to 0 (no rumble reduction) rather than letting a stray
+ * value become valid under our flag. level 0 leaves the report byte-identical.
+ * Anything not framed like the host's 0x31 is left alone. */
+static int ds5_patch_trigger_reduce(uint8_t *data, size_t len, unsigned int level)
+{
+    if (level == 0 || len < 78 || data[0] != 0x31 || data[2] != 0x10) return 0;
+    if (level > DS5_TRIGGER_REDUCE_MAX) level = DS5_TRIGGER_REDUCE_MAX;
+    uint8_t *common = data + 3;
+    uint8_t rumble = (common[1] & 0x40u) ? (uint8_t)(common[36] & 0x0fu) : 0u;
+    uint8_t flag1 = (uint8_t)(common[1] | 0x40u);
+    uint8_t power = (uint8_t)((level << 4) | rumble);
+    if (common[1] == flag1 && common[36] == power) return 0;
+    common[1] = flag1;
+    common[36] = power;
+    ctm_bt_sign_output(data, len);
+    return 1;
+}
+
 /* patch_output: rewrite a DS5 0x36/0x32 BT output report in place per the live
  * settings — audio route (0x9x), volume + audio-ctrl bits (0x90), latency
  * (0x91), haptics gain (0x92) — then re-CRC. AUTO touches only the latency
- * block. When: every outbound report, from the pump. Returns 0 (never drops). */
+ * block. A 0x31 gets only the trigger power reduction (above). When: every outbound report, from the pump. Returns 0 (never drops). */
 static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 {
     tv_bridge_worker_settings_t s;
@@ -96,6 +134,12 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     const tv_bridge_worker_settings_t *settings = &s;
 
     size_t len = len_io ? *len_io : 0;
+    /* 0x31 carries the adaptive-trigger effects; the only thing we touch there
+     * is the trigger power reduction. */
+    if (data && len > 0 && data[0] == 0x31) {
+        (void)ds5_patch_trigger_reduce(data, len, settings->ds5_trigger_reduce);
+        return 0;
+    }
     /* 0x39 is the batched audio/haptic report (two Opus frames + two coil blocks,
      * 547 B) — same sub-block grammar as 0x36, so it patches through the same
      * walker; only the geometry helpers above differ. */

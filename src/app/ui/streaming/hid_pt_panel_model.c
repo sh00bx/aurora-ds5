@@ -254,6 +254,7 @@ bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *
     out->speaker_volume_percent = settings->speaker_volume_percent;
     out->headset_volume_percent = settings->headset_volume_percent;
     out->haptics_gain_centi = settings->haptics_gain_centi;
+    out->trigger_reduce = settings->ds5_trigger_reduce;
     out->auto_plugin = settings->auto_plugin;
     out->composite_passthrough = settings->composite_passthrough;
     return true;
@@ -272,6 +273,7 @@ bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_contr
     settings->headset_volume_percent = in->headset_volume_percent;
     if (hid_pt_model_selected_is_ds5(model)) {
         settings->haptics_gain_centi = in->haptics_gain_centi;
+        settings->ds5_trigger_reduce = in->trigger_reduce;
     }
     apply_settings_to_session(item);
     return true;

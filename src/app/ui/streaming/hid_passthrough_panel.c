@@ -507,7 +507,16 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         lv_slider_set_value(v->haptics_slider, hap, LV_ANIM_OFF);
         hid_pt_view_update_haptics_label(v);
     }
+    if (v->trigger_slider) {
+        int level = (int) c.trigger_reduce;
+        if (level > DS_TRIGGER_REDUCE_MAX) {
+            level = DS_TRIGGER_REDUCE_MAX;
+        }
+        lv_slider_set_value(v->trigger_slider, level, LV_ANIM_OFF);
+        hid_pt_view_update_trigger_label(v);
+    }
     show_row(v->haptics_row, hid_pt_model_selected_is_ds5(&panel->model));
+    show_row(v->trigger_row, hid_pt_model_selected_is_ds5(&panel->model));
     if (v->auto_plugin_cb) {
         set_switch(v->auto_plugin_cb, c.auto_plugin);
     }
@@ -543,6 +552,10 @@ static void customize_setting_changed(hid_pt_panel_t *panel)
     if (v->haptics_slider) {
         /* The model drops this again unless the selection is a DualSense. */
         c.haptics_gain_centi = (unsigned) lv_slider_get_value(v->haptics_slider);
+    }
+    if (v->trigger_slider) {
+        /* DualSense-only as well. */
+        c.trigger_reduce = (unsigned) lv_slider_get_value(v->trigger_slider);
     }
     if (!hid_pt_model_write_controls(&panel->model, &c)) {
         return;
@@ -602,10 +615,11 @@ static void update_customize_panel(hid_pt_panel_t *panel)
     show_row(v->headset_row, has_audio);
     show_row(v->latency_row, has_audio);
     show_row(v->reset_settings_btn, has_audio);
-    /* The haptics row is hidden from inside sync_...(), which only runs for a
-     * device that has the settings record to read it from. */
+    /* The haptics and trigger rows are hidden from inside sync_...(), which
+     * only runs for a device that has the settings record to read it from. */
     if (!has_audio) {
         show_row(v->haptics_row, false);
+        show_row(v->trigger_row, false);
         show_row(v->audio_warning_label, false);
     }
     show_row(v->customize_state, have_device);
@@ -690,6 +704,9 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
             break;
         case HID_PT_CTL_HAPTICS:
             hid_pt_view_update_haptics_label(&panel->view);
+            break;
+        case HID_PT_CTL_TRIGGER_REDUCE:
+            hid_pt_view_update_trigger_label(&panel->view);
             break;
         case HID_PT_CTL_AUDIO_MODE:
             break;
