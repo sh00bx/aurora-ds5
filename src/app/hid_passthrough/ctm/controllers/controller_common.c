@@ -1286,6 +1286,27 @@ static inline bool audio_live_since(uint64_t now, uint64_t last_us)
     return now - last_us < CTM_AUDIO_LIVE_US;
 }
 
+/* A DS4 speaker report (0x17, or the 0x14 form) that arrives WITHOUT the paced
+ * flag while paced ones are still queued. The host sends its stream-startup
+ * burst unpaced right behind a paced STOP run (route 0x00): after a starvation
+ * recovery, after a HELLO reset, and when an effect resumes during the silence
+ * tail. A direct write would put the burst on the air AHEAD of the STOP reports
+ * still in the ring, which the drain then writes into the middle of the new
+ * stream: a disarm with a backwards frame counter inside the very cushion the
+ * burst was sent to build. ENet delivers channel 1 in order, so this ring is
+ * the only place the order could break. Such a report joins the tail of the
+ * ring instead; the drain (8 ms on the raw-ACL path, 3/4 of the host's cadence
+ * on hidraw) still plays the burst out faster than the 16 ms real-time rate,
+ * and with the ring empty it is written at once as before. DS4 only: the ids
+ * are the DS4's, and the DualSense's audio always arrives paced. */
+static bool unpaced_behind_paced(const ctm_controller_t *c, const ctm_paced_ring_t *paced,
+                                 const uint8_t *payload, uint32_t len)
+{
+    return payload && len > 0 && (payload[0] == 0x17 || payload[0] == 0x14) &&
+           ctm_paced_count(paced) > 0 &&
+           c->ops && c->ops->kind && strcmp(c->ops->kind, "ds4") == 0;
+}
+
 static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
                            ctm_paced_ring_t *paced,
                            const ctmb_header_t *h, uint8_t *payload)
@@ -1308,7 +1329,8 @@ static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
             int fd = ctm_composite_out_fd_for_ep(c->comp, (uint8_t)h->request_id,
                                                  ctm_hid_io_fd(c->io));
             (void)ctm_hid_io_write_fd_raw(c->io, fd, payload, h->payload_len);
-        } else if (ctm_paced_should_pace(host_cfg, h, payload, h->payload_len)) {
+        } else if (ctm_paced_should_pace(host_cfg, h, payload, h->payload_len) ||
+                   unpaced_behind_paced(c, paced, payload, h->payload_len)) {
             ctm_paced_queue(paced, payload, h->payload_len);
             /* Post-outage stale trim: after a long stall the burst of late
              * audio is history the pad already glitched through — playing it
