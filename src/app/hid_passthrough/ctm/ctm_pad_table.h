@@ -75,8 +75,13 @@ typedef struct {
 static const ctm_pad_desc_t ctm_pad_table[] = {
     /* Sony */
     {0x054c, 0x0ce6, CTM_PAD_KIND_DS5, "Sony DS5 Controller", CTM_PAD_BLOCK_BT_AUDIO_SINK},
-    {0x054c, 0x09cc, CTM_PAD_KIND_DS4, "Sony DS4 Controller", CTM_PAD_NO_HAPTICS},
-    {0x054c, 0x05c4, CTM_PAD_KIND_DS4, "Sony DS4 Controller", CTM_PAD_NO_HAPTICS},
+    /* No CTM_PAD_NO_HAPTICS: the DS4's rumble does work through the bridge
+     * (0x11 motor bytes, since 1.6.0). The flag only zeroed a gain that nothing
+     * reads for this pad -- the gain scales DS5 voice-coil audio, and the panel
+     * shows its slider for the DS5 alone -- so the stored settings claimed
+     * "vibration 0 %" for a pad that vibrates at full strength. */
+    {0x054c, 0x09cc, CTM_PAD_KIND_DS4, "Sony DS4 Controller", 0},
+    {0x054c, 0x05c4, CTM_PAD_KIND_DS4, "Sony DS4 Controller", 0},
 
     /* Microsoft, the products the app calls an Xbox controller by id alone. */
     {0x045e, 0x02d1, CTM_PAD_KIND_XBOX, "Microsoft Xbox Controller", CTM_PAD_XPAD_COMPATIBLE},
