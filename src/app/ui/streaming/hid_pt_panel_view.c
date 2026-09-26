@@ -25,15 +25,44 @@
  * body box they actually get, which is this minus the error bar when it is up. */
 #define PANE_MAX_H     LV_DPX(428)
 #define DEV_ROW_H      LV_DPX(54)
-#define OPT_ROW_H      LV_DPX(36)
+#define OPT_ROW_H      LV_DPX(30)
+/* Between device rows. The settings column is tighter (OPT_GAP): its tallest
+ * case has to fit the pane without scrolling, see below. */
 #define ROW_GAP        LV_DPX(6)
+#define OPT_GAP        LV_DPX(4)
 #define SLIDER_W       LV_DPX(220)
 #define VALUE_W        LV_DPX(80)
 /* The dropdown spans the track and the number together, so its left edge lands
  * on the same axis every slider starts at. LV_DPX(6) is slab_body()'s gap. */
 #define GUTTER_W       (SLIDER_W + LV_DPX(6) + VALUE_W)
-/* A mode button: the large icon over its one-word name. */
-#define MODE_BTN_H     LV_DPX(44)
+/* A mode button: the large icon (19dpx, a Material em is its line) over its
+ * one-word name (a small line, 14dpx * 1.2 in Museo Sans) -- 36.8dpx of text. */
+#define MODE_BTN_H     LV_DPX(42)
+
+/* The settings column fits its pane, so it never scrolls and no scrollbar ever
+ * shows. The TV draws the UI at 1920x1080, dpi = 1920 / 6 = 320, so one dpx is
+ * 2 px. The sheet is min(SHEET_H 1008, 92 % of 1080 = 993) = 993 px; less its
+ * border (2 x 2), the header (104) and the body padding (2 x 24), a pane gets
+ * 837 px, or 779 with the error bar up (58). Its tallest case, a DualSense
+ * mounted, is eleven children with ten OPT_GAPs of 8:
+ *
+ *   head (title 46 + 4 + state line 34, pad 4)   88
+ *   MODE eyebrow                                  34
+ *   mode row                                      84
+ *   auto-plug                                     60
+ *   AUDIO & HAPTICS eyebrow (pad 8)               42
+ *   audio, speaker, headphone, haptics,
+ *   soften triggers, latency: 6 x 60             360
+ *   gaps: 10 x 8                                  80
+ *                                                ---
+ *                                                748
+ *
+ * which leaves 89 px (31 under the error bar). The audio advisory (two small
+ * lines, pad 8, + a gap: 84) still fits without the error bar: 832. A Flydigi
+ * with its composite switch is 358. In 1.7.28 the same DualSense measured 1020
+ * mounted and 974 on SDL, and a DualShock 4 852 mounted against 806 on SDL --
+ * the 46 px of the "applies over SDL" caption were what tipped it into
+ * scrolling, which is the scrollbar a mounted pad brought up. */
 
 /* ---- event trampolines --------------------------------------------------
  *
@@ -1175,6 +1204,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_gap(sheet, 0, 0);
     lv_obj_set_flex_flow(sheet, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(sheet, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(sheet, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(sheet, LV_OBJ_FLAG_CLICK_FOCUSABLE);
     lv_obj_add_event_cb(sheet, sheet_key_cb, LV_EVENT_KEY, view);
 
@@ -1266,15 +1296,14 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_width(view->list, LV_PCT(100));
     /* Everything the body box has left below the CONTROLLERS label -- a fixed cap
      * would ignore both the label and the error bar and send the last rows
-     * below the sheet's edge. Past it the list scrolls. */
+     * below the sheet's edge. Past it the list scrolls: 787 px at 1080p take
+     * six rows (6 x 108 + 5 x 12), a seventh scrolls in as the cursor reaches
+     * it (hid_pt_view_scroll_row_into_view()). No scrollbar, as nowhere on the
+     * sheet: the rows running on past the edge already say there is more. */
     lv_obj_set_flex_grow(view->list, 1);
     lv_obj_set_style_pad_right(view->list, LV_DPX(4), 0);
     lv_obj_add_flag(view->list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(view->list, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_style_bg_color(view->list, lv_color_hex(OVERLAY_CHALK), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(view->list, 60, LV_PART_SCROLLBAR);
-    lv_obj_set_style_width(view->list, LV_DPX(2), LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(view->list, LV_DPX(1), LV_PART_SCROLLBAR);
+    lv_obj_set_scrollbar_mode(view->list, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_t *right_pane = lv_obj_create(body_row);
     lv_obj_remove_style_all(right_pane);
@@ -1282,19 +1311,18 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_max_height(right_pane, LV_PCT(100), 0);
     lv_obj_set_flex_grow(right_pane, 1);
     lv_obj_set_flex_flow(right_pane, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(right_pane, ROW_GAP, 0);
-    /* Sized to fit at 1080p — that is what the single-line rows buy. The scroll
-     * is the fallback for a smaller panel or a longer translation, and it is the
-     * only scroll container on this side now. */
+    lv_obj_set_style_pad_gap(right_pane, OPT_GAP, 0);
+    /* Sized to fit at 1080p (the arithmetic is at the top of this file). The
+     * scroll is the fallback for a smaller panel, a longer translation or the
+     * error bar and the audio advisory up at once, and it follows the cursor
+     * (scroll_into_view_cb()) without a scrollbar, as nowhere on the sheet. */
     lv_obj_add_flag(right_pane, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_scrollbar_mode(right_pane, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_style_bg_color(right_pane, lv_color_hex(OVERLAY_CHALK), LV_PART_SCROLLBAR);
-    lv_obj_set_style_bg_opa(right_pane, 60, LV_PART_SCROLLBAR);
-    lv_obj_set_style_width(right_pane, LV_DPX(2), LV_PART_SCROLLBAR);
-    lv_obj_set_style_radius(right_pane, LV_DPX(1), LV_PART_SCROLLBAR);
+    lv_obj_set_scrollbar_mode(right_pane, LV_SCROLLBAR_MODE_OFF);
     view->customize_panel = right_pane;
 
-    /* Device header: who is being edited, and how it is doing. */
+    /* Device header: who is being edited and how it is doing, stacked left of
+     * RESET -- the state line beside the button rather than a row of its own
+     * under it is 50 px of the column's height. */
     lv_obj_t *head_row = lv_obj_create(right_pane);
     lv_obj_remove_style_all(head_row);
     lv_obj_set_size(head_row, LV_PCT(100), LV_SIZE_CONTENT);
@@ -1304,18 +1332,29 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_bottom(head_row, LV_DPX(2), 0);
     lv_obj_clear_flag(head_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    view->customize_title = body_text(head_row, locstr("Controller settings"));
-    lv_obj_set_style_text_font(view->customize_title, lv_theme_get_font_large(head_row), 0);
-    lv_label_set_long_mode(view->customize_title, LV_LABEL_LONG_DOT);
-    lv_obj_set_flex_grow(view->customize_title, 1);
-    view->reset_settings_btn = ghost_button(view, head_row, locstr("RESET"), HID_PT_CTL_RESET);
+    lv_obj_t *head_text = lv_obj_create(head_row);
+    lv_obj_remove_style_all(head_text);
+    lv_obj_set_height(head_text, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(head_text, 1);
+    lv_obj_set_flex_flow(head_text, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(head_text, LV_DPX(2), 0);
+    lv_obj_clear_flag(head_text, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* State and battery on one line: recoloured so "BRIDGED" carries the same
-     * teal as the rail on the device's row. */
-    view->customize_state = eyebrow(right_pane, "", OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    view->customize_title = body_text(head_text, locstr("Controller settings"));
+    lv_obj_set_style_text_font(view->customize_title, lv_theme_get_font_large(head_text), 0);
+    /* One line, cut with an ellipsis, like a device row's name: a long name
+     * wrapping to a second line would cost the column a line's height. */
+    lv_label_set_long_mode(view->customize_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(view->customize_title, LV_PCT(100));
+    lv_obj_set_height(view->customize_title,
+                      lv_font_get_line_height(lv_obj_get_style_text_font(view->customize_title, LV_PART_MAIN)));
+
+    /* State and battery on one line: recoloured so "HID" carries the same teal
+     * as the rail on the device's row. */
+    view->customize_state = eyebrow(head_text, "", OVERLAY_CHALK, OVERLAY_OPA_MUTED);
     lv_label_set_recolor(view->customize_state, true);
-    lv_obj_set_style_pad_left(view->customize_state, LV_DPX(3), 0);
-    lv_obj_set_style_pad_bottom(view->customize_state, LV_DPX(4), 0);
+
+    view->reset_settings_btn = ghost_button(view, head_row, locstr("RESET"), HID_PT_CTL_RESET);
 
     /* How the controller reaches the host, first: it decides which of the rows
      * below mean anything at all. The panel fills the row with its buttons. */
@@ -1326,7 +1365,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_remove_style_all(view->mode_row);
     lv_obj_set_size(view->mode_row, LV_PCT(100), MODE_BTN_H);
     lv_obj_set_flex_flow(view->mode_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_gap(view->mode_row, ROW_GAP, 0);
+    lv_obj_set_style_pad_gap(view->mode_row, OPT_GAP, 0);
     lv_obj_clear_flag(view->mode_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_HIDDEN);
 
