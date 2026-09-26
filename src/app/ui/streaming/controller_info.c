@@ -22,6 +22,7 @@
 
 #include "ds5_hidfd.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
+#include "hid_passthrough/hid_pt_gamepad_match.h"
 #include "logging.h"
 
 #endif
@@ -716,6 +717,9 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
 
         bool exact = false;
 #if defined(TARGET_WEBOS)
+        /* What the arrival path announces this pad as, so the badge cannot
+         * claim a type the host was not given. */
+        info->sdl_type = hid_pt_gamepad_sdl_type(state);
         if (has_known_battery_layout(vendor, product)) {
             const ds_node_t *node = ds_claim(&ds, NULL, mac);
             if (node) {

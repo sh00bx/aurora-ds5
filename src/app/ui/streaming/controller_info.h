@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "stream/input/gamepad_type_pref.h"
+
 typedef struct app_t app_t;
 
 /** How much the pad is willing to say about its charge. */
@@ -19,6 +21,7 @@ typedef enum {
 typedef struct {
     char name[48];       /**< as the pad reports itself, e.g. "DualSense Wireless Controller" */
     bool bridged;        /**< handed to the host as a real USB device instead of through SDL */
+    gamepad_type_pref_t sdl_type; /**< the user's SDL type for an SDL pad; AUTO when bridged */
     controller_power_t power;
     int percent;         /**< 0..100, meaningful for EXACT and COARSE */
     bool charging;
