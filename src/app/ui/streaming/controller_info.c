@@ -723,10 +723,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
 #if defined(TARGET_WEBOS)
         pref = hid_pt_gamepad_sdl_type(input, state);
 #endif
-        const SDL_GameControllerType sdl_type = SDL_GameControllerGetType(state->controller);
-        info->sdl_type = gamepad_type_pref_effective(pref, sdl_type == SDL_CONTROLLER_TYPE_PS3 ||
-                                                           sdl_type == SDL_CONTROLLER_TYPE_PS4 ||
-                                                           sdl_type == SDL_CONTROLLER_TYPE_PS5);
+        info->sdl_type = gamepad_type_pref_effective(pref, stream_input_gamepad_auto_builds_ds4(state->controller));
 #if defined(TARGET_WEBOS)
         if (has_known_battery_layout(vendor, product)) {
             const ds_node_t *node = ds_claim(&ds, NULL, mac);

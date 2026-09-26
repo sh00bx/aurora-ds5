@@ -107,6 +107,14 @@ void stream_input_flush_pressed_keys(stream_input_t *input);
 
 void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t *gamepad);
 
+/**
+ * Whether the host builds a DualShock 4 for @p controller when its type is left
+ * on AUTO: the host's own rule applied to what the arrival reports -- a
+ * PlayStation pad, or a Nintendo pad with motion sensors; everything else gets
+ * an Xbox 360. The detected half of gamepad_type_pref_effective().
+ */
+bool stream_input_gamepad_auto_builds_ds4(SDL_GameController *controller);
+
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad);
 
 /**

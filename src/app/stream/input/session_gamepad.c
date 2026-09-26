@@ -410,6 +410,50 @@ void stream_input_handle_jdevice(stream_input_t *input, const SDL_JoyDeviceEvent
     }
 }
 
+/* The type the arrival reports for what SDL detected, before the user's choice
+ * from the Controllers page is applied. */
+static uint8_t detected_ctype(SDL_GameController *controller) {
+    switch (SDL_GameControllerGetType(controller)) {
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+#endif
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+            return LI_CTYPE_NINTENDO;
+        case SDL_CONTROLLER_TYPE_PS3:
+        case SDL_CONTROLLER_TYPE_PS4:
+        case SDL_CONTROLLER_TYPE_PS5:
+            return LI_CTYPE_PS;
+        default:
+            return LI_CTYPE_XBOX;
+    }
+}
+
+bool stream_input_gamepad_auto_builds_ds4(SDL_GameController *controller) {
+    if (controller == NULL) {
+        return false;
+    }
+    switch (detected_ctype(controller)) {
+        case LI_CTYPE_PS:
+            return true;
+        case LI_CTYPE_NINTENDO:
+            /* The host's rule for a type that is neither PS nor Xbox: a DualShock 4
+             * when the pad reports motion (Sunshine/Vibepollo motion_as_ds4, on by
+             * default), else an Xbox 360. The arrival below claims ACCEL/GYRO from
+             * exactly these two calls. A Nintendo pad never claims the touchpad,
+             * the host's other DS4 trigger. */
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+            return SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) ||
+                   SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO);
+#else
+            return false;
+#endif
+        default:
+            return false;
+    }
+}
+
 void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t *gamepad) {
     if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
         return;
@@ -418,28 +462,16 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
         return;
     }
     input->announcedGamepadMask |= 1 << gamepad->gs_id;
-    uint8_t type = LI_CTYPE_XBOX;
+    uint8_t type = detected_ctype(gamepad->controller);
     uint16_t capabilities = LI_CCAP_ANALOG_TRIGGERS;
     commons_log_info("Input", "Controller %d arrived. Name: %s", gamepad->gs_id,
                      SDL_GameControllerName(gamepad->controller));
+    if (type == LI_CTYPE_NINTENDO) {
+        capabilities &= ~LI_CCAP_ANALOG_TRIGGERS;
+    }
     switch (SDL_GameControllerGetType(gamepad->controller)) {
-#if SDL_VERSION_ATLEAST(2, 24, 0)
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-#endif
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: {
-            type = LI_CTYPE_NINTENDO;
-            capabilities &= ~LI_CCAP_ANALOG_TRIGGERS;
-            break;
-        }
-        case SDL_CONTROLLER_TYPE_PS3: {
-            type = LI_CTYPE_PS;
-            break;
-        }
         case SDL_CONTROLLER_TYPE_PS4:
         case SDL_CONTROLLER_TYPE_PS5: {
-            type = LI_CTYPE_PS;
             capabilities |= LI_CCAP_TOUCHPAD;
             commons_log_info("Input", "  controller capability: touchpad");
             break;

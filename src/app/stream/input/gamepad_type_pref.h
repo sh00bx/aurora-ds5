@@ -27,10 +27,12 @@ typedef enum {
 
 /**
  * The pad the host builds for one announced with @p pref: the choice itself, or
- * for AUTO what it makes of the type SDL detected -- a DualShock 4 for a
- * PlayStation pad and an Xbox 360 for everything else, the only two virtual
- * pads it can create. Never AUTO: this is what the Controllers page lights and
- * what the overlay's badge names.
+ * for AUTO what it makes of the pad SDL detected -- a DualShock 4 for a
+ * PlayStation pad or a Nintendo pad with motion sensors, an Xbox 360 for
+ * everything else, the only two virtual pads it can create. The caller works
+ * that out (@p detected_playstation, stream_input_gamepad_auto_builds_ds4()).
+ * Never AUTO: this is what the Controllers page lights and what the overlay's
+ * badge names.
  */
 static inline gamepad_type_pref_t gamepad_type_pref_effective(gamepad_type_pref_t pref, bool detected_playstation)
 {

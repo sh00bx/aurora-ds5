@@ -185,21 +185,14 @@ static bool item_is_bridgeable(const logical_device_t *item)
     return kind && strcmp(kind, "hid") != 0;
 }
 
-/* Whether the row is a PlayStation pad, which the host builds as a DualShock 4
- * when the type is left on AUTO. The family SDL reports when a pad of the
- * session is this row -- the same test the arrival path makes -- else what CTM
- * classified the device as. */
+/* Whether the host builds the row's pad as a DualShock 4 when the type is left
+ * on AUTO. For a pad of the session, the host's own rule on what the arrival
+ * path reports (a PlayStation pad, or a Nintendo one with motion); else whether
+ * CTM classified the device as a PlayStation pad. */
 static bool row_detected_playstation(const row_ref_t *ref)
 {
     if (ref->pad) {
-        switch (SDL_GameControllerGetType(ref->pad->controller)) {
-            case SDL_CONTROLLER_TYPE_PS3:
-            case SDL_CONTROLLER_TYPE_PS4:
-            case SDL_CONTROLLER_TYPE_PS5:
-                return true;
-            default:
-                return false;
-        }
+        return stream_input_gamepad_auto_builds_ds4(ref->pad->controller);
     }
     const char *kind = ref->item ? bridge_kind_for_item(ref->item) : NULL;
     return kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0);
