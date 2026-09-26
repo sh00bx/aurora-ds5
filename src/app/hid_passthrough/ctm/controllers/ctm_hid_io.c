@@ -64,6 +64,10 @@ struct ctm_hid_io {
     unsigned long st_out_39;           /* batched audio/haptic report: counted
                                         * separately so the telemetry line shows
                                         * WHICH audio form is on air. */
+    unsigned long st_out_11, st_out_17; /* DS4 effects / DS4 speaker audio: split
+                                        * out of "other" so the DS4/60s line can
+                                        * tell the two streams sharing its link
+                                        * apart. No DS5 report uses either id. */
     unsigned long st_hid_ok, st_hid_eagain, st_hid_recovered, st_hid_dropped;
     unsigned long st_dedup_skipped;
 };
@@ -196,6 +200,8 @@ void ctm_hid_io_stats_take(ctm_hid_io_t *io, ctm_hid_io_stats_t *out)
     out->out39 = __atomic_exchange_n(&io->st_out_39, 0ul, __ATOMIC_RELAXED);
     out->out31 = __atomic_exchange_n(&io->st_out_31, 0ul, __ATOMIC_RELAXED);
     out->out32 = __atomic_exchange_n(&io->st_out_32, 0ul, __ATOMIC_RELAXED);
+    out->out11 = __atomic_exchange_n(&io->st_out_11, 0ul, __ATOMIC_RELAXED);
+    out->out17 = __atomic_exchange_n(&io->st_out_17, 0ul, __ATOMIC_RELAXED);
     out->out_other = __atomic_exchange_n(&io->st_out_other, 0ul, __ATOMIC_RELAXED);
     out->hid_ok = __atomic_exchange_n(&io->st_hid_ok, 0ul, __ATOMIC_RELAXED);
     out->hid_eagain = __atomic_exchange_n(&io->st_hid_eagain, 0ul, __ATOMIC_RELAXED);
@@ -253,6 +259,8 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
             break;
         case 0x31: __atomic_fetch_add(&io->st_out_31, 1ul, __ATOMIC_RELAXED); break;
         case 0x32: __atomic_fetch_add(&io->st_out_32, 1ul, __ATOMIC_RELAXED); break;
+        case 0x11: __atomic_fetch_add(&io->st_out_11, 1ul, __ATOMIC_RELAXED); break;
+        case 0x17: __atomic_fetch_add(&io->st_out_17, 1ul, __ATOMIC_RELAXED); break;
         default:   __atomic_fetch_add(&io->st_out_other, 1ul, __ATOMIC_RELAXED); break;
     }
     uint8_t patched[CTM_MAX_REPORT];

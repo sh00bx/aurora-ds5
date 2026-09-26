@@ -31,6 +31,7 @@
 #include "ds5_acl_tx.h"
 #include "ds5_hidfd.h"
 #include "ds5_mic_rx.h"
+#include "logging.h"   /* commons_log: the DS4/60s pmlog mirror (survives a TV reboot) */
 
 #include <dirent.h>
 #include <errno.h>
@@ -1488,6 +1489,13 @@ typedef struct {
     uint64_t fb_next_us;
     uint32_t fb_last_seq;
     int fb_have_seq;
+    /* DS4/60s telemetry (tick_ds4_log). The controller's input counters and
+     * the forwarder's drop count are lifetime totals, so the window is the
+     * delta against these bases, taken on the session's first tick. */
+    int ds4;
+    uint64_t ds4_log_next_us;
+    unsigned long ds4_in_base, ds4_coal_base;
+    long ds4_acl_drop_base;
 } ctm_pump_t;
 
 /* One periodic pump task: do whatever is due at this instant, then return the
@@ -1701,11 +1709,15 @@ static uint64_t tick_plc_fill(ctm_pump_t *p)
     return 0;
 }
 
-/* PLC/60s: what the concealment and the output path actually did this window. */
+/* PLC/60s: what the concealment and the output path actually did this window.
+ * Not for a DS4 session even if CTM_AUDIO_PLC forces the PLC on: every PLC
+ * counter is a 0x36/0x39 internal the DS4 never produces, and the io stats
+ * window is read-and-zero, so two lines taking it would each see half.
+ * DS4/60s owns that window there. */
 static uint64_t tick_plc_log(ctm_pump_t *p)
 {
     ctm_controller_t *c = p->c;
-    if (!c->audio.plc_enabled) return 0;
+    if (!c->audio.plc_enabled || p->ds4) return 0;
     uint64_t pnow = ctm_now_us();
     if (c->plc_log_next_us == 0) {
         c->plc_log_next_us = pnow + 60000000ull;
@@ -1740,6 +1752,54 @@ static uint64_t tick_plc_log(ctm_pump_t *p)
     c->audio.st_stale_drop = 0;
     c->plc_log_next_us = pnow + 60000000ull;
     return c->plc_log_next_us;
+}
+
+/* DS4/60s: the DS4 bridge's own window, ungated (the PLC line above is off for
+ * the DS4 by policy, so nothing used to report on this pad at all).
+ *   in/coal   input reports forwarded / dropped by per-burst coalescing; their
+ *             sum is the pad's real input rate, the number the poll-interval
+ *             byte (ds4_patch_output) exists to bring down
+ *   out11/17  effect and speaker reports handed to the output path
+ *   dedup     0x11 skipped as identical to the last one sent
+ *   trim17    paced 0x17 discarded by the post-outage trim (handle_message)
+ *   acl_drop  reports the raw-ACL forwarder could not hand to ds5_txd
+ * The same line goes to pmlog (commons_log, HID-PT tag), at most once per
+ * window: the ctm log lives in /tmp and dies with a TV reboot, which is how
+ * the only HID session of the 2026-09-26 speaker-loop report lost its data. */
+static uint64_t tick_ds4_log(ctm_pump_t *p)
+{
+    ctm_controller_t *c = p->c;
+    if (!p->ds4) return 0;
+    uint64_t dnow = ctm_now_us();
+    long acl_drop_now = 0;
+    if (c->acl_tx) ds5_acl_tx_stats(c->acl_tx, NULL, &acl_drop_now, NULL);
+    if (p->ds4_log_next_us == 0) {
+        p->ds4_in_base = ctm_stat_get(&c->stats.reports_in);
+        p->ds4_coal_base = ctm_stat_get(&c->stats.coalesced);
+        p->ds4_acl_drop_base = acl_drop_now;
+        p->ds4_log_next_us = dnow + 60000000ull;
+        return p->ds4_log_next_us;
+    }
+    if (dnow < p->ds4_log_next_us) return p->ds4_log_next_us;
+
+    ctm_hid_io_stats_t io_st;
+    ctm_hid_io_stats_take(c->io, &io_st);
+    unsigned long in_now = ctm_stat_get(&c->stats.reports_in);
+    unsigned long coal_now = ctm_stat_get(&c->stats.coalesced);
+    char line[200];
+    snprintf(line, sizeof(line),
+             "DS4/60s: in=%lu coal=%lu out11=%lu out17=%lu dedup=%lu trim17=%lu acl_drop=%ld",
+             in_now - p->ds4_in_base, coal_now - p->ds4_coal_base,
+             io_st.out11, io_st.out17, io_st.dedup_skipped, c->st_paced_trim,
+             acl_drop_now - p->ds4_acl_drop_base);
+    ctm_ctl_log(c, "%s", line);
+    commons_log_info("HID-PT", "%s %s", c->dev.mac[0] ? c->dev.mac : "ds4", line);
+    p->ds4_in_base = in_now;
+    p->ds4_coal_base = coal_now;
+    p->ds4_acl_drop_base = acl_drop_now;
+    c->st_paced_trim = 0;
+    p->ds4_log_next_us = dnow + 60000000ull;
+    return p->ds4_log_next_us;
 }
 
 /* NET/60s: downlink arrival pattern + ENet link health (HOL probe, see
@@ -1939,6 +1999,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     pump.paced = &paced;
     pump.host_cfg = &host_cfg;
     pump.fb_enabled = (host_cfg.reserved[0] & CTMB_HOSTCFG_PACE_FEEDBACK) != 0;
+    pump.ds4 = c->ops->kind && strcmp(c->ops->kind, "ds4") == 0;
     /* FIFO-depth gating: the deep elastic FIFO (the type's depth: 10 for the
      * DS5, 6 for the DS4 — see ctm_pump_policy_t.acl_fifo_depth) is only safe
      * under a rate-servo host — it is the servo that bounds the parked latency.
@@ -1956,6 +2017,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
         tick_pace_feedback,
         tick_plc_fill,
         tick_plc_log,
+        tick_ds4_log,
         tick_net_log,
         tick_settings_push,
     };

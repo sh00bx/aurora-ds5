@@ -134,9 +134,11 @@ size_t ctm_hid_io_last_delivered(const ctm_hid_io_t *io, uint8_t report_id,
  * restated pre-reconnect DS4 frame would bring back its rumble. */
 void ctm_hid_io_session_reset(ctm_hid_io_t *io);
 
-/* One telemetry window's counters, for the PLC/60s line. */
+/* One telemetry window's counters, for the PLC/60s (DS5) and DS4/60s lines.
+ * out_other excludes the DS4's 0x11/0x17, which have their own counters. */
 typedef struct {
     unsigned long out36, out39, out31, out32, out_other;
+    unsigned long out11, out17;
     unsigned long hid_ok, hid_eagain, hid_recovered, hid_dropped;
     unsigned long dedup_skipped;
 } ctm_hid_io_stats_t;
