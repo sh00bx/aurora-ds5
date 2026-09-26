@@ -759,12 +759,16 @@ lv_obj_t *hid_pt_view_add_mode(hid_pt_view_t *view, const char *glyph, const cha
     const lv_opa_t fill_opa = live ? LV_OPA_60 : LV_OPA_20;
     /* Twice: with the cursor on it too, or the focus plate (FOCUS_KEY outranks
      * CHECKED) would hide which mode is lit. The border and the bloom stay the
-     * focus look's. */
+     * focus look's, and are the ONLY thing the cursor changes on a lit button --
+     * so lit must not wear the focus edge itself: HID keeps the teal rim, an SDL
+     * type the plain seam of an idle slab. Chalk edge = cursor, fill = lit. */
     lv_obj_set_style_bg_color(btn, fill, LV_STATE_CHECKED);
     lv_obj_set_style_bg_opa(btn, fill_opa, LV_STATE_CHECKED);
     lv_obj_set_style_bg_color(btn, fill, LV_STATE_CHECKED | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_bg_opa(btn, fill_opa, LV_STATE_CHECKED | LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_border_color(btn, fill, LV_STATE_CHECKED);
+    if (live) {
+        lv_obj_set_style_border_color(btn, fill, LV_STATE_CHECKED);
+    }
     lv_obj_set_style_opa(btn, LV_OPA_40, LV_STATE_DISABLED);
 
     lv_obj_t *icon = lv_label_create(btn);
@@ -1367,6 +1371,10 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_flex_flow(view->mode_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_gap(view->mode_row, OPT_GAP, 0);
     lv_obj_clear_flag(view->mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    /* The row is exactly the buttons' height, so without this it would clip
+     * the focus bloom to the slivers between them. Drawing only: the column's
+     * layout and scroll extent read the row's own box, not the bloom. */
+    lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_HIDDEN);
 
     view->auto_plugin_row = switch_row(view, right_pane, locstr("Auto-plug on next stream"),
