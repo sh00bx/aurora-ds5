@@ -176,6 +176,9 @@ static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused)
         return;
     }
     hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, focused);
+    if (zone == HID_PT_ZONE_OPTIONS && hid_pt_view_dropdown_confirms_only(&panel->view, focused)) {
+        zone = HID_PT_ZONE_PICKER;
+    }
     hid_pt_view_set_hints(&panel->view, zone, hid_pt_model_selected_is_plugged(&panel->model));
 }
 
@@ -206,15 +209,36 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
     switch (key) {
         case LV_KEY_UP:
         case LV_KEY_DOWN: {
-            panel_focus(panel, hid_pt_view_step_option(&panel->view, target, key == LV_KEY_UP ? -1 : 1));
+            lv_obj_t *next = hid_pt_view_step_option(&panel->view, target, key == LV_KEY_UP ? -1 : 1);
+            if (!next && key == LV_KEY_UP) {
+                /* Off the top of the column is the header, exactly as from any
+                 * other control there -- stopping the event below would
+                 * otherwise keep panel_control_key() from getting there. */
+                next = panel->view.close_btn;
+            }
+            panel_focus(panel, next);
             lv_event_stop_processing(event);
             return;
         }
         case LV_KEY_LEFT:
         case LV_KEY_RIGHT: {
-            /* LEFT/RIGHT steps a dropdown's value where it steps a slider's, so
-             * the whole settings column answers to one pair of keys. OK still
-             * opens the full list for anyone who wants to see every entry. */
+            if (hid_pt_view_dropdown_confirms_only(&panel->view, target)) {
+                /* Connection and SDL type commit only through OK on their open
+                 * list. Stepped by LEFT/RIGHT, every step would plug a pad in or
+                 * out, or replace the host's pad mid-game -- and LEFT, which
+                 * leaves every switch and button in this column, would do it on
+                 * the way back to the device list. So LEFT does that here too,
+                 * and RIGHT does nothing. */
+                if (key == LV_KEY_LEFT) {
+                    panel_focus_selected_row(panel);
+                }
+                lv_event_stop_processing(event);
+                return;
+            }
+            /* LEFT/RIGHT steps the audio dropdown's value where it steps a
+             * slider's, so the audio block answers to one pair of keys. OK
+             * still opens the full list for anyone who wants to see every
+             * entry. */
             uint16_t count = lv_dropdown_get_option_cnt(target);
             int32_t sel = (int32_t) lv_dropdown_get_selected(target) + (key == LV_KEY_RIGHT ? 1 : -1);
             if (count > 0 && sel >= 0 && sel < (int32_t) count) {

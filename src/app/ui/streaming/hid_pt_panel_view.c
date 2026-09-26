@@ -601,6 +601,11 @@ void hid_pt_view_forget_dropdown(hid_pt_view_t *view)
     lv_group_set_editing(view->group, false);
 }
 
+bool hid_pt_view_dropdown_confirms_only(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    return view && obj && (obj == view->connection_dropdown || obj == view->sdl_type_dropdown);
+}
+
 /**
  * Keep the bookkeeping in step with what the widget just did on its own.
  *
@@ -777,6 +782,9 @@ void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged
             break;
         case HID_PT_ZONE_OPTIONS:
             text = locstr("UP/DOWN  setting        LEFT/RIGHT  adjust        BACK  devices");
+            break;
+        case HID_PT_ZONE_PICKER:
+            text = locstr("UP/DOWN  setting        OK  choose        LEFT/BACK  devices");
             break;
         case HID_PT_ZONE_HEADER:
             text = locstr("LEFT/RIGHT  choose        OK  run        BACK  close");

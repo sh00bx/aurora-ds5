@@ -81,6 +81,10 @@ typedef enum {
     /** Not a place on the sheet: a dropdown's list is up and owns the keys,
      * and the footer should say what they do there. */
     HID_PT_ZONE_DROPDOWN,
+    /** Not a place either: the cursor is on a closed dropdown of the options
+     * column that changes only through its list (see
+     * hid_pt_view_dropdown_confirms_only()), so LEFT/RIGHT adjust nothing. */
+    HID_PT_ZONE_PICKER,
 } hid_pt_zone_t;
 
 typedef struct {
@@ -255,6 +259,15 @@ bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target);
  * where LVGL itself is about to close the list (BACK) and only the panel's
  * notion of "a list is up" has to go. */
 void hid_pt_view_forget_dropdown(hid_pt_view_t *view);
+
+/**
+ * True for the dropdowns whose value is only ever committed by OK on their open
+ * list: Connection and SDL controller type. Each change of theirs plugs a
+ * controller in or out, or replaces the host's pad, so LEFT/RIGHT must not step
+ * them the way they step the audio dropdown -- LEFT leaves for the device list
+ * as it does on a switch.
+ */
+bool hid_pt_view_dropdown_confirms_only(const hid_pt_view_t *view, lv_obj_t *obj);
 
 /* ---- the option column's labels ----------------------------------------- */
 
