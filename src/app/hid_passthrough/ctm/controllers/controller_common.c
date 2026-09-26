@@ -2486,6 +2486,12 @@ void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out
     out->battery_valid  = (upd != 0 && (now - upd) < 5000000ull);
 }
 
+size_t ctm_controller_last_output(ctm_controller_t *c, uint8_t report_id,
+                                  uint8_t *buf, size_t cap, uint64_t *age_us)
+{
+    return c ? ctm_hid_io_last_delivered(c->io, report_id, buf, cap, age_us) : 0;
+}
+
 /* Free an idle (already plugged-out) controller. When: the device is removed
  * from the list. */
 void ctm_controller_destroy(ctm_controller_t *c)

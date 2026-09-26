@@ -20,6 +20,10 @@
  * 0x10, mic 0x20, headphones 0x40. */
 #define DS4_BT_STATUS_OFFSET 32
 
+/* Input poll interval (ms) stamped into byte 1 of every outbound 0x11/0x14/0x17
+ * — see ds4_patch_output. */
+#define DS4_POLL_INTERVAL_MS 0x04u
+
 /* matches: claim the DualShock 4 (either PID) over BT. When: classification. */
 static bool ds4_matches(const ctm_controller_dev_t *dev)
 {
@@ -73,6 +77,13 @@ static uint8_t ds4_volume_raw_byte(unsigned int value)
  *   default). BT[3] high bits 0x10/0x20/0x80 are the volume-valid flags —
  *   without them the pad ignores bytes 21/22/24; the low nibble
  *   (rumble/LED/flash valid) stays the game's. Rumble/LED bytes untouched.
+ * - 0x11/0x14/0x17: byte 1 carries the pad's input poll interval in its low
+ *   six bits (ms, hid-playstation DS4_OUTPUT_HWCTL_BT_POLL_MASK) under the
+ *   HID/CRC bits 0x80/0x40. A host before 2026-09-26 sends 0xC0/0x40, i.e.
+ *   interval 0: up to ~1000 input reports/s on the radio the effects and
+ *   the 62.5/s speaker stream share, and DS4Windows notes that a bare 0x40 on
+ *   0x17 resets the rate to zero. Forced to 4 ms, what SDL and USB use; a
+ *   current host already sends 0xC4/0x44 and this changes nothing.
  * When: every outbound report, from the pump. Returns 0 (never drops). */
 static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 {
@@ -84,6 +95,14 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     if (!data || len < 10) return 0;
 
     int patched = 0;
+
+    if (data[0] == 0x11 || data[0] == 0x14 || data[0] == 0x17) {
+        uint8_t hwctl = (uint8_t) ((data[1] & 0xc0u) | DS4_POLL_INTERVAL_MS);
+        if (data[1] != hwctl) {
+            data[1] = hwctl;
+            patched = 1;
+        }
+    }
 
     if (data[0] == 0x12 || data[0] == 0x14 || data[0] == 0x17) {
         uint8_t route = ds4_route_for_mode(settings->audio_mode);
@@ -128,18 +147,44 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 }
 
 /* BT 0x11 effects report as the host frames it (Vibepollo ds4_reports.h):
- * [0x11][0xC0 = HID + CRC, default poll rate][0x00][31-byte common][pad][crc32]. */
+ * [0x11][hwctl = HID|CRC|poll ms][0x00][31-byte common][pad][crc32]. Inside:
+ * [3] valid flags (0x01 motors, 0x02 lightbar, 0x04 flash, 0xb0 volumes),
+ * [6] weak motor, [7] strong motor, [8..10] RGB, [11..12] flash on/off,
+ * [21]/[22] headphone L/R volume, [24] speaker volume. */
 #define DS4_BT_OUTPUT_LEN 78
+#define DS4_OUT_STATE     6   /* motors, RGB, flash: [6..12] */
+#define DS4_OUT_STATE_LEN 7
 
-/* build_settings_report: a 0x11 that carries the volume sliders and nothing
- * else. patch_output can only stamp them into 0x11 reports the host sends, and
- * the host sends none while a game owns the lightbar and is quiet, or with the
- * synthetic lightbar off -- a slider moved then did nothing until the game
- * happened to write rumble or LED. BT[3] = 0xb0 claims only the volume fields
- * (0x10/0x20 headphone L/R, 0x80 speaker); its low nibble (rumble, lightbar,
- * flash valid) stays 0, so the pad keeps whatever rumble and colour it has and
- * the zeroed bytes behind those flags are ignored. Volume bytes and CRC exactly
- * as ds4_patch_output writes them, so the patch finds nothing to change.
+/* The slider volumes and their valid flags, exactly as ds4_patch_output
+ * stamps them into a host report, for a report this file builds itself. */
+static void ds4_stamp_volumes(uint8_t *buf, const tv_bridge_worker_settings_t *s)
+{
+    uint8_t headset_volume = ds4_volume_raw_byte(s->headset_volume_percent);
+    buf[3] |= 0xb0;
+    buf[21] = headset_volume;
+    buf[22] = headset_volume;
+    buf[24] = ds4_volume_raw_byte(s->speaker_volume_percent);
+}
+
+/* build_settings_report: a 0x11 that carries the volume sliders. patch_output
+ * can only stamp them into 0x11 reports the host sends, and the host sends none
+ * while a game owns the lightbar and is quiet, or with the synthetic lightbar
+ * off -- a slider moved then did nothing until the game happened to write
+ * rumble or LED. BT[3] = 0xb0 claims the volume fields (0x10/0x20 headphone
+ * L/R, 0x80 speaker).
+ *
+ * The rest RESTATES the current effect state instead of zeroing it: a push with
+ * zeroed motor and lightbar bytes is only harmless on a pad that honours the
+ * low flag nibble, and third-party-style firmware applies every field (Linux
+ * hid-playstation always sends rumble and lightbar together for that reason)
+ * -- there, each link-up and slider move blanked the bar and stopped the
+ * motors. So once a 0x11 has been delivered THIS session, its motor, lightbar
+ * and flash bytes and its low flag nibble are copied, and the push says again
+ * what the pad was last told. Never from an earlier session: ctm_hid_io clears
+ * that cache per session, so a reconnect cannot bring stale rumble back.
+ * Without one, the old form: low nibble 0, zeroed bytes behind it.
+ * Volume bytes, poll bits and CRC exactly as ds4_patch_output writes them, so
+ * the patch finds nothing to change.
  * When: session thread, at link-up and after a settings change; the pump sends
  * nothing when the result equals the last report it delivered. */
 static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
@@ -147,14 +192,16 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     if (!buf || cap < DS4_BT_OUTPUT_LEN) return 0;
     tv_bridge_worker_settings_t s;
     ctm_controller_get_settings(c, &s);
-    uint8_t headset_volume = ds4_volume_raw_byte(s.headset_volume_percent);
+    uint8_t last[DS4_BT_OUTPUT_LEN];
+    size_t last_len = ctm_controller_last_output(c, 0x11, last, sizeof(last), NULL);
     memset(buf, 0, DS4_BT_OUTPUT_LEN);
     buf[0] = 0x11;
-    buf[1] = 0xc0;
-    buf[3] = 0xb0;
-    buf[21] = headset_volume;
-    buf[22] = headset_volume;
-    buf[24] = ds4_volume_raw_byte(s.speaker_volume_percent);
+    buf[1] = 0xc0 | DS4_POLL_INTERVAL_MS;
+    if (last_len == DS4_BT_OUTPUT_LEN) {
+        buf[3] = (uint8_t) (last[3] & 0x0fu);
+        memcpy(&buf[DS4_OUT_STATE], &last[DS4_OUT_STATE], DS4_OUT_STATE_LEN);
+    }
+    ds4_stamp_volumes(buf, &s);
     ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);
     return DS4_BT_OUTPUT_LEN;
 }

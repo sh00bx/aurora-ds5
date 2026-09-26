@@ -119,9 +119,19 @@ int ctm_hid_io_feature_set(ctm_hid_io_t *io, const uint8_t *feature, size_t len)
  * gates rumble slotting on how recently that was. */
 uint64_t ctm_hid_io_audio_last_us(const ctm_hid_io_t *io);
 
-/* Drop the dedup cache and zero the telemetry window. When: session start —
- * a dedup match against the pre-reconnect frame would swallow the host's first
- * rumble state of the new session. */
+/* Copy the last DS4 report of this id (0x11 effects or 0x17 audio) the device
+ * or its injector accepted in the current session, as it went out (after
+ * patch_output). Returns its length, 0 when there is none this session, the
+ * id is neither, or it does not fit `cap`; *age_us (optional) = time since it
+ * was sent. Session thread only — the same single-writer state as the dedup
+ * cache. */
+size_t ctm_hid_io_last_delivered(const ctm_hid_io_t *io, uint8_t report_id,
+                                 uint8_t *buf, size_t cap, uint64_t *age_us);
+
+/* Drop the dedup cache, the last-delivered DS4 frames and zero the telemetry
+ * window. When: session start — a dedup match against the pre-reconnect frame
+ * would swallow the host's first rumble state of the new session, and a
+ * restated pre-reconnect DS4 frame would bring back its rumble. */
 void ctm_hid_io_session_reset(ctm_hid_io_t *io);
 
 /* One telemetry window's counters, for the PLC/60s line. */

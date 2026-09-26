@@ -38,6 +38,20 @@ struct ctm_hid_io {
 
     uint64_t audio_last_us;            /* last 0x36/0x39 write: gates rumble slotting */
 
+    /* The last DS4 effect report (0x11) and audio report (0x17) the device or
+     * its injector ACCEPTED this session, as sent (after patch_output), with
+     * the time. Read back via ctm_hid_io_last_delivered() by the DS4 settings
+     * push (restate the live motor/LED state instead of zeroes) and the
+     * session-end quiesce (continue the pad's 0x17 frame counter). Session
+     * thread only, like last31; cleared per session so nothing of a previous
+     * session — a motor value above all — can be restated into this one. */
+    uint8_t last11[80];
+    size_t last11_len;
+    uint64_t last11_us;
+    uint8_t last17[512];               /* DS4 0x17 is 462 B */
+    size_t last17_len;
+    uint64_t last17_us;
+
     /* Per-report-id output histogram + hidraw outcome counters (what actually
      * flows out), read and zeroed once per telemetry window.
      *
@@ -167,6 +181,8 @@ void ctm_hid_io_session_reset(ctm_hid_io_t *io)
     io->last31_len = 0;
     io->last31_ts_us = 0;
     io->audio_last_us = 0;
+    io->last11_len = 0;
+    io->last17_len = 0;
     /* Same read-and-zero the telemetry window uses; the values are discarded
      * because a new session starts a new window. */
     ctm_hid_io_stats_t discard;
@@ -186,6 +202,41 @@ void ctm_hid_io_stats_take(ctm_hid_io_t *io, ctm_hid_io_stats_t *out)
     out->hid_recovered = __atomic_exchange_n(&io->st_hid_recovered, 0ul, __ATOMIC_RELAXED);
     out->hid_dropped = __atomic_exchange_n(&io->st_hid_dropped, 0ul, __ATOMIC_RELAXED);
     out->dedup_skipped = __atomic_exchange_n(&io->st_dedup_skipped, 0ul, __ATOMIC_RELAXED);
+}
+
+/* Remember an accepted DS4 0x11/0x17 (see last11/last17). Any other id, or one
+ * too long for its buffer, is not a DS4 frame and is ignored. */
+static void note_delivered(ctm_hid_io_t *io, const uint8_t *rep, size_t len)
+{
+    if (rep[0] == 0x11 && len <= sizeof(io->last11)) {
+        memcpy(io->last11, rep, len);
+        io->last11_len = len;
+        io->last11_us = ctm_now_us();
+    } else if (rep[0] == 0x17 && len <= sizeof(io->last17)) {
+        memcpy(io->last17, rep, len);
+        io->last17_len = len;
+        io->last17_us = ctm_now_us();
+    }
+}
+
+size_t ctm_hid_io_last_delivered(const ctm_hid_io_t *io, uint8_t report_id,
+                                 uint8_t *buf, size_t cap, uint64_t *age_us)
+{
+    if (!io || !buf) return 0;
+    const uint8_t *src;
+    size_t len;
+    uint64_t at;
+    if (report_id == 0x11) {
+        src = io->last11; len = io->last11_len; at = io->last11_us;
+    } else if (report_id == 0x17) {
+        src = io->last17; len = io->last17_len; at = io->last17_us;
+    } else {
+        return 0;
+    }
+    if (len == 0 || len > cap) return 0;
+    memcpy(buf, src, len);
+    if (age_us) *age_us = ctm_now_us() - at;
+    return len;
 }
 
 int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
@@ -244,6 +295,7 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
     if (io->acl_tx && patched_len > 0 && ds5_acl_is_injectable(patched[0])) {
         int rc = ds5_acl_tx_send(io->acl_tx, patched, patched_len);
         if (rc == DS5_ACL_TX_SENT) {
+            note_delivered(io, patched, patched_len);
             ctm_ctl_note_output_report(io->owner);
             return 0;
         }
@@ -286,6 +338,7 @@ int ctm_hid_io_write(ctm_hid_io_t *io, const uint8_t *data, size_t len)
     pthread_mutex_unlock(&io->mutex);
     if (n == (ssize_t)patched_len) {
         __atomic_fetch_add(&io->st_hid_ok, 1ul, __ATOMIC_RELAXED);
+        note_delivered(io, patched, patched_len);
         ctm_ctl_note_output_report(io->owner);
         return 0;
     }

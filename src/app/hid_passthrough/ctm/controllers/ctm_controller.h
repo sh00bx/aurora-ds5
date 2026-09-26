@@ -199,6 +199,13 @@ uint32_t ctm_controller_adapt_latency_ms(ctm_controller_t *c);
 void ctm_controller_note_b_eff(ctm_controller_t *c, unsigned b_eff,
                                unsigned slider, unsigned adapt_add);
 void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out);
+/* The last DS4 report of this id (0x11 or 0x17) the pad accepted in the
+ * current session, after patch_output — see ctm_hid_io_last_delivered. Returns
+ * its length (0 = none this session); *age_us (optional) = time since. For the
+ * DS4 hooks that run on the session thread (build_settings_report,
+ * build_quiesce_reports); the state it reads is owned by that thread. */
+size_t ctm_controller_last_output(ctm_controller_t *c, uint8_t report_id,
+                                  uint8_t *buf, size_t cap, uint64_t *age_us);
 /* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
 bool ctm_controller_finished(ctm_controller_t *c);
 int  ctm_controller_write_feature(ctm_controller_t *c, const uint8_t *feature, size_t len);
