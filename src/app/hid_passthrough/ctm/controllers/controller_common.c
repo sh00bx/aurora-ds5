@@ -198,6 +198,12 @@ struct ctm_controller {
      * uses them — ctm_hid_io — at session start. */
     int hid_wait_ms;
     uint8_t dedup_report_id;
+    int acl_fifo_depth;            /* servo-host daemon FIFO depth (policy, 0 -> 10) */
+    int paced_keep;                /* stale-trim floor of the paced ring (policy, 0 -> 4) */
+    /* Paced reports the stale trim discarded this telemetry window. Session
+     * thread only (handle_message counts, the DS4/60s tick reads and zeroes);
+     * cleared per session. */
+    unsigned long st_paced_trim;
 
     int wake_pipe[2];
 
@@ -1306,12 +1312,16 @@ static void handle_message(ctm_controller_t *c, ctmb_host_config_t *host_cfg,
             /* Post-outage stale trim: after a long stall the burst of late
              * audio is history the pad already glitched through — playing it
              * all parks its length as PERMANENT extra speaker latency. Keep
-             * ~85ms (4 x 0x39) and drop the oldest, with the fill's counter
-             * anchor kept aligned (ds5_audio_note_dropped). */
-            while (ctm_paced_count(paced) > 4) {
+             * the type's floor (DS5 ~85ms = 4 x 0x39, DS4 96ms = 6 x 0x17;
+             * see ctm_pump_policy_t.paced_keep) and drop the oldest, with the
+             * fill's counter anchor kept aligned (ds5_audio_note_dropped).
+             * Counted: a trimmed report never reaches the pad, and nothing
+             * else in the stack would ever show that it was lost. */
+            while (ctm_paced_count(paced) > c->paced_keep) {
                 const ctm_queued_report_t *r = ctm_paced_peek(paced);
                 ds5_audio_note_dropped(&c->audio, r->data, r->len);
                 ctm_paced_pop(paced);
+                c->st_paced_trim++;
             }
         } else if (!c->acl_tx && payload && h->payload_len >= 8 &&
                    h->payload_len <= CTM_MAX_REPORT &&
@@ -1436,6 +1446,7 @@ static void session_state_reset(ctm_controller_t *c)
     /* Telemetry windows restart with the session so a 60 s line never mixes
      * two of them. */
     c->st_rumble_coal = 0;
+    c->st_paced_trim = 0;
     c->plc_log_next_us = 0;
     c->last_pace_log_us = 0;
     c->net_last_out_us = 0;
@@ -1897,12 +1908,13 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
     pump.paced = &paced;
     pump.host_cfg = &host_cfg;
     pump.fb_enabled = (host_cfg.reserved[0] & CTMB_HOSTCFG_PACE_FEEDBACK) != 0;
-    /* FIFO-depth gating: the deep (10) elastic FIFO is only safe under a
-     * rate-servo host — it is the servo that bounds the parked latency. A
-     * non-servo host (CTM, or a rolled-back Vibepollo) gets the shallow
+    /* FIFO-depth gating: the deep elastic FIFO (the type's depth: 10 for the
+     * DS5, 6 for the DS4 — see ctm_pump_policy_t.acl_fifo_depth) is only safe
+     * under a rate-servo host — it is the servo that bounds the parked latency.
+     * A non-servo host (CTM, or a rolled-back Vibepollo) gets the shallow
      * depth explicitly, so a previous session's override never lingers. */
     if (c->acl_tx) {
-        ds5_acl_tx_set_fifo_depth(c->acl_tx, pump.fb_enabled ? 10 : 3);
+        ds5_acl_tx_set_fifo_depth(c->acl_tx, pump.fb_enabled ? c->acl_fifo_depth : 3);
     }
 
     /* The periodic half of the pump, in the order it has always run. */
@@ -2050,6 +2062,11 @@ static void apply_pump_policy(ctm_controller_t *c)
 
     c->hid_wait_ms = p->hid_eagain_wait_ms;
     c->dedup_report_id = p->dedup_report_id;
+    /* 0 means "the DualSense's value" for these two, not "off": both are
+     * queue depths every type with paced audio needs, and a type added without
+     * them must get the measured defaults rather than an empty queue. */
+    c->acl_fifo_depth = p->acl_fifo_depth ? p->acl_fifo_depth : 10;
+    c->paced_keep = p->paced_keep ? p->paced_keep : 4;
     c->rumble_min_us = p->rumble_min_us;
     c->adapt_enabled = p->adaptive_latency ? 1 : 0;
     c->audio.plc_enabled = p->audio_plc ? 1 : 0;
@@ -2094,10 +2111,11 @@ static void apply_pump_policy(ctm_controller_t *c)
     if (!c->audio.plc_enabled) c->audio.plc_fill_enabled = 0;
 
     ctm_ctl_log(c, "pump policy: idle=%ums hidwait=%dms dedup=0x%02x rumble_min=%uus "
-               "plc=%d fill=%d(%uus) adapt=%d",
+               "plc=%d fill=%d(%uus) adapt=%d fifo=%d keep=%d",
             p->input_idle_timeout_ms, c->hid_wait_ms, c->dedup_report_id,
             c->rumble_min_us, c->audio.plc_enabled, c->audio.plc_fill_enabled,
-            c->audio.plc_fill_interval_us, c->adapt_enabled);
+            c->audio.plc_fill_interval_us, c->adapt_enabled,
+            c->acl_fifo_depth, c->paced_keep);
 }
 
 /* Session thread body: open HID + wake pipe once, then the dual-probe

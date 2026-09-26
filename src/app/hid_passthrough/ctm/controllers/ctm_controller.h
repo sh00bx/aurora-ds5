@@ -77,6 +77,18 @@ typedef struct {
     bool     audio_plc;
     bool     audio_plc_fill;
     bool     adaptive_latency;
+    /* Elastic audio-FIFO depth this type asks ds5_txd for under a rate-servo
+     * host (a non-servo host always gets the shallow 3). 0 = 10, the depth the
+     * DualSense was measured with. It is a count of REPORTS, so its meaning is
+     * the type's report period times this: the daemon ages frames out at
+     * 150 ms, and 10 of the DS4's 16 ms 0x17 (160 ms) shed audio in an
+     * ordinary congestion drain. */
+    uint8_t  acl_fifo_depth;
+    /* Paced output reports kept after the post-outage stale trim in
+     * handle_message. 0 = 4, sized for the DualSense (~85 ms of 0x39). Also a
+     * report count: 4 of the DS4's 0x17 are only 64 ms, less than one ordinary
+     * WiFi bunch, and every trimmed 0x17 is a counter gap the pad starves on. */
+    uint8_t  paced_keep;
 } ctm_pump_policy_t;
 
 typedef struct {

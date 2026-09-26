@@ -218,11 +218,20 @@ static void ds4_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
  * frames are deduped (games re-assert unchanged rumble/LED at report rate, and
  * every skipped write is BT airtime the 62.5/s audio stream needs). The DS5
  * concealment/rumble-slot machinery stays off: it parses 0x36/0x39 internals
- * that do not exist here. */
+ * that do not exist here.
+ *
+ * The two audio queues are sized in 0x17 reports (16 ms each), not copied
+ * from the DS5's 0x39 counts: a 6-deep daemon FIFO is 96 ms, inside ds5_txd's
+ * 150 ms age-out, where the DS5's 10 would be 160 ms and shed audio in an
+ * ordinary drain; and the paced ring keeps 6 reports (96 ms) after a WiFi
+ * bunch instead of 4 (64 ms), because every 0x17 it trims is a counter gap
+ * the pad's small cushion has to absorb. */
 static const ctm_pump_policy_t ds4_policy = {
     .input_idle_timeout_ms = 2000,
     .hid_eagain_wait_ms = 3,
     .dedup_report_id = 0x11,
+    .acl_fifo_depth = 6,
+    .paced_keep = 6,
 };
 
 const ctm_controller_ops_t ctm_controller_ds4_ops = {
