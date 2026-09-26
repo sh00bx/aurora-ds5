@@ -4,6 +4,7 @@
 
 #include "ctm/ctm_state.h"
 #include "ctm/ctm_settings.h"
+#include "hid_passthrough/hid_passthrough_manager.h"
 #include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #include "input/input_gamepad.h"
@@ -57,6 +58,18 @@ static app_input_t *model_app_input(const hid_pt_model_t *model)
     return input ? input->input : NULL;
 }
 
+/* Whether the CTM devices are listed at all. Only while this session runs HID
+ * passthrough: otherwise nothing can be mounted, and g_devices is whatever an
+ * earlier stream in this process left behind. The page then lists the SDL pads
+ * alone, for their SDL type. Without a session the devices are all there is. */
+static bool model_lists_devices(const hid_pt_model_t *model)
+{
+    if (!model || !model->session) {
+        return true;
+    }
+    return hid_passthrough_manager_active(session_get_hid_passthrough(model->session));
+}
+
 static void sdl_row_key(const app_gamepad_state_t *pad, char *out, size_t len)
 {
     char id[HID_PT_STABLE_ID_LEN];
@@ -87,7 +100,7 @@ static void row_key(const row_ref_t *ref, char *out, size_t len)
 static int collect_rows(const hid_pt_model_t *model, row_ref_t *out, int max)
 {
     int n = 0;
-    for (int i = 0; i < g_devices.count && n < max; ++i) {
+    for (int i = 0; model_lists_devices(model) && i < g_devices.count && n < max; ++i) {
         out[n].item = &g_devices.items[i];
         out[n].pad = NULL;
         n++;
@@ -293,9 +306,14 @@ uint64_t hid_pt_model_signature(const hid_pt_model_t *model)
 
 /* ---- status line -------------------------------------------------------- */
 
-void hid_pt_model_status_text(char *buf, size_t len)
+void hid_pt_model_status_text(const hid_pt_model_t *model, char *buf, size_t len)
 {
     if (!buf || len == 0) {
+        return;
+    }
+    if (!model_lists_devices(model)) {
+        const int rows = hid_pt_model_row_count(model);
+        snprintf(buf, len, "%d controller%s | HID passthrough off", rows, rows == 1 ? "" : "s");
         return;
     }
     snprintf(buf, len, "%d device%s | Windows %s",

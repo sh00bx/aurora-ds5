@@ -949,7 +949,7 @@ static void panel_update_status(hid_pt_panel_t *panel) {
         }
     }
     char status[128];
-    hid_pt_model_status_text(status, sizeof(status));
+    hid_pt_model_status_text(&panel->model, status, sizeof(status));
     lv_label_set_text(panel->view.status_label, status);
 }
 

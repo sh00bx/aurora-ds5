@@ -15,7 +15,8 @@
  * The list is every CTM device, then every SDL pad of the session that no CTM
  * device answers for (the agent is not running, or CTM does not list the pad),
  * so a controller's SDL type can always be changed. Such an SDL-only row is
- * keyed "sdl:<stable id>" and has no HID controls.
+ * keyed "sdl:<stable id>" and has no HID controls. A session that does not run
+ * HID passthrough lists its SDL pads alone.
  *
  * Everything here runs on the LVGL thread. That is not a property this module
  * enforces; it is the same contract root.c states for every other CTM caller,
@@ -111,7 +112,9 @@ uint64_t hid_pt_model_signature(const hid_pt_model_t *model);
 
 /* ---- status line -------------------------------------------------------- */
 
-void hid_pt_model_status_text(char *buf, size_t len);
+/** "N devices | Windows <host>", or -- HID passthrough off for this session,
+ * so only SDL pads are listed -- "N controllers | HID passthrough off". */
+void hid_pt_model_status_text(const hid_pt_model_t *model, char *buf, size_t len);
 
 /** The last plug error, or NULL. */
 const char *hid_pt_model_plug_error(void);

@@ -150,10 +150,12 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
                                           OVERLAY_SEAM);
 
 #if defined(TARGET_WEBOS)
-    if (app_configuration->hid_passthrough) {
-        controller->hid_devices_btn = command_button(controller, actions, locstr("Controllers"),
-                                                     OVERLAY_KEY_GREEN);
-    }
+    /* Always, not only with HID passthrough on: the page is also where a
+     * controller's SDL type is chosen, and that choice applies to every stream
+     * whatever the setting says. With passthrough off the page lists the SDL
+     * pads alone. */
+    controller->hid_devices_btn = command_button(controller, actions, locstr("Controllers"),
+                                                 OVERLAY_KEY_GREEN);
 #endif
 
     lv_obj_t *actions_spacing = lv_obj_create(actions);
