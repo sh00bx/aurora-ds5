@@ -2051,9 +2051,14 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
      * DS5, 6 for the DS4 — see ctm_pump_policy_t.acl_fifo_depth) is only safe
      * under a rate-servo host — it is the servo that bounds the parked latency.
      * A non-servo host (CTM, or a rolled-back Vibepollo) gets the shallow
-     * depth explicitly, so a previous session's override never lingers. */
+     * depth explicitly, so a previous session's override never lingers.
+     * The DS4 sets it for its own pad only: the global form is one depth for
+     * every link, and with a DualSense bridged at the same time whichever
+     * session started last would size the other pad's FIFO too. */
     if (c->acl_tx) {
-        ds5_acl_tx_set_fifo_depth(c->acl_tx, pump.fb_enabled ? c->acl_fifo_depth : 3);
+        int depth = pump.fb_enabled ? c->acl_fifo_depth : 3;
+        if (pump.ds4) ds5_acl_tx_set_link_fifo_depth(c->acl_tx, depth);
+        else ds5_acl_tx_set_fifo_depth(c->acl_tx, depth);
     }
 
     /* The periodic half of the pump, in the order it has always run. */

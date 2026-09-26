@@ -295,6 +295,16 @@ static const unsigned GAPGE_EDGE[GAPGE_N] =
 /* Deliberately not /tmp: this one must survive a reboot, unlike SCAN_OFF_MARKER
  * whose whole correctness depends on NOT surviving one. */
 #define IDLE_PERSIST_PATH "/var/lib/webosbrew/ds5_idle_sec"
+/* Code 0x07 = audio-FIFO depth for ONE pad, [A5][5C][07][addr 6 LSB-first]
+ * [depth] (depth 0..FIFO_MAX, 0xFF clears). Code 0x01 is one depth for every
+ * link, which was only right while every pad asked for the same one. Depth is
+ * a count of reports, so the DS4 (16 ms 0x17) asks for fewer than the
+ * DualSense (21 ms 0x39), and with both bridged at once whichever session
+ * started last set the depth for the other pad too. The DS4 sends this one;
+ * the DualSense keeps sending 0x01, so its path is unchanged. A daemon older
+ * than this code consumes the datagram as an unknown control and ignores it,
+ * leaving that pad on the global depth. See link_fifo_depth(). */
+#define ACL_CTRL_LINK_FIFO_DEPTH 0x07
 #define ACL_TAG_LEN         8
 
 struct sockaddr_hci { unsigned short hci_family, hci_dev, hci_channel; };
@@ -625,6 +635,52 @@ static int inject_fifo(void){
      * default; cleared on daemon restart and via 0xFF. */
     if(g_fifo_override>=0 && g_fifo_override<=FIFO_MAX) return g_fifo_override;
     return d;
+}
+
+/* Per-pad depth overrides (ACL_CTRL_LINK_FIFO_DEPTH), keyed by the address in
+ * the same LSB-first form as every tag, NOT by link slot: the app sends the
+ * depth at session start, often before the link is bound, and a slot can change
+ * hands between pads. Main thread only, like g_fifo_override: the control
+ * datagram, the inject path and the .st/status writers all run there. A full
+ * table recycles the entry set longest ago -- a pad that comes back re-sends
+ * its depth with its next session. Cleared on daemon restart. */
+#define LINK_FIFO_SLOTS 8
+static struct { uint8_t used, depth; uint8_t addr[6]; uint32_t stamp; }
+    g_link_fifo[LINK_FIFO_SLOTS];
+static uint32_t g_link_fifo_stamp;
+
+static void link_fifo_set(const uint8_t addr[6], int depth){
+    int slot=-1, freeslot=-1, oldest=0;
+    for(int i=0;i<LINK_FIFO_SLOTS;i++){
+        if(g_link_fifo[i].used && memcmp(g_link_fifo[i].addr,addr,6)==0){ slot=i; break; }
+        if(!g_link_fifo[i].used){ if(freeslot<0) freeslot=i; }
+        else if(g_link_fifo[i].stamp<g_link_fifo[oldest].stamp) oldest=i;   /* read only when full */
+    }
+    char mac[18];
+    snprintf(mac,sizeof mac,"%02x:%02x:%02x:%02x:%02x:%02x",addr[5],addr[4],addr[3],addr[2],addr[1],addr[0]);
+    if(depth<0){
+        if(slot>=0){
+            g_link_fifo[slot].used=0;
+            fprintf(stderr,"[txd] ctrl: audio-FIFO depth for %s cleared -> global\n",mac);
+        }
+        return;
+    }
+    if(slot>=0 && g_link_fifo[slot].depth==(uint8_t)depth){ g_link_fifo[slot].stamp=++g_link_fifo_stamp; return; }
+    if(slot<0) slot=freeslot>=0?freeslot:oldest;
+    g_link_fifo[slot].used=1;
+    g_link_fifo[slot].depth=(uint8_t)depth;
+    memcpy(g_link_fifo[slot].addr,addr,6);
+    g_link_fifo[slot].stamp=++g_link_fifo_stamp;
+    fprintf(stderr,"[txd] ctrl: audio-FIFO depth for %s -> %d\n",mac,depth);
+}
+
+/* The depth a report for `addr` may park in: that pad's own override if it
+ * sent one, else the global depth (inject_fifo) every pad used before. */
+static int link_fifo_depth(const uint8_t *addr, int global){
+    if(!addr) return global;
+    for(int i=0;i<LINK_FIFO_SLOTS;i++)
+        if(g_link_fifo[i].used && memcmp(g_link_fifo[i].addr,addr,6)==0) return g_link_fifo[i].depth;
+    return global;
 }
 
 /* ---- deterministic gap injector (bench instrument, 2026-08-15) ------------- *
@@ -4772,6 +4828,9 @@ int main(int argc,char**argv){
                             g_fifo_override=nv;
                             fprintf(stderr,"[txd] ctrl: audio-FIFO depth override -> %d\n",nv);
                         }
+                    } else if(rep[2]==ACL_CTRL_LINK_FIFO_DEPTH && n>=10){
+                        int nv=(rep[9]==0xFF)?-1:(int)rep[9];
+                        if(nv<=FIFO_MAX) link_fifo_set(&rep[3],nv);
                     } else if(rep[2]==ACL_CTRL_IDLE_LB && n>=6){
                         /* App SELECTION only — never touches g_idle_lb_boot, so the
                          * operator's DS5_IDLE_LIGHTBAR (incl. "off") survives any
@@ -4901,7 +4960,7 @@ int main(int argc,char**argv){
                         __atomic_store_n(&L->last_audio,dnow,__ATOMIC_RELAXED);
                     }
                 }
-                process_report(L,rawfd,report,rlen,link_nonce[idx],fdepth,maxq,expect,&injected,&dropped,&paced);
+                process_report(L,rawfd,report,rlen,link_nonce[idx],link_fifo_depth(expect,fdepth),maxq,expect,&injected,&dropped,&paced);
             }
         }
         if(now_ms()-last_log>10000){
@@ -4943,10 +5002,11 @@ int main(int argc,char**argv){
                  * DualSense segment stays byte-for-byte the old one. is_ds4 is a
                  * one-byte g_lock field read unlocked here like the rest of this
                  * line's snapshot-free reads; the counters are main-thread-owned. */
-                char fxs[80]; fxs[0]='\0';
+                char fxs[96]; fxs[0]='\0';
                 if(L->is_ds4)
-                    snprintf(fxs,sizeof fxs," fxcoal=%ld fxslot=%ld fxlost=%ld",
-                             L->fx_coal,L->fx_slot,L->fx_lost);
+                    snprintf(fxs,sizeof fxs," fxcoal=%ld fxslot=%ld fxlost=%ld fdepth=%d",
+                             L->fx_coal,L->fx_slot,L->fx_lost,
+                             link_fifo_depth(L->bound_addr,inject_fifo()));
                 lo+=snprintf(links+lo,sizeof links-lo,
                     " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld"
                     " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s%s%s",
@@ -5107,7 +5167,10 @@ int main(int argc,char**argv){
                 rec[0]='D';rec[1]='S';rec[2]='5';rec[3]='Q';
                 rec[4]=2; rec[5]=st[i].valid; rec[6]=st[i].q; rec[7]=st[i].fifo;
                 rec[8]=(uint8_t)(mq&0xff); rec[9]=(uint8_t)((mq>>8)&0xff);
-                rec[10]=(uint8_t)(fc_cap&0xff); rec[11]=(uint8_t)((fc_cap>>8)&0xff);
+                /* The cap THIS pad's reports park under (per-pad override,
+                 * else the global): the host servo reads it as this link's. */
+                int lcap=link_fifo_depth(st[i].addr,fc_cap);
+                rec[10]=(uint8_t)(lcap&0xff); rec[11]=(uint8_t)((lcap>>8)&0xff);
                 uint32_t v=st[i].inj;
                 rec[12]=v&0xff; rec[13]=(v>>8)&0xff; rec[14]=(v>>16)&0xff; rec[15]=(v>>24)&0xff;
                 v=st[i].drop;

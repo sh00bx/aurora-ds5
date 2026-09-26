@@ -39,6 +39,7 @@
 #define ACL_CTRL_PAD_ACTIVITY 0x04   /* [A5][5C][04][addr 6 LSB-first] */
 #define ACL_CTRL_PAD_IDLE_CLAIM 0x05 /* [A5][5C][05][addr 6 LSB-first], timer-neutral */
 #define ACL_CTRL_IDLE_TIMEOUT   0x06 /* [A5][5C][06][seconds LE16] */
+#define ACL_CTRL_LINK_FIFO_DEPTH 0x07 /* [A5][5C][07][addr 6 LSB-first][depth] */
 #define ACL_TAG_LEN     8
 
 struct ds5_acl_tx {
@@ -290,6 +291,28 @@ void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth)
     (void)sendto(t->unixfd, msg, sizeof msg, 0,
                  (struct sockaddr *)&t->daddr, sizeof t->daddr);
     acl_log(t, "ctrl: audio-FIFO depth -> %d", depth);
+}
+
+void ds5_acl_tx_set_link_fifo_depth(ds5_acl_tx_t *t, int depth)
+{
+    /* The same depth as above, for THIS pad only: the daemon keys it by the
+     * address every tagged report of this session carries, so another pad's
+     * session (a DualSense asking for 10) neither changes it nor is changed by
+     * it. An untagged (legacy single-pad) session has no address to key on and
+     * sends the global form, which is all a single pad needs. */
+    if (!t || t->unixfd < 0) {
+        return;
+    }
+    if (!t->tagged) {
+        ds5_acl_tx_set_fifo_depth(t, depth);
+        return;
+    }
+    uint8_t msg[3 + 6 + 1] = { ACL_TAG_M0, ACL_TAG_CTRL, ACL_CTRL_LINK_FIFO_DEPTH };
+    memcpy(msg + 3, t->tag + 2, 6);   /* same LSB-first address as every tag */
+    msg[9] = (depth < 0) ? 0xFF : (uint8_t)depth;
+    (void)sendto(t->unixfd, msg, sizeof msg, 0,
+                 (struct sockaddr *)&t->daddr, sizeof t->daddr);
+    acl_log(t, "ctrl: audio-FIFO depth for this pad -> %d", depth);
 }
 
 /* Both control datagrams are the same shape; only the code differs. */

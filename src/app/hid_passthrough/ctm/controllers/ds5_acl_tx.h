@@ -59,6 +59,12 @@ void ds5_acl_tx_stats(ds5_acl_tx_t *t, long *injected, long *dropped, int *ready
  * daemon side; -1 clears the override). Send 10 only when the host advertised
  * CTMB_HOSTCFG_PACE_FEEDBACK; the rate servo is what bounds the parked latency. */
 void ds5_acl_tx_set_fifo_depth(ds5_acl_tx_t *t, int depth);
+/* The same, for this session's pad only (daemon control 0x07, keyed by the
+ * pad's address): the global form above is one depth for every link, so two
+ * pad types that want different depths must not use it at once. Falls back to
+ * the global form on an untagged session. The DS4 uses this; the DualSense
+ * keeps the global form. */
+void ds5_acl_tx_set_link_fifo_depth(ds5_acl_tx_t *t, int depth);
 /* Tell the daemon a human just did something on this pad.
  *
  * The daemon disconnects a pad that has been idle for DS5_IDLE_DISCONNECT_MS so
