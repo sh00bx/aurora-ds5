@@ -758,7 +758,23 @@ static void update_mode_row(hid_pt_panel_t *panel)
             enabled |= 1u << i;
         }
     }
+    lv_obj_t *focused = panel->view.group ? lv_group_get_focused(panel->view.group) : NULL;
     hid_pt_view_set_modes(&panel->view, show, show ? lit_mode(&info) : -1, enabled);
+    /* The cursor must never stay on a button this just disabled or hid: LVGL
+     * hands a disabled focused object no key at all -- no arrow, no OK, not even
+     * BACK -- so the page would be stuck on it. The row's entry (the lit button,
+     * else the first enabled) when the row is still up, else the next setting,
+     * else the device's own row. */
+    if (hid_pt_view_mode_of(&panel->view, focused) >= 0 &&
+        !hid_pt_view_obj_is_focusable(&panel->view, focused)) {
+        lv_obj_t *to = hid_pt_view_first_option(&panel->view);
+        if (to) {
+            panel_focus(panel, to);
+        } else if (hid_pt_view_has_row(&panel->view, panel->selected_index)) {
+            hid_pt_view_focus_row(&panel->view, panel->selected_index);
+            panel_update_hints(panel, panel->view.row_buttons[panel->selected_index]);
+        }
+    }
 }
 
 static void update_device_options(hid_pt_panel_t *panel)
@@ -863,6 +879,10 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
                 hid_pt_model_set_composite(&panel->model,
                                            lv_obj_has_state(panel->view.composite_cb, LV_STATE_CHECKED));
             }
+            /* Composite decides whether the bridge can mount a Flydigi at all,
+             * so it enables or disables the HID button -- now, not on the next
+             * 2 s refresh. */
+            update_mode_row(panel);
             return;
         case HID_PT_CTL_AUTO_PLUGIN:
             if (panel->view.auto_plugin_cb) {
