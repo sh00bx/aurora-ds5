@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 /**
  * Which controller type the host is asked to emulate for a pad that reaches it
  * over SDL (the Moonlight gamepad path), as chosen per controller on the
@@ -22,3 +24,18 @@ typedef enum {
 } gamepad_type_pref_t;
 
 #define GAMEPAD_TYPE_PREF_COUNT 3
+
+/**
+ * The pad the host builds for one announced with @p pref: the choice itself, or
+ * for AUTO what it makes of the type SDL detected -- a DualShock 4 for a
+ * PlayStation pad and an Xbox 360 for everything else, the only two virtual
+ * pads it can create. Never AUTO: this is what the Controllers page lights and
+ * what the overlay's badge names.
+ */
+static inline gamepad_type_pref_t gamepad_type_pref_effective(gamepad_type_pref_t pref, bool detected_playstation)
+{
+    if (pref == GAMEPAD_TYPE_PREF_XBOX || pref == GAMEPAD_TYPE_PREF_PLAYSTATION) {
+        return pref;
+    }
+    return detected_playstation ? GAMEPAD_TYPE_PREF_PLAYSTATION : GAMEPAD_TYPE_PREF_XBOX;
+}

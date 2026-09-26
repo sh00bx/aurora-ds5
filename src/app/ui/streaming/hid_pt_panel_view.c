@@ -3,10 +3,11 @@
 #include "hid_pt_panel_view.h"
 #include "overlay_style.h"
 
+#include "util/font.h"
+#include "lvgl/theme/lv_theme_moonlight.h"
 #include "util/i18n.h"
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 /* The sheet's grid. Every actionable row is the same height and puts its control
@@ -31,6 +32,8 @@
 /* The dropdown spans the track and the number together, so its left edge lands
  * on the same axis every slider starts at. LV_DPX(6) is slab_body()'s gap. */
 #define GUTTER_W       (SLIDER_W + LV_DPX(6) + VALUE_W)
+/* A mode button: the large icon over its one-word name. */
+#define MODE_BTN_H     LV_DPX(44)
 
 /* ---- event trampolines --------------------------------------------------
  *
@@ -104,6 +107,14 @@ static void row_clicked_cb(lv_event_t *event)
     hid_pt_view_t *view = lv_event_get_user_data(event);
     if (view && view->cbs.row_clicked) {
         view->cbs.row_clicked(view->cbs.userdata, row_of(lv_event_get_current_target(event)));
+    }
+}
+
+static void mode_clicked_cb(lv_event_t *event)
+{
+    hid_pt_view_t *view = lv_event_get_user_data(event);
+    if (view && view->cbs.mode_clicked) {
+        view->cbs.mode_clicked(view->cbs.userdata, row_of(lv_event_get_current_target(event)));
     }
 }
 
@@ -390,28 +401,51 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
-#define OPTION_CHAIN_LEN 11
+#define OPTION_CHAIN_LEN 10
+
+/**
+ * Where the cursor enters the mode row: the lit button, else the first enabled
+ * one, else NULL. The row is one stop of the column for UP/DOWN; LEFT/RIGHT
+ * walk it (hid_pt_view_step_mode()).
+ */
+static lv_obj_t *mode_entry(const hid_pt_view_t *view)
+{
+    lv_obj_t *first = NULL;
+    for (int i = 0; i < view->mode_count; ++i) {
+        lv_obj_t *btn = view->mode_btns[i];
+        if (!btn || lv_obj_has_state(btn, LV_STATE_DISABLED)) {
+            continue;
+        }
+        if (lv_obj_has_state(btn, LV_STATE_CHECKED)) {
+            return btn;
+        }
+        if (!first) {
+            first = btn;
+        }
+    }
+    return first;
+}
 
 /**
  * The option column, top to bottom, into @p out.
  *
  * One list, used for the focus group's order and for stepping the cursor, so the
  * two can't disagree. Entries that are hidden for the selected device are
- * skipped by the stepper, not removed from here.
+ * skipped by the stepper, not removed from here. The mode row is one entry,
+ * the button the cursor enters it on.
  */
 static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_LEN])
 {
-    out[0] = view->connection_dropdown;
-    out[1] = view->sdl_type_dropdown;
-    out[2] = view->auto_plugin_cb;
-    out[3] = view->composite_cb;
-    out[4] = view->audio_dropdown;
-    out[5] = view->speaker_slider;
-    out[6] = view->headset_slider;
-    out[7] = view->haptics_slider;
-    out[8] = view->trigger_slider;
-    out[9] = view->latency_slider;
-    out[10] = view->reset_settings_btn;
+    out[0] = mode_entry(view);
+    out[1] = view->auto_plugin_cb;
+    out[2] = view->composite_cb;
+    out[3] = view->audio_dropdown;
+    out[4] = view->speaker_slider;
+    out[5] = view->headset_slider;
+    out[6] = view->haptics_slider;
+    out[7] = view->trigger_slider;
+    out[8] = view->latency_slider;
+    out[9] = view->reset_settings_btn;
 }
 
 /**
@@ -439,9 +473,13 @@ void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
             lv_group_add_obj(view->group, view->row_buttons[i]);
         }
     }
+    /* The whole mode row, in place of the one button the chain names for it. */
+    for (int i = 0; i < view->mode_count; ++i) {
+        group_add(view, view->mode_btns[i]);
+    }
     lv_obj_t *chain[OPTION_CHAIN_LEN];
     option_chain(view, chain);
-    for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
+    for (size_t i = 1; i < OPTION_CHAIN_LEN; ++i) {
         group_add(view, chain[i]);
     }
     group_add(view, view->refresh_btn);
@@ -462,6 +500,9 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
     if (hid_pt_view_row_of(view, obj) >= 0) {
         return HID_PT_WK_ROW;
     }
+    if (hid_pt_view_mode_of(view, obj) >= 0) {
+        return HID_PT_WK_MODE_BTN;
+    }
     const struct {
         lv_obj_t *const *slot;
         hid_pt_widget_kind_t kind;
@@ -474,8 +515,6 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
             {&view->haptics_slider,     HID_PT_WK_SLIDER},
             {&view->trigger_slider,     HID_PT_WK_SLIDER},
             {&view->audio_dropdown,     HID_PT_WK_DROPDOWN},
-            {&view->connection_dropdown, HID_PT_WK_DROPDOWN},
-            {&view->sdl_type_dropdown,  HID_PT_WK_DROPDOWN},
             {&view->reset_settings_btn, HID_PT_WK_OPTION_BTN},
             {&view->refresh_btn,        HID_PT_WK_HEADER_BTN},
             {&view->close_btn,          HID_PT_WK_HEADER_BTN},
@@ -550,11 +589,16 @@ lv_obj_t *hid_pt_view_first_option(const hid_pt_view_t *view)
     lv_obj_t *chain[OPTION_CHAIN_LEN];
     option_chain(view, chain);
     for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
-        if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
+        if (chain[i] && hid_pt_view_obj_is_focusable(view, chain[i])) {
             return chain[i];
         }
     }
     return NULL;
+}
+
+bool hid_pt_view_obj_is_focusable(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    return obj && !hid_pt_view_obj_is_hidden(view, obj) && !lv_obj_has_state(obj, LV_STATE_DISABLED);
 }
 
 lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int step)
@@ -564,18 +608,18 @@ lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int
     }
     lv_obj_t *chain[OPTION_CHAIN_LEN];
     option_chain(view, chain);
-    int at = -1;
-    for (size_t i = 0; i < OPTION_CHAIN_LEN; ++i) {
+    /* Any button of the mode row stands where the row's entry does. */
+    int at = hid_pt_view_mode_of(view, from) >= 0 ? 0 : -1;
+    for (size_t i = 0; i < OPTION_CHAIN_LEN && at < 0; ++i) {
         if (chain[i] == from) {
             at = (int) i;
-            break;
         }
     }
     if (at < 0) {
         return NULL;
     }
     for (int i = at + step; i >= 0 && i < OPTION_CHAIN_LEN; i += step) {
-        if (chain[i] && !hid_pt_view_obj_is_hidden(view, chain[i])) {
+        if (chain[i] && hid_pt_view_obj_is_focusable(view, chain[i])) {
             return chain[i];
         }
     }
@@ -599,11 +643,6 @@ void hid_pt_view_forget_dropdown(hid_pt_view_t *view)
     }
     view->active_dropdown = NULL;
     lv_group_set_editing(view->group, false);
-}
-
-bool hid_pt_view_dropdown_confirms_only(const hid_pt_view_t *view, lv_obj_t *obj)
-{
-    return view && obj && (obj == view->connection_dropdown || obj == view->sdl_type_dropdown);
 }
 
 /**
@@ -641,25 +680,116 @@ static void dropdown_state_sync_cb(lv_event_t *event)
     }
 }
 
-void hid_pt_view_set_sdl_type_auto_label(hid_pt_view_t *view, const char *auto_label)
+/* ---- the mode row -------------------------------------------------------- */
+
+/* Flag writes invalidate and re-lay the column even when nothing changes, and
+ * this runs on the panel's 2 s refresh -- see show_row() in the panel. */
+static void show_obj(lv_obj_t *obj, bool show)
 {
-    if (!view || !view->sdl_type_dropdown || !auto_label) {
+    if (!obj || show != lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
-    lv_obj_t *dd = view->sdl_type_dropdown;
-    if (lv_dropdown_is_open(dd)) {
+    if (show) {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void set_obj_state(lv_obj_t *obj, lv_state_t state, bool on)
+{
+    if (on) {
+        lv_obj_add_state(obj, state);
+    } else {
+        lv_obj_clear_state(obj, state);
+    }
+}
+
+/**
+ * The slab every other control is, split across the column instead of spanning
+ * it, so the cursor lights it exactly the same way. Lit is a fill, not a hue on
+ * the rail: the bridge's teal for HID, the plain white wash for an SDL type --
+ * the two looks the overlay's pad badge wears for the same two cases.
+ *
+ * Not LV_OBJ_FLAG_CHECKABLE: LVGL would toggle that state on its own on the
+ * arrow keys, and a mode is only ever chosen by OK.
+ */
+lv_obj_t *hid_pt_view_add_mode(hid_pt_view_t *view, const char *glyph, const char *label, bool live)
+{
+    if (!view || !view->mode_row || view->mode_count >= HID_PT_MAX_MODES) {
+        return NULL;
+    }
+    const int index = view->mode_count;
+    lv_obj_t *btn = lv_btn_create(view->mode_row);
+    slab_style(btn, LV_PCT(100));
+    lv_obj_set_flex_grow(btn, 1);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    const lv_color_t fill = lv_color_hex(live ? OVERLAY_LIVE : OVERLAY_CHALK);
+    const lv_opa_t fill_opa = live ? LV_OPA_60 : LV_OPA_20;
+    /* Twice: with the cursor on it too, or the focus plate (FOCUS_KEY outranks
+     * CHECKED) would hide which mode is lit. The border and the bloom stay the
+     * focus look's. */
+    lv_obj_set_style_bg_color(btn, fill, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(btn, fill_opa, LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(btn, fill, LV_STATE_CHECKED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_bg_opa(btn, fill_opa, LV_STATE_CHECKED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, fill, LV_STATE_CHECKED);
+    lv_obj_set_style_opa(btn, LV_OPA_40, LV_STATE_DISABLED);
+
+    lv_obj_t *icon = lv_label_create(btn);
+    lv_obj_set_style_text_font(icon, lv_theme_moonlight_get_iconfont_large(btn), 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_label_set_text(icon, glyph ? glyph : "");
+    eyebrow(btn, label, OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+
+    lv_obj_set_user_data(btn, (void *) (intptr_t) index);
+    lv_obj_add_event_cb(btn, mode_clicked_cb, LV_EVENT_CLICKED, view);
+    lv_obj_add_event_cb(btn, key_cb, LV_EVENT_KEY, view);
+    view->mode_btns[index] = btn;
+    view->mode_count++;
+    return btn;
+}
+
+void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, int lit, unsigned enabled)
+{
+    if (!view || !view->mode_row) {
         return;
     }
-    char options[160];
-    snprintf(options, sizeof(options), "%s\n%s\n%s", auto_label, locstr("Xbox 360"),
-             locstr("PlayStation (DualShock 4)"));
-    const char *current = lv_dropdown_get_options(dd);
-    if (current && strcmp(current, options) == 0) {
-        return;
+    for (int i = 0; i < view->mode_count; ++i) {
+        set_obj_state(view->mode_btns[i], LV_STATE_CHECKED, i == lit);
+        set_obj_state(view->mode_btns[i], LV_STATE_DISABLED, (enabled & (1u << i)) == 0);
     }
-    const uint16_t sel = lv_dropdown_get_selected(dd);
-    lv_dropdown_set_options(dd, options);
-    lv_dropdown_set_selected(dd, sel);
+    show_obj(view->mode_heading, show);
+    show_obj(view->mode_row, show);
+}
+
+int hid_pt_view_mode_of(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    if (!view || !obj) {
+        return -1;
+    }
+    for (int i = 0; i < view->mode_count; ++i) {
+        if (view->mode_btns[i] == obj) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+lv_obj_t *hid_pt_view_step_mode(const hid_pt_view_t *view, lv_obj_t *from, int dir)
+{
+    const int at = hid_pt_view_mode_of(view, from);
+    if (at < 0 || dir == 0) {
+        return NULL;
+    }
+    for (int i = at + dir; i >= 0 && i < view->mode_count; i += dir) {
+        if (hid_pt_view_obj_is_focusable(view, view->mode_btns[i])) {
+            return view->mode_btns[i];
+        }
+    }
+    return NULL;
 }
 
 /* ---- the option column's labels ----------------------------------------- */
@@ -783,8 +913,8 @@ void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged
         case HID_PT_ZONE_OPTIONS:
             text = locstr("UP/DOWN  setting        LEFT/RIGHT  adjust        BACK  devices");
             break;
-        case HID_PT_ZONE_PICKER:
-            text = locstr("UP/DOWN  setting        OK  choose        LEFT/BACK  devices");
+        case HID_PT_ZONE_MODE:
+            text = locstr("LEFT/RIGHT  mode        OK  select        BACK  devices");
             break;
         case HID_PT_ZONE_HEADER:
             text = locstr("LEFT/RIGHT  choose        OK  run        BACK  close");
@@ -1188,22 +1318,19 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_bottom(view->customize_state, LV_DPX(4), 0);
 
     /* How the controller reaches the host, first: it decides which of the rows
-     * below mean anything at all. */
+     * below mean anything at all. The panel fills the row with its buttons. */
     view->mode_heading = eyebrow(right_pane, locstr("MODE"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
     lv_obj_set_style_pad_left(view->mode_heading, LV_DPX(3), 0);
     lv_obj_add_flag(view->mode_heading, LV_OBJ_FLAG_HIDDEN);
-    view->connection_row = dropdown_row(view, right_pane, locstr("Connection"),
-                                        locstr("HID passthrough (native)\nSDL (emulated)"),
-                                        HID_PT_CTL_CONNECTION, &view->connection_dropdown);
-    lv_obj_add_flag(view->connection_row, LV_OBJ_FLAG_HIDDEN);
-    view->sdl_type_row = dropdown_row(view, right_pane, locstr("SDL controller type"),
-                                      locstr("Automatic\nXbox 360\nPlayStation (DualShock 4)"),
-                                      HID_PT_CTL_SDL_TYPE, &view->sdl_type_dropdown);
-    lv_obj_add_flag(view->sdl_type_row, LV_OBJ_FLAG_HIDDEN);
-    view->sdl_type_caption = caption(right_pane);
-    lv_label_set_text(view->sdl_type_caption, locstr("Applies when the controller runs over SDL"));
+    view->mode_row = lv_obj_create(right_pane);
+    lv_obj_remove_style_all(view->mode_row);
+    lv_obj_set_size(view->mode_row, LV_PCT(100), MODE_BTN_H);
+    lv_obj_set_flex_flow(view->mode_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_gap(view->mode_row, ROW_GAP, 0);
+    lv_obj_clear_flag(view->mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_HIDDEN);
 
-    view->auto_plugin_row = switch_row(view, right_pane, locstr("Start in HID mode automatically"),
+    view->auto_plugin_row = switch_row(view, right_pane, locstr("Auto-plug on next stream"),
                                        HID_PT_CTL_AUTO_PLUGIN, &view->auto_plugin_cb);
     view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
                                      HID_PT_CTL_COMPOSITE, &view->composite_cb);

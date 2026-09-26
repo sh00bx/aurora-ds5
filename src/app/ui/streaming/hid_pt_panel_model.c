@@ -178,11 +178,39 @@ static gamepad_type_pref_t row_sdl_type(const hid_pt_model_t *model, const row_r
     return ref->item ? hid_pt_prefs_sdl_type_for_logical(ref->item) : GAMEPAD_TYPE_PREF_AUTO;
 }
 
+/* Not the plain "hid" fallback kind: a pad the bridge can mount. */
+static bool item_is_bridgeable(const logical_device_t *item)
+{
+    const char *kind = item ? bridge_kind_for_item(item) : NULL;
+    return kind && strcmp(kind, "hid") != 0;
+}
+
+/* Whether the row is a PlayStation pad, which the host builds as a DualShock 4
+ * when the type is left on AUTO. The family SDL reports when a pad of the
+ * session is this row -- the same test the arrival path makes -- else what CTM
+ * classified the device as. */
+static bool row_detected_playstation(const row_ref_t *ref)
+{
+    if (ref->pad) {
+        switch (SDL_GameControllerGetType(ref->pad->controller)) {
+            case SDL_CONTROLLER_TYPE_PS3:
+            case SDL_CONTROLLER_TYPE_PS4:
+            case SDL_CONTROLLER_TYPE_PS5:
+                return true;
+            default:
+                return false;
+        }
+    }
+    const char *kind = ref->item ? bridge_kind_for_item(ref->item) : NULL;
+    return kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0);
+}
+
 static void fill_row_info(const hid_pt_model_t *model, const row_ref_t *ref, hid_pt_row_info_t *out)
 {
     row_key(ref, out->key, sizeof(out->key));
     out->has_sdl_pad = ref->pad != NULL;
-    out->sdl_type = row_sdl_type(model, ref);
+    out->is_gamepad = ref->pad != NULL || item_is_bridgeable(ref->item);
+    out->effective_type = gamepad_type_pref_effective(row_sdl_type(model, ref), row_detected_playstation(ref));
     if (!ref->item) {
         const char *name = SDL_GameControllerName(ref->pad->controller);
         snprintf(out->label, sizeof(out->label), "%s", name ? name : locstr("Controller"));
@@ -280,13 +308,14 @@ uint64_t hid_pt_model_signature(const hid_pt_model_t *model)
     SIG_MIX(&count, sizeof(count));
     for (int i = 0; i < count; ++i) {
         /* Everything the row draws: its key, and the state line built from
-         * plugged, SDL presence and SDL type -- a type change has to repaint
-         * "SDL · XBOX" without waiting for an unrelated device event. */
+         * plugged, SDL presence and the type the host builds -- a type change
+         * has to repaint "X360" as "DS4" without waiting for an unrelated
+         * device event. */
         hid_pt_row_info_t info;
         fill_row_info(model, &rows[i], &info);
         unsigned char st = (unsigned char) (info.plugged ? 1 : 0);
-        unsigned char pad = (unsigned char) (info.has_sdl_pad ? 1 : 0);
-        unsigned char type = (unsigned char) info.sdl_type;
+        unsigned char pad = (unsigned char) ((info.has_sdl_pad ? 1 : 0) | (info.is_gamepad ? 2 : 0));
+        unsigned char type = (unsigned char) info.effective_type;
         /* The row label carries the " [A]" marker, so auto_plugin belongs in the
          * signature: without it, ticking the checkbox left the marker stale until
          * some unrelated device event happened to change the hash. The label is
@@ -386,8 +415,7 @@ bool hid_pt_model_selected_is_plugged(const hid_pt_model_t *model)
 
 bool hid_pt_model_selected_is_bridgeable(const hid_pt_model_t *model)
 {
-    const char *kind = selected_kind(model);
-    return kind && strcmp(kind, "hid") != 0;
+    return item_is_bridgeable(selected_item(model));
 }
 
 bool hid_pt_model_selected_is_flydigi(const hid_pt_model_t *model)
@@ -432,42 +460,6 @@ bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model)
 {
     row_ref_t ref;
     return selected_row(model, &ref) && !ref.item;
-}
-
-bool hid_pt_model_selected_is_gamepad(const hid_pt_model_t *model)
-{
-    row_ref_t ref;
-    if (!selected_row(model, &ref)) {
-        return false;
-    }
-    return ref.pad != NULL || hid_pt_model_selected_is_bridgeable(model);
-}
-
-const char *hid_pt_model_selected_detected_family(const hid_pt_model_t *model)
-{
-    row_ref_t ref;
-    if (!selected_row(model, &ref) || !ref.pad) {
-        return NULL;
-    }
-    /* The same families the arrival path tells apart. */
-    switch (SDL_GameControllerGetType(ref.pad->controller)) {
-        case SDL_CONTROLLER_TYPE_PS3:
-        case SDL_CONTROLLER_TYPE_PS4:
-        case SDL_CONTROLLER_TYPE_PS5:
-            return locstr("PlayStation");
-        case SDL_CONTROLLER_TYPE_XBOX360:
-        case SDL_CONTROLLER_TYPE_XBOXONE:
-            return locstr("Xbox");
-#if SDL_VERSION_ATLEAST(2, 24, 0)
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-#endif
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
-            return locstr("Nintendo");
-        default:
-            return locstr("Generic");
-    }
 }
 
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model)
@@ -635,8 +627,8 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
         commons_log_info("HID-PT", "SDL controller type for %s set to %s", name, sdl_type_log_name(type));
     } else {
         /* Same place and wording pattern as a failed auto-plug save: the
-         * dropdown reads its value back from the store, so without this line
-         * the choice would just silently snap back. */
+         * mode row lights what the store holds, so without this line the
+         * press would just silently not take. */
         ctm_set_plug_error("SDL controller type for %s could not be saved", name);
     }
 

@@ -44,8 +44,13 @@ typedef struct {
     bool plugged;
     /* An SDL pad of the session is this row. Always true for an SDL-only row. */
     bool has_sdl_pad;
-    /* The type this row's pad is (or will be) announced with over SDL. */
-    gamepad_type_pref_t sdl_type;
+    /* A controller: an SDL pad is this row, or the device is a pad the bridge
+     * can mount. Only these have a mode; anything else is a plain HID device. */
+    bool is_gamepad;
+    /* The pad the host builds for this row over SDL, now or at its next
+     * arrival: the stored type, AUTO resolved (gamepad_type_pref_effective()).
+     * XBOX or PLAYSTATION, never AUTO. Meaningless when !is_gamepad. */
+    gamepad_type_pref_t effective_type;
 } hid_pt_row_info_t;
 
 /**
@@ -105,8 +110,8 @@ bool hid_pt_model_row_info(const hid_pt_model_t *model, int index, hid_pt_row_in
 
 /**
  * A hash over the part of the model the device list draws: the count, and each
- * row's key, plugged state, auto-plug flag, SDL presence and SDL type. The
- * panel re-renders when it changes.
+ * row's key, plugged state, auto-plug flag, SDL presence and the type the host
+ * builds for it. The panel re-renders when it changes.
  */
 uint64_t hid_pt_model_signature(const hid_pt_model_t *model);
 
@@ -148,18 +153,6 @@ bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info
 
 /** An SDL pad with no CTM device behind it: no HID controls at all. */
 bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model);
-
-/**
- * A controller whose SDL type means something: an SDL pad is this row, or the
- * device is a bridgeable pad kind (it runs over SDL whenever it is not mounted).
- */
-bool hid_pt_model_selected_is_gamepad(const hid_pt_model_t *model);
-
-/**
- * The family SDL detects for the selection's pad, translated ("PlayStation",
- * "Xbox", "Nintendo", "Generic"), or NULL when no SDL pad is this row.
- */
-const char *hid_pt_model_selected_detected_family(const hid_pt_model_t *model);
 
 /** default_settings_for_item()'s latency for the selection, or 60 with none. */
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model);

@@ -17,6 +17,10 @@
 
 #define HID_PT_MAX_ROWS 64
 
+/* Buttons the mode row can hold: HID, and one per controller type the host can
+ * emulate over SDL. The panel supplies them (hid_pt_view_add_mode()). */
+#define HID_PT_MAX_MODES 4
+
 #define DS_LATENCY_MIN 0
 #define DS_LATENCY_MAX 200
 #define DS_VOLUME_MAX 100
@@ -25,11 +29,7 @@
 
 /** The controls the option column carries, in focus order. */
 typedef enum {
-    /** HID passthrough or SDL: the plug toggle, as a dropdown. */
-    HID_PT_CTL_CONNECTION = 0,
-    /** The type the host emulates while the pad runs over SDL. */
-    HID_PT_CTL_SDL_TYPE,
-    HID_PT_CTL_COMPOSITE,
+    HID_PT_CTL_COMPOSITE = 0,
     HID_PT_CTL_AUTO_PLUGIN,
     HID_PT_CTL_LATENCY,
     HID_PT_CTL_AUDIO_MODE,
@@ -59,6 +59,8 @@ typedef enum {
     HID_PT_WK_SLIDER,
     HID_PT_WK_DROPDOWN,
     HID_PT_WK_OPTION_BTN,
+    /** A button of the mode row: LEFT/RIGHT walk the row, OK selects. */
+    HID_PT_WK_MODE_BTN,
 } hid_pt_widget_kind_t;
 
 static inline bool hid_pt_view_kind_is_option(hid_pt_widget_kind_t kind)
@@ -81,10 +83,9 @@ typedef enum {
     /** Not a place on the sheet: a dropdown's list is up and owns the keys,
      * and the footer should say what they do there. */
     HID_PT_ZONE_DROPDOWN,
-    /** Not a place either: the cursor is on a closed dropdown of the options
-     * column that changes only through its list (see
-     * hid_pt_view_dropdown_confirms_only()), so LEFT/RIGHT adjust nothing. */
-    HID_PT_ZONE_PICKER,
+    /** Not a place either: the cursor is on the mode row of the options
+     * column, where LEFT/RIGHT pick a button rather than adjust a value. */
+    HID_PT_ZONE_MODE,
 } hid_pt_zone_t;
 
 typedef struct {
@@ -95,6 +96,8 @@ typedef struct {
     void (*clicked)(void *userdata, hid_pt_ctl_t id);
     /** A device row was activated — by OK, or by a click. */
     void (*row_clicked)(void *userdata, int row);
+    /** Mode button @p mode (the order of hid_pt_view_add_mode()) was pressed. */
+    void (*mode_clicked)(void *userdata, int mode);
     void (*row_focused)(void *userdata, int row);
     /** LV_EVENT_KEY on any control, and on the sheet itself. */
     void (*key)(void *userdata, lv_event_t *event);
@@ -115,11 +118,9 @@ typedef struct {
     lv_obj_t *error_row;
     lv_obj_t *list;
     lv_obj_t *mode_heading;
-    lv_obj_t *connection_row;
-    lv_obj_t *connection_dropdown;
-    lv_obj_t *sdl_type_row;
-    lv_obj_t *sdl_type_dropdown;
-    lv_obj_t *sdl_type_caption;
+    lv_obj_t *mode_row;
+    lv_obj_t *mode_btns[HID_PT_MAX_MODES];
+    int mode_count;
     lv_obj_t *composite_row;
     lv_obj_t *composite_cb;
     lv_obj_t *auto_plugin_row;
@@ -233,7 +234,8 @@ void hid_pt_view_focus_row(hid_pt_view_t *view, int row);
 
 /**
  * The option control the cursor should land on when it enters the settings
- * column, or NULL when the column is empty for this device.
+ * column, or NULL when the column is empty for this device. With the mode row
+ * up that is its lit button, or its first enabled one.
  */
 lv_obj_t *hid_pt_view_first_option(const hid_pt_view_t *view);
 
@@ -260,15 +262,6 @@ bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target);
  * notion of "a list is up" has to go. */
 void hid_pt_view_forget_dropdown(hid_pt_view_t *view);
 
-/**
- * True for the dropdowns whose value is only ever committed by OK on their open
- * list: Connection and SDL controller type. Each change of theirs plugs a
- * controller in or out, or replaces the host's pad, so LEFT/RIGHT must not step
- * them the way they step the audio dropdown -- LEFT leaves for the device list
- * as it does on a switch.
- */
-bool hid_pt_view_dropdown_confirms_only(const hid_pt_view_t *view, lv_obj_t *obj);
-
 /* ---- the option column's labels ----------------------------------------- */
 
 /** @p default_ms is named in the row's label; the panel supplies it. */
@@ -288,11 +281,32 @@ void hid_pt_view_update_trigger_label(hid_pt_view_t *view);
  */
 bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir);
 
+/* ---- the mode row -------------------------------------------------------- */
+
 /**
- * Name the SDL type dropdown's first entry, e.g. "Automatic (PlayStation)".
- *
- * Rewrites the options only when the text changes and never while the list is
- * up, keeping the selected index -- setting options resets a dropdown's
- * selection, and this runs on every 2 s refresh.
+ * Append a button to the mode row: @p glyph in the icon font above @p label.
+ * @p live lights it in the bridge's teal rather than the plain selected fill.
+ * Call after hid_pt_view_create(), in the order the buttons read left to right;
+ * that order is the index hid_pt_view_cbs_t::mode_clicked reports. Returns the
+ * button, or NULL once HID_PT_MAX_MODES are there.
  */
-void hid_pt_view_set_sdl_type_auto_label(hid_pt_view_t *view, const char *auto_label);
+lv_obj_t *hid_pt_view_add_mode(hid_pt_view_t *view, const char *glyph, const char *label, bool live);
+
+/**
+ * Show the mode row (with its heading) or hide it, light button @p lit (-1:
+ * none) and enable exactly the buttons whose bit is set in @p enabled. A
+ * disabled button is dimmed, takes no click, and the cursor passes it by.
+ */
+void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, int lit, unsigned enabled);
+
+/** The mode button @p obj is, or -1. */
+int hid_pt_view_mode_of(const hid_pt_view_t *view, lv_obj_t *obj);
+
+/** The next enabled mode button from @p from in direction @p dir, or NULL. */
+lv_obj_t *hid_pt_view_step_mode(const hid_pt_view_t *view, lv_obj_t *from, int dir);
+
+/**
+ * Whether the cursor may rest on @p obj: not under a hidden ancestor, and not
+ * disabled (a mode button the selection cannot use).
+ */
+bool hid_pt_view_obj_is_focusable(const hid_pt_view_t *view, lv_obj_t *obj);
