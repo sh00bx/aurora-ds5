@@ -542,6 +542,18 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
         stream_input_send_gamepad_remove(input, gp);
     }
     input->moonlightExcludedMask |= (uint16_t) (1u << gp->gs_id);
+    /* The mask stops every Moonlight rumble/LED callback for this slot, but not
+     * SDL itself: a rumble SDL still holds (the pad was driven through Moonlight
+     * before the bridge took it) is re-sent by SDL_RUMBLE_RESEND every 2 s and
+     * zeroed again at its expiry, each time as a full effect report into a pad
+     * the bridge now owns -- a second writer of stale motor and lightbar bytes.
+     * Rumble 0 with duration 0 clears both timers; when SDL's rumble is already
+     * 0 it writes nothing at all. */
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    if (gp->controller) {
+        SDL_GameControllerRumble(gp->controller, 0, 0, 0);
+    }
+#endif
     if (item) {
         item->moonlight_gs_id = (int8_t) gp->gs_id;
     }
