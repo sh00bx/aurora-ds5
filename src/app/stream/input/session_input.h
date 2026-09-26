@@ -109,6 +109,17 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
 
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad);
 
+/**
+ * Replace the host's virtual pad for @p gamepad with one of the type the arrival
+ * path reads now -- after the Controllers page changed that controller's SDL
+ * type. A removal and an arrival for the same slot, nothing else.
+ *
+ * A no-op unless the pad is currently announced over SDL: a bridged (excluded)
+ * pad, a view-only session, or a pad the host was never told about keeps its
+ * state, and the new type applies at its next arrival.
+ */
+void stream_input_reannounce_gamepad(stream_input_t *input, app_gamepad_state_t *gamepad);
+
 void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *event);
 
 void stream_input_handle_text(stream_input_t *input, const SDL_TextInputEvent *event);

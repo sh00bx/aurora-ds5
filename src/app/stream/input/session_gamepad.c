@@ -72,6 +72,10 @@ static void stream_input_send_gamepad_battery(stream_input_t *input, app_gamepad
 
 static void cancel_stats_hold(void);
 
+#if defined(TARGET_WEBOS)
+static const char *li_ctype_name(uint8_t type);
+#endif
+
 static void cancel_all_holds(void);
 
 static Uint32 stats_hold_timer_cb(Uint32 interval, void *param);
@@ -473,6 +477,28 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
         commons_log_info("Input", "  controller capability: RGB LED");
     }
 #endif
+#if defined(TARGET_WEBOS)
+    /* The user's per-controller choice from the Controllers page: only the type
+     * moves. The capabilities stay what the pad has -- the host ignores what an
+     * X360 target cannot use, and the touchpad-as-mouse path needs the touchpad
+     * bit on a DualShock announced as an Xbox pad. */
+    const uint8_t detected = type;
+    switch (hid_pt_gamepad_sdl_type(gamepad)) {
+        case GAMEPAD_TYPE_PREF_XBOX:
+            type = LI_CTYPE_XBOX;
+            break;
+        case GAMEPAD_TYPE_PREF_PLAYSTATION:
+            type = LI_CTYPE_PS;
+            break;
+        case GAMEPAD_TYPE_PREF_AUTO:
+        default:
+            break;
+    }
+    if (type != detected) {
+        commons_log_info("Input", "Controller %d type: %s (user choice, detected %s)", gamepad->gs_id,
+                         li_ctype_name(type), li_ctype_name(detected));
+    }
+#endif
     uint8_t battery_state, battery_percentage;
     /* Only claim the capability when SDL has an actual reading for this pad. Claiming it for a
      * pad that never reports one leaves the host waiting for a value that never comes. */
@@ -504,6 +530,34 @@ void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t
             stream_input_moonlight_active_mask(input) & (uint16_t) ~(1u << (unsigned) gamepad->gs_id);
     commons_log_info("Input", "Controller %d removed (Moonlight mask 0x%x)", gamepad->gs_id, activeGamepadMask);
     LiSendMultiControllerEvent(gamepad->gs_id, (short) activeGamepadMask, 0, 0, 0, 0, 0, 0, 0);
+}
+
+void stream_input_reannounce_gamepad(stream_input_t *input, app_gamepad_state_t *gamepad) {
+    if (input == NULL || gamepad == NULL || gamepad->gs_id < 0 || !input->started) {
+        return;
+    }
+    /* Bridged, view-only, or never announced: there is no host pad to replace, and
+     * the new type simply applies at the next arrival (e.g. after an HID unplug). */
+    if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
+        return;
+    }
+    if ((input->announcedGamepadMask & (1u << (unsigned) gamepad->gs_id)) == 0) {
+        return;
+    }
+    /* The host pad being removed may still have a rumble running that SDL keeps
+     * re-sending (SDL_RUMBLE_RESEND); the new pad would never stop it. Rumble 0
+     * with duration 0 clears it, and writes nothing when SDL's rumble is 0. */
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    if (gamepad->controller != NULL) {
+        SDL_GameControllerRumble(gamepad->controller, 0, 0, 0);
+    }
+#endif
+    commons_log_info("Input", "Controller %d re-announced for a type change", gamepad->gs_id);
+    /* One ordered input queue carries both: the removal frees the host's virtual
+     * pad, the arrival allocates a new one in the same slot with the type the
+     * arrival now reads from the pref. Nothing here touches the HID bridge. */
+    stream_input_send_gamepad_remove(input, gamepad);
+    stream_input_send_gamepad_arrive(input, gamepad);
 }
 
 static void stream_input_send_unannounced_gamepads(stream_input_t *input) {
@@ -605,6 +659,21 @@ static void stream_input_send_gamepad_battery(stream_input_t *input, app_gamepad
      * anything, so there is nothing to gate on the server flavour here. */
     LiSendControllerBatteryEvent((uint8_t) gamepad->gs_id, state, percentage);
 }
+
+#if defined(TARGET_WEBOS)
+static const char *li_ctype_name(uint8_t type) {
+    switch (type) {
+        case LI_CTYPE_XBOX:
+            return "Xbox";
+        case LI_CTYPE_PS:
+            return "PlayStation";
+        case LI_CTYPE_NINTENDO:
+            return "Nintendo";
+        default:
+            return "unknown";
+    }
+}
+#endif
 
 static void cancel_stats_hold(void) {
     if (stats_hold_timer) {

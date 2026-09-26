@@ -7,13 +7,15 @@
 
 #include "ctm/ctm_state.h"
 #include "input/app_input.h"
+#include "stream/input/gamepad_type_pref.h"
 
 struct stream_input_t;
 
 /* Pad<->bridged-device identity lives entirely inside hid_pt_gamepad_match.c:
  * one ordered tier table plus the two resolvers over it. Nothing outside needs
  * a raw match, and exporting one invited callers to pick their own confidence
- * floor by accident. */
+ * floor by accident. The questions other modules do need answered are exported
+ * one by one below, each with its floor fixed in here. */
 
 /* True if the gamepad should be auto-bridged (and thus kept off the Moonlight
  * gamepad path). Robust against a transiently-unreadable SDL serial during
@@ -44,6 +46,20 @@ void hid_pt_moonlight_reconcile_exclusions(struct stream_input_t *input);
 
 bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
                                           const app_gamepad_state_t *gamepad);
+
+/* The controller type to announce for this pad over SDL. Its own pref first;
+ * for a pad with no usable serial, whose id is only the synthetic per-model
+ * form, the pref of the logical device it resolves to -- the same floor
+ * hid_pt_gamepad_is_autoplug() uses, for the same reason: a pad WITH a serial is
+ * only ever given its own pref, never a same-model sibling's. */
+gamepad_type_pref_t hid_pt_gamepad_sdl_type(const app_gamepad_state_t *gamepad);
+
+/* Which listed device this SDL pad is, for the Controllers page, or NULL. Pure:
+ * it never binds a slot, so it may run on every render. Identity or a VID:PID
+ * only one device has, never a similar name: the page writes this pad's SDL
+ * type under what it answers, and re-announces the pad, so a guess would edit
+ * the wrong controller. */
+logical_device_t *hid_pt_gamepad_panel_peer(const app_gamepad_state_t *gamepad);
 
 #endif
 

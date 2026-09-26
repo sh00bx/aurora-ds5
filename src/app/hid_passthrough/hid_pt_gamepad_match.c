@@ -495,6 +495,34 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
     }
 }
 
+gamepad_type_pref_t hid_pt_gamepad_sdl_type(const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return GAMEPAD_TYPE_PREF_AUTO;
+    }
+    char sid[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
+    const gamepad_type_pref_t own = hid_pt_prefs_get_sdl_type(sid);
+    if (own != GAMEPAD_TYPE_PREF_AUTO || !hid_pt_stable_id_is_synthetic(sid)) {
+        /* With a readable serial the only logical device that may answer is the
+         * EXACT_ID one, and that one's id is `sid` itself -- nothing to add. */
+        return own;
+    }
+    /* No serial right now (the stream-churn window hid_pt_gamepad_is_autoplug()
+     * describes): the Controllers page stored the choice under the MAC-keyed id
+     * of the logical device, so reach it through the VID:PID tiers. */
+    hid_pt_logical_match_t m = resolve_logical(gamepad, HID_PT_CONF_FUZZY, false);
+    return m.item ? hid_pt_prefs_sdl_type_for_logical(m.item) : GAMEPAD_TYPE_PREF_AUTO;
+}
+
+logical_device_t *hid_pt_gamepad_panel_peer(const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return NULL;
+    }
+    return resolve_logical(gamepad, HID_PT_CONF_VIDPID, false).item;
+}
+
 uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)
 {
     uint16_t mask = 0;
