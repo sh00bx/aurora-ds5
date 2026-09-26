@@ -716,10 +716,18 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
         snprintf(info->power_text, sizeof(info->power_text), "-");
 
         bool exact = false;
+        /* What the arrival path announces this pad as -- the stored type, and
+         * on AUTO what the host builds from the detected one -- so the badge
+         * cannot claim a type the host was not given. */
+        gamepad_type_pref_t pref = GAMEPAD_TYPE_PREF_AUTO;
 #if defined(TARGET_WEBOS)
-        /* What the arrival path announces this pad as, so the badge cannot
-         * claim a type the host was not given. */
-        info->sdl_type = hid_pt_gamepad_sdl_type(input, state);
+        pref = hid_pt_gamepad_sdl_type(input, state);
+#endif
+        const SDL_GameControllerType sdl_type = SDL_GameControllerGetType(state->controller);
+        info->sdl_type = gamepad_type_pref_effective(pref, sdl_type == SDL_CONTROLLER_TYPE_PS3 ||
+                                                           sdl_type == SDL_CONTROLLER_TYPE_PS4 ||
+                                                           sdl_type == SDL_CONTROLLER_TYPE_PS5);
+#if defined(TARGET_WEBOS)
         if (has_known_battery_layout(vendor, product)) {
             const ds_node_t *node = ds_claim(&ds, NULL, mac);
             if (node) {

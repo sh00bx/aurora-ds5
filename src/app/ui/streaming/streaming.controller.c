@@ -408,17 +408,15 @@ static void streaming_refresh_controllers(streaming_controller_t *controller) {
 
         /* Teal is "this pad is bridged" everywhere in the overlay — the rail on
          * its row in the Controllers sheet, and this badge. It used to be
-         * purple, after the colour the button had before the redesign. An SDL
-         * pad names the type the user chose for it on that sheet, if any, the
-         * same words its row there uses. */
+         * purple, after the colour the button had before the redesign. The
+         * words are the names of that sheet's mode buttons, the one lit for
+         * this pad: HID, or the pad the host builds for it over SDL. */
         lv_obj_t *badge = controller->stats_items.pads[i].badge;
-        const char *via = "SDL";
+        const char *via = "X360";
         if (pad->bridged) {
             via = "HID";
-        } else if (pad->sdl_type == GAMEPAD_TYPE_PREF_XBOX) {
-            via = "XBOX";
         } else if (pad->sdl_type == GAMEPAD_TYPE_PREF_PLAYSTATION) {
-            via = "PS";
+            via = "DS4";
         }
         lv_label_set_text(badge, via);
         lv_obj_set_style_bg_color(badge, pad->bridged ? lv_color_hex(OVERLAY_LIVE)
