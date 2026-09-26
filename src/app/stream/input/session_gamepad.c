@@ -555,7 +555,11 @@ void stream_input_reannounce_gamepad(stream_input_t *input, app_gamepad_state_t 
     commons_log_info("Input", "Controller %d re-announced for a type change", gamepad->gs_id);
     /* One ordered input queue carries both: the removal frees the host's virtual
      * pad, the arrival allocates a new one in the same slot with the type the
-     * arrival now reads from the pref. Nothing here touches the HID bridge. */
+     * arrival now reads from the pref. Nothing here touches the HID bridge.
+     * Back to back is safe only because moonlight-common-c never batches two
+     * controller packets whose active masks differ: before that, the arrival's
+     * trailing mask packet could overwrite the still-queued removal in place,
+     * and the host kept the old pad and refused the arrival. */
     stream_input_send_gamepad_remove(input, gamepad);
     stream_input_send_gamepad_arrive(input, gamepad);
 }
