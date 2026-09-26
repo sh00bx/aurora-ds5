@@ -43,6 +43,12 @@ export default function codepoints() {
             cpFile.extname = '.json';
         }
         file.codepoints = await codepointsList(cpFile.path, cpFile.extname, cp => list.includes(cp));
+        /* A name the font does not have would otherwise just go missing: no
+         * glyph in the subset and no define in the symbols header. */
+        const unknown = list.filter(name => !(name in file.codepoints));
+        if (unknown.length) {
+            throw new Error(`${lstFile.basename}: not in ${cpFile.basename}: ${unknown.join(', ')}`);
+        }
         return file;
     });
 }

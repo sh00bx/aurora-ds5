@@ -5,6 +5,8 @@
 
 #include <fontconfig/fontconfig.h>
 
+#include <stdlib.h>
+
 
 static bool fontset_load_fc(app_fontset_t *set, FcPattern *font);
 
@@ -21,6 +23,25 @@ int app_font_init(app_fonts_t *fonts, int dpi) {
     app_fontset_t iconfonts = fontset;
     if (!fontset_load_mem(&iconfonts, "MaterialIcons", res_mat_iconfont_data, res_mat_iconfont_size)) {
         return -1;
+    }
+    /* The brand marks Material has no glyph for (Xbox, PlayStation), as the
+     * icon fonts' fallback: a label set in an icon font draws both sets, and
+     * LVGL asks this one only for codepoints the Material subset lacks. The
+     * gulp pipeline refuses a codepoint the two subsets share. Optional: without
+     * it those two glyphs are blank, nothing else changes. */
+    iconfonts.fallback = calloc(1, sizeof(app_fontset_t));
+    if (iconfonts.fallback) {
+        iconfonts.fallback->small_size = iconfonts.small_size;
+        iconfonts.fallback->normal_size = iconfonts.normal_size;
+        iconfonts.fallback->large_size = iconfonts.large_size;
+        if (fontset_load_mem(iconfonts.fallback, "AuroraBrands", res_fab_iconfont_data, res_fab_iconfont_size)) {
+            iconfonts.normal->fallback = iconfonts.fallback->normal;
+            iconfonts.large->fallback = iconfonts.fallback->large;
+            iconfonts.small->fallback = iconfonts.fallback->small;
+        } else {
+            free(iconfonts.fallback);
+            iconfonts.fallback = NULL;
+        }
     }
     //does not necessarily have to be a specific name.  You could put anything here and Fontconfig WILL find a font for you
     FcPattern *pattern = FcNameParse((const FcChar8 *) FONT_FAMILY);

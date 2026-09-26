@@ -109,6 +109,7 @@ Thanks to everyone helping improve Aurora:
 
 - Base: [GuiDev1994/aurora-tv](https://github.com/GuiDev1994/aurora-tv), forked from [mariotaku/moonlight-tv](https://github.com/mariotaku/moonlight-tv)
 - DS5 raw-ACL daemon: [sh00bx/webos-ds5-raw-acl](https://github.com/sh00bx/webos-ds5-raw-acl) (MIT), vendored in `src/daemon/ds5_txd/`
+- Xbox/PlayStation marks: [Font Awesome Free](https://fontawesome.com) 7.3.1 brand icons (CC BY 4.0), embedded as a font subset under the SIL OFL 1.1 — see [COPYRIGHT](COPYRIGHT)
 - Components: [moonlight-embedded](https://github.com/irtimmer/moonlight-embedded), [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c)
 
 ## License

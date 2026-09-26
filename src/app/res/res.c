@@ -4,6 +4,7 @@
 #include "gen/fav_indicator.h"
 #include "gen/defcover.h"
 #include "gen/material_icons_regular_ttf.h"
+#include "gen/fa_brands_400_ttf.h"
 
 const lv_sdl_img_data_t lv_sdl_img_data_logo_96 = {
         .type = LV_SDL_IMG_TYPE_CONST_PTR,
@@ -25,3 +26,6 @@ const lv_sdl_img_data_t lv_sdl_img_data_defcover = {
 
 const unsigned char *res_mat_iconfont_data = ttf_material_icons_regular_data;
 const unsigned int res_mat_iconfont_size = ttf_material_icons_regular_size;
+
+const unsigned char *res_fab_iconfont_data = ttf_fa_brands_400_data;
+const unsigned int res_fab_iconfont_size = ttf_fa_brands_400_size;
