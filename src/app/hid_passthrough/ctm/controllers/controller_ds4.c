@@ -158,6 +158,7 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 /* BT 0x17 pure-audio report: [0x17][hwctl][0xa0][frame ctr LE16][route]
  * [436 B SBC][pad][crc32]; the counter advances by 4 (SBC frames) per report. */
 #define DS4_0X17_LEN      462
+#define DS4_0X17_ROUTE    5   /* 0x00 = no target: the audio plane is disarmed */
 
 /* The slider volumes and their valid flags, exactly as ds4_patch_output
  * stamps them into a host report, for a report this file builds itself. */
@@ -216,9 +217,18 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
  * stops without a "no target" route (0x00) -- the host's stop burst is the only
  * thing that ends it, and a session that dies mid-stream (host link lost, the
  * stream quit, a switch to the SDL path) never sends one, so the pad loops
- * until it is switched off. If a 0x17 went out in the last 5 s, send the same
- * stop the host would: 8 reports with route 0x00, the frame counter carried on
- * from the last one delivered (+4 per report, as the pad expects), re-signed.
+ * until it is switched off. So when the last 0x17 delivered this session left
+ * the plane ARMED (route != 0x00), send the same stop the host would: 8
+ * reports with route 0x00, the frame counter carried on from the last one
+ * delivered (+4 per report, as the pad expects), re-signed. Armed is judged by
+ * the route, not by the report's age: a lost host link only ends this session
+ * once ENet's peer timeout (5 s minimum, 30 s maximum) has run out, so the
+ * last 0x17 is always at least that old on exactly the path this exists for,
+ * and the pad loops for as long as it stays on however old it is. A stream
+ * that ended cleanly finished on the host's own route-0x00 reports and needs
+ * nothing -- unless it ended in the last 5 s, the original rule, kept because
+ * "delivered" means handed to ds5_txd, which can still age out or overflow a
+ * queued report, so a recent stop run is repeated rather than trusted.
  * They are copies of that last report; with no target the pad decodes none of
  * the SBC payload. ds4_patch_output passes route 0x00 through untouched in
  * every audio mode, so the user's mode cannot re-arm the plane here.
@@ -238,7 +248,7 @@ static int ds4_build_quiesce_reports(ctm_controller_t *c, uint8_t *buf, size_t c
     uint8_t last17[DS4_0X17_LEN];
     uint64_t age17 = 0;
     size_t l17 = ctm_controller_last_output(c, 0x17, last17, sizeof(last17), &age17);
-    if (l17 == DS4_0X17_LEN && age17 < 5000000ull) {
+    if (l17 == DS4_0X17_LEN && (last17[DS4_0X17_ROUTE] != 0x00 || age17 < 5000000ull)) {
         uint16_t ctr = (uint16_t) (last17[3] | (last17[4] << 8));
         for (int k = 0; k < 8 && n < max - 1 && off + DS4_0X17_LEN <= cap; ++k) {
             uint8_t *r = buf + off;
@@ -247,7 +257,7 @@ static int ds4_build_quiesce_reports(ctm_controller_t *c, uint8_t *buf, size_t c
             r[1] = 0x40 | DS4_POLL_INTERVAL_MS;
             r[3] = (uint8_t) (ctr & 0xffu);
             r[4] = (uint8_t) (ctr >> 8);
-            r[5] = 0x00;
+            r[DS4_0X17_ROUTE] = 0x00;
             ctm_bt_sign_output(r, DS4_0X17_LEN);
             len[n++] = DS4_0X17_LEN;
             off += DS4_0X17_LEN;
