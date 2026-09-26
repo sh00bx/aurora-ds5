@@ -144,6 +144,13 @@
                                        * and KEEPS being injected through a genuine stall
                                        * (credits stay free), so audio recency is the one
                                        * signal whose sign differs between the two cases. */
+#define PHANTOM_RESET_MS       2000   /* DS4 link: credits still "in flight" but neither an inject
+                                       * nor a NOCP for this long -> nothing is in flight; the
+                                       * controller dropped those packets without completing
+                                       * them. The stall backstop cannot see this: it only runs
+                                       * while a caller is BLOCKED, and an idle link blocks
+                                       * nobody, so the residue survived into the next stream
+                                       * as a permanently shallower window. */
 /* Edges of the cumulative NOCP-gap histogram, in ms. Chosen to straddle the
  * usable slider range (0..200, default 60) offset by one report of audio, so
  * every plausible pad buffer has an edge within a few ms of its own starvation
@@ -585,6 +592,17 @@ static int inject_maxq(void){
                                      * latest-wins drop, silently defeating the
                                      * anti-dropout buffering. 16 entries x 1KB per link
                                      * is negligible. */
+/* DS4 effect-state slot (2026-09-26). A DS4 0x11 (rumble + lightbar) that met a
+ * full credit window used to be thrown away with nothing but `paced++` — the
+ * NEWEST state lost, although the comment at the call site said latest-wins. A
+ * dropped motors-off or colour change then waited for the game's next write,
+ * and the app's 0x11 dedup (250 ms TTL) holds identical follow-ups back on top.
+ * Each link now keeps the newest blocked 0x11 in a one-deep slot and puts it on
+ * the air the moment a credit returns, ahead of held audio. Report 0x11 only:
+ * it is DS4-only in this family, so DualSense 0x31/0x32 keep their exact old
+ * path. 0x11 is 78 B on air; the slot is sized with headroom and anything
+ * larger falls back to the old drop. */
+#define FX_SLOT_MAX          128
 #define INJECT_FIFO_DEFAULT  0
 static int g_fifo_override=-1;   /* ACL_CTRL_FIFO_DEPTH; main thread only */
 
@@ -773,6 +791,9 @@ struct ds5_link {
                                 (nocp_k_ok); clock domains are never mixed. */
     uint8_t  nocp_k_ok;      /* last_nocp_k holds a kernel stamp (else the next interval
                                 falls back to the old monotonic delta) */
+    uint64_t last_inj;       /* last successful inject write (g_lock). Only the DS4
+                                phantom-outstanding check reads it: with last_nocp it
+                                proves the link has been silent in BOTH directions. */
     uint64_t last_wr_err_log;/* rate limit for the structural-write-error line (inject) */
     uint64_t last_demand;    /* last report the APP handed us for this link. Written by the
                                 inject thread; since the gap histogram moved into the NOCP
@@ -806,6 +827,18 @@ struct ds5_link {
     struct { uint8_t buf[FIFO_ENTRY_MAX]; int len; uint64_t ts; } fifo[FIFO_MAX];
     int      fifo_head, fifo_count;
     uint16_t fifo_gen;       /* nonce the held backlog was queued under (stale-drop) */
+    /* DS4 effect-state slot (inject) — see FX_SLOT_MAX and drain_fx_slot(). Same
+     * ownership as the FIFO: written by the main thread only; the capture
+     * thread's NOCP handler reads fx_len as a relaxed hint to decide whether a
+     * returned credit is worth a wakeup. Counters are link-lifetime totals like
+     * drop_total, main thread only, printed on DS4 links' status segment:
+     *   fx_coal  blocked 0x11 parked in the slot instead of dropped
+     *   fx_slot  parked 0x11 that later went on the air
+     *   fx_lost  parked 0x11 overwritten by a newer one before a credit came */
+    uint8_t  fx_buf[FX_SLOT_MAX];
+    int      fx_len;         /* 0 = empty */
+    uint16_t fx_gen;         /* nonce the held frame was parked under (stale-drop) */
+    long     fx_coal, fx_slot, fx_lost;
     /* per-link inject/drop totals (main thread only; published in the .st
      * telemetry record). The old records carried the daemon-GLOBAL counters,
      * so with two pads the host rate servo attributed one pad's drop storm to
@@ -1203,6 +1236,27 @@ static long g_flush_rb_lost = 0;
  * spend the budget the sniff pin and the scan reconciler need. */
 #define FLUSH_RB_MAX_READS 3
 
+/* Write a link's credit window off as lost and start counting afresh. Shared by
+ * the stall backstop in inject_one() and the DS4 phantom-outstanding check in the
+ * main loop, so both leave identical bookkeeping behind. Caller holds g_lock. */
+static void credit_resync_locked(struct ds5_link *L){
+    /* Remember what we are abandoning, so the credits for these
+     * packets cannot later be spent on newer ones. Capped at the
+     * ring size: more cannot physically be in flight, and an
+     * uncapped accumulation across repeated write-offs during one
+     * long blackout would absorb credits well past the real debt. */
+    if(g_ghost_ttl_ms>0 && L->outstanding>0){
+        int g=L->ghost+L->outstanding;
+        L->ghost = g>TXRING ? TXRING : g;
+        L->ghost_ts=now_ms();
+    }
+    L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
+    L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
+    L->nocp_k_ok=0;                     /* monotonic re-arm has no kernel twin: the
+                                         * next NOCP restarts the kernel-stamp chain
+                                         * instead of measuring across the write-off */
+}
+
 /* Inject one output report as a raw-ACL frame onto link L under g_lock, honoring
  * the credit window. Critical section identical in scope to the legacy inline path
  * (one bounded, non-blocking write; TOCTOU handle re-check under the same lock).
@@ -1282,21 +1336,7 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
             int held = gap_hold_active();
             int blocked = held || L->outstanding>=lim || (is_rumble && L->rumble_fly>=rcap);
             if(!held && blocked && L->last_nocp && now_ms()-L->last_nocp>STALL_RESET_MS){
-                /* Remember what we are abandoning, so the credits for these
-                 * packets cannot later be spent on newer ones. Capped at the
-                 * ring size: more cannot physically be in flight, and an
-                 * uncapped accumulation across repeated write-offs during one
-                 * long blackout would absorb credits well past the real debt. */
-                if(g_ghost_ttl_ms>0 && L->outstanding>0){
-                    int g=L->ghost+L->outstanding;
-                    L->ghost = g>TXRING ? TXRING : g;
-                    L->ghost_ts=now_ms();
-                }
-                L->outstanding=0; txwin_reset(L);   /* credits presumed lost -> resync */
-                L->last_nocp=now_ms();              /* re-arm: at most one resync per STALL_RESET_MS */
-                L->nocp_k_ok=0;                     /* monotonic re-arm has no kernel twin: the
-                                                     * next NOCP restarts the kernel-stamp chain
-                                                     * instead of measuring across the write-off */
+                credit_resync_locked(L);
                 blocked=0;
             }
             if(blocked){
@@ -1322,7 +1362,7 @@ static int inject_one(struct ds5_link *L, int rawfd, const uint8_t *rep, int n, 
                     frame[2] = (uint8_t)((frame[2]&0xCF) | (is_audio_report(rep[0]) ? (2<<4) : (0<<4)));
                 frame[9]=0xA2; memcpy(frame+10,rep,n);
                 ssize_t wr=write(rawfd,frame,10+n);
-                if(wr==(ssize_t)(10+n)){ r=1; L->outstanding++; txwin_push(L,is_rumble); }
+                if(wr==(ssize_t)(10+n)){ r=1; L->outstanding++; txwin_push(L,is_rumble); L->last_inj=now_ms(); }
                 else if(wr<0 && errno==EBADF){ L->have=0; *reason="inject EBADF -> template INVALID (reconnect)"; r=-1; }
                 else {
                     /* A short/failed write is otherwise indistinguishable from
@@ -1387,6 +1427,21 @@ static long drain_fifo(struct ds5_link *L, int rawfd, int maxq, int *need_inval,
         break;                                      /* credits full (0) -> retry next wakeup */
     }
     return inj;
+}
+
+/* Put a link's parked DS4 0x11 on the air if a credit allows (main thread only).
+ * Every caller runs it BEFORE drain_fifo(): the slot is the pad's newest effect
+ * state and one credit is all it needs, while held audio would otherwise take
+ * every credit the NOCP just returned. Empty slot (every DS5 link) = no-op, so
+ * the DualSense path is untouched. Returns the number injected (0/1); on
+ * template invalidation sets need_inval + reason exactly like drain_fifo. */
+static long drain_fx_slot(struct ds5_link *L, int rawfd, int maxq, int *need_inval, const char **reason, const uint8_t *expect){
+    if(L->fx_len<=0) return 0;
+    int r=inject_one(L,rawfd,L->fx_buf,L->fx_len,maxq,reason,expect,1 /* parked app state */);
+    if(r==1){ L->fx_len=0; L->fx_slot++; L->inj_total++; return 1; }
+    if(r==-1){ *need_inval=1; L->fx_len=0; }        /* template gone: the state is moot */
+    else if(r==-2) L->fx_len=0;                     /* no template / slot moved */
+    return 0;                                       /* credits still full -> keep holding */
 }
 static int      g_rawfd = -1;          /* main's raw HCI socket, shared for link-policy writes */
 
@@ -3448,8 +3503,13 @@ static void handle_hci_event(const uint8_t *e, int el, uint64_t kms){
              * loop NOW instead of letting the backlog wait for the next app
              * datagram. Relaxed read of a main-thread-owned int — this is a HINT
              * (the main loop re-checks under its own ownership), so a stale value
-             * can only cost a spurious wakeup or fall back to the old behaviour. */
-            if(__atomic_load_n(&L->fifo_count,__ATOMIC_RELAXED)>0) kick=1;
+             * can only cost a spurious wakeup or fall back to the old behaviour.
+             * A parked DS4 0x11 (fx_len, same ownership and same hint rule) is
+             * held state too: without this a slot with no audio behind it would
+             * wait for the next app datagram, which for a change-only effect
+             * stream may be hundreds of ms away. */
+            if(__atomic_load_n(&L->fifo_count,__ATOMIC_RELAXED)>0 ||
+               __atomic_load_n(&L->fx_len,__ATOMIC_RELAXED)>0) kick=1;
             /* Refresh the stall timestamp ONLY for OUR handle's completions:
              * a global refresh would let any other device's NOCP chatter
              * (Magic Remote etc.) suppress the 150ms backstop exactly when
@@ -4146,20 +4206,39 @@ static void process_report(struct ds5_link *L, int rawfd, const uint8_t *report,
         /* Rumble FIRST, before the audio backlog: it is an independent stream (its
          * ordering vs audio does not matter), and draining held audio ahead of it
          * would hand every freed credit to audio within the same wakeup — starvation
-         * by ordering, on top of the type-aware window in inject_one(). Rumble itself
-         * stays latest-wins on a full window: a stale rumble is wrong. */
+         * by ordering, on top of the type-aware window in inject_one(). A blocked
+         * DualSense 0x31/0x32 is dropped (`paced`), as it always was. A blocked DS4
+         * 0x11 is PARKED instead (FX_SLOT_MAX): the newest state replaces whatever
+         * the slot held and goes out on the next credit, so this is now really
+         * latest-wins rather than drop-newest. A 0x11 that does get through
+         * empties the slot — what it held is older than what just went out, and
+         * must never land after it. */
         r=inject_one(L,rawfd,report,n,maxq,&reason,expect,1);
-        if(r==1){(*injected)++; L->inj_total++;}
+        if(r==1){
+            (*injected)++; L->inj_total++;
+            if(report[0]==0x11) L->fx_len=0;
+        }
         else if(r==-1)need_inval=1;
-        else if(r==0)(*paced)++;         /* latest-wins drop */
+        else if(r==0){
+            if(report[0]==0x11 && n<=(int)sizeof L->fx_buf){
+                if(L->fx_len>0) L->fx_lost++;
+                memcpy(L->fx_buf,report,(size_t)n); L->fx_len=n;
+                L->fx_gen=snap_nonce;    /* parked under THIS binding */
+                L->fx_coal++;
+            } else {
+                (*paced)++;              /* drop-newest (DualSense rumble) */
+            }
+        }
         else {(*dropped)++; L->drop_total++;}   /* r==-2: no live template */
         if(!need_inval)(*injected)+=drain_fifo(L,rawfd,maxq,&need_inval,&reason,expect);
     } else {
         /* Audio: strict FIFO order — backlog first, then the fresh frame. On a full
          * window with the FIFO enabled the fresh frame is HELD (few-ms delay, drained
          * on the next arrival) rather than punching a ~10ms hole; FIFO-off stays
-         * latest-wins. */
-        (*injected)+=drain_fifo(L,rawfd,maxq,&need_inval,&reason,expect);
+         * latest-wins. A parked DS4 0x11 goes ahead of all of it, for the same
+         * reason rumble goes first above; empty (every DualSense) = no-op. */
+        (*injected)+=drain_fx_slot(L,rawfd,maxq,&need_inval,&reason,expect);
+        if(!need_inval)(*injected)+=drain_fifo(L,rawfd,maxq,&need_inval,&reason,expect);
         if(need_inval){
             (*dropped)++; L->drop_total++;   /* template just died; fresh frame is moot */
         } else {
@@ -4454,10 +4533,28 @@ int main(int argc,char**argv){
         uint16_t link_nonce[MAX_LINKS];
         {
             struct { int have, qd; uint64_t ln, ld, ss; uint16_t nonce; uint64_t rx; uint8_t addr[6];
-                     uint8_t ds4; int rst; long r30,r50,r80; } sn[MAX_LINKS];
+                     uint8_t ds4; int rst; long r30,r50,r80; int phantom; } sn[MAX_LINKS];
             uint64_t nowm=now_ms(), other_now;
             pthread_mutex_lock(&g_lock);
             for(int i=0;i<MAX_LINKS;i++){
+                /* DS4 phantom-outstanding self-heal (PHANTOM_RESET_MS). Credits
+                 * "in flight" with no inject AND no NOCP for 2 s: nothing is in
+                 * flight, the controller discarded those packets (stream teardown
+                 * does exactly that, see the DEMAND GATE below). Checked here, under
+                 * the lock and before the snapshot, so the rest of this pass already
+                 * sees the resynced window. DS4 links only: a DualSense keeps its
+                 * exact old accounting. The capture thread may have stamped
+                 * last_nocp after nowm was read, hence the ordering guards. */
+                sn[i].phantom=0;
+                {
+                    struct ds5_link *P=&g_links[i];
+                    if(P->have && P->is_ds4 && P->outstanding>0 && !gap_hold_active() &&
+                       P->last_nocp && nowm>P->last_nocp && nowm-P->last_nocp>=PHANTOM_RESET_MS &&
+                       (!P->last_inj || (nowm>P->last_inj && nowm-P->last_inj>=PHANTOM_RESET_MS))){
+                        sn[i].phantom=P->outstanding;
+                        credit_resync_locked(P);
+                    }
+                }
                 sn[i].have=g_links[i].have; sn[i].qd=g_links[i].outstanding;
                 sn[i].ln=g_links[i].last_nocp; sn[i].nonce=g_links[i].nonce;
                 sn[i].rx=g_links[i].rx_pkts; sn[i].ld=g_links[i].last_demand;
@@ -4500,11 +4597,16 @@ int main(int argc,char**argv){
                                 i,sn[i].r30,sn[i].r50,sn[i].r80);
                     L->ep_start=0;
                 }
+                if(sn[i].phantom)
+                    fprintf(stderr,"[txd] L%d phantom outstanding %d reset\n",i,sn[i].phantom);
                 /* Stale-backlog gate: a rebind bumps the nonce, so audio still held
                  * from the previous binding must be dropped, not played into the new
                  * session (drain_fifo also clears on the no-template path, but that
                  * never runs when the invalidate->rebind happens between wakeups). */
                 if(L->fifo_count>0 && L->fifo_gen!=sn[i].nonce) fifo_clear(L);
+                /* Same gate for a parked DS4 0x11, plus unbind: a state frame
+                 * from a binding that is gone must never land on the next one. */
+                if(L->fx_len>0 && (!sn[i].have || L->fx_gen!=sn[i].nonce)) L->fx_len=0;
                 /* Credit-freed drain. The NOCP that returned a credit is what woke
                  * us (g_kickfd), so put the held frame on the air NOW instead of at
                  * the next app datagram — that wait was a systematic 0..21.33ms
@@ -4515,10 +4617,14 @@ int main(int argc,char**argv){
                  * how long a backlog can sit if a kick is ever missed.
                  * `expect` = this link's snapshotted address, so inject_one's
                  * re-check still skips a pad that the capture thread rebound
-                 * between the snapshot and here. */
-                if(L->fifo_count>0){
-                    int kneed=0; const char *kreason=NULL;
-                    injected+=drain_fifo(L,rawfd,inject_maxq(),&kneed,&kreason,sn[i].addr);
+                 * between the snapshot and here. A parked DS4 0x11 goes first
+                 * (drain_fx_slot); on a DualSense link the slot is always empty
+                 * and this is the old FIFO-only drain. */
+                if(L->fx_len>0 || L->fifo_count>0){
+                    int kneed=0; const char *kreason=NULL; int kmaxq=inject_maxq();
+                    injected+=drain_fx_slot(L,rawfd,kmaxq,&kneed,&kreason,sn[i].addr);
+                    if(!kneed && L->fifo_count>0)
+                        injected+=drain_fifo(L,rawfd,kmaxq,&kneed,&kreason,sn[i].addr);
                     if(kneed){
                         publish_all();
                         fprintf(stderr,"[txd] %s\n",kreason?kreason:"template invalid (credit drain)");
@@ -4808,8 +4914,9 @@ int main(int argc,char**argv){
              * measurement change to note in the ledger, not a format change.) */
             /* 224 -> 416: the cumulative histogram adds up to ~120 chars per
              * link once it is populated, and snprintf would silently truncate
-             * the tail fields rather than the new one. */
-            char links[MAX_LINKS*416]; int lo=0; links[0]='\0';
+             * the tail fields rather than the new one. 416 -> 480 for the DS4
+             * slot counters (fxs) appended behind it. */
+            char links[MAX_LINKS*480]; int lo=0; links[0]='\0';
             for(int i=0;i<MAX_LINKS;i++){
                 struct ds5_link *L=&g_links[i];
                 if(!L->ever_bound) continue;
@@ -4832,9 +4939,17 @@ int main(int argc,char**argv){
                         go+=snprintf(gge+go,sizeof gge-go,"%s%u:%ld",
                                      b?"/":"",GAPGE_EDGE[b],L->gapge[b]);
                 }
+                /* DS4 effect slot (FX_SLOT_MAX), APPENDED on DS4 links only, so a
+                 * DualSense segment stays byte-for-byte the old one. is_ds4 is a
+                 * one-byte g_lock field read unlocked here like the rest of this
+                 * line's snapshot-free reads; the counters are main-thread-owned. */
+                char fxs[80]; fxs[0]='\0';
+                if(L->is_ds4)
+                    snprintf(fxs,sizeof fxs," fxcoal=%ld fxslot=%ld fxlost=%ld",
+                             L->fx_coal,L->fx_slot,L->fx_lost);
                 lo+=snprintf(links+lo,sizeof links-lo,
                     " | L%d %02x:%02x:%02x:%02x:%02x:%02x have=%d q=%d rq=%d fifo=%d gaps=%ld/%ld/%ld"
-                    " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s%s",
+                    " gmax=%llu drops=%ld/%ld/%ld ghost=%d/%ld/%ld%s%s%s",
                     i,a[5],a[4],a[3],a[2],a[1],a[0],L->have,L->outstanding,L->rumble_fly,
                     L->fifo_count,L->gap30,L->gap50,L->gap80,
                     (unsigned long long)L->gap_max,
@@ -4844,7 +4959,7 @@ int main(int argc,char**argv){
                      * session-fatal leak the TTL exists to prevent, and this is
                      * where it would show. */
                     L->ghost,L->ghost_absorbed,L->ghost_expired,
-                    synth,gge);
+                    synth,gge,fxs);
                 if(lo>=(int)sizeof links) break;
             }
             /* Measured too: this is the LONGEST single write the inject thread
