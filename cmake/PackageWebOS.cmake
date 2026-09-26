@@ -38,6 +38,11 @@ install(PROGRAMS "${DS5_TXD_BIN}" DESTINATION services/com.aurora.ds5.txd)
 # src/app/platform/webos/tv_game_mode.c.
 install(PROGRAMS "${CMAKE_SOURCE_DIR}/tools/gamemode.sh" DESTINATION tools)
 
+# The Aurora Brands icon font compiled into the app is a Modified Version of
+# Font Awesome Free under the SIL OFL 1.1, which must travel with every copy:
+# its name table carries the licence line and URL, this is the full text.
+install(FILES "${CMAKE_SOURCE_DIR}/src/app/res/iconfonts/fa-brands-400.LICENSE.txt" DESTINATION licenses)
+
 # Generate translations
 foreach (I18N_LOCALE ${I18N_LOCALES})
     string(REPLACE "-" "/" I18N_JSON_DIR "resources/${I18N_LOCALE}")

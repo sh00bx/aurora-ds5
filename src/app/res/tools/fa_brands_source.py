@@ -25,8 +25,9 @@ What it does to Font Awesome Free's brands face, and why:
     it, cut off and sitting lower than the Material icon next to it.
   - Renames the family. The SIL OFL 1.1 reserves the name "Font Awesome", and
     a subset with moved outlines is a Modified Version. The copyright line is
-    kept, and the licence is named in the font itself (name IDs 13/14); the
-    full text is iconfonts/fa-brands-400.LICENSE.txt.
+    kept, and the licence is named in the font itself (name IDs 13/14, which
+    gulp-subset-font.ts keeps in the build's re-subset too); the full text is
+    iconfonts/fa-brands-400.LICENSE.txt, installed into the IPK's licenses/.
 """
 
 import os
