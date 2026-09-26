@@ -4425,9 +4425,23 @@ int main(int argc,char**argv){
      * thread's path would be measured as a LINK stall. Locking is cheap (the
      * daemon's footprint is small and static) and turns that artefact class off.
      * Refusal is loud but not fatal — the daemon measured fine for months
-     * without it, it just could not PROVE the gaps were the radio's. */
-    if(mlockall(MCL_CURRENT|MCL_FUTURE)==0)
-        fprintf(stderr,"[txd] mlockall: resident\n");
+     * without it, it just could not PROVE the gaps were the radio's.
+     * MCL_ONFAULT locks pages as they are touched instead of committing every
+     * mapping up front: without it the six thread stacks (glibc default 8 MB
+     * each, two of them LG's preloaded tLibSystrim/tFragmentation that no
+     * stack-size attr of ours reaches) were fully resident and unevictable,
+     * ~45 MB for a daemon whose working set is a few MB — and memchute counts
+     * unevictable RAM toward its close-all-background-apps emergency. A page
+     * once touched stays locked, so the hot path still never takes a major
+     * fault; an untouched stack page costs one minor fault (zero fill), not a
+     * swap-in. Same fix as aurora's main.c. */
+#ifndef MCL_ONFAULT
+#define MCL_ONFAULT 4
+#endif
+    if(mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT)==0)
+        fprintf(stderr,"[txd] mlockall: resident (onfault)\n");
+    else if(mlockall(MCL_CURRENT|MCL_FUTURE)==0)
+        fprintf(stderr,"[txd] mlockall: resident (full)\n");
     else
         fprintf(stderr,"[txd] mlockall REFUSED (%s) — swap pressure can inflate measured gaps\n",
                 strerror(errno));
