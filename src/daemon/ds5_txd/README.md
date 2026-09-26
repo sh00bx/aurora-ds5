@@ -243,6 +243,7 @@ exactly the most interesting event class. De-duplicate on the whole line.
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 4d1cc2012d118cbc9f0442272207cc4c, 82120 bytes   (mlockall MCL_ONFAULT: lock pages on fault, not every 8 MB thread stack, 1.7.29)
     # md5 b1b7483ef0009adf771f22b7e4d5e1bc, 82120 bytes   (DS4 0x11 effect slot + NOCP kick, DS4 phantom-outstanding self-heal, per-pad audio-FIFO depth ctrl 0x07, 1.7.27)
     # md5 817553e91ee9bb4739b6a720c9248b29, 81908 bytes   (W3-02 mic uplink plumbing: HCI-monitor 0x31 audio-in -> /tmp/ds5_mic.<mac>.sock, lever /tmp/ds5_mic default OFF, 1.7.14)
     # md5 864de4a60fac51134f694d0901e3c3bb, 81428 bytes   (deep-review 08-27 batch: idle poll drain, app-ping recency, scan-off marker order, persist lock, DS4-aware lightbar+audio stamp, 1.7.6)
