@@ -187,13 +187,14 @@ bool hid_pt_model_set_auto_plugin(const hid_pt_model_t *model, bool on);
 bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on);
 
 /**
- * Store the selection's SDL controller type and, when its pad is announced over
- * SDL right now, re-announce it so the host re-creates the pad with that type.
+ * Store the selection's SDL controller type and re-announce every pad whose
+ * type that changes, so the host re-creates it with the new one.
  *
- * Written under every identity the row has (the pad's own stable id and the
- * CTM device's), so the choice is found whichever of the two the next arrival
- * resolves. False when the store refused it; the reason is then in the plug
- * error the status line shows.
+ * Written under the ids hid_pt_gamepad_sdl_type() reads: the CTM device's (with
+ * "Automatic" kept as an explicit choice, since that id is read first) and the
+ * pad's own serial, never a synthetic per-model id next to a device. False when
+ * the store refused it; the reason is then in the plug error the status line
+ * shows.
  */
 bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type);
 

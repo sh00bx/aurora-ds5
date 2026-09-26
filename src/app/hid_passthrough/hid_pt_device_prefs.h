@@ -53,8 +53,8 @@ void hid_pt_prefs_flush(void);
 /* Emit the [hid_pt_devices] section into an already-open ini writer. Used by
  * settings_save() so a full-config rewrite preserves the per-device prefs
  * instead of truncating them. Only non-default prefs are written: an opted-in
- * auto-plug as `<id> = true`, an SDL type other than AUTO as
- * `<id>.sdl_type = xbox|playstation`. An absent key reads as the default. */
+ * auto-plug as `<id> = true`, a chosen SDL type as
+ * `<id>.sdl_type = xbox|playstation|auto`. An absent key reads as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
@@ -65,11 +65,20 @@ bool hid_pt_prefs_auto_plugin_for_gamepad(const app_gamepad_state_t *gamepad);
  * the table and the flush with the auto-plug pref above. */
 gamepad_type_pref_t hid_pt_prefs_get_sdl_type(const char *stable_id);
 
+/* True when an SDL type was chosen for this id -- AUTO included, see
+ * hid_pt_prefs_set_sdl_type() -- and then *out is that choice. */
+bool hid_pt_prefs_lookup_sdl_type(const char *stable_id, gamepad_type_pref_t *out);
+
 /* Store (and persist) the SDL type for one device. Same contract as
  * hid_pt_prefs_set_auto_plugin(): false when the choice could NOT be stored (an
  * empty id, or a full table in which every slot holds a non-default pref), and
- * the caller must say so. Setting AUTO never needs a slot. */
-bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type);
+ * the caller must say so.
+ *
+ * AUTO with @p keep_auto false erases the choice and never needs a slot. With
+ * @p keep_auto true it is stored as a choice of its own, which a lookup that
+ * falls back to another id when this one has none needs: there "Automatic" must
+ * stop the fallback rather than reveal what the other id holds. */
+bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type, bool keep_auto);
 
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item);
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad);

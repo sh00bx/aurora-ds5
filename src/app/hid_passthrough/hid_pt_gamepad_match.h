@@ -47,19 +47,20 @@ void hid_pt_moonlight_reconcile_exclusions(struct stream_input_t *input);
 bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
                                           const app_gamepad_state_t *gamepad);
 
-/* The controller type to announce for this pad over SDL. Its own pref first;
- * for a pad with no usable serial, whose id is only the synthetic per-model
- * form, the pref of the logical device it resolves to -- the same floor
- * hid_pt_gamepad_is_autoplug() uses, for the same reason: a pad WITH a serial is
- * only ever given its own pref, never a same-model sibling's. */
-gamepad_type_pref_t hid_pt_gamepad_sdl_type(const app_gamepad_state_t *gamepad);
+/* The controller type to announce for this pad over SDL: what was chosen for
+ * the listed device the pad is (hid_pt_gamepad_panel_peer()), else what was
+ * chosen for the pad's own id, else AUTO. @p input is the app's pad table, which
+ * the one-pad-per-device pairing needs; NULL skips that check. */
+gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad);
 
 /* Which listed device this SDL pad is, for the Controllers page, or NULL. Pure:
  * it never binds a slot, so it may run on every render. Identity or a VID:PID
  * only one device has, never a similar name: the page writes this pad's SDL
  * type under what it answers, and re-announces the pad, so a guess would edit
- * the wrong controller. */
-logical_device_t *hid_pt_gamepad_panel_peer(const app_gamepad_state_t *gamepad);
+ * the wrong controller. One pad per device: of two pads that both name one
+ * device, the better match (then the lower SDL index) gets it and the other
+ * gets NULL, so it has a row -- and a type -- of its own. */
+logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad);
 
 #endif
 

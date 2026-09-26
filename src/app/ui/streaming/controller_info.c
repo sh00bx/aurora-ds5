@@ -719,7 +719,7 @@ int controller_info_collect(app_t *app, controller_info_t *out, int max) {
 #if defined(TARGET_WEBOS)
         /* What the arrival path announces this pad as, so the badge cannot
          * claim a type the host was not given. */
-        info->sdl_type = hid_pt_gamepad_sdl_type(state);
+        info->sdl_type = hid_pt_gamepad_sdl_type(input, state);
         if (has_known_battery_layout(vendor, product)) {
             const ds_node_t *node = ds_claim(&ds, NULL, mac);
             if (node) {

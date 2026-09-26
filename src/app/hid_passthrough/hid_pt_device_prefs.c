@@ -26,7 +26,7 @@
  * a serial that happens to start with "sdl". */
 #define HID_PT_SYNTHETIC_PREFIX "sdl_"
 
-/* Key suffix of the SDL type pref: `<stable_id>.sdl_type = xbox|playstation`.
+/* Key suffix of the SDL type pref: `<stable_id>.sdl_type = xbox|playstation|auto`.
  * A separate key rather than a new value for the auto-plug line, so a file
  * written by this build still reads correctly in an older one: there the whole
  * key normalises to an id no device has, and its value is not "true", so the
@@ -36,6 +36,12 @@
 typedef struct {
     char id[HID_PT_STABLE_ID_LEN];
     bool auto_plugin;
+    /* An SDL type was chosen for this id, and sdl_type is that choice -- AUTO
+     * included. An explicit AUTO is not the same as no choice: a CTM device's
+     * id is read before the pad's own (hid_pt_gamepad_sdl_type()), so
+     * "Automatic" picked while the pad was mounted has to be able to outvote an
+     * older Xbox stored under the pad's SDL serial. */
+    bool sdl_type_set;
     gamepad_type_pref_t sdl_type;
 } hid_pt_pref_entry_t;
 
@@ -43,11 +49,20 @@ static hid_pt_pref_entry_t g_hid_pt_prefs[HID_PT_PREFS_MAX];
 static int g_hid_pt_pref_count;
 
 /* An entry every reader would answer exactly as it answers a missing one: no
- * auto-plug, SDL type AUTO. Such an entry carries no information, which is what
- * makes it the one a full table may reuse and the one the writer may skip. */
+ * auto-plug, no SDL type chosen. Such an entry carries no information, which is
+ * what makes it the one a full table may reuse and the one the writer may
+ * skip. */
 static bool pref_is_default(const hid_pt_pref_entry_t *e)
 {
-    return !e->auto_plugin && e->sdl_type == GAMEPAD_TYPE_PREF_AUTO;
+    return !e->auto_plugin && !e->sdl_type_set;
+}
+
+/* Holds nothing but an explicit "Automatic". Worth keeping (see sdl_type_set),
+ * but the least of what a full table holds: it is taken only when no default
+ * entry is left, and never to make room for another one of its kind. */
+static bool pref_is_explicit_auto_only(const hid_pt_pref_entry_t *e)
+{
+    return !e->auto_plugin && e->sdl_type_set && e->sdl_type == GAMEPAD_TYPE_PREF_AUTO;
 }
 
 static const char *sdl_type_ini_value(gamepad_type_pref_t type)
@@ -58,6 +73,7 @@ static const char *sdl_type_ini_value(gamepad_type_pref_t type)
         case GAMEPAD_TYPE_PREF_PLAYSTATION:
             return "playstation";
         case GAMEPAD_TYPE_PREF_AUTO:
+            return "auto";
         default:
             return NULL;
     }
@@ -128,7 +144,7 @@ static hid_pt_pref_entry_t *pref_find(const char *stable_id)
     return NULL;
 }
 
-static hid_pt_pref_entry_t *pref_upsert(const char *stable_id)
+static hid_pt_pref_entry_t *pref_upsert(const char *stable_id, bool may_evict_explicit_auto)
 {
     if (!stable_id || !stable_id[0]) {
         return NULL;
@@ -151,6 +167,13 @@ static hid_pt_pref_entry_t *pref_upsert(const char *stable_id)
             if (pref_is_default(&g_hid_pt_prefs[i])) {
                 e = &g_hid_pt_prefs[i];
                 break;
+            }
+        }
+        for (int i = 0; i < g_hid_pt_pref_count && !e && may_evict_explicit_auto; ++i) {
+            if (pref_is_explicit_auto_only(&g_hid_pt_prefs[i])) {
+                commons_log_info("HID-PT", "pref table full: dropping the explicit SDL type Automatic of %s",
+                                 g_hid_pt_prefs[i].id);
+                e = &g_hid_pt_prefs[i];
             }
         }
         if (!e) {
@@ -232,7 +255,7 @@ bool hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled)
         return true;
     }
     if (!e) {
-        e = pref_upsert(stable_id);
+        e = pref_upsert(stable_id, true);
     }
     if (!e) {
         commons_log_warn("HID-PT",
@@ -261,11 +284,24 @@ bool hid_pt_prefs_auto_plugin_for_gamepad(const app_gamepad_state_t *gamepad)
 
 gamepad_type_pref_t hid_pt_prefs_get_sdl_type(const char *stable_id)
 {
-    const hid_pt_pref_entry_t *e = pref_find(stable_id);
-    return e ? e->sdl_type : GAMEPAD_TYPE_PREF_AUTO;
+    gamepad_type_pref_t type = GAMEPAD_TYPE_PREF_AUTO;
+    hid_pt_prefs_lookup_sdl_type(stable_id, &type);
+    return type;
 }
 
-bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type)
+bool hid_pt_prefs_lookup_sdl_type(const char *stable_id, gamepad_type_pref_t *out)
+{
+    const hid_pt_pref_entry_t *e = pref_find(stable_id);
+    if (!e || !e->sdl_type_set) {
+        return false;
+    }
+    if (out) {
+        *out = e->sdl_type;
+    }
+    return true;
+}
+
+bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type, bool keep_auto)
 {
     if (!stable_id || !stable_id[0]) {
         commons_log_warn("HID-PT", "SDL type pref dropped: device has no stable id");
@@ -275,12 +311,20 @@ bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type)
         return false;
     }
     hid_pt_pref_entry_t *e = pref_find(stable_id);
-    if (!e && type == GAMEPAD_TYPE_PREF_AUTO) {
-        /* Same rule as auto-plug: a missing entry already reads as AUTO. */
+    if (type == GAMEPAD_TYPE_PREF_AUTO && !keep_auto) {
+        /* No choice at all: the same answer as a missing entry, so it never
+         * needs a slot and only has to clear one that holds a type. */
+        if (e && e->sdl_type_set) {
+            e->sdl_type_set = false;
+            e->sdl_type = GAMEPAD_TYPE_PREF_AUTO;
+            hid_pt_prefs_flush();
+        }
         return true;
     }
     if (!e) {
-        e = pref_upsert(stable_id);
+        /* Another explicit Automatic may give up its slot for a real type, but
+         * not for one more of its own kind. */
+        e = pref_upsert(stable_id, type != GAMEPAD_TYPE_PREF_AUTO);
     }
     if (!e) {
         commons_log_warn("HID-PT",
@@ -288,9 +332,10 @@ bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type)
                          stable_id, HID_PT_PREFS_MAX);
         return false;
     }
-    if (e->sdl_type == type) {
+    if (e->sdl_type_set && e->sdl_type == type) {
         return true;
     }
+    e->sdl_type_set = true;
     e->sdl_type = type;
     hid_pt_prefs_flush();
     return true;
@@ -331,16 +376,19 @@ static void sdl_type_ini_entry(const char *name, size_t id_len, const char *valu
         type = GAMEPAD_TYPE_PREF_XBOX;
     } else if (strcmp(value, "playstation") == 0) {
         type = GAMEPAD_TYPE_PREF_PLAYSTATION;
+    } else if (strcmp(value, "auto") == 0) {
+        type = GAMEPAD_TYPE_PREF_AUTO;
     } else {
-        /* AUTO is never written, and an unknown word from a newer build reads
-         * as the default rather than as a guess. */
+        /* An unknown word from a newer build reads as no choice rather than as
+         * a guess. */
         return;
     }
-    hid_pt_pref_entry_t *e = pref_upsert(id);
+    hid_pt_pref_entry_t *e = pref_upsert(id, type != GAMEPAD_TYPE_PREF_AUTO);
     if (!e) {
         commons_log_warn("HID-PT", "SDL type pref for %s dropped on load: table full", id);
         return;
     }
+    e->sdl_type_set = true;
     e->sdl_type = type;
 }
 
@@ -375,7 +423,7 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
          * actually opted in are parsed. */
         return 1;
     }
-    hid_pt_pref_entry_t *e = pref_upsert(id);
+    hid_pt_pref_entry_t *e = pref_upsert(id, true);
     if (!e) {
         commons_log_warn("HID-PT", "auto-plug pref for %s dropped on load: table full", id);
         return 1;
@@ -405,7 +453,7 @@ void hid_pt_prefs_write_section(FILE *fp)
         if (e->auto_plugin) {
             ini_write_bool(fp, e->id, true);
         }
-        const char *sdl_type = sdl_type_ini_value(e->sdl_type);
+        const char *sdl_type = e->sdl_type_set ? sdl_type_ini_value(e->sdl_type) : NULL;
         if (sdl_type) {
             char key[HID_PT_STABLE_ID_LEN + sizeof(HID_PT_SDL_TYPE_SUFFIX)];
             snprintf(key, sizeof(key), "%s" HID_PT_SDL_TYPE_SUFFIX, e->id);

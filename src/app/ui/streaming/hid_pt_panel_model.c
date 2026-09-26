@@ -76,11 +76,13 @@ static void row_key(const row_ref_t *ref, char *out, size_t len)
 /**
  * Every CTM device, then every SDL pad no CTM device answers for.
  *
- * A pad is paired with the device hid_pt_gamepad_panel_peer() names, first pad
- * first. A second pad that names a device already paired gets a row of its own
- * rather than vanishing: two same-model pads next to one listed device must
- * both stay reachable. SDL-only rows are one per stable id -- two pads with the
- * same (synthetic) id share one pref, so one row edits both.
+ * A pad is paired with the device hid_pt_gamepad_panel_peer() names. That
+ * pairing is one pad per device and is the same one the arrival reads the type
+ * through, so a second pad that names a device already paired gets a row of its
+ * own -- and its own type -- rather than vanishing or showing the first pad's:
+ * two same-model pads next to one listed device must both stay reachable.
+ * SDL-only rows are one per stable id -- two pads with the same (synthetic) id
+ * share one pref, so one row edits both.
  */
 static int collect_rows(const hid_pt_model_t *model, row_ref_t *out, int max)
 {
@@ -100,7 +102,7 @@ static int collect_rows(const hid_pt_model_t *model, row_ref_t *out, int max)
         if (!gp || !gp->controller) {
             continue;
         }
-        const logical_device_t *peer = hid_pt_gamepad_panel_peer(gp);
+        const logical_device_t *peer = hid_pt_gamepad_panel_peer(input, gp);
         if (peer) {
             const int r = (int) (peer - g_devices.items);
             if (r >= 0 && r < device_rows && !out[r].pad) {
@@ -154,20 +156,20 @@ static bool selected_row(const hid_pt_model_t *model, row_ref_t *out)
 
 /* The type the row's pad is announced with (hid_pt_gamepad_sdl_type(), which
  * is what the arrival reads), or -- no pad right now -- what the CTM device's
- * own id stores, which is what the next arrival will find. */
-static gamepad_type_pref_t row_sdl_type(const row_ref_t *ref)
+ * own id stores, which is what the next arrival reads first. */
+static gamepad_type_pref_t row_sdl_type(const hid_pt_model_t *model, const row_ref_t *ref)
 {
     if (ref->pad) {
-        return hid_pt_gamepad_sdl_type(ref->pad);
+        return hid_pt_gamepad_sdl_type(model_app_input(model), ref->pad);
     }
     return ref->item ? hid_pt_prefs_sdl_type_for_logical(ref->item) : GAMEPAD_TYPE_PREF_AUTO;
 }
 
-static void fill_row_info(const row_ref_t *ref, hid_pt_row_info_t *out)
+static void fill_row_info(const hid_pt_model_t *model, const row_ref_t *ref, hid_pt_row_info_t *out)
 {
     row_key(ref, out->key, sizeof(out->key));
     out->has_sdl_pad = ref->pad != NULL;
-    out->sdl_type = row_sdl_type(ref);
+    out->sdl_type = row_sdl_type(model, ref);
     if (!ref->item) {
         const char *name = SDL_GameControllerName(ref->pad->controller);
         snprintf(out->label, sizeof(out->label), "%s", name ? name : locstr("Controller"));
@@ -246,7 +248,7 @@ bool hid_pt_model_row_info(const hid_pt_model_t *model, int index, hid_pt_row_in
     if (!out || index < 0 || index >= count) {
         return false;
     }
-    fill_row_info(&rows[index], out);
+    fill_row_info(model, &rows[index], out);
     return true;
 }
 
@@ -268,7 +270,7 @@ uint64_t hid_pt_model_signature(const hid_pt_model_t *model)
          * plugged, SDL presence and SDL type -- a type change has to repaint
          * "SDL · XBOX" without waiting for an unrelated device event. */
         hid_pt_row_info_t info;
-        fill_row_info(&rows[i], &info);
+        fill_row_info(model, &rows[i], &info);
         unsigned char st = (unsigned char) (info.plugged ? 1 : 0);
         unsigned char pad = (unsigned char) (info.has_sdl_pad ? 1 : 0);
         unsigned char type = (unsigned char) info.sdl_type;
@@ -404,7 +406,7 @@ bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info
     if (!out || !selected_row(model, &ref)) {
         return false;
     }
-    fill_row_info(&ref, out);
+    fill_row_info(model, &ref, out);
     return true;
 }
 
@@ -548,73 +550,90 @@ static const char *sdl_type_log_name(gamepad_type_pref_t type)
     }
 }
 
+/* Bounds the before/after snapshot below; gs_ids are 0..15 anyway. */
+#define HID_PT_MAX_PADS 16
+
 bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type)
 {
     row_ref_t ref;
     if (!selected_row(model, &ref)) {
         return false;
     }
-    /* Both identities, when the row has both and they differ: a USB DualShock's
-     * SDL serial and its hidraw-derived CTM id do not coincide, and the choice
-     * must still be found after it went HID and back, when the arrival may only
-     * reach it through the CTM device. For a Bluetooth pad the two are the same
-     * MAC and this is one write. */
-    char ids[2][HID_PT_STABLE_ID_LEN];
-    int id_count = 0;
+    app_input_t *app_input = model_app_input(model);
+    short pad_count = app_input ? app_input_get_max_gamepads(app_input) : 0;
+    if (pad_count > HID_PT_MAX_PADS) {
+        pad_count = HID_PT_MAX_PADS;
+    }
+    /* What every pad is announced with now, to re-announce exactly the ones
+     * whose type this write changes -- normally just the row's pad, but pads
+     * that share a synthetic id share its pref too. */
+    gamepad_type_pref_t before[HID_PT_MAX_PADS];
+    for (short i = 0; i < pad_count; ++i) {
+        const app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
+        before[i] = (gp && gp->controller) ? hid_pt_gamepad_sdl_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
+    }
+
+    /* The ids hid_pt_gamepad_sdl_type() reads, in its order. The listed device
+     * first, "Automatic" kept as a choice of its own: that id is read before
+     * the pad's, and while the controller is mounted it is the only one this
+     * row has, so it must be able to outvote an older type under the pad's
+     * SDL serial (a USB DualShock's serial is not its hidraw id). For an
+     * SDL-only row it is the device the pad would pair with if the device list
+     * is not shown -- normally none. */
+    const logical_device_t *device = ref.item;
+    if (!device && ref.pad) {
+        device = hid_pt_gamepad_panel_peer(app_input, ref.pad);
+    }
+    char device_id[HID_PT_STABLE_ID_LEN] = "";
+    if (device) {
+        hid_pt_stable_id_for_logical(device, device_id, sizeof(device_id));
+    }
+    /* Then the pad's own id, kept in step so the choice also holds where the
+     * pad pairs with no device -- except the synthetic per-model form next to
+     * a device: it is shared by every serial-less pad of that model, and a
+     * device's choice written there would outlive any later change made while
+     * the serial was readable. Such a pad reaches the device's id anyway. Last
+     * in line, so "Automatic" here just erases. */
+    char pad_id[HID_PT_STABLE_ID_LEN] = "";
     if (ref.pad) {
-        hid_pt_stable_id_for_gamepad(ref.pad, ids[id_count], sizeof(ids[0]));
-        if (ids[id_count][0]) {
-            id_count++;
+        hid_pt_stable_id_for_gamepad(ref.pad, pad_id, sizeof(pad_id));
+        if ((device && hid_pt_stable_id_is_synthetic(pad_id)) || strcmp(pad_id, device_id) == 0) {
+            pad_id[0] = '\0';
         }
     }
-    if (ref.item) {
-        hid_pt_stable_id_for_logical(ref.item, ids[id_count], sizeof(ids[0]));
-        if (ids[id_count][0] && (id_count == 0 || strcmp(ids[0], ids[id_count]) != 0)) {
-            id_count++;
-        }
-    }
+
     char name[HID_PT_PANEL_NAME_LEN];
     if (!hid_pt_model_selected_name(model, name, sizeof(name))) {
         name[0] = '\0';
     }
-    bool stored = id_count > 0;
-    for (int i = 0; i < id_count; ++i) {
-        stored = hid_pt_prefs_set_sdl_type(ids[i], type) && stored;
+    bool stored = device_id[0] || pad_id[0];
+    if (device_id[0]) {
+        stored = hid_pt_prefs_set_sdl_type(device_id, type, true) && stored;
     }
-    if (!stored) {
+    if (pad_id[0]) {
+        stored = hid_pt_prefs_set_sdl_type(pad_id, type, false) && stored;
+    }
+    if (stored) {
+        commons_log_info("HID-PT", "SDL controller type for %s set to %s", name, sdl_type_log_name(type));
+    } else {
         /* Same place and wording pattern as a failed auto-plug save: the
          * dropdown reads its value back from the store, so without this line
          * the choice would just silently snap back. */
         ctm_set_plug_error("SDL controller type for %s could not be saved", name);
-        return false;
     }
-    commons_log_info("HID-PT", "SDL controller type for %s set to %s", name, sdl_type_log_name(type));
 
-    /* Every announced pad under one of those ids gets a fresh host pad of the
-     * new type -- normally just this row's pad, but two pads that share a
-     * synthetic id share the pref too. stream_input_reannounce_gamepad() itself
-     * leaves bridged, unannounced and view-only pads alone. */
+    /* Even after a partial failure: whatever did change must reach the host,
+     * or the badge would name a type the host was not given.
+     * stream_input_reannounce_gamepad() itself leaves bridged, unannounced and
+     * view-only pads alone. */
     stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
-    app_input_t *app_input = input ? input->input : NULL;
-    if (!app_input) {
-        return true;
-    }
-    for (short i = 0; i < app_input_get_max_gamepads(app_input); ++i) {
+    for (short i = 0; input && i < pad_count; ++i) {
         app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
-        if (!gp || !gp->controller) {
-            continue;
-        }
-        char gid[HID_PT_STABLE_ID_LEN];
-        hid_pt_stable_id_for_gamepad(gp, gid, sizeof(gid));
-        bool mine = gp == ref.pad;
-        for (int k = 0; k < id_count && !mine; ++k) {
-            mine = strcmp(gid, ids[k]) == 0;
-        }
-        if (mine) {
+        if (gp && gp->controller && hid_pt_gamepad_sdl_type(app_input, gp) != before[i]) {
             stream_input_reannounce_gamepad(input, gp);
         }
     }
-    return true;
+    return stored;
 }
 
 bool hid_pt_model_reset_selected(const hid_pt_model_t *model)

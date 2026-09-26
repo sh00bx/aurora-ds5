@@ -495,32 +495,76 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
     }
 }
 
-gamepad_type_pref_t hid_pt_gamepad_sdl_type(const app_gamepad_state_t *gamepad)
-{
-    if (!gamepad || !gamepad->controller) {
-        return GAMEPAD_TYPE_PREF_AUTO;
-    }
-    char sid[HID_PT_STABLE_ID_LEN];
-    hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
-    const gamepad_type_pref_t own = hid_pt_prefs_get_sdl_type(sid);
-    if (own != GAMEPAD_TYPE_PREF_AUTO || !hid_pt_stable_id_is_synthetic(sid)) {
-        /* With a readable serial the only logical device that may answer is the
-         * EXACT_ID one, and that one's id is `sid` itself -- nothing to add. */
-        return own;
-    }
-    /* No serial right now (the stream-churn window hid_pt_gamepad_is_autoplug()
-     * describes): the Controllers page stored the choice under the MAC-keyed id
-     * of the logical device, so reach it through the VID:PID tiers. */
-    hid_pt_logical_match_t m = resolve_logical(gamepad, HID_PT_CONF_FUZZY, false);
-    return m.item ? hid_pt_prefs_sdl_type_for_logical(m.item) : GAMEPAD_TYPE_PREF_AUTO;
-}
-
-logical_device_t *hid_pt_gamepad_panel_peer(const app_gamepad_state_t *gamepad)
+/* Which listed device this pad is, one pad per device. resolve_logical() at the
+ * VID:PID floor answers for the pad alone, so two same-model pads next to one
+ * listed device both name it; only one of them can be it. The stronger evidence
+ * wins, and between equals the lower SDL index -- the order the Controllers page
+ * walks the pads in. Everything that reads or writes a pad's SDL type goes
+ * through this one pairing, so the page can never show a row whose type the
+ * arrival reads from somewhere else. */
+static logical_device_t *pad_peer(app_input_t *input, const app_gamepad_state_t *gamepad)
 {
     if (!gamepad || !gamepad->controller) {
         return NULL;
     }
-    return resolve_logical(gamepad, HID_PT_CONF_VIDPID, false).item;
+    const hid_pt_logical_match_t m = resolve_logical(gamepad, HID_PT_CONF_VIDPID, false);
+    if (!m.item || !input) {
+        return m.item;
+    }
+    bool before_me = true;
+    for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
+        const app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
+        if (gp == gamepad) {
+            before_me = false;
+            continue;
+        }
+        if (!gp || !gp->controller) {
+            continue;
+        }
+        const hid_pt_logical_match_t o = resolve_logical(gp, HID_PT_CONF_VIDPID, false);
+        if (o.item != m.item) {
+            continue;
+        }
+        if (o.confidence > m.confidence || (o.confidence == m.confidence && before_me)) {
+            return NULL;
+        }
+    }
+    return m.item;
+}
+
+gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return GAMEPAD_TYPE_PREF_AUTO;
+    }
+    gamepad_type_pref_t type = GAMEPAD_TYPE_PREF_AUTO;
+    /* The listed device first. It is the one id every write reaches: the page
+     * writes it for a mounted controller, which is not in SDL and so has no pad
+     * id to write, and "Automatic" is stored there explicitly so it can outvote
+     * an older type under the pad's own id. The pairing is the page's own
+     * (identity, or a VID:PID only this device has, one pad per device): a pad
+     * WITH a serial reaches a device by VID:PID only when that device is the one
+     * of its model the TV lists, i.e. the same controller under another id (a
+     * USB DualShock's SDL serial is not its hidraw id). */
+    const logical_device_t *peer = pad_peer(input, gamepad);
+    char id[HID_PT_STABLE_ID_LEN];
+    if (peer) {
+        hid_pt_stable_id_for_logical(peer, id, sizeof(id));
+        if (hid_pt_prefs_lookup_sdl_type(id, &type)) {
+            return type;
+        }
+    }
+    /* Then the pad's own id: its serial, or the synthetic per-model form. The
+     * synthetic one is only ever written for a pad no listed device is (see
+     * hid_pt_model_set_sdl_type()), so it cannot shadow a device's choice. */
+    hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
+    hid_pt_prefs_lookup_sdl_type(id, &type);
+    return type;
+}
+
+logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    return pad_peer(input, gamepad);
 }
 
 uint16_t hid_pt_moonlight_excluded_mask_at_start(app_input_t *input)

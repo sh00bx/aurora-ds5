@@ -483,7 +483,7 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
      * X360 target cannot use, and the touchpad-as-mouse path needs the touchpad
      * bit on a DualShock announced as an Xbox pad. */
     const uint8_t detected = type;
-    switch (hid_pt_gamepad_sdl_type(gamepad)) {
+    switch (hid_pt_gamepad_sdl_type(input->input, gamepad)) {
         case GAMEPAD_TYPE_PREF_XBOX:
             type = LI_CTYPE_XBOX;
             break;
