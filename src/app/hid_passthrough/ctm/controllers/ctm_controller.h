@@ -143,6 +143,19 @@ typedef struct {
      * NULL => never. */
     size_t (*build_settings_report)(ctm_controller_t *c, uint8_t *buf, size_t cap);
 
+    /* Reports that leave the pad quiet when a session ends — host link lost,
+     * plug-out, app exit. A pad keeps doing whatever it was last told: motors
+     * at their last value, and a DS4 even loops its speaker buffer when the
+     * audio stream just stops. Fill up to `max` reports back to back into
+     * `buf` (`cap` bytes), each length into `len[]`, and return how many
+     * (0 = nothing to say). Called once on the session thread right after the
+     * pump loop exits, while the injector and the HID fd are still up; the
+     * pump writes them through the normal output path (patch_output, signing,
+     * raw-ACL routing), gives the burst a bounded time and ignores failures —
+     * the pad may already be gone. NULL => nothing is written. */
+    int (*build_quiesce_reports)(ctm_controller_t *c, uint8_t *buf, size_t cap,
+                                 size_t *len, int max);
+
     /* Optional per-input-report hook (DS5 battery, etc.). NULL => none. */
     void (*on_input_report)(ctm_controller_t *c, const uint8_t *data, size_t len);
 

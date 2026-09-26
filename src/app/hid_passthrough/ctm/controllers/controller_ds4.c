@@ -154,6 +154,10 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 #define DS4_BT_OUTPUT_LEN 78
 #define DS4_OUT_STATE     6   /* motors, RGB, flash: [6..12] */
 #define DS4_OUT_STATE_LEN 7
+#define DS4_OUT_RGB       8
+/* BT 0x17 pure-audio report: [0x17][hwctl][0xa0][frame ctr LE16][route]
+ * [436 B SBC][pad][crc32]; the counter advances by 4 (SBC frames) per report. */
+#define DS4_0X17_LEN      462
 
 /* The slider volumes and their valid flags, exactly as ds4_patch_output
  * stamps them into a host report, for a report this file builds itself. */
@@ -204,6 +208,71 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     ds4_stamp_volumes(buf, &s);
     ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);
     return DS4_BT_OUTPUT_LEN;
+}
+
+/* build_quiesce_reports: what the pad must hear when the session ends.
+ *
+ * Speaker: the DS4 latches and loops its audio buffer when the 0x17 stream
+ * stops without a "no target" route (0x00) -- the host's stop burst is the only
+ * thing that ends it, and a session that dies mid-stream (host link lost, the
+ * stream quit, a switch to the SDL path) never sends one, so the pad loops
+ * until it is switched off. If a 0x17 went out in the last 5 s, send the same
+ * stop the host would: 8 reports with route 0x00, the frame counter carried on
+ * from the last one delivered (+4 per report, as the pad expects), re-signed.
+ * They are copies of that last report; with no target the pad decodes none of
+ * the SBC payload. ds4_patch_output passes route 0x00 through untouched in
+ * every audio mode, so the user's mode cannot re-arm the plane here.
+ *
+ * Motors: an ERM keeps its last value until told otherwise. One 0x11 with
+ * both motors 0 follows. It is full state (0x03) when the lightbar colour is
+ * known from a 0x11 delivered this session with its LED flag, so a pad that
+ * applies every field keeps its colour; otherwise it claims the motors only
+ * (0x01). Volumes and poll bits as ds4_patch_output stamps them. */
+static int ds4_build_quiesce_reports(ctm_controller_t *c, uint8_t *buf, size_t cap,
+                                     size_t *len, int max)
+{
+    if (!buf || !len || max <= 0) return 0;
+    int n = 0;
+    size_t off = 0;
+
+    uint8_t last17[DS4_0X17_LEN];
+    uint64_t age17 = 0;
+    size_t l17 = ctm_controller_last_output(c, 0x17, last17, sizeof(last17), &age17);
+    if (l17 == DS4_0X17_LEN && age17 < 5000000ull) {
+        uint16_t ctr = (uint16_t) (last17[3] | (last17[4] << 8));
+        for (int k = 0; k < 8 && n < max - 1 && off + DS4_0X17_LEN <= cap; ++k) {
+            uint8_t *r = buf + off;
+            memcpy(r, last17, DS4_0X17_LEN);
+            ctr = (uint16_t) (ctr + 4u);
+            r[1] = 0x40 | DS4_POLL_INTERVAL_MS;
+            r[3] = (uint8_t) (ctr & 0xffu);
+            r[4] = (uint8_t) (ctr >> 8);
+            r[5] = 0x00;
+            ctm_bt_sign_output(r, DS4_0X17_LEN);
+            len[n++] = DS4_0X17_LEN;
+            off += DS4_0X17_LEN;
+        }
+    }
+
+    if (n < max && off + DS4_BT_OUTPUT_LEN <= cap) {
+        tv_bridge_worker_settings_t s;
+        ctm_controller_get_settings(c, &s);
+        uint8_t last11[DS4_BT_OUTPUT_LEN];
+        size_t l11 = ctm_controller_last_output(c, 0x11, last11, sizeof(last11), NULL);
+        uint8_t *r = buf + off;
+        memset(r, 0, DS4_BT_OUTPUT_LEN);
+        r[0] = 0x11;
+        r[1] = 0xc0 | DS4_POLL_INTERVAL_MS;
+        r[3] = 0x01;                                   /* motors: both 0 below */
+        if (l11 == DS4_BT_OUTPUT_LEN && (last11[3] & 0x02u)) {
+            r[3] |= 0x02;
+            memcpy(&r[DS4_OUT_RGB], &last11[DS4_OUT_RGB], 3);
+        }
+        ds4_stamp_volumes(r, &s);
+        ctm_bt_sign_output(r, DS4_BT_OUTPUT_LEN);
+        len[n++] = DS4_BT_OUTPUT_LEN;
+    }
+    return n;
 }
 
 /* on_input_report: read-only observer of what the pad sends us.
@@ -296,6 +365,7 @@ const ctm_controller_ops_t ctm_controller_ds4_ops = {
                              * the proactive send is build_settings_report, since
                              * set_settings runs on the LVGL thread */
     .build_settings_report = ds4_build_settings_report,
+    .build_quiesce_reports = ds4_build_quiesce_reports,
     .on_input_report = ds4_on_input_report,
     .neutralize_input = ds4_neutralize_input,
 };

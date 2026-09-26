@@ -1824,6 +1824,37 @@ static uint64_t tick_settings_push(ctm_pump_t *p)
     return c->settings_retry_us;
 }
 
+/* Write the type's session-end reports (ops->build_quiesce_reports). Runs on
+ * the session thread, the only one allowed to write to the device, right after
+ * the pump loop — the raw-ACL forwarder and the HID fd outlive run_session, so
+ * both are still up. Each report goes through ctm_hid_io_write, i.e. patched,
+ * signed and routed exactly like host output. The link may be gone for either
+ * side (host dropped, pad dropped): every failure is ignored, and the burst is
+ * cut off after QUIESCE_BUDGET_US so a stuck hidraw write path (EAGAIN waits
+ * are up to hid_wait_ms each) cannot hold up the teardown or a plug-out. */
+#define QUIESCE_MAX_REPORTS 12
+#define QUIESCE_BUDGET_US   50000ull
+static void session_quiesce(ctm_controller_t *c)
+{
+    uint8_t buf[4096];
+    size_t len[QUIESCE_MAX_REPORTS];
+    int n = c->ops->build_quiesce_reports(c, buf, sizeof(buf), len, QUIESCE_MAX_REPORTS);
+    if (n <= 0) return;
+    if (n > QUIESCE_MAX_REPORTS) n = QUIESCE_MAX_REPORTS;
+    uint64_t t0 = ctm_now_us();
+    size_t off = 0;
+    int written = 0, tried = 0;
+    for (int i = 0; i < n; ++i) {
+        if (len[i] == 0 || off + len[i] > sizeof(buf) ||
+            ctm_now_us() - t0 > QUIESCE_BUDGET_US) break;
+        if (ctm_hid_io_write(c->io, buf + off, len[i]) == 0) written++;
+        tried++;
+        off += len[i];
+    }
+    ctm_ctl_log(c, "session end: quiesce %d/%d report(s) accepted (%d built, %llu us)",
+                written, tried, n, (unsigned long long)(ctm_now_us() - t0));
+}
+
 /* Run one connected session: handshake, start the input thread (plus the
  * composite sibling readers and the xpad feeder where the type uses them), then
  * the output/feature receive loop + paced drain until the link drops or stop.
@@ -1994,6 +2025,10 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
             }
         }
     }
+
+    /* The pad hears nothing more from this session: tell it to stop before
+     * anything is torn down (see session_quiesce). */
+    if (c->ops->build_quiesce_reports) session_quiesce(c);
 
     pthread_mutex_lock(&c->status_mutex);
     c->st_connected = 0;
