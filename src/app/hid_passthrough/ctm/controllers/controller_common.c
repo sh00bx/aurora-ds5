@@ -1787,30 +1787,22 @@ static uint64_t tick_plc_log(ctm_pump_t *p)
  *   acl_drop  reports the raw-ACL forwarder could not hand to ds5_txd
  * The same line goes to pmlog (commons_log, HID-PT tag), at most once per
  * window: the ctm log lives in /tmp and dies with a TV reboot, which is how
- * the only HID session of the 2026-09-26 speaker-loop report lost its data. */
-static uint64_t tick_ds4_log(ctm_pump_t *p)
+ * the only HID session of the 2026-09-26 speaker-loop report lost its data.
+ * The label carries the window's length: 60 s for a full one, less for the
+ * last one of a session (ds4_log_flush). */
+static void ds4_log_emit(ctm_pump_t *p, uint64_t dnow, uint64_t window_us)
 {
     ctm_controller_t *c = p->c;
-    if (!p->ds4) return 0;
-    uint64_t dnow = ctm_now_us();
     long acl_drop_now = 0;
     if (c->acl_tx) ds5_acl_tx_stats(c->acl_tx, NULL, &acl_drop_now, NULL);
-    if (p->ds4_log_next_us == 0) {
-        p->ds4_in_base = ctm_stat_get(&c->stats.reports_in);
-        p->ds4_coal_base = ctm_stat_get(&c->stats.coalesced);
-        p->ds4_acl_drop_base = acl_drop_now;
-        p->ds4_log_next_us = dnow + 60000000ull;
-        return p->ds4_log_next_us;
-    }
-    if (dnow < p->ds4_log_next_us) return p->ds4_log_next_us;
-
     ctm_hid_io_stats_t io_st;
     ctm_hid_io_stats_take(c->io, &io_st);
     unsigned long in_now = ctm_stat_get(&c->stats.reports_in);
     unsigned long coal_now = ctm_stat_get(&c->stats.coalesced);
     char line[200];
     snprintf(line, sizeof(line),
-             "DS4/60s: in=%lu coal=%lu out11=%lu out17=%lu dedup=%lu trim17=%lu acl_drop=%ld",
+             "DS4/%llus: in=%lu coal=%lu out11=%lu out17=%lu dedup=%lu trim17=%lu acl_drop=%ld",
+             (unsigned long long)((window_us + 500000ull) / 1000000ull),
              in_now - p->ds4_in_base, coal_now - p->ds4_coal_base,
              io_st.out11, io_st.out17, io_st.dedup_skipped, c->st_paced_trim,
              acl_drop_now - p->ds4_acl_drop_base);
@@ -1821,7 +1813,40 @@ static uint64_t tick_ds4_log(ctm_pump_t *p)
     p->ds4_acl_drop_base = acl_drop_now;
     c->st_paced_trim = 0;
     p->ds4_log_next_us = dnow + 60000000ull;
+}
+
+static uint64_t tick_ds4_log(ctm_pump_t *p)
+{
+    ctm_controller_t *c = p->c;
+    if (!p->ds4) return 0;
+    uint64_t dnow = ctm_now_us();
+    if (p->ds4_log_next_us == 0) {
+        long acl_drop_now = 0;
+        if (c->acl_tx) ds5_acl_tx_stats(c->acl_tx, NULL, &acl_drop_now, NULL);
+        p->ds4_in_base = ctm_stat_get(&c->stats.reports_in);
+        p->ds4_coal_base = ctm_stat_get(&c->stats.coalesced);
+        p->ds4_acl_drop_base = acl_drop_now;
+        p->ds4_log_next_us = dnow + 60000000ull;
+        return p->ds4_log_next_us;
+    }
+    if (dnow < p->ds4_log_next_us) return p->ds4_log_next_us;
+    ds4_log_emit(p, dnow, 60000000ull);
     return p->ds4_log_next_us;
+}
+
+/* The session's last, partial DS4 window, when the pump loop ends. Without it
+ * a session shorter than 60 s left no line at all, and every session lost the
+ * window it ended in -- the one that holds a latch or a drop burst right
+ * before the link or the pad went away. A window under 1 s is skipped: it
+ * says nothing, and a link that flaps would only fill pmlog with them. Runs
+ * before session_quiesce, so the counters are the host's traffic only. */
+static void ds4_log_flush(ctm_pump_t *p)
+{
+    if (!p->ds4 || p->ds4_log_next_us == 0) return;
+    uint64_t dnow = ctm_now_us();
+    uint64_t start = p->ds4_log_next_us - 60000000ull;
+    if (dnow <= start || dnow - start < 1000000ull) return;
+    ds4_log_emit(p, dnow, dnow - start);
 }
 
 /* NET/60s: downlink arrival pattern + ENet link health (HOL probe, see
@@ -2110,6 +2135,7 @@ static void run_session(ctm_controller_t *c, const ctmb_device_caps_t *caps,
         }
     }
 
+    ds4_log_flush(&pump);
     /* The pad hears nothing more from this session: tell it to stop before
      * anything is torn down (see session_quiesce). */
     if (c->ops->build_quiesce_reports) session_quiesce(c);
