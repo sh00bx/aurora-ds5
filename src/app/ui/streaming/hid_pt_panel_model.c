@@ -4,10 +4,16 @@
 
 #include "ctm/ctm_state.h"
 #include "ctm/ctm_settings.h"
+#include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
+#include "input/input_gamepad.h"
 #include "stream/session.h"
+#include "stream/input/session_input.h"
 
+#include "logging.h"
 #include "util/i18n.h"
+
+#include <SDL.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -19,9 +25,168 @@ _Static_assert(sizeof(((logical_device_t *) 0)->name) == HID_PT_PANEL_NAME_LEN,
 _Static_assert((unsigned) TV_BRIDGE_AUDIO_AUTO == HID_PT_AUDIO_MODE_AUTO,
                "the panel's audio-mode indices are the bridge's enum values");
 
+/* Keys of the SDL-only rows. No CTM key has this form (they are "hid:",
+ * "usb:", "input:", "flydigi:" and "steam:"), so logical_device_by_key() never
+ * resolves one, and every CTM-only operation below is a no-op on such a row. */
+#define SDL_ROW_KEY_PREFIX "sdl:"
+
+/* As many rows as the CTM table has devices: the view draws no more than that
+ * either (HID_PT_MAX_ROWS), so a pad past it could not be shown anyway. */
+#define HID_PT_MAX_LIST_ROWS MAX_DEVICES
+
 static logical_device_t *selected_item(const hid_pt_model_t *model)
 {
     return model ? logical_device_by_key(model->selected_key) : NULL;
+}
+
+/* ---- rows ----------------------------------------------------------------
+ *
+ * What one row of the list stands for: a CTM device, an SDL pad, or both. The
+ * list is re-derived on every question rather than cached: g_devices is rebuilt
+ * on the manager's poll and SDL pads come and go on hotplug, both on their own
+ * cadence, and a 64-entry walk is nothing next to a render.
+ */
+typedef struct {
+    logical_device_t *item;     /* NULL for an SDL-only row */
+    app_gamepad_state_t *pad;   /* NULL when no SDL pad of the session is this row */
+} row_ref_t;
+
+static app_input_t *model_app_input(const hid_pt_model_t *model)
+{
+    stream_input_t *input = (model && model->session) ? session_get_input(model->session) : NULL;
+    return input ? input->input : NULL;
+}
+
+static void sdl_row_key(const app_gamepad_state_t *pad, char *out, size_t len)
+{
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_gamepad(pad, id, sizeof(id));
+    snprintf(out, len, SDL_ROW_KEY_PREFIX "%s", id);
+}
+
+static void row_key(const row_ref_t *ref, char *out, size_t len)
+{
+    if (ref->item) {
+        snprintf(out, len, "%s", ref->item->key);
+    } else {
+        sdl_row_key(ref->pad, out, len);
+    }
+}
+
+/**
+ * Every CTM device, then every SDL pad no CTM device answers for.
+ *
+ * A pad is paired with the device hid_pt_gamepad_panel_peer() names, first pad
+ * first. A second pad that names a device already paired gets a row of its own
+ * rather than vanishing: two same-model pads next to one listed device must
+ * both stay reachable. SDL-only rows are one per stable id -- two pads with the
+ * same (synthetic) id share one pref, so one row edits both.
+ */
+static int collect_rows(const hid_pt_model_t *model, row_ref_t *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < g_devices.count && n < max; ++i) {
+        out[n].item = &g_devices.items[i];
+        out[n].pad = NULL;
+        n++;
+    }
+    const int device_rows = n;
+    app_input_t *input = model_app_input(model);
+    if (!input) {
+        return n;
+    }
+    for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
+        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
+        if (!gp || !gp->controller) {
+            continue;
+        }
+        const logical_device_t *peer = hid_pt_gamepad_panel_peer(gp);
+        if (peer) {
+            const int r = (int) (peer - g_devices.items);
+            if (r >= 0 && r < device_rows && !out[r].pad) {
+                out[r].pad = gp;
+                continue;
+            }
+        }
+        if (n >= max) {
+            continue;
+        }
+        char key[HID_PT_PANEL_KEY_LEN];
+        sdl_row_key(gp, key, sizeof(key));
+        bool dup = false;
+        for (int r = device_rows; r < n && !dup; ++r) {
+            char other[HID_PT_PANEL_KEY_LEN];
+            sdl_row_key(out[r].pad, other, sizeof(other));
+            dup = strcmp(key, other) == 0;
+        }
+        if (dup) {
+            continue;
+        }
+        out[n].item = NULL;
+        out[n].pad = gp;
+        n++;
+    }
+    return n;
+}
+
+static bool row_for_key(const hid_pt_model_t *model, const char *key, row_ref_t *out)
+{
+    if (!key || !key[0]) {
+        return false;
+    }
+    row_ref_t rows[HID_PT_MAX_LIST_ROWS];
+    const int count = collect_rows(model, rows, HID_PT_MAX_LIST_ROWS);
+    for (int i = 0; i < count; ++i) {
+        char k[HID_PT_PANEL_KEY_LEN];
+        row_key(&rows[i], k, sizeof(k));
+        if (strcmp(k, key) == 0) {
+            *out = rows[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool selected_row(const hid_pt_model_t *model, row_ref_t *out)
+{
+    return model && row_for_key(model, model->selected_key, out);
+}
+
+/* The type the row's pad is announced with (hid_pt_gamepad_sdl_type(), which
+ * is what the arrival reads), or -- no pad right now -- what the CTM device's
+ * own id stores, which is what the next arrival will find. */
+static gamepad_type_pref_t row_sdl_type(const row_ref_t *ref)
+{
+    if (ref->pad) {
+        return hid_pt_gamepad_sdl_type(ref->pad);
+    }
+    return ref->item ? hid_pt_prefs_sdl_type_for_logical(ref->item) : GAMEPAD_TYPE_PREF_AUTO;
+}
+
+static void fill_row_info(const row_ref_t *ref, hid_pt_row_info_t *out)
+{
+    row_key(ref, out->key, sizeof(out->key));
+    out->has_sdl_pad = ref->pad != NULL;
+    out->sdl_type = row_sdl_type(ref);
+    if (!ref->item) {
+        const char *name = SDL_GameControllerName(ref->pad->controller);
+        snprintf(out->label, sizeof(out->label), "%s", name ? name : locstr("Controller"));
+        out->plugged = false;
+        return;
+    }
+    const logical_device_t *item = ref->item;
+    out->plugged = item->plugged;
+    snprintf(out->label, sizeof(out->label), "%s", item->name);
+    if (is_flydigi_logical_device(item)) {
+        snprintf(out->label, sizeof(out->label), "%s (%s)", item->name,
+                 flydigi_is_xinput_evdev_only(item) ? "XInput" :
+                 flydigi_is_xinput_mode(item) ? "XInput" : "D-Input");
+    }
+    const tv_bridge_worker_settings_t *settings = settings_for_item(item);
+    if (settings && settings->auto_plugin) {
+        size_t len = strlen(out->label);
+        snprintf(out->label + len, sizeof(out->label) - len, " [A]");
+    }
 }
 
 static const char *selected_kind(const hid_pt_model_t *model)
@@ -50,41 +215,42 @@ void hid_pt_model_resolve_selection(hid_pt_model_t *model)
     if (!model) {
         return;
     }
-    if (!logical_device_by_key(model->selected_key) && g_devices.count > 0) {
-        hid_pt_model_set_selected_key(model, g_devices.items[0].key);
+    row_ref_t rows[HID_PT_MAX_LIST_ROWS];
+    const int count = collect_rows(model, rows, HID_PT_MAX_LIST_ROWS);
+    for (int i = 0; i < count; ++i) {
+        char k[HID_PT_PANEL_KEY_LEN];
+        row_key(&rows[i], k, sizeof(k));
+        if (strcmp(k, model->selected_key) == 0) {
+            return;
+        }
+    }
+    if (count > 0) {
+        char first[HID_PT_PANEL_KEY_LEN];
+        row_key(&rows[0], first, sizeof(first));
+        hid_pt_model_set_selected_key(model, first);
     }
 }
 
 /* ---- the device list ---------------------------------------------------- */
 
-int hid_pt_model_device_count(void)
+int hid_pt_model_row_count(const hid_pt_model_t *model)
 {
-    return g_devices.count;
+    row_ref_t rows[HID_PT_MAX_LIST_ROWS];
+    return collect_rows(model, rows, HID_PT_MAX_LIST_ROWS);
 }
 
-bool hid_pt_model_row_info(int index, hid_pt_row_info_t *out)
+bool hid_pt_model_row_info(const hid_pt_model_t *model, int index, hid_pt_row_info_t *out)
 {
-    if (!out || index < 0 || index >= g_devices.count) {
+    row_ref_t rows[HID_PT_MAX_LIST_ROWS];
+    const int count = collect_rows(model, rows, HID_PT_MAX_LIST_ROWS);
+    if (!out || index < 0 || index >= count) {
         return false;
     }
-    const logical_device_t *item = &g_devices.items[index];
-    snprintf(out->key, sizeof(out->key), "%s", item->key);
-    out->plugged = item->plugged;
-    snprintf(out->label, sizeof(out->label), "%s", item->name);
-    if (is_flydigi_logical_device(item)) {
-        snprintf(out->label, sizeof(out->label), "%s (%s)", item->name,
-                 flydigi_is_xinput_evdev_only(item) ? "XInput" :
-                 flydigi_is_xinput_mode(item) ? "XInput" : "D-Input");
-    }
-    const tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (settings && settings->auto_plugin) {
-        size_t len = strlen(out->label);
-        snprintf(out->label + len, sizeof(out->label) - len, " [A]");
-    }
+    fill_row_info(&rows[index], out);
     return true;
 }
 
-uint64_t hid_pt_model_signature(void)
+uint64_t hid_pt_model_signature(const hid_pt_model_t *model)
 {
     uint64_t sig = 1469598103934665603ULL;
 #define SIG_MIX(p, n) do {                                              \
@@ -94,21 +260,30 @@ uint64_t hid_pt_model_signature(void)
             sig *= 1099511628211ULL;                                    \
         }                                                               \
     } while (0)
-    SIG_MIX(&g_devices.count, sizeof(g_devices.count));
-    for (int i = 0; i < g_devices.count; ++i) {
-        const logical_device_t *item = &g_devices.items[i];
-        unsigned char st = (unsigned char) (item->plugged ? 1 : 0);
+    row_ref_t rows[HID_PT_MAX_LIST_ROWS];
+    const int count = collect_rows(model, rows, HID_PT_MAX_LIST_ROWS);
+    SIG_MIX(&count, sizeof(count));
+    for (int i = 0; i < count; ++i) {
+        /* Everything the row draws: its key, and the state line built from
+         * plugged, SDL presence and SDL type -- a type change has to repaint
+         * "SDL · XBOX" without waiting for an unrelated device event. */
+        hid_pt_row_info_t info;
+        fill_row_info(&rows[i], &info);
+        unsigned char st = (unsigned char) (info.plugged ? 1 : 0);
+        unsigned char pad = (unsigned char) (info.has_sdl_pad ? 1 : 0);
+        unsigned char type = (unsigned char) info.sdl_type;
         /* The row label carries the " [A]" marker, so auto_plugin belongs in the
          * signature: without it, ticking the checkbox left the marker stale until
-         * some unrelated device event happened to change the hash.
-         * settings_for_item() materialises the record for a device that has none
-         * yet -- hid_pt_model_row_info() does the same for every row the panel
-         * draws, so this adds no entry the renderer would not have added anyway. */
-        const tv_bridge_worker_settings_t *settings = settings_for_item(item);
-        unsigned char ap = (unsigned char) ((settings && settings->auto_plugin) ? 1 : 0);
-        SIG_MIX(item->key, strlen(item->key));
+         * some unrelated device event happened to change the hash. The label is
+         * mixed whole, which covers that. fill_row_info()'s settings_for_item()
+         * materialises the record for a device that has none yet -- the renderer
+         * does the same for every row it draws, so this adds no entry the
+         * renderer would not have added anyway. */
+        SIG_MIX(info.key, strlen(info.key));
+        SIG_MIX(info.label, strlen(info.label));
         SIG_MIX(&st, 1);
-        SIG_MIX(&ap, 1);
+        SIG_MIX(&pad, 1);
+        SIG_MIX(&type, 1);
     }
 #undef SIG_MIX
     return sig;
@@ -210,12 +385,69 @@ bool hid_pt_model_selected_is_flydigi(const hid_pt_model_t *model)
 
 bool hid_pt_model_selected_name(const hid_pt_model_t *model, char *buf, size_t len)
 {
-    const logical_device_t *item = selected_item(model);
-    if (!item || !buf || len == 0) {
+    row_ref_t ref;
+    if (!buf || len == 0 || !selected_row(model, &ref)) {
         return false;
     }
-    snprintf(buf, len, "%s", item->name);
+    if (ref.item) {
+        snprintf(buf, len, "%s", ref.item->name);
+    } else {
+        const char *name = SDL_GameControllerName(ref.pad->controller);
+        snprintf(buf, len, "%s", name ? name : locstr("Controller"));
+    }
     return true;
+}
+
+bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info_t *out)
+{
+    row_ref_t ref;
+    if (!out || !selected_row(model, &ref)) {
+        return false;
+    }
+    fill_row_info(&ref, out);
+    return true;
+}
+
+bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model)
+{
+    row_ref_t ref;
+    return selected_row(model, &ref) && !ref.item;
+}
+
+bool hid_pt_model_selected_is_gamepad(const hid_pt_model_t *model)
+{
+    row_ref_t ref;
+    if (!selected_row(model, &ref)) {
+        return false;
+    }
+    return ref.pad != NULL || hid_pt_model_selected_is_bridgeable(model);
+}
+
+const char *hid_pt_model_selected_detected_family(const hid_pt_model_t *model)
+{
+    row_ref_t ref;
+    if (!selected_row(model, &ref) || !ref.pad) {
+        return NULL;
+    }
+    /* The same families the arrival path tells apart. */
+    switch (SDL_GameControllerGetType(ref.pad->controller)) {
+        case SDL_CONTROLLER_TYPE_PS3:
+        case SDL_CONTROLLER_TYPE_PS4:
+        case SDL_CONTROLLER_TYPE_PS5:
+            return locstr("PlayStation");
+        case SDL_CONTROLLER_TYPE_XBOX360:
+        case SDL_CONTROLLER_TYPE_XBOXONE:
+            return locstr("Xbox");
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+#endif
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+            return locstr("Nintendo");
+        default:
+            return locstr("Generic");
+    }
 }
 
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model)
@@ -300,6 +532,88 @@ bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on)
     }
     settings->composite_passthrough = on;
     apply_settings_to_session(item);
+    return true;
+}
+
+static const char *sdl_type_log_name(gamepad_type_pref_t type)
+{
+    switch (type) {
+        case GAMEPAD_TYPE_PREF_XBOX:
+            return "xbox";
+        case GAMEPAD_TYPE_PREF_PLAYSTATION:
+            return "playstation";
+        case GAMEPAD_TYPE_PREF_AUTO:
+        default:
+            return "auto";
+    }
+}
+
+bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type)
+{
+    row_ref_t ref;
+    if (!selected_row(model, &ref)) {
+        return false;
+    }
+    /* Both identities, when the row has both and they differ: a USB DualShock's
+     * SDL serial and its hidraw-derived CTM id do not coincide, and the choice
+     * must still be found after it went HID and back, when the arrival may only
+     * reach it through the CTM device. For a Bluetooth pad the two are the same
+     * MAC and this is one write. */
+    char ids[2][HID_PT_STABLE_ID_LEN];
+    int id_count = 0;
+    if (ref.pad) {
+        hid_pt_stable_id_for_gamepad(ref.pad, ids[id_count], sizeof(ids[0]));
+        if (ids[id_count][0]) {
+            id_count++;
+        }
+    }
+    if (ref.item) {
+        hid_pt_stable_id_for_logical(ref.item, ids[id_count], sizeof(ids[0]));
+        if (ids[id_count][0] && (id_count == 0 || strcmp(ids[0], ids[id_count]) != 0)) {
+            id_count++;
+        }
+    }
+    char name[HID_PT_PANEL_NAME_LEN];
+    if (!hid_pt_model_selected_name(model, name, sizeof(name))) {
+        name[0] = '\0';
+    }
+    bool stored = id_count > 0;
+    for (int i = 0; i < id_count; ++i) {
+        stored = hid_pt_prefs_set_sdl_type(ids[i], type) && stored;
+    }
+    if (!stored) {
+        /* Same place and wording pattern as a failed auto-plug save: the
+         * dropdown reads its value back from the store, so without this line
+         * the choice would just silently snap back. */
+        ctm_set_plug_error("SDL controller type for %s could not be saved", name);
+        return false;
+    }
+    commons_log_info("HID-PT", "SDL controller type for %s set to %s", name, sdl_type_log_name(type));
+
+    /* Every announced pad under one of those ids gets a fresh host pad of the
+     * new type -- normally just this row's pad, but two pads that share a
+     * synthetic id share the pref too. stream_input_reannounce_gamepad() itself
+     * leaves bridged, unannounced and view-only pads alone. */
+    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
+    app_input_t *app_input = input ? input->input : NULL;
+    if (!app_input) {
+        return true;
+    }
+    for (short i = 0; i < app_input_get_max_gamepads(app_input); ++i) {
+        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
+        if (!gp || !gp->controller) {
+            continue;
+        }
+        char gid[HID_PT_STABLE_ID_LEN];
+        hid_pt_stable_id_for_gamepad(gp, gid, sizeof(gid));
+        bool mine = gp == ref.pad;
+        for (int k = 0; k < id_count && !mine; ++k) {
+            mine = strcmp(gid, ids[k]) == 0;
+        }
+        if (mine) {
+            stream_input_reannounce_gamepad(input, gp);
+        }
+    }
     return true;
 }
 

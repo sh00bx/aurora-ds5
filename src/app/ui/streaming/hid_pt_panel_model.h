@@ -1,16 +1,21 @@
 #pragma once
 
 /**
- * Selection state for the HID passthrough panel, and the panel's whole view of
- * the CTM bridge.
+ * Selection state for the Controllers panel, and the panel's whole view of the
+ * CTM bridge and of the session's SDL pads.
  *
- * This header deliberately exposes no CTM type: the panel's other two
+ * This header deliberately exposes no CTM or SDL type: the panel's other two
  * translation units (the widget layer in hid_pt_panel_view.c and the wiring in
  * hid_passthrough_panel.c) get devices as plain values -- a key, a label, a
  * plugged flag, a block of control values -- and can therefore not reach
- * g_devices, g_sessions, g_settings or g_agent_host at all. Of the panel's
- * three translation units, only this module's includes ctm_state.h, so those
- * names are not even declared in the other two.
+ * g_devices, g_sessions, g_settings, g_agent_host or an SDL pad at all. Of the
+ * panel's three translation units, only this module's includes ctm_state.h,
+ * so those names are not even declared in the other two.
+ *
+ * The list is every CTM device, then every SDL pad of the session that no CTM
+ * device answers for (the agent is not running, or CTM does not list the pad),
+ * so a controller's SDL type can always be changed. Such an SDL-only row is
+ * keyed "sdl:<stable id>" and has no HID controls.
  *
  * Everything here runs on the LVGL thread. That is not a property this module
  * enforces; it is the same contract root.c states for every other CTM caller,
@@ -20,6 +25,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include "stream/input/gamepad_type_pref.h"
 
 typedef struct session_t session_t;
 
@@ -34,6 +41,10 @@ typedef struct {
     /* Name, plus the Flydigi mode suffix and the " [A]" auto-plug marker. */
     char label[128];
     bool plugged;
+    /* An SDL pad of the session is this row. Always true for an SDL-only row. */
+    bool has_sdl_pad;
+    /* The type this row's pad is (or will be) announced with over SDL. */
+    gamepad_type_pref_t sdl_type;
 } hid_pt_row_info_t;
 
 /**
@@ -66,6 +77,9 @@ typedef enum {
 
 typedef struct {
     char selected_key[HID_PT_PANEL_KEY_LEN];
+    /* Where the SDL pads come from, and where a type change is re-announced.
+     * NULL lists the CTM devices only. */
+    session_t *session;
 } hid_pt_model_t;
 
 /* ---- selection ---------------------------------------------------------- */
@@ -74,25 +88,26 @@ void hid_pt_model_set_selected_key(hid_pt_model_t *model, const char *key);
 const char *hid_pt_model_selected_key(const hid_pt_model_t *model);
 
 /**
- * Point the selection at the first device when the selected key has left the
- * model. A selection that still resolves, and an empty model, are both left
+ * Point the selection at the first row when the selected key has left the
+ * list. A selection that still resolves, and an empty list, are both left
  * alone.
  */
 void hid_pt_model_resolve_selection(hid_pt_model_t *model);
 
 /* ---- the device list ---------------------------------------------------- */
 
-int hid_pt_model_device_count(void);
+/** Rows in the list: CTM devices first, then SDL-only pads. */
+int hid_pt_model_row_count(const hid_pt_model_t *model);
 
-/** Fill @p out for device @p index. False (and @p out untouched) when out of range. */
-bool hid_pt_model_row_info(int index, hid_pt_row_info_t *out);
+/** Fill @p out for row @p index. False (and @p out untouched) when out of range. */
+bool hid_pt_model_row_info(const hid_pt_model_t *model, int index, hid_pt_row_info_t *out);
 
 /**
  * A hash over the part of the model the device list draws: the count, and each
- * device's key, plugged state and auto-plug flag. The panel re-renders when it
- * changes.
+ * row's key, plugged state, auto-plug flag, SDL presence and SDL type. The
+ * panel re-renders when it changes.
  */
-uint64_t hid_pt_model_signature(void);
+uint64_t hid_pt_model_signature(const hid_pt_model_t *model);
 
 /* ---- status line -------------------------------------------------------- */
 
@@ -125,6 +140,24 @@ bool hid_pt_model_selected_has_audio(const hid_pt_model_t *model);
 /** The selected device's name. False when nothing is selected. */
 bool hid_pt_model_selected_name(const hid_pt_model_t *model, char *buf, size_t len);
 
+/** The selected row as the list draws it. False when nothing is selected. */
+bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info_t *out);
+
+/** An SDL pad with no CTM device behind it: no HID controls at all. */
+bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model);
+
+/**
+ * A controller whose SDL type means something: an SDL pad is this row, or the
+ * device is a bridgeable pad kind (it runs over SDL whenever it is not mounted).
+ */
+bool hid_pt_model_selected_is_gamepad(const hid_pt_model_t *model);
+
+/**
+ * The family SDL detects for the selection's pad, translated ("PlayStation",
+ * "Xbox", "Nintendo", "Generic"), or NULL when no SDL pad is this row.
+ */
+const char *hid_pt_model_selected_detected_family(const hid_pt_model_t *model);
+
 /** default_settings_for_item()'s latency for the selection, or 60 with none. */
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model);
 
@@ -152,6 +185,17 @@ bool hid_pt_model_set_auto_plugin(const hid_pt_model_t *model, bool on);
 
 /** Write the Flydigi composite flag and push it at a live bridge. */
 bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on);
+
+/**
+ * Store the selection's SDL controller type and, when its pad is announced over
+ * SDL right now, re-announce it so the host re-creates the pad with that type.
+ *
+ * Written under every identity the row has (the pad's own stable id and the
+ * CTM device's), so the choice is found whichever of the two the next arrival
+ * resolves. False when the store refused it; the reason is then in the plug
+ * error the status line shows.
+ */
+bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type);
 
 /**
  * Overwrite the selection's settings with the per-device defaults, without

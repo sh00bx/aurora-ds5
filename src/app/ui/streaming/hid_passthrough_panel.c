@@ -1,23 +1,26 @@
 #if defined(TARGET_WEBOS)
 
 /**
- * The HID passthrough panel's wiring.
+ * The Controllers panel's wiring.
  *
  * Three files, one job each. hid_pt_panel_view.c builds and drives the widgets;
  * its TU has no include path to the model, so it cannot name a device.
  * hid_pt_panel_model.c owns the selection and is the panel's only door to the
- * CTM globals; this TU in turn has no include path to ctm_state.h. That leaves
- * this file as the one place where a widget event meets a device.
+ * CTM globals and the session's SDL pads; this TU in turn has no include path
+ * to ctm_state.h. That leaves this file as the one place where a widget event
+ * meets a device.
  *
  * The two directions are kept apart:
- *   - sync_customize_ui_from_settings() and update_device_options() push the
- *     model into the widgets. They run on the 2 s refresh as well as on a
- *     selection change, so they must not overwrite a control the user currently
- *     owns -- see the comment on sync_customize_ui_from_settings() for the one
- *     control where that is enforced, and why the sliders need no such guard.
- *   - customize_setting_changed(), and the composite and auto-plug branches of
- *     panel_value_changed(), push the widgets into the model. Every caller is a
- *     widget's LV_EVENT_VALUE_CHANGED, i.e. a change the user just made.
+ *   - sync_customize_ui_from_settings(), update_mode_rows() and
+ *     update_device_options() push the model into the widgets. They run on the
+ *     2 s refresh as well as on a selection change, so they must not overwrite a
+ *     control the user currently owns -- see the comment on
+ *     sync_customize_ui_from_settings() for why the dropdowns are the controls
+ *     where that is enforced, and why the sliders need no such guard.
+ *   - customize_setting_changed(), and the connection, SDL type, composite and
+ *     auto-plug branches of panel_value_changed(), push the widgets into the
+ *     model. Every caller is a widget's LV_EVENT_VALUE_CHANGED, i.e. a change
+ *     the user just made.
  */
 
 #include "hid_passthrough_panel.h"
@@ -89,6 +92,7 @@ static void update_row_styles(hid_pt_panel_t *panel) {
 
 static void panel_update_status(hid_pt_panel_t *panel);
 static void update_device_options(hid_pt_panel_t *panel);
+static void update_mode_rows(hid_pt_panel_t *panel);
 static void panel_select_device(hid_pt_panel_t *panel, int row);
 static void panel_focus_selected_row(hid_pt_panel_t *panel);
 static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused);
@@ -124,7 +128,7 @@ static void panel_focus_selected_row(hid_pt_panel_t *panel)
 /**
  * Move the cursor to the nearest row in direction @p step, or nowhere.
  *
- * The downward bound is the model's *current* device count, not the number of
+ * The downward bound is the model's *current* row count, not the number of
  * rows on screen. Those differ when the model changed after the last render, and
  * then the trailing rows are not reachable with DOWN until the next re-render.
  * Carried over unchanged from the previous key handling.
@@ -140,7 +144,7 @@ static bool panel_step_row(hid_pt_panel_t *panel, int from, int step)
         }
         return false;
     }
-    for (int j = from + 1; j < hid_pt_model_device_count() && j < HID_PT_MAX_ROWS; ++j) {
+    for (int j = from + 1; j < hid_pt_model_row_count(&panel->model) && j < HID_PT_MAX_ROWS; ++j) {
         if (hid_pt_view_has_row(&panel->view, j)) {
             hid_pt_view_focus_row(&panel->view, j);
             return true;
@@ -208,9 +212,9 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
         }
         case LV_KEY_LEFT:
         case LV_KEY_RIGHT: {
-            /* LEFT/RIGHT steps the audio mode where it steps a slider's value, so
+            /* LEFT/RIGHT steps a dropdown's value where it steps a slider's, so
              * the whole settings column answers to one pair of keys. OK still
-             * opens the full list for anyone who wants to see all five at once. */
+             * opens the full list for anyone who wants to see every entry. */
             uint16_t count = lv_dropdown_get_option_cnt(target);
             int32_t sel = (int32_t) lv_dropdown_get_selected(target) + (key == LV_KEY_RIGHT ? 1 : -1);
             if (count > 0 && sel >= 0 && sel < (int32_t) count) {
@@ -227,7 +231,7 @@ static void panel_dropdown_key(void *userdata, lv_event_t *event)
 
 /* The footer follows the list: while it is up the keys pick an option, and the
  * moment it is gone they are the settings column's again. */
-static void panel_dropdown_toggled(void *userdata, bool open)
+static void panel_dropdown_toggled(void *userdata, lv_obj_t *dropdown, bool open)
 {
     hid_pt_panel_t *panel = userdata;
     if (!panel) {
@@ -237,7 +241,7 @@ static void panel_dropdown_toggled(void *userdata, bool open)
         hid_pt_view_set_hints(&panel->view, HID_PT_ZONE_DROPDOWN,
                               hid_pt_model_selected_is_plugged(&panel->model));
     } else {
-        panel_update_hints(panel, panel->view.audio_dropdown);
+        panel_update_hints(panel, dropdown);
     }
 }
 
@@ -417,8 +421,47 @@ static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t 
 }
 
 /**
- * The one line under the device's name: whether it is bridged, and how it is
- * doing. "BRIDGED" is tinted with the same teal the device's rail wears in the
+ * A row's second line, and whether it wears the bridge's teal: "HID" for a
+ * mounted controller; "SDL", or "SDL · XBOX" / "SDL · PS" when the user chose
+ * a type, for one an SDL pad of the session is; "IDLE" for anything else.
+ */
+static const char *row_state_text(const hid_pt_row_info_t *info, bool *live)
+{
+    *live = info->plugged;
+    if (info->plugged) {
+        return locstr("HID");
+    }
+    if (!info->has_sdl_pad) {
+        return locstr("IDLE");
+    }
+    switch (info->sdl_type) {
+        case GAMEPAD_TYPE_PREF_XBOX:
+            return locstr("SDL · XBOX");
+        case GAMEPAD_TYPE_PREF_PLAYSTATION:
+            return locstr("SDL · PS");
+        case GAMEPAD_TYPE_PREF_AUTO:
+        default:
+            return locstr("SDL");
+    }
+}
+
+/* Repaint the selected row's state line now, rather than on the next re-render
+ * the signature change will bring 2 s later. */
+static void refresh_selected_row_state(hid_pt_panel_t *panel)
+{
+    hid_pt_row_info_t info;
+    if (!hid_pt_view_has_row(&panel->view, panel->selected_index) ||
+        !hid_pt_model_selected_row_info(&panel->model, &info)) {
+        return;
+    }
+    bool live = false;
+    const char *state = row_state_text(&info, &live);
+    hid_pt_view_set_row_state(&panel->view, panel->selected_index, state, live);
+}
+
+/**
+ * The one line under the device's name: how it reaches the host, and how it is
+ * doing. "HID" is tinted with the same teal the device's rail wears in the
  * list, so the two say the same thing in the same colour.
  */
 static void update_state_line(hid_pt_panel_t *panel)
@@ -428,8 +471,12 @@ static void update_state_line(hid_pt_panel_t *panel)
     }
     char battery[64];
     const bool has_battery = hid_pt_model_battery_text(&panel->model, battery, sizeof(battery));
-    const bool plugged = hid_pt_model_selected_is_plugged(&panel->model);
-    const char *state = plugged ? locstr("BRIDGED") : locstr("IDLE");
+    hid_pt_row_info_t info;
+    if (!hid_pt_model_selected_row_info(&panel->model, &info)) {
+        memset(&info, 0, sizeof(info));
+    }
+    bool plugged = false;
+    const char *state = row_state_text(&info, &plugged);
     char line[128];
     if (plugged) {
         /* LVGL's inline recolour: #rrggbb marks the run, # ends it. The teal is
@@ -638,17 +685,65 @@ static void update_composite_row(hid_pt_panel_t *panel) {
     show_row(panel->view.composite_row, show);
 }
 
+/**
+ * The MODE section: Connection for a controller that can be mounted as HID, the
+ * SDL type for anything that is (or can become) an SDL pad, and the caption that
+ * says the type waits while the controller is mounted.
+ *
+ * Same rule as the audio dropdown in sync_customize_ui_from_settings(): a list
+ * that is up belongs to the user, so its value is not written back under them.
+ */
+static void update_mode_rows(hid_pt_panel_t *panel)
+{
+    if (!panel) {
+        return;
+    }
+    hid_pt_view_t *v = &panel->view;
+    const bool connection = hid_pt_model_selected_is_bridgeable(&panel->model);
+    const bool gamepad = hid_pt_model_selected_is_gamepad(&panel->model);
+    const bool plugged = hid_pt_model_selected_is_plugged(&panel->model);
+    if (connection && v->connection_dropdown && !hid_pt_view_dropdown_is_open(v, v->connection_dropdown)) {
+        /* Entry 0 is HID passthrough, entry 1 SDL. */
+        const uint16_t want = plugged ? 0 : 1;
+        if (lv_dropdown_get_selected(v->connection_dropdown) != want) {
+            lv_dropdown_set_selected(v->connection_dropdown, want);
+        }
+    }
+    hid_pt_row_info_t info;
+    if (gamepad && v->sdl_type_dropdown && !hid_pt_view_dropdown_is_open(v, v->sdl_type_dropdown) &&
+        hid_pt_model_selected_row_info(&panel->model, &info)) {
+        const char *family = hid_pt_model_selected_detected_family(&panel->model);
+        char auto_label[64];
+        if (family) {
+            snprintf(auto_label, sizeof(auto_label), locstr("Automatic (%s)"), family);
+        } else {
+            snprintf(auto_label, sizeof(auto_label), "%s", locstr("Automatic"));
+        }
+        hid_pt_view_set_sdl_type_auto_label(v, auto_label);
+        /* The entries are in gamepad_type_pref_t order. */
+        if (lv_dropdown_get_selected(v->sdl_type_dropdown) != (uint16_t) info.sdl_type) {
+            lv_dropdown_set_selected(v->sdl_type_dropdown, (uint16_t) info.sdl_type);
+        }
+    }
+    show_row(v->mode_heading, connection || gamepad);
+    show_row(v->connection_row, connection);
+    show_row(v->sdl_type_row, gamepad);
+    show_row(v->sdl_type_caption, gamepad && plugged);
+}
+
 static void update_device_options(hid_pt_panel_t *panel)
 {
+    update_mode_rows(panel);
     update_auto_plugin_row(panel);
     update_composite_row(panel);
     update_customize_panel(panel);
 }
 
-/* The row is the button now: OK on a device, or a click anywhere on it, is the
- * plug. There is no second control to aim at. */
-static void panel_row_clicked(void *userdata, int row) {
-    hid_pt_panel_t *panel = userdata;
+/* HID <-> SDL for the device in @p row: the one path both the row's OK and the
+ * Connection dropdown take, so the two cannot disagree about what a toggle
+ * does. Nothing here but the existing plug/unplug. */
+static void panel_toggle_plug(hid_pt_panel_t *panel, int row)
+{
     if (!panel || !hid_pt_view_has_row(&panel->view, row)) {
         return;
     }
@@ -659,18 +754,36 @@ static void panel_row_clicked(void *userdata, int row) {
      * The model also owns the failure cases -- the device having left since the
      * row was drawn, and the plug-in refusing -- and leaves the reason in the
      * plug error the status line shows. */
-    bool plugged = false;
-    if (hid_pt_model_toggle_plug(&panel->model, panel->row_keys[row], panel->session, &plugged) !=
+    if (hid_pt_model_toggle_plug(&panel->model, panel->row_keys[row], panel->session, NULL) !=
         HID_PT_PLUG_DONE) {
         panel_update_status(panel);
         return;
     }
     panel->selected_index = row;
 
-    hid_pt_view_set_row_state(&panel->view, row, plugged);
+    refresh_selected_row_state(panel);
     update_row_styles(panel);
     update_device_options(panel);
     panel_update_status(panel);
+}
+
+/* The row is the button now: OK on a device, or a click anywhere on it, is the
+ * plug. There is no second control to aim at. */
+static void panel_row_clicked(void *userdata, int row) {
+    hid_pt_panel_t *panel = userdata;
+    if (!panel || !hid_pt_view_has_row(&panel->view, row)) {
+        return;
+    }
+    if (strcmp(hid_pt_model_selected_key(&panel->model), panel->row_keys[row]) != 0) {
+        panel_select_device(panel, row);
+    }
+    if (hid_pt_model_selected_is_sdl_only(&panel->model)) {
+        /* No CTM device behind the pad, so there is nothing to mount. OK takes
+         * the cursor to what such a row does have: its SDL type. */
+        panel_focus(panel, hid_pt_view_first_option(&panel->view));
+        return;
+    }
+    panel_toggle_plug(panel, row);
     panel_update_hints(panel, panel->view.row_buttons[row]);
 }
 
@@ -686,6 +799,30 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
                 hid_pt_model_set_composite(&panel->model,
                                            lv_obj_has_state(panel->view.composite_cb, LV_STATE_CHECKED));
             }
+            return;
+        case HID_PT_CTL_CONNECTION:
+            if (panel->view.connection_dropdown &&
+                hid_pt_view_has_row(&panel->view, panel->selected_index)) {
+                const bool want_hid = lv_dropdown_get_selected(panel->view.connection_dropdown) == 0;
+                if (want_hid != hid_pt_model_selected_is_plugged(&panel->model)) {
+                    panel_toggle_plug(panel, panel->selected_index);
+                }
+            }
+            /* Back to what actually happened -- a refused plug-in leaves the
+             * device on SDL, and the dropdown must say so. */
+            update_mode_rows(panel);
+            return;
+        case HID_PT_CTL_SDL_TYPE:
+            if (panel->view.sdl_type_dropdown) {
+                const uint16_t sel = lv_dropdown_get_selected(panel->view.sdl_type_dropdown);
+                if (sel < GAMEPAD_TYPE_PREF_COUNT &&
+                    !hid_pt_model_set_sdl_type(&panel->model, (gamepad_type_pref_t) sel)) {
+                    panel_update_status(panel);
+                }
+            }
+            refresh_selected_row_state(panel);
+            update_state_line(panel);
+            update_mode_rows(panel);
             return;
         case HID_PT_CTL_AUTO_PLUGIN:
             if (panel->view.auto_plugin_cb) {
@@ -748,8 +885,8 @@ static void render_device_list(hid_pt_panel_t *panel) {
     hid_pt_view_list_clear(&panel->view);
     memset(panel->row_keys, 0, sizeof(panel->row_keys));
 
-    const int device_count = hid_pt_model_device_count();
-    if (device_count == 0) {
+    const int row_count = hid_pt_model_row_count(&panel->model);
+    if (row_count == 0) {
         hid_pt_view_list_show_empty(&panel->view);
         return;
     }
@@ -757,16 +894,18 @@ static void render_device_list(hid_pt_panel_t *panel) {
     hid_pt_view_list_prepare(&panel->view);
 
     const char *sel = hid_pt_model_selected_key(&panel->model);
-    for (int i = 0; i < device_count && i < HID_PT_MAX_ROWS; ++i) {
+    for (int i = 0; i < row_count && i < HID_PT_MAX_ROWS; ++i) {
         hid_pt_row_info_t info;
-        if (!hid_pt_model_row_info(i, &info)) {
+        if (!hid_pt_model_row_info(&panel->model, i, &info)) {
             /* Only out-of-range fails, and the loop bound is the count the model
              * validates against; stop rather than leave a hole in the arrays. */
             break;
         }
         /* What this row stands for, for as long as it exists. */
         snprintf(panel->row_keys[i], sizeof(panel->row_keys[0]), "%s", info.key);
-        hid_pt_view_add_row(&panel->view, i, info.label, info.plugged,
+        bool live = false;
+        const char *state = row_state_text(&info, &live);
+        hid_pt_view_add_row(&panel->view, i, info.label, state, live,
                             sel[0] && strcmp(info.key, sel) == 0);
     }
     hid_pt_view_rebuild_focus_order(&panel->view);
@@ -867,7 +1006,7 @@ static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
                       hid_pt_view_kind_is_option(hid_pt_view_kind_of(&panel->view, prev_focus));
     bool prev_editing = keep_focus && lv_group_get_editing(panel->view.group);
 
-    uint64_t sig = hid_pt_model_signature();
+    uint64_t sig = hid_pt_model_signature(&panel->model);
     bool rerendered = false;
     if (!panel->have_rendered || sig != panel->last_sig) {
         panel->last_sig = sig;
@@ -942,6 +1081,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
         return NULL;
     }
     panel->session = session;
+    panel->model.session = session;
     panel->on_close = on_close;
     panel->on_close_userdata = userdata;
     panel->selected_index = -1;

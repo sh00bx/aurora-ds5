@@ -635,8 +635,8 @@ msgid "Virtual Mouse"
 msgstr "Mouse virtual"
 
 #: src/app/ui/streaming/streaming.view.c
-msgid "HID Devices"
-msgstr "Dispositivos HID"
+msgid "Controllers"
+msgstr "Controles"
 
 #: src/app/ui/streaming/hid_passthrough_panel.c
 msgid "No HID gamepads visible to Aurora"
@@ -675,8 +675,8 @@ msgid "Devices"
 msgstr "Dispositivos"
 
 #: src/app/ui/streaming/hid_passthrough_panel.c
-msgid "No HID devices visible to the native app"
-msgstr "Nenhum dispositivo HID visível para o app nativo"
+msgid "No controllers found"
+msgstr "Nenhum controle encontrado"
 
 #: src/app/ui/streaming/hid_passthrough_panel.c
 msgid "Recognize as native Flydigi on PC"

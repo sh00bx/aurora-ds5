@@ -151,7 +151,7 @@ lv_obj_t *streaming_scene_create(lv_fragment_t *self, lv_obj_t *parent) {
 
 #if defined(TARGET_WEBOS)
     if (app_configuration->hid_passthrough) {
-        controller->hid_devices_btn = command_button(controller, actions, locstr("HID Devices"),
+        controller->hid_devices_btn = command_button(controller, actions, locstr("Controllers"),
                                                      OVERLAY_KEY_GREEN);
     }
 #endif

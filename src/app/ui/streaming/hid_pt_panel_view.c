@@ -6,6 +6,7 @@
 #include "util/i18n.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* The sheet's grid. Every actionable row is the same height and puts its control
@@ -264,7 +265,7 @@ void hid_pt_view_list_show_empty(hid_pt_view_t *view)
         return;
     }
     lv_obj_t *empty = lv_label_create(view->list);
-    lv_label_set_text(empty, locstr("No HID devices visible to the native app"));
+    lv_label_set_text(empty, locstr("No controllers found"));
     lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(empty, LV_PCT(100));
     lv_obj_set_style_text_color(empty, lv_color_hex(OVERLAY_CHALK), 0);
@@ -281,22 +282,23 @@ void hid_pt_view_list_prepare(hid_pt_view_t *view)
     lv_obj_set_style_pad_gap(view->list, ROW_GAP, 0);
 }
 
-void hid_pt_view_set_row_state(hid_pt_view_t *view, int row, bool plugged)
+void hid_pt_view_set_row_state(hid_pt_view_t *view, int row, const char *text, bool live)
 {
     if (!view || row < 0 || row >= HID_PT_MAX_ROWS || !view->row_state_labels[row]) {
         return;
     }
     lv_obj_t *state = view->row_state_labels[row];
-    lv_label_set_text(state, plugged ? locstr("BRIDGED") : locstr("IDLE"));
-    lv_obj_set_style_text_color(state, lv_color_hex(plugged ? OVERLAY_LIVE : OVERLAY_CHALK), 0);
-    lv_obj_set_style_text_opa(state, plugged ? LV_OPA_COVER : OVERLAY_OPA_FAINT, 0);
+    lv_label_set_text(state, text ? text : "");
+    lv_obj_set_style_text_color(state, lv_color_hex(live ? OVERLAY_LIVE : OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(state, live ? LV_OPA_COVER : OVERLAY_OPA_FAINT, 0);
     if (view->row_rails[row]) {
         lv_obj_set_style_bg_color(view->row_rails[row],
-                                  lv_color_hex(plugged ? OVERLAY_LIVE : OVERLAY_SEAM), 0);
+                                  lv_color_hex(live ? OVERLAY_LIVE : OVERLAY_SEAM), 0);
     }
 }
 
-void hid_pt_view_add_row(hid_pt_view_t *view, int i, const char *label, bool plugged, bool selected)
+void hid_pt_view_add_row(hid_pt_view_t *view, int i, const char *label, const char *state, bool live,
+                         bool selected)
 {
     if (!view || !view->list || i < 0 || i >= HID_PT_MAX_ROWS) {
         return;
@@ -329,7 +331,7 @@ void hid_pt_view_add_row(hid_pt_view_t *view, int i, const char *label, bool plu
     lv_obj_set_height(name, lv_font_get_line_height(lv_obj_get_style_text_font(name, LV_PART_MAIN)));
 
     view->row_state_labels[i] = eyebrow(body, NULL, OVERLAY_CHALK, OVERLAY_OPA_FAINT);
-    hid_pt_view_set_row_state(view, i, plugged);
+    hid_pt_view_set_row_state(view, i, state, live);
     hid_pt_view_set_row_selected(view, i, selected);
 }
 
@@ -388,7 +390,7 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
-#define OPTION_CHAIN_LEN 9
+#define OPTION_CHAIN_LEN 11
 
 /**
  * The option column, top to bottom, into @p out.
@@ -399,15 +401,17 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
  */
 static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_LEN])
 {
-    out[0] = view->auto_plugin_cb;
-    out[1] = view->composite_cb;
-    out[2] = view->audio_dropdown;
-    out[3] = view->speaker_slider;
-    out[4] = view->headset_slider;
-    out[5] = view->haptics_slider;
-    out[6] = view->trigger_slider;
-    out[7] = view->latency_slider;
-    out[8] = view->reset_settings_btn;
+    out[0] = view->connection_dropdown;
+    out[1] = view->sdl_type_dropdown;
+    out[2] = view->auto_plugin_cb;
+    out[3] = view->composite_cb;
+    out[4] = view->audio_dropdown;
+    out[5] = view->speaker_slider;
+    out[6] = view->headset_slider;
+    out[7] = view->haptics_slider;
+    out[8] = view->trigger_slider;
+    out[9] = view->latency_slider;
+    out[10] = view->reset_settings_btn;
 }
 
 /**
@@ -470,6 +474,8 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
             {&view->haptics_slider,     HID_PT_WK_SLIDER},
             {&view->trigger_slider,     HID_PT_WK_SLIDER},
             {&view->audio_dropdown,     HID_PT_WK_DROPDOWN},
+            {&view->connection_dropdown, HID_PT_WK_DROPDOWN},
+            {&view->sdl_type_dropdown,  HID_PT_WK_DROPDOWN},
             {&view->reset_settings_btn, HID_PT_WK_OPTION_BTN},
             {&view->refresh_btn,        HID_PT_WK_HEADER_BTN},
             {&view->close_btn,          HID_PT_WK_HEADER_BTN},
@@ -576,7 +582,7 @@ lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int
     return NULL;
 }
 
-/* ---- the audio dropdown's list ------------------------------------------ */
+/* ---- the dropdowns' lists ------------------------------------------------ */
 
 bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target)
 {
@@ -626,8 +632,29 @@ static void dropdown_state_sync_cb(lv_event_t *event)
     view->active_dropdown = open ? dropdown : NULL;
     lv_group_set_editing(view->group, open);
     if (view->cbs.dropdown_toggled) {
-        view->cbs.dropdown_toggled(view->cbs.userdata, open);
+        view->cbs.dropdown_toggled(view->cbs.userdata, dropdown, open);
     }
+}
+
+void hid_pt_view_set_sdl_type_auto_label(hid_pt_view_t *view, const char *auto_label)
+{
+    if (!view || !view->sdl_type_dropdown || !auto_label) {
+        return;
+    }
+    lv_obj_t *dd = view->sdl_type_dropdown;
+    if (lv_dropdown_is_open(dd)) {
+        return;
+    }
+    char options[160];
+    snprintf(options, sizeof(options), "%s\n%s\n%s", auto_label, locstr("Xbox 360"),
+             locstr("PlayStation (DualShock 4)"));
+    const char *current = lv_dropdown_get_options(dd);
+    if (current && strcmp(current, options) == 0) {
+        return;
+    }
+    const uint16_t sel = lv_dropdown_get_selected(dd);
+    lv_dropdown_set_options(dd, options);
+    lv_dropdown_set_selected(dd, sel);
 }
 
 /* ---- the option column's labels ----------------------------------------- */
@@ -756,9 +783,9 @@ void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged
             break;
         case HID_PT_ZONE_LIST:
         default:
-            text = plugged
-                   ? locstr("UP/DOWN  device        OK  unplug        RIGHT  settings        BACK  close")
-                   : locstr("UP/DOWN  device        OK  plug in        RIGHT  settings        BACK  close");
+            /* One line whatever the row's state: OK flips a controller between
+             * HID and SDL in both directions, so it names both. */
+            text = locstr("UP/DOWN  controller        OK  HID/SDL        RIGHT  settings        BACK  close");
             break;
     }
     lv_label_set_text(view->hint_label, text);
@@ -902,6 +929,74 @@ static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     return row;
 }
 
+/**
+ * A settings row whose control is a dropdown in the shared gutter.
+ *
+ * No box of its own: the row already is the box. The theme gives a dropdown a
+ * filled plate, a border and a blue focus outline, which next to four bare
+ * slider rows made this one row look like a different design — and the plate
+ * clipped its own text, because the theme's vertical padding is written for a
+ * content-sized dropdown, not one that has to fit a fixed row.
+ *
+ * So: transparent, borderless, its own padding, and the value right-aligned on
+ * the same axis every slider's number sits on.
+ */
+static lv_obj_t *dropdown_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label,
+                              const char *options, hid_pt_ctl_t id, lv_obj_t **dropdown_out)
+{
+    lv_obj_t *body;
+    lv_obj_t *row = option_row(parent, label, &body, NULL);
+    lv_obj_t *dd = lv_dropdown_create(body);
+    lv_dropdown_set_options(dd, options);
+    lv_obj_set_size(dd, GUTTER_W, LV_DPX(26));
+    lv_obj_set_style_bg_opa(dd, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dd, 0, 0);
+    lv_obj_set_style_outline_width(dd, 0, 0);
+    lv_obj_set_style_outline_width(dd, 0, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_shadow_width(dd, 0, 0);
+    lv_obj_set_style_text_color(dd, lv_color_hex(OVERLAY_CHALK), 0);
+    /* lv_dropdown draws its text at pad_top and its symbol against the right
+     * edge, and ignores text_align entirely — so the padding IS the layout: the
+     * value starts where every slider's track starts, the chevron ends where
+     * every number ends. */
+    lv_obj_set_style_pad_hor(dd, 0, 0);
+    lv_obj_set_style_pad_ver(dd, LV_DPX(5), 0);
+    lv_obj_set_style_text_color(dd, lv_color_hex(OVERLAY_CHALK), LV_PART_INDICATOR);
+    lv_obj_set_style_text_opa(dd, OVERLAY_OPA_MUTED, LV_PART_INDICATOR);
+    bind_slab_focus(dd, row);
+    /* Not bind_control(): a dropdown wants its KEY handler WITHOUT
+     * LV_EVENT_PREPROCESS, so LVGL's own list handling runs first, plus a second
+     * preprocess handler that turns the arrow keys into panel navigation while
+     * the list is closed. */
+    lv_obj_set_user_data(dd, (void *) (intptr_t) id);
+    lv_obj_add_event_cb(dd, value_changed_cb, LV_EVENT_VALUE_CHANGED, view);
+    lv_obj_add_event_cb(dd, key_cb, LV_EVENT_KEY, view);
+    lv_obj_add_event_cb(dd, dropdown_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
+    /* After LVGL's own open/close handling (no PREPROCESS): see the comment on
+     * dropdown_state_sync_cb for why these three events cover every toggle. */
+    lv_obj_add_event_cb(dd, dropdown_state_sync_cb, LV_EVENT_RELEASED, view);
+    lv_obj_add_event_cb(dd, dropdown_state_sync_cb, LV_EVENT_DEFOCUSED, view);
+    lv_obj_add_event_cb(dd, dropdown_state_sync_cb, LV_EVENT_VALUE_CHANGED, view);
+    if (dropdown_out) {
+        *dropdown_out = dd;
+    }
+    return row;
+}
+
+/** One quiet, wrapping line under the settings it is about. Starts hidden. */
+static lv_obj_t *caption(lv_obj_t *parent)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label, LV_PCT(100));
+    lv_obj_set_style_text_font(label, lv_theme_get_font_small(parent), 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_text_opa(label, OVERLAY_OPA_MUTED, 0);
+    lv_obj_set_style_pad_left(label, LV_DPX(3), 0);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    return label;
+}
+
 lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt_view_cbs_t *cbs)
 {
     if (!view || !cbs) {
@@ -967,7 +1062,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_flex_flow(title_block, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_gap(title_block, LV_DPX(2), 0);
     lv_obj_clear_flag(title_block, LV_OBJ_FLAG_SCROLLABLE);
-    eyebrow(title_block, locstr("HID PASSTHROUGH"), OVERLAY_CHALK, OVERLAY_OPA_FAINT);
+    eyebrow(title_block, locstr("INPUT"), OVERLAY_CHALK, OVERLAY_OPA_FAINT);
     lv_obj_t *title = body_text(title_block, locstr("Controllers"));
     lv_obj_set_style_text_font(title, lv_theme_get_font_large(title_block), 0);
 
@@ -1025,13 +1120,13 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_gap(left_pane, LV_DPX(8), 0);
     lv_obj_clear_flag(left_pane, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *devices_title = eyebrow(left_pane, locstr("DEVICES"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_t *devices_title = eyebrow(left_pane, locstr("CONTROLLERS"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
     lv_obj_set_style_pad_left(devices_title, LV_DPX(3), 0);
 
     view->list = lv_obj_create(left_pane);
     lv_obj_remove_style_all(view->list);
     lv_obj_set_width(view->list, LV_PCT(100));
-    /* Everything the body box has left below the DEVICES label -- a fixed cap
+    /* Everything the body box has left below the CONTROLLERS label -- a fixed cap
      * would ignore both the label and the error bar and send the last rows
      * below the sheet's edge. Past it the list scrolls. */
     lv_obj_set_flex_grow(view->list, 1);
@@ -1084,7 +1179,23 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_left(view->customize_state, LV_DPX(3), 0);
     lv_obj_set_style_pad_bottom(view->customize_state, LV_DPX(4), 0);
 
-    view->auto_plugin_row = switch_row(view, right_pane, locstr("Auto-plug on next stream"),
+    /* How the controller reaches the host, first: it decides which of the rows
+     * below mean anything at all. */
+    view->mode_heading = eyebrow(right_pane, locstr("MODE"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_set_style_pad_left(view->mode_heading, LV_DPX(3), 0);
+    lv_obj_add_flag(view->mode_heading, LV_OBJ_FLAG_HIDDEN);
+    view->connection_row = dropdown_row(view, right_pane, locstr("Connection"),
+                                        locstr("HID passthrough (native)\nSDL (emulated)"),
+                                        HID_PT_CTL_CONNECTION, &view->connection_dropdown);
+    lv_obj_add_flag(view->connection_row, LV_OBJ_FLAG_HIDDEN);
+    view->sdl_type_row = dropdown_row(view, right_pane, locstr("SDL controller type"),
+                                      locstr("Automatic\nXbox 360\nPlayStation (DualShock 4)"),
+                                      HID_PT_CTL_SDL_TYPE, &view->sdl_type_dropdown);
+    lv_obj_add_flag(view->sdl_type_row, LV_OBJ_FLAG_HIDDEN);
+    view->sdl_type_caption = caption(right_pane);
+    lv_label_set_text(view->sdl_type_caption, locstr("Applies when the controller runs over SDL"));
+
+    view->auto_plugin_row = switch_row(view, right_pane, locstr("Start in HID mode automatically"),
                                        HID_PT_CTL_AUTO_PLUGIN, &view->auto_plugin_cb);
     view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
                                      HID_PT_CTL_COMPOSITE, &view->composite_cb);
@@ -1093,48 +1204,9 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_set_style_pad_left(view->audio_heading, LV_DPX(3), 0);
     lv_obj_set_style_pad_top(view->audio_heading, LV_DPX(4), 0);
 
-    lv_obj_t *audio_body;
-    view->audio_row = option_row(right_pane, locstr("Audio output"), &audio_body, NULL);
-    view->audio_dropdown = lv_dropdown_create(audio_body);
-    lv_dropdown_set_options(view->audio_dropdown,
-                            locstr("Auto (game decides)\nOff\nController speaker\nHeadphone jack\nSpeaker + jack"));
-    /* No box of its own: the row already is the box. The theme gives a dropdown a
-     * filled plate, a border and a blue focus outline, which next to four bare
-     * slider rows made this one row look like a different design — and the plate
-     * clipped its own text, because the theme's vertical padding is written for a
-     * content-sized dropdown, not one that has to fit a fixed row.
-     *
-     * So: transparent, borderless, its own padding, and the value right-aligned
-     * on the same axis every slider's number sits on. */
-    lv_obj_set_size(view->audio_dropdown, GUTTER_W, LV_DPX(26));
-    lv_obj_set_style_bg_opa(view->audio_dropdown, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(view->audio_dropdown, 0, 0);
-    lv_obj_set_style_outline_width(view->audio_dropdown, 0, 0);
-    lv_obj_set_style_outline_width(view->audio_dropdown, 0, LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_shadow_width(view->audio_dropdown, 0, 0);
-    lv_obj_set_style_text_color(view->audio_dropdown, lv_color_hex(OVERLAY_CHALK), 0);
-    /* lv_dropdown draws its text at pad_top and its symbol against the right
-     * edge, and ignores text_align entirely — so the padding IS the layout: the
-     * value starts where every slider's track starts, the chevron ends where
-     * every number ends. */
-    lv_obj_set_style_pad_hor(view->audio_dropdown, 0, 0);
-    lv_obj_set_style_pad_ver(view->audio_dropdown, LV_DPX(5), 0);
-    lv_obj_set_style_text_color(view->audio_dropdown, lv_color_hex(OVERLAY_CHALK), LV_PART_INDICATOR);
-    lv_obj_set_style_text_opa(view->audio_dropdown, OVERLAY_OPA_MUTED, LV_PART_INDICATOR);
-    bind_slab_focus(view->audio_dropdown, view->audio_row);
-    /* Not bind_control(): the dropdown wants its KEY handler WITHOUT
-     * LV_EVENT_PREPROCESS, so LVGL's own list handling runs first, plus a second
-     * preprocess handler that turns the arrow keys into panel navigation while
-     * the list is closed. */
-    lv_obj_set_user_data(view->audio_dropdown, (void *) (intptr_t) HID_PT_CTL_AUDIO_MODE);
-    lv_obj_add_event_cb(view->audio_dropdown, value_changed_cb, LV_EVENT_VALUE_CHANGED, view);
-    lv_obj_add_event_cb(view->audio_dropdown, key_cb, LV_EVENT_KEY, view);
-    lv_obj_add_event_cb(view->audio_dropdown, dropdown_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, view);
-    /* After LVGL's own open/close handling (no PREPROCESS): see the comment on
-     * dropdown_state_sync_cb for why these three events cover every toggle. */
-    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_RELEASED, view);
-    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_DEFOCUSED, view);
-    lv_obj_add_event_cb(view->audio_dropdown, dropdown_state_sync_cb, LV_EVENT_VALUE_CHANGED, view);
+    view->audio_row = dropdown_row(view, right_pane, locstr("Audio output"),
+                                   locstr("Auto (game decides)\nOff\nController speaker\nHeadphone jack\nSpeaker + jack"),
+                                   HID_PT_CTL_AUDIO_MODE, &view->audio_dropdown);
 
     view->speaker_row = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
                                    HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);
@@ -1150,16 +1222,9 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
 
     /* The advisory sits under the settings it is about, one quiet line rather
      * than a coloured block: it is a consequence to know, not an error. */
-    view->audio_warning_label = lv_label_create(right_pane);
-    lv_label_set_long_mode(view->audio_warning_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(view->audio_warning_label, LV_PCT(100));
-    lv_obj_set_style_text_font(view->audio_warning_label, lv_theme_get_font_small(right_pane), 0);
-    lv_obj_set_style_text_color(view->audio_warning_label, lv_color_hex(OVERLAY_CHALK), 0);
-    lv_obj_set_style_text_opa(view->audio_warning_label, OVERLAY_OPA_MUTED, 0);
-    lv_obj_set_style_pad_left(view->audio_warning_label, LV_DPX(3), 0);
+    view->audio_warning_label = caption(right_pane);
     lv_obj_set_style_pad_top(view->audio_warning_label, LV_DPX(4), 0);
     lv_label_set_recolor(view->audio_warning_label, true);
-    lv_obj_add_flag(view->audio_warning_label, LV_OBJ_FLAG_HIDDEN);
 
     /* No footer key-hint bar: the sheet reads cleaner without it. hint_label
      * stays NULL, which hid_pt_view_set_hints() already tolerates, so the zone

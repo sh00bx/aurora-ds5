@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * The HID passthrough panel's widgets: what they are, how they are built, and
+ * The Controllers panel's widgets: what they are, how they are built, and
  * every operation that only needs LVGL to answer.
  *
  * Nothing here knows what a device is. The list is filled row by row from
@@ -25,7 +25,11 @@
 
 /** The controls the option column carries, in focus order. */
 typedef enum {
-    HID_PT_CTL_COMPOSITE = 0,
+    /** HID passthrough or SDL: the plug toggle, as a dropdown. */
+    HID_PT_CTL_CONNECTION = 0,
+    /** The type the host emulates while the pad runs over SDL. */
+    HID_PT_CTL_SDL_TYPE,
+    HID_PT_CTL_COMPOSITE,
     HID_PT_CTL_AUTO_PLUGIN,
     HID_PT_CTL_LATENCY,
     HID_PT_CTL_AUDIO_MODE,
@@ -74,8 +78,8 @@ typedef enum {
     HID_PT_ZONE_LIST = 0,
     HID_PT_ZONE_OPTIONS,
     HID_PT_ZONE_HEADER,
-    /** Not a place on the sheet: the audio dropdown's list is up and owns the
-     * keys, and the footer should say what they do there. */
+    /** Not a place on the sheet: a dropdown's list is up and owns the keys,
+     * and the footer should say what they do there. */
     HID_PT_ZONE_DROPDOWN,
 } hid_pt_zone_t;
 
@@ -90,11 +94,11 @@ typedef struct {
     void (*row_focused)(void *userdata, int row);
     /** LV_EVENT_KEY on any control, and on the sheet itself. */
     void (*key)(void *userdata, lv_event_t *event);
-    /** LV_EVENT_KEY | LV_EVENT_PREPROCESS on the audio dropdown only. */
+    /** LV_EVENT_KEY | LV_EVENT_PREPROCESS on the dropdowns only. */
     void (*dropdown_key)(void *userdata, lv_event_t *event);
-    /** The audio dropdown's list just opened or closed (any cause: OK, BACK,
-     * a pointer click, focus leaving). Bookkeeping is already up to date. */
-    void (*dropdown_toggled)(void *userdata, bool open);
+    /** @p dropdown's list just opened or closed (any cause: OK, BACK, a
+     * pointer click, focus leaving). Bookkeeping is already up to date. */
+    void (*dropdown_toggled)(void *userdata, lv_obj_t *dropdown, bool open);
     /** The panel's root object is being deleted. */
     void (*deleted)(void *userdata);
 } hid_pt_view_cbs_t;
@@ -106,6 +110,12 @@ typedef struct {
     lv_obj_t *error_label;
     lv_obj_t *error_row;
     lv_obj_t *list;
+    lv_obj_t *mode_heading;
+    lv_obj_t *connection_row;
+    lv_obj_t *connection_dropdown;
+    lv_obj_t *sdl_type_row;
+    lv_obj_t *sdl_type_dropdown;
+    lv_obj_t *sdl_type_caption;
     lv_obj_t *composite_row;
     lv_obj_t *composite_cb;
     lv_obj_t *auto_plugin_row;
@@ -184,14 +194,16 @@ void hid_pt_view_list_show_empty(hid_pt_view_t *view);
 /** Lay the emptied list out for rows. Call once before the first add_row(). */
 void hid_pt_view_list_prepare(hid_pt_view_t *view);
 
-void hid_pt_view_add_row(hid_pt_view_t *view, int row, const char *label, bool plugged, bool selected);
+/** @p state is the row's second line; @p live paints it and the rail teal. */
+void hid_pt_view_add_row(hid_pt_view_t *view, int row, const char *label, const char *state, bool live,
+                         bool selected);
 
 bool hid_pt_view_has_row(const hid_pt_view_t *view, int row);
 
 void hid_pt_view_set_row_selected(hid_pt_view_t *view, int row, bool selected);
 
-/** Repaint @p row's rail and state line for its new bridge state. */
-void hid_pt_view_set_row_state(hid_pt_view_t *view, int row, bool plugged);
+/** Repaint @p row's rail and state line: @p state as text, teal when @p live. */
+void hid_pt_view_set_row_state(hid_pt_view_t *view, int row, const char *state, bool live);
 
 /** Which of the panel's controls @p obj is, or HID_PT_WK_NONE. */
 hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *obj);
@@ -236,7 +248,7 @@ void hid_pt_view_scroll_row_into_view(hid_pt_view_t *view, int row);
  */
 bool hid_pt_view_obj_is_hidden(const hid_pt_view_t *view, lv_obj_t *obj);
 
-/* ---- the audio dropdown's list ------------------------------------------ */
+/* ---- the dropdowns' lists ------------------------------------------------ */
 
 bool hid_pt_view_dropdown_is_open(const hid_pt_view_t *view, lv_obj_t *target);
 /** Drop the open-list bookkeeping without touching the widget. For the case
@@ -262,3 +274,12 @@ void hid_pt_view_update_trigger_label(hid_pt_view_t *view);
  * when @p obj is not a slider, so the caller can treat the key as navigation.
  */
 bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir);
+
+/**
+ * Name the SDL type dropdown's first entry, e.g. "Automatic (PlayStation)".
+ *
+ * Rewrites the options only when the text changes and never while the list is
+ * up, keeping the selected index -- setting options resets a dropdown's
+ * selection, and this runs on every 2 s refresh.
+ */
+void hid_pt_view_set_sdl_type_auto_label(hid_pt_view_t *view, const char *auto_label);
