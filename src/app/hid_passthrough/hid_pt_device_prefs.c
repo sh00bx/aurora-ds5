@@ -26,13 +26,42 @@
  * a serial that happens to start with "sdl". */
 #define HID_PT_SYNTHETIC_PREFIX "sdl_"
 
+/* Key suffix of the SDL type pref: `<stable_id>.sdl_type = xbox|playstation`.
+ * A separate key rather than a new value for the auto-plug line, so a file
+ * written by this build still reads correctly in an older one: there the whole
+ * key normalises to an id no device has, and its value is not "true", so the
+ * old parser drops it exactly like an opted-out entry. */
+#define HID_PT_SDL_TYPE_SUFFIX ".sdl_type"
+
 typedef struct {
     char id[HID_PT_STABLE_ID_LEN];
     bool auto_plugin;
+    gamepad_type_pref_t sdl_type;
 } hid_pt_pref_entry_t;
 
 static hid_pt_pref_entry_t g_hid_pt_prefs[HID_PT_PREFS_MAX];
 static int g_hid_pt_pref_count;
+
+/* An entry every reader would answer exactly as it answers a missing one: no
+ * auto-plug, SDL type AUTO. Such an entry carries no information, which is what
+ * makes it the one a full table may reuse and the one the writer may skip. */
+static bool pref_is_default(const hid_pt_pref_entry_t *e)
+{
+    return !e->auto_plugin && e->sdl_type == GAMEPAD_TYPE_PREF_AUTO;
+}
+
+static const char *sdl_type_ini_value(gamepad_type_pref_t type)
+{
+    switch (type) {
+        case GAMEPAD_TYPE_PREF_XBOX:
+            return "xbox";
+        case GAMEPAD_TYPE_PREF_PLAYSTATION:
+            return "playstation";
+        case GAMEPAD_TYPE_PREF_AUTO:
+        default:
+            return NULL;
+    }
+}
 
 void hid_pt_stable_id(const char *raw, char *out, size_t out_len)
 {
@@ -111,14 +140,15 @@ static hid_pt_pref_entry_t *pref_upsert(const char *stable_id)
     if (g_hid_pt_pref_count < HID_PT_PREFS_MAX) {
         e = &g_hid_pt_prefs[g_hid_pt_pref_count++];
     } else {
-        /* Full. An entry with auto_plugin == false and a missing entry are the
-         * same answer to every reader (pref_find -> NULL -> false), so the
-         * opted-out slot carries no information and is the one to reuse. This is
-         * what keeps the table from wedging: it used to be append-only for the
-         * app's whole lifetime, and once 32 controllers had ever been toggled,
-         * enabling auto-plug on the 33rd silently did nothing. */
+        /* Full. A default entry and a missing entry are the same answer to
+         * every reader (pref_find -> NULL -> false / AUTO), so the all-default
+         * slot carries no information and is the one to reuse. This is what
+         * keeps the table from wedging: it used to be append-only for the app's
+         * whole lifetime, and once 32 controllers had ever been toggled,
+         * enabling auto-plug on the 33rd silently did nothing. An entry that
+         * only holds an SDL type is NOT default and must not be taken. */
         for (int i = 0; i < g_hid_pt_pref_count; ++i) {
-            if (!g_hid_pt_prefs[i].auto_plugin) {
+            if (pref_is_default(&g_hid_pt_prefs[i])) {
                 e = &g_hid_pt_prefs[i];
                 break;
             }
@@ -206,7 +236,7 @@ bool hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled)
     }
     if (!e) {
         commons_log_warn("HID-PT",
-                         "auto-plug pref for %s NOT stored: all %d slots hold opted-in devices",
+                         "auto-plug pref for %s NOT stored: all %d slots hold non-default prefs",
                          stable_id, HID_PT_PREFS_MAX);
         return false;
     }
@@ -229,6 +259,91 @@ bool hid_pt_prefs_auto_plugin_for_gamepad(const app_gamepad_state_t *gamepad)
     return hid_pt_prefs_get_auto_plugin(id);
 }
 
+gamepad_type_pref_t hid_pt_prefs_get_sdl_type(const char *stable_id)
+{
+    const hid_pt_pref_entry_t *e = pref_find(stable_id);
+    return e ? e->sdl_type : GAMEPAD_TYPE_PREF_AUTO;
+}
+
+bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type)
+{
+    if (!stable_id || !stable_id[0]) {
+        commons_log_warn("HID-PT", "SDL type pref dropped: device has no stable id");
+        return false;
+    }
+    if ((unsigned) type >= GAMEPAD_TYPE_PREF_COUNT) {
+        return false;
+    }
+    hid_pt_pref_entry_t *e = pref_find(stable_id);
+    if (!e && type == GAMEPAD_TYPE_PREF_AUTO) {
+        /* Same rule as auto-plug: a missing entry already reads as AUTO. */
+        return true;
+    }
+    if (!e) {
+        e = pref_upsert(stable_id);
+    }
+    if (!e) {
+        commons_log_warn("HID-PT",
+                         "SDL type pref for %s NOT stored: all %d slots hold non-default prefs",
+                         stable_id, HID_PT_PREFS_MAX);
+        return false;
+    }
+    if (e->sdl_type == type) {
+        return true;
+    }
+    e->sdl_type = type;
+    hid_pt_prefs_flush();
+    return true;
+}
+
+gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item)
+{
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_logical(item, id, sizeof(id));
+    return hid_pt_prefs_get_sdl_type(id);
+}
+
+gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad)
+{
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
+    return hid_pt_prefs_get_sdl_type(id);
+}
+
+/* `<stable_id>.sdl_type = xbox|playstation`. Split BEFORE normalising: '.' is
+ * inside the id alphabet, so the suffix would otherwise just become part of an
+ * id no device has. */
+static void sdl_type_ini_entry(const char *name, size_t id_len, const char *value)
+{
+    char raw[HID_PT_STABLE_ID_LEN];
+    if (id_len >= sizeof(raw)) {
+        id_len = sizeof(raw) - 1;
+    }
+    memcpy(raw, name, id_len);
+    raw[id_len] = '\0';
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id(raw, id, sizeof(id));
+    if (!id[0] || !value) {
+        return;
+    }
+    gamepad_type_pref_t type;
+    if (strcmp(value, "xbox") == 0) {
+        type = GAMEPAD_TYPE_PREF_XBOX;
+    } else if (strcmp(value, "playstation") == 0) {
+        type = GAMEPAD_TYPE_PREF_PLAYSTATION;
+    } else {
+        /* AUTO is never written, and an unknown word from a newer build reads
+         * as the default rather than as a guess. */
+        return;
+    }
+    hid_pt_pref_entry_t *e = pref_upsert(id);
+    if (!e) {
+        commons_log_warn("HID-PT", "SDL type pref for %s dropped on load: table full", id);
+        return;
+    }
+    e->sdl_type = type;
+}
+
 int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *value)
 {
     if (!section || strcmp(section, "hid_pt_devices") != 0) {
@@ -236,6 +351,12 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
     }
     if (!name || !name[0]) {
         return 0;
+    }
+    const size_t name_len = strlen(name);
+    const size_t suffix_len = strlen(HID_PT_SDL_TYPE_SUFFIX);
+    if (name_len > suffix_len && strcmp(name + name_len - suffix_len, HID_PT_SDL_TYPE_SUFFIX) == 0) {
+        sdl_type_ini_entry(name, name_len - suffix_len, value);
+        return 1;
     }
     /* Normalise on load, so keys written by an older build in one of the two
      * pre-unification forms (a raw SDL serial, or a verbatim `hid:hidraw3` /
@@ -268,19 +389,28 @@ void hid_pt_prefs_write_section(FILE *fp)
     if (!fp) {
         return;
     }
-    /* Only opted-in devices go to disk. A `= false` line said exactly what its
+    /* Only non-default prefs go to disk. A `= false` line said exactly what its
      * absence says, and writing them back made the section grow by one entry per
      * controller that had ever been toggled, forever. */
     bool wrote_header = false;
     for (int i = 0; i < g_hid_pt_pref_count; ++i) {
-        if (!g_hid_pt_prefs[i].auto_plugin) {
+        const hid_pt_pref_entry_t *e = &g_hid_pt_prefs[i];
+        if (pref_is_default(e)) {
             continue;
         }
         if (!wrote_header) {
             ini_write_section(fp, "hid_pt_devices");
             wrote_header = true;
         }
-        ini_write_bool(fp, g_hid_pt_prefs[i].id, true);
+        if (e->auto_plugin) {
+            ini_write_bool(fp, e->id, true);
+        }
+        const char *sdl_type = sdl_type_ini_value(e->sdl_type);
+        if (sdl_type) {
+            char key[HID_PT_STABLE_ID_LEN + sizeof(HID_PT_SDL_TYPE_SUFFIX)];
+            snprintf(key, sizeof(key), "%s" HID_PT_SDL_TYPE_SUFFIX, e->id);
+            ini_write_string(fp, key, sdl_type);
+        }
     }
 }
 

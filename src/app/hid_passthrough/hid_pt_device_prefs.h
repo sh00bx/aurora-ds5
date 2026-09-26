@@ -9,6 +9,7 @@
 
 #include "ctm/ctm_state.h"
 #include "input/app_input.h"
+#include "stream/input/gamepad_type_pref.h"
 
 /* Every buffer that holds a stable id is this long. */
 #define HID_PT_STABLE_ID_LEN 96
@@ -51,12 +52,27 @@ void hid_pt_prefs_flush(void);
 
 /* Emit the [hid_pt_devices] section into an already-open ini writer. Used by
  * settings_save() so a full-config rewrite preserves the per-device prefs
- * instead of truncating them. Only devices that opted IN are written; an absent
- * key reads as false. */
+ * instead of truncating them. Only non-default prefs are written: an opted-in
+ * auto-plug as `<id> = true`, an SDL type other than AUTO as
+ * `<id>.sdl_type = xbox|playstation`. An absent key reads as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
 bool hid_pt_prefs_auto_plugin_for_gamepad(const app_gamepad_state_t *gamepad);
+
+/* The controller type the host should emulate for this device while it runs
+ * over SDL; GAMEPAD_TYPE_PREF_AUTO when nothing is stored. Shares the entry,
+ * the table and the flush with the auto-plug pref above. */
+gamepad_type_pref_t hid_pt_prefs_get_sdl_type(const char *stable_id);
+
+/* Store (and persist) the SDL type for one device. Same contract as
+ * hid_pt_prefs_set_auto_plugin(): false when the choice could NOT be stored (an
+ * empty id, or a full table in which every slot holds a non-default pref), and
+ * the caller must say so. Setting AUTO never needs a slot. */
+bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type);
+
+gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item);
+gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad);
 
 /* INI parse hook: return 1 on handled entry. */
 int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *value);
