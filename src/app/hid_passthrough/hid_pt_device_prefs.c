@@ -433,6 +433,18 @@ bool hid_pt_prefs_lookup_lightbar(const char *stable_id, gamepad_mode_t mode, li
     return true;
 }
 
+bool hid_pt_prefs_lookup_lightbar_game(const char *stable_id, bool *game)
+{
+    const hid_pt_pref_entry_t *e = pref_find(stable_id);
+    if (!e) {
+        return false;
+    }
+    if (game) {
+        *game = !e->lightbar_game_off;
+    }
+    return true;
+}
+
 bool hid_pt_prefs_set_lightbar(const char *stable_id, gamepad_mode_t mode, const lightbar_pref_t *lb, bool keep_auto)
 {
     if (!stable_id || !stable_id[0] || !lb) {
@@ -486,7 +498,9 @@ lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, 
     char id[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_logical(item, id, sizeof(id));
     lightbar_pref_t lb = lightbar_pref_automatic();
-    hid_pt_prefs_lookup_lightbar(id, mode, &lb);
+    if (!hid_pt_prefs_lookup_lightbar(id, mode, &lb)) {
+        hid_pt_prefs_lookup_lightbar_game(id, &lb.game);
+    }
     return lb;
 }
 

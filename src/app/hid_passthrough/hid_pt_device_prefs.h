@@ -97,6 +97,13 @@ gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t 
  * the SDL type above. */
 bool hid_pt_prefs_lookup_lightbar(const char *stable_id, gamepad_mode_t mode, lightbar_pref_t *out);
 
+/* The controller's one "game may change it" switch alone: true when this id
+ * has an entry, and then *game is its switch -- also for a mode that has no
+ * colour of its own, whose lightbar_pref_t is Automatic with the switch on.
+ * What a colour chosen for such a mode must carry over, so choosing one never
+ * turns the switch back on for every mode. */
+bool hid_pt_prefs_lookup_lightbar_game(const char *stable_id, bool *game);
+
 /* Store (and persist) the lightbar colour of @p mode for one device, and with a
  * colour the controller's "game may change it". Same contract as
  * hid_pt_prefs_set_sdl_type(), @p keep_auto included -- except that Automatic
@@ -106,7 +113,7 @@ bool hid_pt_prefs_set_lightbar(const char *stable_id, gamepad_mode_t mode, const
                                bool keep_auto);
 
 /* What is stored under the device's own id for @p mode, Automatic when
- * nothing is. */
+ * nothing is -- with the controller's game switch either way. */
 lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, gamepad_mode_t mode);
 
 /* ---- per-game mode ([controller_app_modes]) --------------------------------

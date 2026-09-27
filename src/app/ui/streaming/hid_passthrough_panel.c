@@ -1042,11 +1042,11 @@ static void picker_changed(hid_pt_panel_t *panel)
 }
 
 /* OK: the colour is stored for the lit mode, as a swatch's would be -- the
- * game switch kept, or on when it comes from Automatic. */
+ * controller's one game switch kept as it is, from Automatic too. */
 static void picker_ok(hid_pt_panel_t *panel)
 {
     const lightbar_pref_t from = panel->picker.from;
-    lightbar_pref_t want = {false, panel->picker.rgb, from.automatic || from.game};
+    lightbar_pref_t want = {false, panel->picker.rgb, from.game};
     const bool change = !lightbar_pref_equal(&want, &from);
     if (change && !hid_pt_model_set_lightbar(&panel->model, &want)) {
         panel_update_status(panel);
@@ -1087,8 +1087,10 @@ static void picker_key(hid_pt_panel_t *panel, lv_event_t *event, lv_obj_t *targe
 }
 
 /* A swatch: that colour, or Automatic. A colour keeps the game switch where
- * it was; coming from Automatic, where the switch is hidden, it starts on.
- * Custom opens the picker instead, whether it is lit or not. */
+ * it is -- ONE switch per controller: coming from Automatic, where it is
+ * hidden, it is still the one the other modes have (a mode without a colour
+ * reads it too, hid_pt_gamepad_lightbar()), never turned back on. Custom opens
+ * the picker instead, whether it is lit or not. */
 static void panel_swatch_clicked(void *userdata, int swatch)
 {
     hid_pt_panel_t *panel = userdata;
@@ -1107,7 +1109,7 @@ static void panel_swatch_clicked(void *userdata, int swatch)
     if (!SWATCHES[swatch].automatic) {
         want.automatic = false;
         want.rgb = SWATCHES[swatch].rgb;
-        want.game = lb.automatic || lb.game;
+        want.game = lb.game;
     }
     if (!lightbar_pref_equal(&want, &lb)) {
         panel_set_lightbar(panel, &want);

@@ -638,14 +638,26 @@ lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_st
      * "Automatic" there included, then the pad's own. */
     const logical_device_t *peer = pad_peer(input, gamepad);
     char id[HID_PT_STABLE_ID_LEN];
+    /* A mode without a colour is Automatic, but with the controller's game
+     * switch as stored -- in the same order -- not a default "on": a colour
+     * chosen for that mode carries it over. */
+    bool game = true;
+    bool game_known = false;
     if (peer) {
         hid_pt_stable_id_for_logical(peer, id, sizeof(id));
         if (hid_pt_prefs_lookup_lightbar(id, mode, &lb)) {
             return lb;
         }
+        game_known = hid_pt_prefs_lookup_lightbar_game(id, &game);
     }
     hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
-    hid_pt_prefs_lookup_lightbar(id, mode, &lb);
+    if (hid_pt_prefs_lookup_lightbar(id, mode, &lb)) {
+        return lb;
+    }
+    if (!game_known) {
+        hid_pt_prefs_lookup_lightbar_game(id, &game);
+    }
+    lb.game = game;
     return lb;
 }
 
