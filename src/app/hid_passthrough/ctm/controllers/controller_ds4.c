@@ -265,7 +265,9 @@ static void ds4_stamp_volumes(uint8_t *buf, const tv_bridge_worker_settings_t *s
  * too -- or the game's, while the game owns the bar and may: the link-up push
  * is what paints the bar when no game colour is known, and a change on the
  * page reaches the pad through this push at once instead of waiting for the
- * host's next 0x11.
+ * host's next 0x11. On Automatic it carries the colour the game painted last
+ * this session, if it painted at all -- so going back to Automatic takes the
+ * user's colour off at once -- and otherwise leaves the bar to the host.
  * When: session thread, at link-up and after a settings change; the pump sends
  * nothing when the result equals the last report it delivered. */
 static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
@@ -286,6 +288,10 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     bool game = false;
     if (ds4_lightbar_colour(c, &s, &rgb, &game)) {
         ds4_stamp_lightbar(buf, rgb, !s.lightbar_game);
+    } else if (ctm_controller_game_lightbar_last(c, &rgb)) {
+        /* Automatic: the bar as the game last painted it, not the colour of
+         * ours the restated state may still carry. */
+        ds4_stamp_lightbar(buf, rgb, false);
     }
     ds4_stamp_volumes(buf, &s);
     ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);

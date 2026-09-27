@@ -56,7 +56,8 @@ void hid_pt_prefs_flush(void);
  * preserves the per-device prefs instead of truncating them. Only non-default
  * prefs are written: an opted-in auto-plug as `<id> = true`, a chosen SDL type
  * as `<id>.sdl_type = xbox|playstation|dualsense|switch|auto`, a chosen
- * lightbar as `<id>.lightbar = auto|off|rrggbb` (+ `<id>.lightbar_game = 0`),
+ * lightbar per mode as `<id>.lightbar.<mode> = auto|off|rrggbb` (+ 1.7.30's
+ * `<id>.lightbar` where it was read, + `<id>.lightbar_game = 0`),
  * a game's fixed mode as `<app> = hid|x360|ds4|ds5|switch`. An absent key reads
  * as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
@@ -87,19 +88,26 @@ bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type, 
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item);
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad);
 
-/* The lightbar colour chosen for this id, Automatic included: true when one
- * was stored, and then *out is it. Shares the entry, the table, the flush and
- * the explicit-Automatic rule with the SDL type above:
- * `<id>.lightbar = auto|off|rrggbb`, `<id>.lightbar_game = 0` for a colour the
- * game may not change. */
-bool hid_pt_prefs_lookup_lightbar(const char *stable_id, lightbar_pref_t *out);
+/* The lightbar colour chosen for this id in @p mode (never NONE), Automatic
+ * included: true when one was stored, and then *out is it. One colour per mode,
+ * `<id>.lightbar.<mode> = auto|off|rrggbb`, falling back to 1.7.30's one colour
+ * `<id>.lightbar` for a mode without its own; and one "game may change it" for
+ * all of them, `<id>.lightbar_game = 0` for colours the game may not change.
+ * Shares the entry, the table, the flush and the explicit-Automatic rule with
+ * the SDL type above. */
+bool hid_pt_prefs_lookup_lightbar(const char *stable_id, gamepad_mode_t mode, lightbar_pref_t *out);
 
-/* Store (and persist) the lightbar colour for one device. Same contract as
- * hid_pt_prefs_set_sdl_type(), @p keep_auto included. */
-bool hid_pt_prefs_set_lightbar(const char *stable_id, const lightbar_pref_t *lb, bool keep_auto);
+/* Store (and persist) the lightbar colour of @p mode for one device, and with a
+ * colour the controller's "game may change it". Same contract as
+ * hid_pt_prefs_set_sdl_type(), @p keep_auto included -- except that Automatic
+ * is always kept where the mode would otherwise fall back to a 1.7.30 colour.
+ * False for mode NONE: that key is only ever read. */
+bool hid_pt_prefs_set_lightbar(const char *stable_id, gamepad_mode_t mode, const lightbar_pref_t *lb,
+                               bool keep_auto);
 
-/* What is stored under the device's own id, Automatic when nothing is. */
-lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item);
+/* What is stored under the device's own id for @p mode, Automatic when
+ * nothing is. */
+lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, gamepad_mode_t mode);
 
 /* ---- per-game mode ([controller_app_modes]) --------------------------------
  *

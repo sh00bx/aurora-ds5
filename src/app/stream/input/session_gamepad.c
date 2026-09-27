@@ -580,6 +580,9 @@ void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t
             stream_input_moonlight_active_mask(input) & (uint16_t) ~(1u << (unsigned) gamepad->gs_id);
     commons_log_info("Input", "Controller %d removed (Moonlight mask 0x%x)", gamepad->gs_id, activeGamepadMask);
     LiSendMultiControllerEvent(gamepad->gs_id, (short) activeGamepadMask, 0, 0, 0, 0, 0, 0, 0);
+#if defined(TARGET_WEBOS)
+    hid_pt_lightbar_pad_removed(gamepad);
+#endif
 }
 
 void stream_input_reannounce_gamepad(stream_input_t *input, app_gamepad_state_t *gamepad) {

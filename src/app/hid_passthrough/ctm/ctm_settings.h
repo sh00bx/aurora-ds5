@@ -40,10 +40,11 @@ typedef struct {
     bool composite_passthrough;   /* Flydigi: forward full USB composite to host */
     bool block_bt_audio_sink;     /* prevent BlueZ from registering DS5 as A2DP sink */
     bool auto_plugin;             /* auto-bridge via HID passthrough on next stream start */
-    /* The lightbar colour chosen on the Controllers page (DS4/DS5). Without
-     * lightbar_user (Automatic) the host's reports pass untouched. Otherwise
-     * lightbar_rgb (0xRRGGBB, 0 = off) is painted, and lightbar_game lets a
-     * colour the game paints itself win until it paints black. */
+    /* The lightbar colour chosen on the Controllers page for mode HID
+     * (DS4/DS5). Without lightbar_user (Automatic) the host's reports pass
+     * untouched, and a settings push restores what the game painted last.
+     * Otherwise lightbar_rgb (0xRRGGBB, 0 = off) is painted, and lightbar_game
+     * lets a colour the game paints itself win until it paints black. */
     bool lightbar_user;
     unsigned int lightbar_rgb;
     bool lightbar_game;

@@ -34,9 +34,14 @@
  * old parser drops it exactly like an opted-out entry. */
 #define HID_PT_SDL_TYPE_SUFFIX ".sdl_type"
 
-/* Key suffixes of the lightbar pref, same reasoning as the SDL type's:
- * `<stable_id>.lightbar = auto|off|rrggbb` and, only for a colour the game may
- * NOT change, `<stable_id>.lightbar_game = 0`. */
+/* Key suffixes of the lightbar pref, same reasoning as the SDL type's: one
+ * colour per mode, `<stable_id>.lightbar.<mode> = auto|off|rrggbb` with <mode>
+ * one of hid|x360|ds4|ds5|switch, and, only for colours the game may NOT
+ * change, `<stable_id>.lightbar_game = 0` -- one switch per controller.
+ * 1.7.30 kept one colour per controller as `<stable_id>.lightbar`: still read,
+ * as the colour of every mode without a key of its own, never written again
+ * but kept, so its owner keeps their colour wherever they have not chosen
+ * another. */
 #define HID_PT_LIGHTBAR_SUFFIX ".lightbar"
 #define HID_PT_LIGHTBAR_GAME_SUFFIX ".lightbar_game"
 
@@ -50,12 +55,17 @@ typedef struct {
      * older Xbox stored under the pad's SDL serial. */
     bool sdl_type_set;
     gamepad_type_pref_t sdl_type;
-    /* A lightbar colour was chosen for this id, Automatic included -- the same
-     * device-first lookup as sdl_type_set, for the same reason. */
-    bool lightbar_set;
-    bool lightbar_automatic;
-    uint32_t lightbar_rgb;
-    /* Stored inverted, so a zeroed entry means the default: the game may. */
+    /* The lightbar colour chosen for this id per mode, indexed by
+     * gamepad_mode_t; [GAMEPAD_MODE_NONE] is 1.7.30's one colour, the fallback
+     * of every mode without its own. `set` includes an explicit Automatic --
+     * the same device-first lookup as sdl_type_set, for the same reason. */
+    struct {
+        bool set;
+        bool automatic;
+        uint32_t rgb;
+    } lightbar[GAMEPAD_MODE_COUNT];
+    /* Stored inverted, so a zeroed entry means the default: the game may. One
+     * for every mode's colour. */
     bool lightbar_game_off;
 } hid_pt_pref_entry_t;
 
@@ -78,13 +88,25 @@ static int g_app_mode_count;
 static char g_current_app_key[HID_PT_STABLE_ID_LEN];
 static char g_current_app_name[128];
 
+/* Any mode's lightbar stored -- with @p colour_only, a colour rather than an
+ * explicit Automatic. */
+static bool pref_has_lightbar(const hid_pt_pref_entry_t *e, bool colour_only)
+{
+    for (int m = 0; m < GAMEPAD_MODE_COUNT; ++m) {
+        if (e->lightbar[m].set && !(colour_only && e->lightbar[m].automatic)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* An entry every reader would answer exactly as it answers a missing one: no
- * auto-plug, no SDL type chosen. Such an entry carries no information, which is
- * what makes it the one a full table may reuse and the one the writer may
- * skip. */
+ * auto-plug, no SDL type chosen, no lightbar. Such an entry carries no
+ * information, which is what makes it the one a full table may reuse and the
+ * one the writer may skip. */
 static bool pref_is_default(const hid_pt_pref_entry_t *e)
 {
-    return !e->auto_plugin && !e->sdl_type_set && !e->lightbar_set;
+    return !e->auto_plugin && !e->sdl_type_set && !pref_has_lightbar(e, false);
 }
 
 /* Holds nothing but explicit "Automatic"s (SDL type, lightbar or both). Worth
@@ -94,8 +116,7 @@ static bool pref_is_default(const hid_pt_pref_entry_t *e)
 static bool pref_is_explicit_auto_only(const hid_pt_pref_entry_t *e)
 {
     const bool sdl_auto = !e->sdl_type_set || e->sdl_type == GAMEPAD_TYPE_PREF_AUTO;
-    const bool lightbar_auto = !e->lightbar_set || e->lightbar_automatic;
-    return !e->auto_plugin && sdl_auto && lightbar_auto && !pref_is_default(e);
+    return !e->auto_plugin && sdl_auto && !pref_has_lightbar(e, true) && !pref_is_default(e);
 }
 
 static const char *sdl_type_ini_value(gamepad_type_pref_t type)
@@ -393,34 +414,44 @@ gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t 
     return hid_pt_prefs_get_sdl_type(id);
 }
 
-bool hid_pt_prefs_lookup_lightbar(const char *stable_id, lightbar_pref_t *out)
+bool hid_pt_prefs_lookup_lightbar(const char *stable_id, gamepad_mode_t mode, lightbar_pref_t *out)
 {
     const hid_pt_pref_entry_t *e = pref_find(stable_id);
-    if (!e || !e->lightbar_set) {
+    if (!e || (unsigned) mode >= GAMEPAD_MODE_COUNT) {
+        return false;
+    }
+    /* The mode's own colour, else the one 1.7.30 kept for every mode. */
+    const int m = e->lightbar[mode].set ? (int) mode : GAMEPAD_MODE_NONE;
+    if (!e->lightbar[m].set) {
         return false;
     }
     if (out) {
-        out->automatic = e->lightbar_automatic;
-        out->rgb = e->lightbar_rgb & 0xFFFFFFu;
+        out->automatic = e->lightbar[m].automatic;
+        out->rgb = e->lightbar[m].rgb & 0xFFFFFFu;
         out->game = !e->lightbar_game_off;
     }
     return true;
 }
 
-bool hid_pt_prefs_set_lightbar(const char *stable_id, const lightbar_pref_t *lb, bool keep_auto)
+bool hid_pt_prefs_set_lightbar(const char *stable_id, gamepad_mode_t mode, const lightbar_pref_t *lb, bool keep_auto)
 {
     if (!stable_id || !stable_id[0] || !lb) {
         commons_log_warn("HID-PT", "lightbar pref dropped: device has no stable id");
         return false;
     }
+    if (mode == GAMEPAD_MODE_NONE || (unsigned) mode >= GAMEPAD_MODE_COUNT) {
+        /* 1.7.30's one colour is read, never written. */
+        return false;
+    }
     hid_pt_pref_entry_t *e = pref_find(stable_id);
-    if (lb->automatic && !keep_auto) {
-        /* No choice: what a missing entry says, so it only clears. */
-        if (e && e->lightbar_set) {
-            e->lightbar_set = false;
-            e->lightbar_automatic = false;
-            e->lightbar_rgb = 0;
-            e->lightbar_game_off = false;
+    /* Automatic with nothing else to outvote is no choice: what a missing key
+     * says, so it only clears. Not over 1.7.30's colour, which the mode would
+     * fall back to -- there it is stored, as it is where the caller keeps it. */
+    const bool legacy_colour = e && e->lightbar[GAMEPAD_MODE_NONE].set &&
+                               !e->lightbar[GAMEPAD_MODE_NONE].automatic;
+    if (lb->automatic && !keep_auto && !legacy_colour) {
+        if (e && e->lightbar[mode].set) {
+            memset(&e->lightbar[mode], 0, sizeof(e->lightbar[mode]));
             hid_pt_prefs_flush();
         }
         return true;
@@ -434,25 +465,28 @@ bool hid_pt_prefs_set_lightbar(const char *stable_id, const lightbar_pref_t *lb,
         return false;
     }
     const uint32_t rgb = lb->automatic ? 0 : (lb->rgb & 0xFFFFFFu);
-    const bool game_off = !lb->automatic && !lb->game;
-    if (e->lightbar_set && e->lightbar_automatic == lb->automatic && e->lightbar_rgb == rgb &&
+    /* The game switch is the controller's, one for every mode: a colour sets
+     * it, Automatic (which has no switch) leaves it as the other modes have
+     * it. */
+    const bool game_off = lb->automatic ? e->lightbar_game_off : !lb->game;
+    if (e->lightbar[mode].set && e->lightbar[mode].automatic == lb->automatic && e->lightbar[mode].rgb == rgb &&
         e->lightbar_game_off == game_off) {
         return true;
     }
-    e->lightbar_set = true;
-    e->lightbar_automatic = lb->automatic;
-    e->lightbar_rgb = rgb;
+    e->lightbar[mode].set = true;
+    e->lightbar[mode].automatic = lb->automatic;
+    e->lightbar[mode].rgb = rgb;
     e->lightbar_game_off = game_off;
     hid_pt_prefs_flush();
     return true;
 }
 
-lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item)
+lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, gamepad_mode_t mode)
 {
     char id[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_logical(item, id, sizeof(id));
     lightbar_pref_t lb = lightbar_pref_automatic();
-    hid_pt_prefs_lookup_lightbar(id, &lb);
+    hid_pt_prefs_lookup_lightbar(id, mode, &lb);
     return lb;
 }
 
@@ -474,6 +508,17 @@ static const char *app_mode_ini_value(gamepad_mode_t mode)
         case GAMEPAD_MODE_NONE:
         default:
             return NULL;
+    }
+}
+
+/* `.lightbar.<mode>` for a mode, 1.7.30's `.lightbar` for NONE. */
+static void lightbar_mode_suffix(gamepad_mode_t mode, char *out, size_t len)
+{
+    const char *word = app_mode_ini_value(mode);
+    if (word) {
+        snprintf(out, len, HID_PT_LIGHTBAR_SUFFIX ".%s", word);
+    } else {
+        snprintf(out, len, HID_PT_LIGHTBAR_SUFFIX);
     }
 }
 
@@ -661,8 +706,9 @@ static bool suffixed_ini_id(const char *name, size_t id_len, char id[HID_PT_STAB
     return id[0] != '\0';
 }
 
-/* `<stable_id>.lightbar = auto|off|rrggbb`. */
-static void lightbar_ini_entry(const char *name, size_t id_len, const char *value)
+/* `<stable_id>.lightbar.<mode> = auto|off|rrggbb`, or 1.7.30's
+ * `<stable_id>.lightbar` for @p mode NONE. */
+static void lightbar_ini_entry(const char *name, size_t id_len, gamepad_mode_t mode, const char *value)
 {
     char id[HID_PT_STABLE_ID_LEN];
     if (!suffixed_ini_id(name, id_len, id) || !value) {
@@ -686,9 +732,9 @@ static void lightbar_ini_entry(const char *name, size_t id_len, const char *valu
         commons_log_warn("HID-PT", "lightbar pref for %s dropped on load: table full", id);
         return;
     }
-    e->lightbar_set = true;
-    e->lightbar_automatic = automatic;
-    e->lightbar_rgb = rgb;
+    e->lightbar[mode].set = true;
+    e->lightbar[mode].automatic = automatic;
+    e->lightbar[mode].rgb = rgb;
 }
 
 /* `<stable_id>.lightbar_game = 0|1`. Only 0 carries anything; a line for an id
@@ -734,8 +780,16 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
         sdl_type_ini_entry(name, id_len, value);
         return 1;
     }
+    for (int m = GAMEPAD_MODE_NONE + 1; m < GAMEPAD_MODE_COUNT; ++m) {
+        char suffix[32];
+        lightbar_mode_suffix((gamepad_mode_t) m, suffix, sizeof(suffix));
+        if (ini_name_has_suffix(name, suffix, &id_len)) {
+            lightbar_ini_entry(name, id_len, (gamepad_mode_t) m, value);
+            return 1;
+        }
+    }
     if (ini_name_has_suffix(name, HID_PT_LIGHTBAR_SUFFIX, &id_len)) {
-        lightbar_ini_entry(name, id_len, value);
+        lightbar_ini_entry(name, id_len, GAMEPAD_MODE_NONE, value);
         return 1;
     }
     if (ini_name_has_suffix(name, HID_PT_LIGHTBAR_GAME_SUFFIX, &id_len)) {
@@ -795,22 +849,28 @@ void hid_pt_prefs_write_section(FILE *fp)
             snprintf(key, sizeof(key), "%s" HID_PT_SDL_TYPE_SUFFIX, e->id);
             ini_write_string(fp, key, sdl_type);
         }
-        if (e->lightbar_set) {
-            char key[HID_PT_STABLE_ID_LEN + sizeof(HID_PT_LIGHTBAR_GAME_SUFFIX)];
+        for (int m = 0; m < GAMEPAD_MODE_COUNT; ++m) {
+            if (!e->lightbar[m].set) {
+                continue;
+            }
+            char suffix[32];
+            char key[HID_PT_STABLE_ID_LEN + sizeof(suffix)];
             char value[8];
-            if (e->lightbar_automatic) {
+            if (e->lightbar[m].automatic) {
                 snprintf(value, sizeof(value), "auto");
-            } else if (e->lightbar_rgb == 0) {
+            } else if (e->lightbar[m].rgb == 0) {
                 snprintf(value, sizeof(value), "off");
             } else {
-                snprintf(value, sizeof(value), "%06x", (unsigned) (e->lightbar_rgb & 0xFFFFFFu));
+                snprintf(value, sizeof(value), "%06x", (unsigned) (e->lightbar[m].rgb & 0xFFFFFFu));
             }
-            snprintf(key, sizeof(key), "%s" HID_PT_LIGHTBAR_SUFFIX, e->id);
+            lightbar_mode_suffix((gamepad_mode_t) m, suffix, sizeof(suffix));
+            snprintf(key, sizeof(key), "%s%s", e->id, suffix);
             ini_write_string(fp, key, value);
-            if (!e->lightbar_automatic && e->lightbar_game_off) {
-                snprintf(key, sizeof(key), "%s" HID_PT_LIGHTBAR_GAME_SUFFIX, e->id);
-                ini_write_string(fp, key, "0");
-            }
+        }
+        if (pref_has_lightbar(e, true) && e->lightbar_game_off) {
+            char key[HID_PT_STABLE_ID_LEN + sizeof(HID_PT_LIGHTBAR_GAME_SUFFIX)];
+            snprintf(key, sizeof(key), "%s" HID_PT_LIGHTBAR_GAME_SUFFIX, e->id);
+            ini_write_string(fp, key, "0");
         }
     }
     for (int i = 0; i < g_app_mode_count; ++i) {

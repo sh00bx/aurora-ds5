@@ -260,6 +260,10 @@ struct ctm_controller {
      * game's. Session thread only; cleared per session. */
     bool lb_game_owned;
     uint32_t lb_game_rgb;
+    /* Whether the game has painted at all this session, and its last colour,
+     * black included: what Automatic puts back on the bar. */
+    bool lb_game_seen;
+    uint32_t lb_game_last;
     int own_output;
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
@@ -1498,6 +1502,8 @@ static void session_state_reset(ctm_controller_t *c)
     /* A new link: the game has painted nothing on it yet. */
     c->lb_game_owned = false;
     c->lb_game_rgb = 0;
+    c->lb_game_seen = false;
+    c->lb_game_last = 0;
     c->own_output = 0;
 }
 
@@ -2658,6 +2664,8 @@ void ctm_controller_note_game_lightbar(ctm_controller_t *c, uint32_t rgb)
     if (!c) return;
     c->lb_game_owned = rgb != 0;
     if (rgb != 0) c->lb_game_rgb = rgb;
+    c->lb_game_seen = true;
+    c->lb_game_last = rgb;
     /* The game has just told the pad a colour of its own (or handed the bar
      * back), so the last push no longer says what the pad shows: a push that
      * repeats it byte for byte -- the user's colour again, once the game may
@@ -2671,6 +2679,13 @@ bool ctm_controller_game_lightbar(ctm_controller_t *c, uint32_t *rgb)
 {
     if (!c || !c->lb_game_owned) return false;
     if (rgb) *rgb = c->lb_game_rgb;
+    return true;
+}
+
+bool ctm_controller_game_lightbar_last(ctm_controller_t *c, uint32_t *rgb)
+{
+    if (!c || !c->lb_game_seen) return false;
+    if (rgb) *rgb = c->lb_game_last;
     return true;
 }
 

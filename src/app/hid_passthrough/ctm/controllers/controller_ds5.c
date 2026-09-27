@@ -402,7 +402,10 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
  * rides along, as on every paint of the daemon's idle painter: over BT the
  * firmware ignores a colour until the bar has been released, and a fresh link
  * re-latches that gate. Host framing and signature, so it passes through
- * patch_output like any host report. Automatic: nothing (0).
+ * patch_output like any host report. Automatic: the colour the game painted
+ * last this session -- so going back to Automatic takes the user's colour off
+ * at once -- or, when it painted nothing, nothing at all (0): the bar is the
+ * host's.
  * When: session thread, at link-up and after a settings change. */
 static size_t ds5_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
 {
@@ -415,7 +418,7 @@ static size_t ds5_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     ctm_controller_get_settings(c, &s);
     uint32_t rgb = 0;
     bool game = false;
-    if (!ds5_lightbar_colour(c, &s, &rgb, &game)) return 0;
+    if (!ds5_lightbar_colour(c, &s, &rgb, &game) && !ctm_controller_game_lightbar_last(c, &rgb)) return 0;
     memset(buf, 0, DS5_BT_OUT_LEN);
     buf[0] = 0x31;
     buf[1] = (uint8_t) ((__atomic_fetch_add(&seq, 1u, __ATOMIC_RELAXED) & 0x0fu) << 4);

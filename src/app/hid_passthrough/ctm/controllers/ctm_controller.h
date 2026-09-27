@@ -222,13 +222,16 @@ size_t ctm_controller_last_output(ctm_controller_t *c, uint8_t report_id,
 /* The lightbar ownership rule, as the DS hooks learn it from the host's
  * reports: a game that paints a non-black colour owns the bar until it paints
  * black, which hands it back (note_game_lightbar() with that colour, 0 for
- * black). game_lightbar() says whether the game owns it now, and with what.
- * own_output() is true while the session thread writes a report the bridge
- * built itself (build_settings_report, build_quiesce_reports) -- patch_output
- * sees those too, and they must not count as the game's. All three are
- * session-thread state, reset per session. */
+ * black). game_lightbar() says whether the game owns it now, and with what;
+ * game_lightbar_last() whether it painted at all, and its last colour, black
+ * included -- what the bar goes back to when the user's colour becomes
+ * Automatic. own_output() is true while the session thread writes a report the
+ * bridge built itself (build_settings_report, build_quiesce_reports) --
+ * patch_output sees those too, and they must not count as the game's. All of
+ * it is session-thread state, reset per session. */
 void ctm_controller_note_game_lightbar(ctm_controller_t *c, uint32_t rgb);
 bool ctm_controller_game_lightbar(ctm_controller_t *c, uint32_t *rgb);
+bool ctm_controller_game_lightbar_last(ctm_controller_t *c, uint32_t *rgb);
 bool ctm_controller_own_output(ctm_controller_t *c);
 /* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
 bool ctm_controller_finished(ctm_controller_t *c);

@@ -57,10 +57,21 @@ bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
  * pairing needs; NULL skips that check. */
 gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad);
 
-/* The lightbar colour chosen for this pad: the listed device's choice, else the
- * pad's own id's, else Automatic -- the same ids and order as
+/* The lightbar colour chosen for this pad in @p mode: the listed device's
+ * choice, else the pad's own id's, else Automatic -- the same ids and order as
  * hid_pt_gamepad_sdl_type(). */
-lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad);
+lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad,
+                                        gamepad_mode_t mode);
+
+/* The mode this pad runs in on the host over SDL: the type it is announced as
+ * (hid_pt_gamepad_sdl_type(), the lock included), Automatic resolved to the
+ * pad the host builds for it. X360, DS4, DS5 or SWITCH; NONE without a pad. */
+gamepad_mode_t hid_pt_gamepad_host_mode(app_input_t *input, const app_gamepad_state_t *gamepad);
+
+/* The mode this pad comes back in, whatever the current game fixes: HID when
+ * its auto-plug flag is set (on the pad's own id or the listed device it is),
+ * else its own SDL type, Automatic resolved. NONE without a pad. */
+gamepad_mode_t hid_pt_gamepad_own_mode(app_input_t *input, const app_gamepad_state_t *gamepad);
 
 /* Which listed device this SDL pad is, for the Controllers page, or NULL. Pure:
  * it never binds a slot, so it may run on every render. Identity or a VID:PID

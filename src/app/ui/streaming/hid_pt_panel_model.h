@@ -86,6 +86,15 @@ typedef struct {
     /* Where the SDL pads come from, and where a type change is re-announced.
      * NULL lists the CTM devices only. */
     session_t *session;
+    /* A colour-picker preview on a mounted controller's settings record: the
+     * device, and the record's lightbar as it was, to put back at the end. */
+    struct {
+        bool record;
+        char key[HID_PT_PANEL_KEY_LEN];
+        bool user;
+        unsigned rgb;
+        bool game;
+    } lightbar_preview;
 } hid_pt_model_t;
 
 /* ---- selection ---------------------------------------------------------- */
@@ -163,11 +172,14 @@ bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model);
 bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model);
 
 /**
- * The selection's lightbar colour: what its pad resolves to
+ * The selection's lightbar colour in the mode its mode row lights -- HID while
+ * mounted, else the pad the host builds for it (the game's lock included) --
+ * which is the one the LIGHTBAR row shows and edits; that mode into
+ * *@p mode_out (may be NULL). The colour is what its pad resolves to
  * (hid_pt_gamepad_lightbar()), or without a pad what the device's own id
  * stores. Automatic when nothing was chosen; false when nothing is selected.
  */
-bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out);
+bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out, gamepad_mode_t *mode_out);
 
 /** default_settings_for_item()'s latency for the selection, or 60 with none. */
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model);
@@ -220,14 +232,27 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
 bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type);
 
 /**
- * Store the selection's lightbar colour and paint it at once wherever the
- * controller is: the bridge's settings record (pushed to a mounted pad through
- * ctm_controller_set_settings()) and every SDL pad of the session
- * (hid_pt_lightbar_refresh()). Written under the ids hid_pt_model_set_sdl_type()
- * writes, by the same rules. False when the store refused it; the reason is
- * then in the plug error, and the colour still applies until the app quits.
+ * Store the selection's lightbar colour for the mode hid_pt_model_selected_lightbar()
+ * names -- @p lb's game switch for every mode of the controller -- and paint it
+ * at once wherever the controller is: the bridge's settings record (pushed to a
+ * mounted pad through ctm_controller_set_settings()) and every SDL pad of the
+ * session (hid_pt_lightbar_refresh()). Written under the ids
+ * hid_pt_model_set_sdl_type() writes, by the same rules. False when the store
+ * refused it; the reason is then in the plug error, and the colour still
+ * applies until the app quits.
  */
 bool hid_pt_model_set_lightbar(const hid_pt_model_t *model, const lightbar_pref_t *lb);
+
+/**
+ * The colour picker's live preview: show @p rgb on the selection's bar at once
+ * through the path a change takes -- the bridge's record for a mounted pad
+ * (the game kept off it meanwhile), the SDL pad otherwise -- storing nothing.
+ * The caller throttles it. Ends with hid_pt_model_end_lightbar_preview(): with
+ * @p keep after the colour was stored (the record already holds it), without
+ * for a cancel, which puts back what the bar showed.
+ */
+void hid_pt_model_preview_lightbar(hid_pt_model_t *model, uint32_t rgb);
+void hid_pt_model_end_lightbar_preview(hid_pt_model_t *model, bool keep);
 
 /* ---- the game's fixed mode ---------------------------------------------- */
 

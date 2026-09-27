@@ -852,7 +852,7 @@ static void update_lightbar_row(hid_pt_panel_t *panel)
     }
     lightbar_pref_t lb;
     const bool show = hid_pt_model_selected_has_lightbar(&panel->model) &&
-                      hid_pt_model_selected_lightbar(&panel->model, &lb);
+                      hid_pt_model_selected_lightbar(&panel->model, &lb, NULL);
     if (!show) {
         lb = lightbar_pref_automatic();
     }
@@ -891,7 +891,7 @@ static void panel_swatch_clicked(void *userdata, int swatch)
     hid_pt_panel_t *panel = userdata;
     lightbar_pref_t lb;
     if (!panel || swatch < 0 || swatch >= SWATCH_COUNT || !hid_pt_model_selected_has_lightbar(&panel->model) ||
-        !hid_pt_model_selected_lightbar(&panel->model, &lb)) {
+        !hid_pt_model_selected_lightbar(&panel->model, &lb, NULL)) {
         return;
     }
     lightbar_pref_t want = lightbar_pref_automatic();
@@ -1103,7 +1103,7 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
             return;
         case HID_PT_CTL_LIGHTBAR_GAME: {
             lightbar_pref_t lb;
-            if (panel->view.lightbar_game_cb && hid_pt_model_selected_lightbar(&panel->model, &lb) &&
+            if (panel->view.lightbar_game_cb && hid_pt_model_selected_lightbar(&panel->model, &lb, NULL) &&
                 !lb.automatic) {
                 lb.game = lv_obj_has_state(panel->view.lightbar_game_cb, LV_STATE_CHECKED);
                 panel_set_lightbar(panel, &lb);

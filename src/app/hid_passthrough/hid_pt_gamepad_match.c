@@ -5,6 +5,7 @@
 #include "hid_pt_gamepad_match.h"
 
 #include "hid_pt_device_prefs.h"
+#include "hid_pt_lightbar.h"
 #include "ctm/ctm_state.h"
 #include "input/app_input.h"
 #include "input/input_gamepad.h"
@@ -626,7 +627,7 @@ gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepa
     return hid_pt_prefs_effective_sdl_type(pad_own_sdl_type(input, gamepad));
 }
 
-lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad)
+lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad, gamepad_mode_t mode)
 {
     lightbar_pref_t lb = lightbar_pref_automatic();
     if (!gamepad || !gamepad->controller) {
@@ -639,13 +640,37 @@ lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_st
     char id[HID_PT_STABLE_ID_LEN];
     if (peer) {
         hid_pt_stable_id_for_logical(peer, id, sizeof(id));
-        if (hid_pt_prefs_lookup_lightbar(id, &lb)) {
+        if (hid_pt_prefs_lookup_lightbar(id, mode, &lb)) {
             return lb;
         }
     }
     hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
-    hid_pt_prefs_lookup_lightbar(id, &lb);
+    hid_pt_prefs_lookup_lightbar(id, mode, &lb);
     return lb;
+}
+
+gamepad_mode_t hid_pt_gamepad_host_mode(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return GAMEPAD_MODE_NONE;
+    }
+    return gamepad_type_pref_mode(gamepad_type_pref_effective(hid_pt_gamepad_sdl_type(input, gamepad),
+                                                              stream_input_gamepad_auto_builds_ds4(gamepad->controller)));
+}
+
+gamepad_mode_t hid_pt_gamepad_own_mode(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return GAMEPAD_MODE_NONE;
+    }
+    /* "Mode HID" is the auto-plug flag, read where hid_pt_gamepad_is_autoplug()
+     * reads it: the pad's own id, then the listed device it is. */
+    const logical_device_t *peer = pad_peer(input, gamepad);
+    if (hid_pt_prefs_auto_plugin_for_gamepad(gamepad) || (peer && hid_pt_prefs_auto_plugin_for_logical(peer))) {
+        return GAMEPAD_MODE_HID;
+    }
+    return gamepad_type_pref_mode(gamepad_type_pref_effective(pad_own_sdl_type(input, gamepad),
+                                                              stream_input_gamepad_auto_builds_ds4(gamepad->controller)));
 }
 
 logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad)
@@ -715,6 +740,8 @@ static void moonlight_exclude_gamepad(stream_input_t *input, app_gamepad_state_t
     if (item) {
         item->moonlight_gs_id = (int8_t) gp->gs_id;
     }
+    /* The bar is the bridge's now, in the controller's HID colour. */
+    hid_pt_lightbar_pad_bridged(input->input, gp);
     commons_log_info("HID-PT", "Moonlight slot %d removed for HID bridge (%s)",
                      gp->gs_id, item ? item->name : "?");
 }

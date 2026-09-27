@@ -223,6 +223,18 @@ static void fill_row_info(const hid_pt_model_t *model, const row_ref_t *ref, hid
     }
 }
 
+/* The mode whose lightbar colour the page shows and edits for a row: the one
+ * its mode row lights -- HID while it is mounted, else the pad the host builds
+ * for it over SDL, the game's lock included. Colours are never per game: a
+ * lock only decides which of the controller's own colours this is. */
+static gamepad_mode_t row_lightbar_mode(const hid_pt_model_t *model, const row_ref_t *ref)
+{
+    if (ref->item && ref->item->plugged) {
+        return GAMEPAD_MODE_HID;
+    }
+    return gamepad_type_pref_mode(gamepad_type_pref_effective(row_sdl_type(model, ref), row_detected_playstation(ref)));
+}
+
 static const char *selected_kind(const hid_pt_model_t *model)
 {
     const logical_device_t *item = selected_item(model);
@@ -471,14 +483,18 @@ bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model)
 #endif
 }
 
-bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out)
+bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out, gamepad_mode_t *mode_out)
 {
     row_ref_t ref;
     if (!out || !selected_row(model, &ref)) {
         return false;
     }
-    *out = ref.pad ? hid_pt_gamepad_lightbar(model_app_input(model), ref.pad)
-                   : ref.item ? hid_pt_prefs_lightbar_for_logical(ref.item) : lightbar_pref_automatic();
+    const gamepad_mode_t mode = row_lightbar_mode(model, &ref);
+    *out = ref.pad ? hid_pt_gamepad_lightbar(model_app_input(model), ref.pad, mode)
+                   : ref.item ? hid_pt_prefs_lightbar_for_logical(ref.item, mode) : lightbar_pref_automatic();
+    if (mode_out) {
+        *mode_out = mode;
+    }
     return true;
 }
 
@@ -608,6 +624,16 @@ static gamepad_type_pref_t host_type(app_input_t *app_input, const app_gamepad_s
                                        stream_input_gamepad_auto_builds_ds4(gp->controller));
 }
 
+/* Every SDL pad of the session back in the colour of the mode it is in now --
+ * after anything that may have moved one: a pad the host gets a new pad for is
+ * repainted by its arrival anyway, this covers the rest (a pad not announced,
+ * whose remembered mode changed). A bridged slot only in the record. */
+static void refresh_lightbars(const hid_pt_model_t *model)
+{
+    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
+    hid_pt_lightbar_refresh(model_app_input(model), input ? input->moonlightExcludedMask : 0);
+}
+
 bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type)
 {
     row_ref_t ref;
@@ -672,6 +698,7 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
             stream_input_reannounce_gamepad(input, gp);
         }
     }
+    refresh_lightbars(model);
     return stored;
 }
 
@@ -681,45 +708,115 @@ bool hid_pt_model_set_lightbar(const hid_pt_model_t *model, const lightbar_pref_
     if (!lb || !selected_row(model, &ref)) {
         return false;
     }
+    const gamepad_mode_t mode = row_lightbar_mode(model, &ref);
     char device_id[HID_PT_STABLE_ID_LEN];
     char pad_id[HID_PT_STABLE_ID_LEN];
     const logical_device_t *device = choice_ids(model, &ref, device_id, pad_id);
     bool stored = device_id[0] || pad_id[0];
     if (device_id[0]) {
-        stored = hid_pt_prefs_set_lightbar(device_id, lb, true) && stored;
+        stored = hid_pt_prefs_set_lightbar(device_id, mode, lb, true) && stored;
     }
     if (pad_id[0]) {
-        stored = hid_pt_prefs_set_lightbar(pad_id, lb, false) && stored;
+        stored = hid_pt_prefs_set_lightbar(pad_id, mode, lb, false) && stored;
     }
     char name[HID_PT_PANEL_NAME_LEN];
     if (!hid_pt_model_selected_name(model, name, sizeof(name))) {
         name[0] = '\0';
     }
+    const char *mode_name = gamepad_mode_label(mode) ? gamepad_mode_label(mode) : "?";
     if (stored) {
         if (lb->automatic) {
-            commons_log_info("HID-PT", "lightbar for %s set to Automatic", name);
+            commons_log_info("HID-PT", "lightbar for %s in %s set to Automatic", name, mode_name);
         } else {
-            commons_log_info("HID-PT", "lightbar for %s set to %06x, game may change it: %s", name,
+            commons_log_info("HID-PT", "lightbar for %s in %s set to %06x, game may change it: %s", name, mode_name,
                              (unsigned) lb->rgb, lb->game ? "yes" : "no");
         }
     } else {
         ctm_set_plug_error("Lightbar colour for %s could not be saved", name);
     }
-    /* Mounted: the record is what the bridge paints from, and setting it
-     * pushes a report at once. Not mounted, the record is what the next mount
-     * starts with. */
+    /* Mounted: the record is what the bridge paints from -- the HID colour,
+     * and the controller's one game switch -- and setting it pushes a report at
+     * once. Not mounted, the record is what the next mount starts with. */
     tv_bridge_worker_settings_t *settings = device ? settings_for_item(device) : NULL;
     if (settings) {
-        settings->lightbar_user = !lb->automatic;
-        settings->lightbar_rgb = lb->automatic ? 0 : lb->rgb;
-        settings->lightbar_game = lb->automatic || lb->game;
-        apply_settings_to_session(device);
+        const tv_bridge_worker_settings_t before = *settings;
+        if (mode == GAMEPAD_MODE_HID) {
+            settings->lightbar_user = !lb->automatic;
+            settings->lightbar_rgb = lb->automatic ? 0 : lb->rgb;
+        }
+        if (!lb->automatic) {
+            settings->lightbar_game = lb->game;
+        }
+        if (before.lightbar_user != settings->lightbar_user || before.lightbar_rgb != settings->lightbar_rgb ||
+            before.lightbar_game != settings->lightbar_game) {
+            apply_settings_to_session(device);
+        }
     }
     /* Over SDL: every pad, since pads sharing an id share the choice; a
      * bridged slot is left to the bridge. */
-    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
-    hid_pt_lightbar_refresh(model_app_input(model), input ? input->moonlightExcludedMask : 0);
+    refresh_lightbars(model);
     return stored;
+}
+
+void hid_pt_model_preview_lightbar(hid_pt_model_t *model, uint32_t rgb)
+{
+    row_ref_t ref;
+    if (!model || !selected_row(model, &ref)) {
+        return;
+    }
+    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
+    const logical_device_t *device = ref.item;
+    if (!device && ref.pad) {
+        device = hid_pt_gamepad_panel_peer(model_app_input(model), ref.pad);
+    }
+    if (row_lightbar_mode(model, &ref) == GAMEPAD_MODE_HID) {
+        /* Mounted: the bridge paints it, from the record. Its lightbar is
+         * saved once and put back when the preview ends, as it was. */
+        tv_bridge_worker_settings_t *settings = device ? settings_for_item(device) : NULL;
+        if (!settings) {
+            return;
+        }
+        if (!model->lightbar_preview.record) {
+            model->lightbar_preview.record = true;
+            snprintf(model->lightbar_preview.key, sizeof(model->lightbar_preview.key), "%s", device->key);
+            model->lightbar_preview.user = settings->lightbar_user;
+            model->lightbar_preview.rgb = settings->lightbar_rgb;
+            model->lightbar_preview.game = settings->lightbar_game;
+        }
+        if (settings->lightbar_user && !settings->lightbar_game && settings->lightbar_rgb == (rgb & 0xFFFFFFu)) {
+            return;
+        }
+        /* The game does not get the bar while the user is choosing. */
+        settings->lightbar_user = true;
+        settings->lightbar_rgb = rgb & 0xFFFFFFu;
+        settings->lightbar_game = false;
+        apply_settings_to_session(device);
+    } else if (ref.pad && !(input && hid_pt_gamepad_is_moonlight_excluded(input, ref.pad))) {
+        hid_pt_lightbar_preview(model_app_input(model), ref.pad, rgb);
+    }
+}
+
+void hid_pt_model_end_lightbar_preview(hid_pt_model_t *model, bool keep)
+{
+    if (!model) {
+        return;
+    }
+    if (model->lightbar_preview.record) {
+        model->lightbar_preview.record = false;
+        /* By key: the record belongs to the device that was previewed, and a
+         * device gone since has no bridge left to repaint. After an OK the
+         * record already holds the stored colour. */
+        const logical_device_t *device = logical_device_by_key(model->lightbar_preview.key);
+        tv_bridge_worker_settings_t *settings = device ? settings_for_item(device) : NULL;
+        if (settings && !keep) {
+            settings->lightbar_user = model->lightbar_preview.user;
+            settings->lightbar_rgb = model->lightbar_preview.rgb;
+            settings->lightbar_game = model->lightbar_preview.game;
+            apply_settings_to_session(device);
+        }
+    }
+    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
+    hid_pt_lightbar_preview_end(model_app_input(model), input ? input->moonlightExcludedMask : 0);
 }
 
 bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type)
@@ -754,6 +851,9 @@ bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_ty
         hid_pt_stable_id_for_gamepad(ref.pad, pad_id, sizeof(pad_id));
         hid_pt_prefs_set_auto_plugin(pad_id, false);
     }
+    /* The mode it comes back in is what its bar shows until the host has a pad
+     * for it (and what the idle painter paints). */
+    refresh_lightbars(model);
     return stored;
 }
 
@@ -846,6 +946,7 @@ bool hid_pt_model_set_app_mode(hid_pt_model_t *model, gamepad_mode_t mode)
             stream_input_reannounce_gamepad(input, gp);
         }
     }
+    refresh_lightbars(model);
     return true;
 }
 
