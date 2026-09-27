@@ -386,11 +386,13 @@ void stream_input_handle_jdevice(stream_input_t *input, const SDL_JoyDeviceEvent
         // serial-keyed pref would miss and this would fall through to
         // stream_input_send_gamepad_arrive() below -> the host spawns a parallel
         // ViGEm/Xbox pad next to the CTM DS5 and the game flaps Xbox<->DS5.
-        if (hid_pt_gamepad_is_autoplug(input->input, gamepad)) {
-            hid_passthrough_manager_t *mgr = session_get_hid_passthrough(input->session);
-            if (mgr != NULL && hid_passthrough_manager_active(mgr)) {
-                hid_passthrough_manager_request_rescan(mgr, input);
-            }
+        // Only while this session runs the bridge: a controller whose mode is
+        // HID but that nothing can mount (HID passthrough off) runs over SDL in
+        // its own type instead of being announced to nobody.
+        hid_passthrough_manager_t *mgr = session_get_hid_passthrough(input->session);
+        if (mgr != NULL && hid_passthrough_manager_active(mgr) &&
+            hid_pt_gamepad_is_autoplug(input->input, gamepad)) {
+            hid_passthrough_manager_request_rescan(mgr, input);
             return;
         }
 #endif

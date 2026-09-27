@@ -218,11 +218,6 @@ static void fill_row_info(const hid_pt_model_t *model, const row_ref_t *ref, hid
                  flydigi_is_xinput_evdev_only(item) ? "XInput" :
                  flydigi_is_xinput_mode(item) ? "XInput" : "D-Input");
     }
-    const tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (settings && settings->auto_plugin) {
-        size_t len = strlen(out->label);
-        snprintf(out->label + len, sizeof(out->label) - len, " [A]");
-    }
 }
 
 static const char *selected_kind(const hid_pt_model_t *model)
@@ -309,13 +304,7 @@ uint64_t hid_pt_model_signature(const hid_pt_model_t *model)
         unsigned char st = (unsigned char) (info.plugged ? 1 : 0);
         unsigned char pad = (unsigned char) ((info.has_sdl_pad ? 1 : 0) | (info.is_gamepad ? 2 : 0));
         unsigned char type = (unsigned char) info.effective_type;
-        /* The row label carries the " [A]" marker, so auto_plugin belongs in the
-         * signature: without it, ticking the checkbox left the marker stale until
-         * some unrelated device event happened to change the hash. The label is
-         * mixed whole, which covers that. fill_row_info()'s settings_for_item()
-         * materialises the record for a device that has none yet -- the renderer
-         * does the same for every row it draws, so this adds no entry the
-         * renderer would not have added anyway. */
+        /* The label is mixed whole: a Flydigi's mode suffix is part of it. */
         SIG_MIX(info.key, strlen(info.key));
         SIG_MIX(info.label, strlen(info.label));
         SIG_MIX(&st, 1);
@@ -492,7 +481,6 @@ bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *
     out->headset_volume_percent = settings->headset_volume_percent;
     out->haptics_gain_centi = settings->haptics_gain_centi;
     out->trigger_reduce = settings->ds5_trigger_reduce;
-    out->auto_plugin = settings->auto_plugin;
     out->composite_passthrough = settings->composite_passthrough;
     return true;
 }
@@ -513,18 +501,6 @@ bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_contr
         settings->ds5_trigger_reduce = in->trigger_reduce;
     }
     apply_settings_to_session(item);
-    return true;
-}
-
-bool hid_pt_model_set_auto_plugin(const hid_pt_model_t *model, bool on)
-{
-    const logical_device_t *item = selected_item(model);
-    tv_bridge_worker_settings_t *settings = settings_for_item(item);
-    if (!item || !settings) {
-        return false;
-    }
-    settings->auto_plugin = on;
-    hid_pt_sync_auto_plugin_pref(item);
     return true;
 }
 
@@ -635,6 +611,41 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
         if (gp && gp->controller && hid_pt_gamepad_sdl_type(app_input, gp) != before[i]) {
             stream_input_reannounce_gamepad(input, gp);
         }
+    }
+    return stored;
+}
+
+bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type)
+{
+    row_ref_t ref;
+    if (!selected_row(model, &ref) || (hid && !ref.item)) {
+        return false;
+    }
+    if (!hid && !hid_pt_model_set_sdl_type(model, type)) {
+        return false;
+    }
+    bool stored = true;
+    if (ref.item) {
+        tv_bridge_worker_settings_t *settings = settings_for_item(ref.item);
+        if (!settings) {
+            return false;
+        }
+        /* The record first, then the store, exactly as the auto-plug switch
+         * did: the record is what the reconcile reads, the store what the next
+         * launch reads, and the sync reports a refused write in the error line
+         * itself. */
+        settings->auto_plugin = hid;
+        hid_pt_sync_auto_plugin_pref(ref.item);
+        stored = hid_pt_prefs_auto_plugin_for_logical(ref.item) == hid;
+    }
+    if (!hid && ref.pad) {
+        /* A pad whose serial is not the device's id (a USB DualShock) may still
+         * carry an auto-plug flag under that serial from an older build, and
+         * hid_pt_gamepad_is_autoplug() reads it first: it would keep taking the
+         * pad off SDL at every stream start. Clearing needs no slot. */
+        char pad_id[HID_PT_STABLE_ID_LEN];
+        hid_pt_stable_id_for_gamepad(ref.pad, pad_id, sizeof(pad_id));
+        hid_pt_prefs_set_auto_plugin(pad_id, false);
     }
     return stored;
 }

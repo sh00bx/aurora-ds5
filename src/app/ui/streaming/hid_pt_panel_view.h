@@ -30,7 +30,6 @@
 /** The controls the option column carries, in focus order. */
 typedef enum {
     HID_PT_CTL_COMPOSITE = 0,
-    HID_PT_CTL_AUTO_PLUGIN,
     HID_PT_CTL_LATENCY,
     HID_PT_CTL_AUDIO_MODE,
     HID_PT_CTL_SPEAKER,
@@ -123,8 +122,6 @@ typedef struct {
     int mode_count;
     lv_obj_t *composite_row;
     lv_obj_t *composite_cb;
-    lv_obj_t *auto_plugin_row;
-    lv_obj_t *auto_plugin_cb;
     lv_obj_t *customize_panel;
     lv_obj_t *customize_title;
     lv_obj_t *customize_state;

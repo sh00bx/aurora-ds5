@@ -39,7 +39,7 @@ typedef struct session_t session_t;
 /** One device as the list needs to draw it. */
 typedef struct {
     char key[HID_PT_PANEL_KEY_LEN];
-    /* Name, plus the Flydigi mode suffix and the " [A]" auto-plug marker. */
+    /* Name, plus the Flydigi mode suffix. */
     char label[128];
     bool plugged;
     /* An SDL pad of the session is this row. Always true for an SDL-only row. */
@@ -69,7 +69,6 @@ typedef struct {
     unsigned headset_volume_percent;
     unsigned haptics_gain_centi;
     unsigned trigger_reduce;        /* DualSense trigger power reduction, 0 = off */
-    bool auto_plugin;
     bool composite_passthrough;
 } hid_pt_controls_t;
 
@@ -110,8 +109,8 @@ bool hid_pt_model_row_info(const hid_pt_model_t *model, int index, hid_pt_row_in
 
 /**
  * A hash over the part of the model the device list draws: the count, and each
- * row's key, plugged state, auto-plug flag, SDL presence and the type the host
- * builds for it. The panel re-renders when it changes.
+ * row's key, label, plugged state, SDL presence and the type the host builds
+ * for it. The panel re-renders when it changes.
  */
 uint64_t hid_pt_model_signature(const hid_pt_model_t *model);
 
@@ -176,9 +175,6 @@ bool hid_pt_model_read_controls(const hid_pt_model_t *model, hid_pt_controls_t *
  */
 bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_controls_t *in);
 
-/** Write the auto-plug flag and persist it to the pref store. */
-bool hid_pt_model_set_auto_plugin(const hid_pt_model_t *model, bool on);
-
 /** Write the Flydigi composite flag and push it at a live bridge. */
 bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on);
 
@@ -193,6 +189,19 @@ bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on);
  * shows.
  */
 bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type);
+
+/**
+ * Remember the selection's mode: the one it comes back in after a Bluetooth
+ * reconnect, at the next stream and after an app restart. @p hid sets the
+ * device's auto-plug flag, which is what "mode HID" is stored as, and keeps the
+ * SDL type for when it leaves HID; otherwise the flag is cleared and @p type is
+ * stored through hid_pt_model_set_sdl_type(), re-announce included.
+ *
+ * Mounts and unmounts nothing: the caller does that through the plug toggle.
+ * False when a pref could not be written; the reason is then in the plug error
+ * the status line shows.
+ */
+bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type);
 
 /**
  * Overwrite the selection's settings with the per-device defaults, without

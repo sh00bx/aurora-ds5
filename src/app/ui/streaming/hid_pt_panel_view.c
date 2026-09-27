@@ -44,25 +44,26 @@
  * 2 px. The sheet is min(SHEET_H 1008, 92 % of 1080 = 993) = 993 px; less its
  * border (2 x 2), the header (104) and the body padding (2 x 24), a pane gets
  * 837 px, or 779 with the error bar up (58). Its tallest case, a DualSense
- * mounted, is eleven children with ten OPT_GAPs of 8:
+ * mounted, is ten children with nine OPT_GAPs of 8:
  *
  *   head (title 46 + 4 + state line 34, pad 4)   88
  *   MODE eyebrow                                  34
  *   mode row                                      84
- *   auto-plug                                     60
  *   AUDIO & HAPTICS eyebrow (pad 8)               42
  *   audio, speaker, headphone, haptics,
  *   soften triggers, latency: 6 x 60             360
- *   gaps: 10 x 8                                  80
+ *   gaps: 9 x 8                                   72
  *                                                ---
- *                                                748
+ *                                                680
  *
- * which leaves 89 px (31 under the error bar). The audio advisory (two small
- * lines, pad 8, + a gap: 84) still fits without the error bar: 832. A Flydigi
- * with its composite switch is 358. In 1.7.28 the same DualSense measured 1020
- * mounted and 974 on SDL, and a DualShock 4 852 mounted against 806 on SDL --
- * the 46 px of the "applies over SDL" caption were what tipped it into
- * scrolling, which is the scrollbar a mounted pad brought up. */
+ * which leaves 157 px (99 under the error bar). The audio advisory (two small
+ * lines, pad 8, + a gap: 84) fits under the error bar too: 764. A Flydigi with
+ * its composite switch is 290. The auto-plug switch (60 + a gap) went in
+ * 1.7.30, when a controller started keeping its mode. In 1.7.28 the same
+ * DualSense measured 1020 mounted and 974 on SDL, and a DualShock 4 852
+ * mounted against 806 on SDL -- the 46 px of the "applies over SDL" caption
+ * were what tipped it into scrolling, which is the scrollbar a mounted pad
+ * brought up. */
 
 /* ---- event trampolines --------------------------------------------------
  *
@@ -430,7 +431,7 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
-#define OPTION_CHAIN_LEN 10
+#define OPTION_CHAIN_LEN 9
 
 /**
  * Where the cursor enters the mode row: the lit button, else the first enabled
@@ -466,15 +467,14 @@ static lv_obj_t *mode_entry(const hid_pt_view_t *view)
 static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_LEN])
 {
     out[0] = mode_entry(view);
-    out[1] = view->auto_plugin_cb;
-    out[2] = view->composite_cb;
-    out[3] = view->audio_dropdown;
-    out[4] = view->speaker_slider;
-    out[5] = view->headset_slider;
-    out[6] = view->haptics_slider;
-    out[7] = view->trigger_slider;
-    out[8] = view->latency_slider;
-    out[9] = view->reset_settings_btn;
+    out[1] = view->composite_cb;
+    out[2] = view->audio_dropdown;
+    out[3] = view->speaker_slider;
+    out[4] = view->headset_slider;
+    out[5] = view->haptics_slider;
+    out[6] = view->trigger_slider;
+    out[7] = view->latency_slider;
+    out[8] = view->reset_settings_btn;
 }
 
 /**
@@ -537,7 +537,6 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
         hid_pt_widget_kind_t kind;
     } table[] = {
             {&view->composite_cb,       HID_PT_WK_SWITCH},
-            {&view->auto_plugin_cb,     HID_PT_WK_SWITCH},
             {&view->latency_slider,     HID_PT_WK_SLIDER},
             {&view->speaker_slider,     HID_PT_WK_SLIDER},
             {&view->headset_slider,     HID_PT_WK_SLIDER},
@@ -1377,8 +1376,6 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_HIDDEN);
 
-    view->auto_plugin_row = switch_row(view, right_pane, locstr("Auto-plug on next stream"),
-                                       HID_PT_CTL_AUTO_PLUGIN, &view->auto_plugin_cb);
     view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
                                      HID_PT_CTL_COMPOSITE, &view->composite_cb);
 

@@ -17,7 +17,7 @@
  *     control the user currently owns -- see the comment on
  *     sync_customize_ui_from_settings() for why the audio dropdown is the
  *     control where that is enforced, and why the sliders need no such guard.
- *   - customize_setting_changed(), the composite and auto-plug branches of
+ *   - customize_setting_changed(), the composite branch of
  *     panel_value_changed(), and panel_mode_clicked() push the widgets into the
  *     model. Every caller is a widget's LV_EVENT_VALUE_CHANGED or a button's
  *     click, i.e. a change the user just made.
@@ -618,9 +618,6 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
     }
     show_row(v->haptics_row, hid_pt_model_selected_is_ds5(&panel->model));
     show_row(v->trigger_row, hid_pt_model_selected_is_ds5(&panel->model));
-    if (v->auto_plugin_cb) {
-        set_switch(v->auto_plugin_cb, c.auto_plugin);
-    }
     update_audio_warning(panel, &c);
 }
 
@@ -664,29 +661,12 @@ static void customize_setting_changed(hid_pt_panel_t *panel)
     update_audio_warning(panel, &c);
 }
 
-/* Both switch rows do the same two things: show themselves only for a device the
- * setting applies to, and mirror that device's stored value while they do. The
- * value is written only when the settings record could be read, so a device
- * without one leaves the switch where it was rather than clearing it. */
-static void update_auto_plugin_row(hid_pt_panel_t *panel)
-{
-    if (!panel || !panel->view.auto_plugin_row || !panel->view.auto_plugin_cb) {
-        return;
-    }
-    const bool show = hid_pt_model_selected_is_bridgeable(&panel->model);
-    hid_pt_controls_t c;
-    if (show && hid_pt_model_read_controls(&panel->model, &c)) {
-        set_switch(panel->view.auto_plugin_cb, c.auto_plugin);
-    }
-    show_row(panel->view.auto_plugin_row, show);
-}
-
 /**
  * Show the settings the selected device actually has.
  *
  * The whole column used to be hidden at once for anything that is not a
- * PlayStation pad, which meant a bridgeable device with an auto-plug setting had
- * nowhere to show it. Rows are hidden one group at a time now, and the flex
+ * PlayStation pad, which meant a bridgeable device with a setting of its own
+ * had nowhere to show it. Rows are hidden one group at a time now, and the flex
  * layout closes the gap.
  */
 static void update_customize_panel(hid_pt_panel_t *panel)
@@ -727,6 +707,10 @@ static void update_customize_panel(hid_pt_panel_t *panel)
     update_state_line(panel);
 }
 
+/* Shown only for a device the setting applies to, mirroring that device's
+ * stored value while it is. The value is written only when the settings record
+ * could be read, so a device without one leaves the switch where it was rather
+ * than clearing it. */
 static void update_composite_row(hid_pt_panel_t *panel) {
     if (!panel || !panel->view.composite_row || !panel->view.composite_cb) {
         return;
@@ -780,7 +764,6 @@ static void update_mode_row(hid_pt_panel_t *panel)
 static void update_device_options(hid_pt_panel_t *panel)
 {
     update_mode_row(panel);
-    update_auto_plugin_row(panel);
     update_composite_row(panel);
     update_customize_panel(panel);
 }
@@ -813,8 +796,66 @@ static void panel_toggle_plug(hid_pt_panel_t *panel, int row)
     panel_update_status(panel);
 }
 
+/* The MODES entry for HID, or for the SDL type @p type. -1 when there is none. */
+static int mode_index(bool hid, gamepad_type_pref_t type)
+{
+    for (int i = 0; i < MODE_COUNT; ++i) {
+        if (MODES[i].hid ? hid : (!hid && MODES[i].type == type)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Choose MODES[@p mode] for the selected controller: mounted as HID, or over
+ * SDL as that type. The choice is REMEMBERED -- the controller comes back in it
+ * after a reconnect, at the next stream and after an app restart
+ * (hid_pt_model_persist_mode()) -- and acted on:
+ * - HID: the plug-in path, then the flag. A refused plug-in keeps the choice,
+ *   so the reconcile mounts the pad once whatever refused it has cleared; the
+ *   reason is in the error line either way.
+ * - X360/DS4: the type is stored FIRST, re-announcing the pad if it is on SDL
+ *   now; mounted, it then leaves HID through the plain unplug, whose slot
+ *   restore announces it at once with the stored type. A refused write stops
+ *   there and says so, leaving the controller where it is.
+ * - The lit button: stored and nothing else, no plug and no re-announce -- it
+ *   makes what is lit the mode the controller keeps.
+ */
+static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
+{
+    hid_pt_row_info_t info;
+    if (!panel || mode < 0 || mode >= MODE_COUNT || !hid_pt_view_has_row(&panel->view, panel->selected_index) ||
+        !hid_pt_model_selected_row_info(&panel->model, &info) || !info.is_gamepad) {
+        return;
+    }
+    if (MODES[mode].hid) {
+        if (!hid_pt_model_selected_is_bridgeable(&panel->model)) {
+            return;
+        }
+        if (!info.plugged) {
+            panel_toggle_plug(panel, panel->selected_index);
+        }
+        /* After the plug: a plug-in clears the error line, and a refused
+         * write here has to stay on it. */
+        if (!hid_pt_model_persist_mode(&panel->model, true, MODES[mode].type)) {
+            panel_update_status(panel);
+        }
+    } else if (!hid_pt_model_persist_mode(&panel->model, false, MODES[mode].type)) {
+        panel_update_status(panel);
+    } else if (info.plugged) {
+        panel_toggle_plug(panel, panel->selected_index);
+    }
+    refresh_selected_row_state(panel);
+    update_state_line(panel);
+    update_mode_row(panel);
+}
+
 /* The row is the button now: OK on a device, or a click anywhere on it, is the
- * plug. There is no second control to aim at. */
+ * plug. There is no second control to aim at. On a controller it is the mode
+ * row's own choice -- HID when on SDL, and back to the SDL type the host builds
+ * for it when mounted -- so the row remembers it exactly as a button press
+ * does. */
 static void panel_row_clicked(void *userdata, int row) {
     hid_pt_panel_t *panel = userdata;
     if (!panel || !hid_pt_view_has_row(&panel->view, row)) {
@@ -823,48 +864,29 @@ static void panel_row_clicked(void *userdata, int row) {
     if (strcmp(hid_pt_model_selected_key(&panel->model), panel->row_keys[row]) != 0) {
         panel_select_device(panel, row);
     }
-    if (hid_pt_model_selected_is_sdl_only(&panel->model)) {
-        /* No CTM device behind the pad, so there is nothing to mount. OK takes
-         * the cursor to what such a row does have: its mode row, on the type
-         * the host builds for it now. */
+    hid_pt_row_info_t info;
+    if (!hid_pt_model_selected_row_info(&panel->model, &info)) {
+        return;
+    }
+    if (info.is_gamepad && !hid_pt_model_selected_is_bridgeable(&panel->model)) {
+        /* No device behind the pad the bridge can mount (an SDL-only row, or
+         * one CTM lists as plain HID). OK takes the cursor to what such a row
+         * does have: its mode row, on the type the host builds for it now. */
         panel_focus(panel, hid_pt_view_first_option(&panel->view));
         return;
     }
-    panel_toggle_plug(panel, row);
+    if (info.is_gamepad) {
+        panel_choose_mode(panel, mode_index(!info.plugged, info.effective_type));
+    } else {
+        panel_toggle_plug(panel, row);
+    }
     panel_update_hints(panel, panel->view.row_buttons[row]);
 }
 
-/**
- * A mode button: the selected controller mounted as HID, or over SDL as that
- * type. Pressing the lit one does nothing -- no plug, no re-announce.
- *
- * A type is stored FIRST, then acted on. Mounted, the pad leaves HID through
- * the plain unplug, whose slot restore announces it at once with the type the
- * arrival now reads from the store; on SDL, hid_pt_model_set_sdl_type()
- * re-announces the pads whose type the write changed. A write the store
- * refused leaves the controller where it is, and the reason in the error line,
- * like a refused plug-in.
- */
+/* A mode button was pressed. */
 static void panel_mode_clicked(void *userdata, int mode)
 {
-    hid_pt_panel_t *panel = userdata;
-    hid_pt_row_info_t info;
-    if (!panel || mode < 0 || mode >= MODE_COUNT || !hid_pt_view_has_row(&panel->view, panel->selected_index) ||
-        !hid_pt_model_selected_row_info(&panel->model, &info) || lit_mode(&info) == mode) {
-        return;
-    }
-    if (MODES[mode].hid) {
-        if (hid_pt_model_selected_is_bridgeable(&panel->model)) {
-            panel_toggle_plug(panel, panel->selected_index);
-        }
-    } else if (!hid_pt_model_set_sdl_type(&panel->model, MODES[mode].type)) {
-        panel_update_status(panel);
-    } else if (info.plugged) {
-        panel_toggle_plug(panel, panel->selected_index);
-    }
-    refresh_selected_row_state(panel);
-    update_state_line(panel);
-    update_mode_row(panel);
+    panel_choose_mode(userdata, mode);
 }
 
 static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
@@ -883,12 +905,6 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
              * so it enables or disables the HID button -- now, not on the next
              * 2 s refresh. */
             update_mode_row(panel);
-            return;
-        case HID_PT_CTL_AUTO_PLUGIN:
-            if (panel->view.auto_plugin_cb) {
-                hid_pt_model_set_auto_plugin(&panel->model,
-                                             lv_obj_has_state(panel->view.auto_plugin_cb, LV_STATE_CHECKED));
-            }
             return;
         case HID_PT_CTL_LATENCY:
             hid_pt_view_update_latency_label(&panel->view, hid_pt_model_default_latency_ms(&panel->model));

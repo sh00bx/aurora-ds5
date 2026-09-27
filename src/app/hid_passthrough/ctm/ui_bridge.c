@@ -173,7 +173,7 @@ static void record_refresh_auto_plugin(ui_device_settings_t *record, const logic
              * record keeps the user's choice for this run, as the error text
              * promises; re-reading the store here is the revert this branch
              * exists to stop. */
-            ctm_set_plug_error("Auto-plug for %s could not be saved", item->name);
+            ctm_set_plug_error("HID mode for %s could not be saved", item->name);
         }
         return;
     }
@@ -276,7 +276,7 @@ void hid_pt_sync_auto_plugin_pref(const logical_device_t *item)
         /* The panel's checkbox reflects settings_for_item(), not the pref store,
          * so it stays ticked whatever happens here. Say so where the user can
          * see it, instead of letting the setting vanish at the next launch. */
-        ctm_set_plug_error("Auto-plug for %s could not be saved", item->name);
+        ctm_set_plug_error("HID mode for %s could not be saved", item->name);
     }
 }
 
@@ -1250,7 +1250,7 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
                              * auto-plug never having been on, and the only other
                              * evidence is the pad that keeps flickering away
                              * from the game. */
-                            ctm_set_plug_error("Auto-plug for %s keeps failing; stopped retrying",
+                            ctm_set_plug_error("Mounting %s as HID keeps failing; stopped retrying",
                                                item->name);
                         } else {
                             log_append("auto-plug: %s died instantly %d times; giving up for now",
@@ -1337,7 +1337,7 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
                 e->giveup_ms = mono_ms();
                 e->giveup_rounds++;
                 if (e->giveup_rounds >= AUTOPLUG_GIVEUP_MAX_ROUNDS) {
-                    ctm_set_plug_error("Auto-plug for %s keeps failing; stopped retrying",
+                    ctm_set_plug_error("Mounting %s as HID keeps failing; stopped retrying",
                                        item->name);
                 } else {
                     log_append("auto-plug: giving up on %s for now after %d attempts",
