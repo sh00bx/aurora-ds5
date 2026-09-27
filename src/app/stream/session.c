@@ -23,6 +23,7 @@
 #include "hid_passthrough/ctm/ctm_state.h"
 #include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
+#include "hid_passthrough/hid_pt_lightbar.h"
 #include "platform/webos/tv_game_mode.h"
 #endif
 
@@ -133,6 +134,10 @@ void session_destroy(session_t *session) {
     SDL_WaitThread(session->thread, NULL);
 #if defined(TARGET_WEBOS)
     hid_pt_prefs_set_current_app(NULL);
+    /* Again once the connection is gone: a host LED event can still arrive
+     * between session_stop_input() and here, and an error ends a stream
+     * without the former. */
+    hid_pt_lightbar_stream_ended(&session->app->input);
 #endif
     serverdata_free(session->server);
     SDL_DestroyCond(session->cond);
@@ -216,6 +221,11 @@ void session_stop_input(session_t *session) {
     if (session->config.hid_passthrough) {
         hid_passthrough_manager_stop(&session->hid_pt);
     }
+#if defined(TARGET_WEBOS)
+    /* After the bridges are down, so an unmounted pad gets the user's colour
+     * back over SDL too. */
+    hid_pt_lightbar_stream_ended(&session->app->input);
+#endif
 }
 
 bool session_has_input(session_t *session) {

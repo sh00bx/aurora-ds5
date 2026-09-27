@@ -39,10 +39,16 @@ void hid_pt_lightbar_pad_arrived(app_input_t *input, app_gamepad_state_t *gamepa
  * includes ignoring it for a colour the game may not change. */
 bool hid_pt_lightbar_host_led(app_input_t *input, int gs_id, uint8_t r, uint8_t g, uint8_t b);
 
-/* The choices changed on the Controllers page: re-resolve and repaint every
- * open pad, except the slots in @p skip_mask (bridged: an SDL write there
- * would be a second writer next to the bridge). Main thread. */
+/* The choices changed on the Controllers page: re-resolve every open pad and
+ * repaint it, except the slots in @p skip_mask (bridged: an SDL write there
+ * would be a second writer next to the bridge), whose choice is only
+ * recorded for the painter. Main thread. */
 void hid_pt_lightbar_refresh(app_input_t *input, uint16_t skip_mask);
+
+/* The stream ended (its bridges are down): forget every game's colour and put
+ * the user's back on every open pad and into the painter. Automatic pads are
+ * left as they are, as always. Main thread. */
+void hid_pt_lightbar_stream_ended(app_input_t *input);
 
 #endif
 

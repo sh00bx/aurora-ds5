@@ -102,9 +102,11 @@ static void update_painter(void)
     }
 }
 
-/* Resolve @p gamepad's choice and paint it. @p fresh_host_pad: the host has a
- * new pad for it, whose game has painted nothing yet. */
-static void apply(app_input_t *input, app_gamepad_state_t *gamepad, bool fresh_host_pad)
+/* Resolve @p gamepad's choice and, with @p paint, paint it. @p fresh_host_pad:
+ * the host has a new pad for it, whose game has painted nothing yet. Without
+ * @p paint only the record (and so the painter's colour) follows the choice --
+ * for a pad the bridge paints while it is mounted. */
+static void apply(app_input_t *input, app_gamepad_state_t *gamepad, bool fresh_host_pad, bool paint)
 {
     if (!gamepad || !gamepad->controller || !slot_ok(gamepad->gs_id)) {
         return;
@@ -123,7 +125,7 @@ static void apply(app_input_t *input, app_gamepad_state_t *gamepad, bool fresh_h
     SDL_AtomicUnlock(&g_pads_lock);
     /* Automatic paints nothing: whatever SDL, the host or the firmware put on
      * the bar stays, as it always did. */
-    if (!user.automatic) {
+    if (paint && !user.automatic) {
         set_led(gamepad->controller, rgb);
     }
     update_painter();
@@ -131,12 +133,12 @@ static void apply(app_input_t *input, app_gamepad_state_t *gamepad, bool fresh_h
 
 void hid_pt_lightbar_pad_opened(app_input_t *input, app_gamepad_state_t *gamepad)
 {
-    apply(input, gamepad, true);
+    apply(input, gamepad, true, true);
 }
 
 void hid_pt_lightbar_pad_arrived(app_input_t *input, app_gamepad_state_t *gamepad)
 {
-    apply(input, gamepad, true);
+    apply(input, gamepad, true, true);
 }
 
 void hid_pt_lightbar_pad_closed(app_gamepad_state_t *gamepad)
@@ -191,11 +193,26 @@ void hid_pt_lightbar_refresh(app_input_t *input, uint16_t skip_mask)
     }
     for (short i = 0; i < app_input_get_max_gamepads(input); ++i) {
         app_gamepad_state_t *gp = app_input_gamepad_state_by_index(input, i);
-        if (!gp || !gp->controller || !slot_ok(gp->gs_id) || (skip_mask & (1u << (unsigned) gp->gs_id))) {
+        if (!gp || !gp->controller || !slot_ok(gp->gs_id)) {
             continue;
         }
-        apply(input, gp, false);
+        /* A skipped (bridged) slot still takes the new choice into its record:
+         * it is what the idle painter is handed once the stream ends and the
+         * daemon holds the pad again. */
+        apply(input, gp, false, (skip_mask & (1u << (unsigned) gp->gs_id)) == 0);
     }
+}
+
+void hid_pt_lightbar_stream_ended(app_input_t *input)
+{
+    /* The game that owned a bar is gone with its stream: its colour must not
+     * stay on the pad, nor be what the idle painter keeps repainting. */
+    SDL_AtomicLock(&g_pads_lock);
+    for (int i = 0; i < LB_SLOTS; ++i) {
+        g_pads[i].game_owns = false;
+    }
+    SDL_AtomicUnlock(&g_pads_lock);
+    hid_pt_lightbar_refresh(input, 0);
 }
 
 #endif
