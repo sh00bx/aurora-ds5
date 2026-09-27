@@ -969,9 +969,10 @@ static void panel_toggle_lock(hid_pt_panel_t *panel, const hid_pt_row_info_t *in
         mode = info->plugged ? GAMEPAD_MODE_HID
                              : info->effective_type == GAMEPAD_TYPE_PREF_XBOX ? GAMEPAD_MODE_X360 : GAMEPAD_MODE_DS4;
     }
-    if (!hid_pt_model_set_app_mode(&panel->model, mode)) {
-        panel_update_status(panel);
-    }
+    /* The error line either way: a controller the lock could not mount says
+     * why even though the lock itself took. */
+    hid_pt_model_set_app_mode(&panel->model, mode);
+    panel_update_status(panel);
     /* Any controller may have moved, not just this one. */
     refresh_devices(panel, false);
 }
@@ -989,10 +990,11 @@ static void panel_toggle_lock(hid_pt_panel_t *panel, const hid_pt_row_info_t *in
  *   restore announces it at once with the stored type. A refused write stops
  *   there and says so, leaving the controller where it is.
  * - The lit button: stored and nothing else, no plug and no re-announce -- it
- *   makes what is lit the mode the controller keeps.
- * While the streamed game is locked, a button changes the lock instead -- the
- * game's mode, for every controller in it -- and no controller's own mode is
- * touched. GAME itself switches the lock (panel_toggle_lock()).
+ *   makes what is lit the mode the controller keeps (the host pad is compared,
+ *   not the pref, so "Automatic" becoming an explicit DS4 moves nothing).
+ * While the streamed game is locked, a button other than the lit one changes
+ * the lock instead -- the game's mode, for every controller in it -- and no
+ * controller's own mode is touched. GAME itself switches the lock (panel_toggle_lock()).
  */
 static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
 {
@@ -1009,11 +1011,14 @@ static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
     if (lock != GAMEPAD_MODE_NONE) {
         /* While the game is locked a button changes the GAME's mode, for every
          * controller in it; each controller's own mode stays as it was for
-         * when the lock goes. */
-        if (MODES[mode].mode != lock && (!mode_is_hid(mode) || hid_pt_model_selected_is_bridgeable(&panel->model))) {
-            if (!hid_pt_model_set_app_mode(&panel->model, MODES[mode].mode)) {
-                panel_update_status(panel);
-            }
+         * when the lock goes. The row's lit button changes nothing: under a
+         * HID lock a controller that cannot be mounted runs in its own SDL
+         * type and lights that, and pressing what is lit must not quietly
+         * move the whole game to it. */
+        if (MODES[mode].mode != lock && mode != lit_mode(&info) &&
+            (!mode_is_hid(mode) || hid_pt_model_selected_is_bridgeable(&panel->model))) {
+            hid_pt_model_set_app_mode(&panel->model, MODES[mode].mode);
+            panel_update_status(panel);
             refresh_devices(panel, false);
         }
         return;

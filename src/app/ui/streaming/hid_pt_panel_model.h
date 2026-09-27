@@ -243,9 +243,10 @@ gamepad_mode_t hid_pt_model_app_mode(const hid_pt_model_t *model);
  * Fix the current game's mode to @p mode, or remove the lock with
  * GAMEPAD_MODE_NONE, and bring every controller of the session to its new
  * effective mode at once -- the lock's, or without one each controller's own:
- * mounted or unmounted through the plain plug toggle, re-announced where its
- * SDL type moved, and left alone where nothing changes. A mount that fails
- * leaves its reason in the plug error and the others still go ahead.
+ * mounted or unmounted through the plain plug toggle, re-announced where the
+ * pad the host builds for it changes, and left alone where nothing changes. A
+ * mount that fails leaves its reason in the plug error (the first one, if
+ * several fail) and the others still go ahead.
  *
  * False when the lock could not be stored (no game, full table); the reason is
  * then in the plug error, and no controller was touched. The selection is kept.

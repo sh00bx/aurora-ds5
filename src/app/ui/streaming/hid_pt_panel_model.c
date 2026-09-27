@@ -590,6 +590,17 @@ static const char *sdl_type_log_name(gamepad_type_pref_t type)
 /* Bounds the before/after snapshot below; gs_ids are 0..15 anyway. */
 #define HID_PT_MAX_PADS 16
 
+/* The pad the host builds for @p gp now: its SDL type as the lock has it,
+ * Automatic resolved. What a re-announce is decided on -- the stored pref alone
+ * is not: "Automatic" on a DualSense and an explicit DS4 are the same host pad,
+ * and moving between the two (a lock taken or dropped, the lit button pressed)
+ * must not unplug and replug it under the game. */
+static gamepad_type_pref_t host_type(app_input_t *app_input, const app_gamepad_state_t *gp)
+{
+    return gamepad_type_pref_effective(hid_pt_gamepad_sdl_type(app_input, gp),
+                                       stream_input_gamepad_auto_builds_ds4(gp->controller));
+}
+
 bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t type)
 {
     row_ref_t ref;
@@ -601,13 +612,14 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
     if (pad_count > HID_PT_MAX_PADS) {
         pad_count = HID_PT_MAX_PADS;
     }
-    /* What every pad is announced with now, to re-announce exactly the ones
-     * whose type this write changes -- normally just the row's pad, but pads
-     * that share a synthetic id share its pref too. */
+    /* What every pad is announced as now, to re-announce exactly the ones
+     * whose host pad this write changes -- normally just the row's pad, but
+     * pads that share a synthetic id share its pref too. The lit button stores
+     * its type and so changes no host pad: nothing is re-announced for it. */
     gamepad_type_pref_t before[HID_PT_MAX_PADS];
     for (short i = 0; i < pad_count; ++i) {
         const app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
-        before[i] = (gp && gp->controller) ? hid_pt_gamepad_sdl_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
+        before[i] = (gp && gp->controller) ? host_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
     }
 
     /* The ids hid_pt_gamepad_sdl_type() reads, in its order (choice_ids()).
@@ -649,7 +661,7 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
     stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
     for (short i = 0; input && i < pad_count; ++i) {
         app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
-        if (gp && gp->controller && hid_pt_gamepad_sdl_type(app_input, gp) != before[i]) {
+        if (gp && gp->controller && host_type(app_input, gp) != before[i]) {
             stream_input_reannounce_gamepad(input, gp);
         }
     }
@@ -773,8 +785,18 @@ static void apply_effective_mounts(hid_pt_model_t *model)
     }
     char selected[HID_PT_PANEL_KEY_LEN];
     snprintf(selected, sizeof(selected), "%s", model->selected_key);
+    /* Each toggle starts by clearing the plug error, so the next device's would
+     * wipe the reason this one did not move. Keep the first and put it back. */
+    char first_error[160] = "";
     for (int i = 0; i < count; ++i) {
-        hid_pt_model_toggle_plug(model, keys[i], model->session, NULL);
+        if (hid_pt_model_toggle_plug(model, keys[i], model->session, NULL) != HID_PT_PLUG_DONE &&
+            !first_error[0]) {
+            const char *err = ctm_last_plug_error();
+            snprintf(first_error, sizeof(first_error), "%s", err ? err : "");
+        }
+    }
+    if (first_error[0]) {
+        ctm_set_plug_error("%s", first_error);
     }
     /* The toggle selects what it plugged; the page stays on its controller. */
     hid_pt_model_set_selected_key(model, selected);
@@ -792,15 +814,17 @@ bool hid_pt_model_set_app_mode(hid_pt_model_t *model, gamepad_mode_t mode)
     if (pad_count > HID_PT_MAX_PADS) {
         pad_count = HID_PT_MAX_PADS;
     }
-    /* Which pads the host has over SDL now, and as what: only those can need a
-     * re-announce. A pad the plug-out below hands back to SDL is announced by
-     * its slot restore with the new type already. */
+    /* Which pads the host has over SDL now, and as what pad: only those can
+     * need a re-announce, and only where the host pad itself changes -- the
+     * controller the lock is taken from is already what the lock says. A pad
+     * the plug-out below hands back to SDL is announced by its slot restore
+     * with the new type already. */
     gamepad_type_pref_t before[HID_PT_MAX_PADS];
     bool on_sdl[HID_PT_MAX_PADS];
     for (short i = 0; i < pad_count; ++i) {
         const app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
         const bool live = gp && gp->controller && gp->gs_id >= 0;
-        before[i] = live ? hid_pt_gamepad_sdl_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
+        before[i] = live ? host_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
         on_sdl[i] = live && input && !hid_pt_gamepad_is_moonlight_excluded(input, gp) &&
                     (input->announcedGamepadMask & (1u << (unsigned) gp->gs_id)) != 0;
     }
@@ -811,7 +835,7 @@ bool hid_pt_model_set_app_mode(hid_pt_model_t *model, gamepad_mode_t mode)
     apply_effective_mounts(model);
     for (short i = 0; input && i < pad_count; ++i) {
         app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
-        if (on_sdl[i] && gp && gp->controller && hid_pt_gamepad_sdl_type(app_input, gp) != before[i]) {
+        if (on_sdl[i] && gp && gp->controller && host_type(app_input, gp) != before[i]) {
             stream_input_reannounce_gamepad(input, gp);
         }
     }
