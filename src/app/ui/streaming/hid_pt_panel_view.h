@@ -428,7 +428,8 @@ void hid_pt_view_set_custom_swatch(hid_pt_view_t *view, bool has_colour, uint32_
  * UP/DOWN on the LIGHTBAR row: from a swatch to the one above or below it in
  * the next line in direction @p dir (the line's last when it is shorter), or
  * NULL where the row ends -- the caller then leaves it for the next setting.
- * The switch has no line below it and answers NULL.
+ * The switch at the end of the first line counts as past its last swatch:
+ * DOWN goes to the second line's last, UP off the row.
  */
 lv_obj_t *hid_pt_view_step_lightbar_line(const hid_pt_view_t *view, lv_obj_t *from, int dir);
 

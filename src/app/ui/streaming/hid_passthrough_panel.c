@@ -499,7 +499,7 @@ static void panel_control_key(void *userdata, lv_event_t *event)
                      * swatch above or below, and off the row from its first or
                      * last line. */
                     lv_obj_t *next = NULL;
-                    if (kind == HID_PT_WK_SWATCH) {
+                    if (lightbar) {
                         next = hid_pt_view_step_lightbar_line(&panel->view, target, dir);
                     }
                     if (!next) {

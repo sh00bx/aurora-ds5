@@ -1099,7 +1099,12 @@ lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, i
 
 lv_obj_t *hid_pt_view_step_lightbar_line(const hid_pt_view_t *view, lv_obj_t *from, int dir)
 {
-    const int swatch = hid_pt_view_swatch_of(view, from);
+    int swatch = hid_pt_view_swatch_of(view, from);
+    if (swatch < 0 && view && from && from == view->lightbar_game_cb) {
+        /* The switch ends the first line, past its last swatch: DOWN is the
+         * second line's last, never a jump over the whole line. */
+        swatch = HID_PT_SWATCHES_PER_LINE - 1;
+    }
     if (swatch < 0 || dir == 0) {
         return NULL;
     }
