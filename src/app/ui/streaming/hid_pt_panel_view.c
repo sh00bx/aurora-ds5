@@ -39,9 +39,10 @@
  * one-word name (a small line, 14dpx * 1.2 in Museo Sans) -- 36.8dpx of text. */
 #define MODE_BTN_H     LV_DPX(42)
 /* A slider in a paired row (two side by side): half a row leaves the track
- * and the number this much, the label the rest. */
-#define PAIR_SLIDER_W  LV_DPX(70)
-#define PAIR_VALUE_W   LV_DPX(40)
+ * and the number this much, the label the rest. The number has to hold
+ * "200 %" on one line: ~90 px in the page's 32 px Museo Sans. */
+#define PAIR_SLIDER_W  LV_DPX(62)
+#define PAIR_VALUE_W   LV_DPX(48)
 /* A lightbar swatch: a disc a little smaller than a switch is tall, so its
  * ring (SWATCH_RING + SWATCH_RING_PAD a side) still fits the 30dpx row. */
 #define SWATCH_D       LV_DPX(20)
@@ -78,10 +79,11 @@
  * 1.7.30 took the auto-plug switch out (60 + a gap) and put in the lock line,
  * the LIGHTBAR heading and row (+160), which would have been 840 -- over the
  * error-bar pane. The sliders pair up instead: two to a row, halves of
- * (1084 - 8) / 2 = 538 px, of which the rail and padding take 64, a
- * PAIR_SLIDER_W track 140, a PAIR_VALUE_W number 80 ("100 %") and the gaps 24,
- * leaving the label 230 -- hence "Speaker"/"Headphones"/"Haptics" there, the
- * section heading already says what they adjust. The LIGHTBAR row is one row
+ * (1084 - 8) / 2 = 538 px, of which the rail, padding and border take 68, a
+ * PAIR_SLIDER_W track 124, a PAIR_VALUE_W number 96 ("100 %" is 87-90 px,
+ * "200 %" 90) and the gaps 24, leaving the label 226 -- hence
+ * "Speaker"/"Headphones"/"Haptics" there ("Soften triggers", the longest, is
+ * 218-223), the section heading already says what they adjust. The LIGHTBAR row is one row
  * for the same reason: nine 40 px discs and their gaps take 468 of its 1020,
  * the switch 88, and the label keeps ~440 for its ~340.
  * 1.7.29 measured 748 for the same DualSense (with the auto-plug switch); in

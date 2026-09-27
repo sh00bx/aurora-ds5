@@ -454,8 +454,15 @@ bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model)
         return false;
     }
     const char *kind = ref.item ? bridge_kind_for_item(ref.item) : NULL;
-    if (kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0)) {
+    const bool playstation = kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0);
+    /* Mounted, only the bridge paints the bar, and only its DS4/DS5 types do
+     * (controller_ds4.c/controller_ds5.c claim Bluetooth pads alone); a pad on
+     * a cable runs on the generic type, which paints nothing. */
+    if (playstation && strcmp(bus_label(ref.item->bus), "BT") == 0) {
         return true;
+    }
+    if (ref.item && ref.item->plugged) {
+        return false;
     }
 #if SDL_VERSION_ATLEAST(2, 0, 14)
     return ref.pad && SDL_GameControllerHasLED(ref.pad->controller);

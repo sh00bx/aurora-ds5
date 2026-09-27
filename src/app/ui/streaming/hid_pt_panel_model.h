@@ -155,8 +155,10 @@ bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info
 bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model);
 
 /**
- * A controller whose lightbar aurora can paint: a DS4/DS5 the bridge knows (it
- * paints mounted pads), or an SDL pad SDL can set an LED on.
+ * A controller whose lightbar aurora can paint: a Bluetooth DS4/DS5 (the
+ * bridge paints it mounted, SDL on SDL), or an SDL pad that is not mounted and
+ * that SDL can set an LED on. A DS4/DS5 mounted over a cable has none: the
+ * bridge drives it with its generic type, which paints nothing.
  */
 bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model);
 
