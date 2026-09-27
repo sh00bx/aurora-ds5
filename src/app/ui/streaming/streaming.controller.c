@@ -410,13 +410,12 @@ static void streaming_refresh_controllers(streaming_controller_t *controller) {
          * its row in the Controllers sheet, and this badge. It used to be
          * purple, after the colour the button had before the redesign. The
          * words are the names of that sheet's mode buttons, the one lit for
-         * this pad: HID, or the pad the host builds for it over SDL. */
+         * this pad: HID, or the pad the host builds for it over SDL -- X360,
+         * DS4, DS5 or SWITCH. */
         lv_obj_t *badge = controller->stats_items.pads[i].badge;
-        const char *via = "X360";
-        if (pad->bridged) {
-            via = "HID";
-        } else if (pad->sdl_type == GAMEPAD_TYPE_PREF_PLAYSTATION) {
-            via = "DS4";
+        const char *via = gamepad_mode_label(pad->bridged ? GAMEPAD_MODE_HID : gamepad_type_pref_mode(pad->sdl_type));
+        if (!via) {
+            via = "X360";
         }
         lv_label_set_text(badge, via);
         lv_obj_set_style_bg_color(badge, pad->bridged ? lv_color_hex(OVERLAY_LIVE)

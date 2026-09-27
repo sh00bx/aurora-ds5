@@ -50,7 +50,8 @@ typedef struct {
     bool is_gamepad;
     /* The pad the host builds for this row over SDL, now or at its next
      * arrival: the stored type, AUTO resolved (gamepad_type_pref_effective()).
-     * XBOX or PLAYSTATION, never AUTO. Meaningless when !is_gamepad. */
+     * XBOX, PLAYSTATION, DUALSENSE or SWITCH, never AUTO. Meaningless when
+     * !is_gamepad. */
     gamepad_type_pref_t effective_type;
 } hid_pt_row_info_t;
 

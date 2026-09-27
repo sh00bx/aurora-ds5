@@ -21,8 +21,8 @@ typedef enum {
 typedef struct {
     char name[48];       /**< as the pad reports itself, e.g. "DualSense Wireless Controller" */
     bool bridged;        /**< handed to the host as a real USB device instead of through SDL */
-    /** For an SDL pad, the pad the host builds for it: XBOX or PLAYSTATION
-     * (gamepad_type_pref_effective()). AUTO when bridged. */
+    /** For an SDL pad, the pad the host builds for it: XBOX, PLAYSTATION,
+     * DUALSENSE or SWITCH (gamepad_type_pref_effective()). AUTO when bridged. */
     gamepad_type_pref_t sdl_type;
     controller_power_t power;
     int percent;         /**< 0..100, meaningful for EXACT and COARSE */

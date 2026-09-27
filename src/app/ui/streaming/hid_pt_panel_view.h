@@ -19,9 +19,9 @@
 #define HID_PT_MAX_ROWS 64
 
 /* Buttons the mode row can hold: HID, one per controller type the host can
- * emulate over SDL, and the game lock. The panel supplies them
- * (hid_pt_view_add_mode()). */
-#define HID_PT_MAX_MODES 5
+ * emulate over SDL (X360, DS4, DS5, SWITCH), and the game lock. The panel
+ * supplies them (hid_pt_view_add_mode()). */
+#define HID_PT_MAX_MODES 6
 
 /* Swatches the LIGHTBAR row can hold: Automatic, Off and the palette. The panel
  * supplies them (hid_pt_view_add_swatch()). */

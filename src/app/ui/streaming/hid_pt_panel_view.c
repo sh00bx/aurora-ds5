@@ -36,7 +36,13 @@
  * on the same axis every slider starts at. LV_DPX(6) is slab_body()'s gap. */
 #define GUTTER_W       (SLIDER_W + LV_DPX(6) + VALUE_W)
 /* A mode button: the large icon (19dpx, a Material em is its line) over its
- * one-word name (a small line, 14dpx * 1.2 in Museo Sans) -- 36.8dpx of text. */
+ * one-word name (a small line, 14dpx * 1.2 in Museo Sans) -- 36.8dpx of text.
+ * Six share the row, flex-grown over the settings column's 1084 px at
+ * 1920x1080 (sheet 1760, less its border 4, the device column 600, the body
+ * padding 48 and the gap 24): (1084 - 5 x OPT_GAP 8) / 6 = 174 px each. The
+ * longest name, "SWITCH", is six small capitals at 28 px with 4 px tracking,
+ * about 125 px, and the icon 38: both fit with room, so the buttons keep their
+ * padding and the label its size. Without a game (no GAME) five take 210. */
 #define MODE_BTN_H     LV_DPX(42)
 /* A slider in a paired row (two side by side): half a row leaves the track
  * and the number this much, the label the rest. The number has to hold

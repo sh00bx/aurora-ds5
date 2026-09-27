@@ -46,24 +46,31 @@
 
 /**
  * The mode row, left to right: mounted as HID, then one button per controller
- * type the host can emulate for a pad over SDL. Vibepollo has virtual drivers
- * for exactly two, Xbox 360 and DualShock 4; a type it learns later (a Switch
- * Pro pad, once there is a driver for it) is one more line here -- and one
- * more gamepad_type_pref_t and gamepad_mode_t, which the arrival already maps
- * to its LI_CTYPE. Last, GAME: not a mode but the lock that fixes the mode for
- * the game being streamed (GAMEPAD_MODE_NONE marks it).
+ * type the host can emulate for a pad over SDL -- Xbox 360 and DualShock 4
+ * over ViGEm, DualSense and Switch Pro over Vibepollo's own virtual-gamepad
+ * driver (an Xbox Series pad is not wanted for now). A type the host learns
+ * later is one more line here -- and one more gamepad_type_pref_t,
+ * gamepad_mode_t and wire value (gamepad_type_pref.h). The two PlayStation
+ * pads share Font Awesome's mark and differ by name; neither Font Awesome Free
+ * nor Simple Icons has a Nintendo mark, so SWITCH wears Material's gamepad
+ * (sports_esports, the one whose grips look like a Pro controller's). Last,
+ * GAME: not a mode but the lock that fixes the mode for the game being
+ * streamed (GAMEPAD_MODE_NONE marks it).
  *
- * The labels are also what a row's state line and the overlay's pad badge say.
+ * The labels are gamepad_mode_label()'s: what a row's state line, the
+ * overlay's pad badge and the LIGHTBAR heading say.
  */
 static const struct {
     const char *glyph;
     const char *label;
     gamepad_mode_t mode;
 } MODES[] = {
-        {MAT_SYMBOL_USB,        "HID",  GAMEPAD_MODE_HID},
-        {FA_SYMBOL_XBOX,        "X360", GAMEPAD_MODE_X360},
-        {FA_SYMBOL_PLAYSTATION, "DS4",  GAMEPAD_MODE_DS4},
-        {MAT_SYMBOL_LOCK,       "GAME", GAMEPAD_MODE_NONE},
+        {MAT_SYMBOL_USB,            "HID",    GAMEPAD_MODE_HID},
+        {FA_SYMBOL_XBOX,            "X360",   GAMEPAD_MODE_X360},
+        {FA_SYMBOL_PLAYSTATION,     "DS4",    GAMEPAD_MODE_DS4},
+        {FA_SYMBOL_PLAYSTATION,     "DS5",    GAMEPAD_MODE_DS5},
+        {MAT_SYMBOL_SPORTS_ESPORTS, "SWITCH", GAMEPAD_MODE_SWITCH},
+        {MAT_SYMBOL_LOCK,           "GAME",   GAMEPAD_MODE_NONE},
 };
 
 #define MODE_COUNT ((int) (sizeof(MODES) / sizeof(MODES[0])))
@@ -539,9 +546,9 @@ static int lit_mode(const hid_pt_row_info_t *info)
 
 /**
  * A row's second line, and whether it wears the bridge's teal: the name of its
- * lit mode button -- "HID" for a mounted controller, "X360" or "DS4" for the
- * pad the host builds for it over SDL -- or "IDLE" for a device that is not a
- * controller.
+ * lit mode button -- "HID" for a mounted controller, "X360", "DS4", "DS5" or
+ * "SWITCH" for the pad the host builds for it over SDL -- or "IDLE" for a
+ * device that is not a controller.
  */
 static const char *row_state_text(const hid_pt_row_info_t *info, bool *live)
 {
@@ -966,8 +973,7 @@ static void panel_toggle_lock(hid_pt_panel_t *panel, const hid_pt_row_info_t *in
 {
     gamepad_mode_t mode = GAMEPAD_MODE_NONE;
     if (hid_pt_model_app_mode(&panel->model) == GAMEPAD_MODE_NONE) {
-        mode = info->plugged ? GAMEPAD_MODE_HID
-                             : info->effective_type == GAMEPAD_TYPE_PREF_XBOX ? GAMEPAD_MODE_X360 : GAMEPAD_MODE_DS4;
+        mode = info->plugged ? GAMEPAD_MODE_HID : gamepad_type_pref_mode(info->effective_type);
     }
     /* The error line either way: a controller the lock could not mount says
      * why even though the lock itself took. */
@@ -985,8 +991,8 @@ static void panel_toggle_lock(hid_pt_panel_t *panel, const hid_pt_row_info_t *in
  * - HID: the plug-in path, then the flag. A refused plug-in keeps the choice,
  *   so the reconcile mounts the pad once whatever refused it has cleared; the
  *   reason is in the error line either way.
- * - X360/DS4: the type is stored FIRST, re-announcing the pad if it is on SDL
- *   now; mounted, it then leaves HID through the plain unplug, whose slot
+ * - An SDL type: the type is stored FIRST, re-announcing the pad if it is on
+ *   SDL now; mounted, it then leaves HID through the plain unplug, whose slot
  *   restore announces it at once with the stored type. A refused write stops
  *   there and says so, leaving the controller where it is.
  * - The lit button: stored and nothing else, no plug and no re-announce -- it
