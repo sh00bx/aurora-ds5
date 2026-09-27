@@ -23,9 +23,12 @@
  * supplies them (hid_pt_view_add_mode()). */
 #define HID_PT_MAX_MODES 6
 
-/* Swatches the LIGHTBAR row can hold: Automatic, Off and the palette. The panel
- * supplies them (hid_pt_view_add_swatch()). */
-#define HID_PT_MAX_SWATCHES 10
+/* Swatches the LIGHTBAR row can hold: Automatic, Off and the palette, in lines
+ * of HID_PT_SWATCHES_PER_LINE. The panel supplies them
+ * (hid_pt_view_add_swatch()). */
+#define HID_PT_MAX_SWATCHES 16
+#define HID_PT_SWATCHES_PER_LINE 8
+#define HID_PT_SWATCH_LINES ((HID_PT_MAX_SWATCHES + HID_PT_SWATCHES_PER_LINE - 1) / HID_PT_SWATCHES_PER_LINE)
 
 #define DS_LATENCY_MIN 0
 #define DS_LATENCY_MAX 200
@@ -138,8 +141,10 @@ typedef struct {
     lv_obj_t *composite_cb;
     lv_obj_t *lightbar_heading;
     lv_obj_t *lightbar_row;
-    /* The swatches sit in the row's body, left of the game switch's label. */
+    /* The swatches sit in lines in the row's body, the first line ending in
+     * the game switch's label and the switch. */
     lv_obj_t *lightbar_body;
+    lv_obj_t *lightbar_lines[HID_PT_SWATCH_LINES];
     lv_obj_t *swatches[HID_PT_MAX_SWATCHES];
     int swatch_count;
     lv_obj_t *lightbar_game_label;
@@ -341,26 +346,39 @@ bool hid_pt_view_obj_is_focusable(const hid_pt_view_t *view, lv_obj_t *obj);
 /* ---- the LIGHTBAR row ------------------------------------------------------ */
 
 /**
- * Append a swatch: a disc filled with @p rgb, with @p text on it (the "A" of
+ * Append a swatch: a disc filled with @p rgb -- the colour as the screen is to
+ * show it, not the bar's dim value -- with @p text on it (the "A" of
  * Automatic), or with @p glyph from the icon font (Off's cross); both NULL for
- * a plain colour. Call after hid_pt_view_create(), left to right; that order is
- * the index hid_pt_view_cbs_t::swatch_clicked reports. NULL once
- * HID_PT_MAX_SWATCHES are there.
+ * a plain colour. Call after hid_pt_view_create(), left to right and line by
+ * line (HID_PT_SWATCHES_PER_LINE each); that order is the index
+ * hid_pt_view_cbs_t::swatch_clicked reports. NULL once HID_PT_MAX_SWATCHES are
+ * there.
  */
 lv_obj_t *hid_pt_view_add_swatch(hid_pt_view_t *view, uint32_t rgb, const char *text, const char *glyph);
 
 /**
- * Show the LIGHTBAR heading and row or hide them, ring swatch @p lit (-1:
- * none), and show "Game may change colour" (@p show_game) switched to
- * @p game_on. Writes only what changes -- this runs on the 2 s refresh.
+ * Show the LIGHTBAR heading (@p heading, e.g. "LIGHTBAR · DS4") and row or
+ * hide them, ring swatch @p lit (-1: none), and show "Game may change colour"
+ * (@p show_game) switched to @p game_on. Writes only what changes -- this runs
+ * on the 2 s refresh.
  */
-void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, int lit, bool show_game, bool game_on);
+void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, const char *heading, int lit, bool show_game,
+                              bool game_on);
 
 /** The swatch @p obj is, or -1. */
 int hid_pt_view_swatch_of(const hid_pt_view_t *view, lv_obj_t *obj);
 
 /**
  * LEFT/RIGHT on the LIGHTBAR row: from a swatch or the game switch to the next
- * one of those the cursor may rest on in direction @p dir, or NULL at the end.
+ * one of those the cursor may rest on in direction @p dir within its line --
+ * the first line ends in the switch -- or NULL at the end.
  */
 lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, int dir);
+
+/**
+ * UP/DOWN on the LIGHTBAR row: from a swatch to the one above or below it in
+ * the next line in direction @p dir (the line's last when it is shorter), or
+ * NULL where the row ends -- the caller then leaves it for the next setting.
+ * The switch has no line below it and answers NULL.
+ */
+lv_obj_t *hid_pt_view_step_lightbar_line(const hid_pt_view_t *view, lv_obj_t *from, int dir);

@@ -654,8 +654,8 @@ gamepad_mode_t hid_pt_gamepad_host_mode(app_input_t *input, const app_gamepad_st
     if (!gamepad || !gamepad->controller) {
         return GAMEPAD_MODE_NONE;
     }
-    return gamepad_type_pref_mode(gamepad_type_pref_effective(hid_pt_gamepad_sdl_type(input, gamepad),
-                                                              stream_input_gamepad_auto_builds_ds4(gamepad->controller)));
+    const bool ds4 = stream_input_gamepad_auto_builds_ds4(gamepad->controller);
+    return gamepad_type_pref_mode(gamepad_type_pref_effective(hid_pt_gamepad_sdl_type(input, gamepad), ds4));
 }
 
 gamepad_mode_t hid_pt_gamepad_own_mode(app_input_t *input, const app_gamepad_state_t *gamepad)
@@ -669,8 +669,8 @@ gamepad_mode_t hid_pt_gamepad_own_mode(app_input_t *input, const app_gamepad_sta
     if (hid_pt_prefs_auto_plugin_for_gamepad(gamepad) || (peer && hid_pt_prefs_auto_plugin_for_logical(peer))) {
         return GAMEPAD_MODE_HID;
     }
-    return gamepad_type_pref_mode(gamepad_type_pref_effective(pad_own_sdl_type(input, gamepad),
-                                                              stream_input_gamepad_auto_builds_ds4(gamepad->controller)));
+    const bool ds4 = stream_input_gamepad_auto_builds_ds4(gamepad->controller);
+    return gamepad_type_pref_mode(gamepad_type_pref_effective(pad_own_sdl_type(input, gamepad), ds4));
 }
 
 logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad)

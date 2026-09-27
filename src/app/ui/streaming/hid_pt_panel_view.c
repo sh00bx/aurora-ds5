@@ -49,12 +49,18 @@
  * "200 %" on one line: ~90 px in the page's 32 px Museo Sans. */
 #define PAIR_SLIDER_W  LV_DPX(62)
 #define PAIR_VALUE_W   LV_DPX(48)
-/* A lightbar swatch: a disc a little smaller than a switch is tall, so its
- * ring (SWATCH_RING + SWATCH_RING_PAD a side) still fits the 30dpx row. */
-#define SWATCH_D       LV_DPX(20)
+/* A lightbar swatch: a disc smaller than a switch is tall, with its ring
+ * (SWATCH_RING + SWATCH_RING_PAD, 8 px a side) around it. The LIGHTBAR slab
+ * holds two lines of them, SWATCH_LINE_GAP apart: 36 + 16 + 36 of its 108 px,
+ * which leaves 10 px above and below -- an outer ring ends on the slab's
+ * border, as it did in 1.7.30's one-line row of 40 px discs -- and 8 px between
+ * a ring and the disc in the other line. */
+#define SWATCH_D       LV_DPX(18)
 #define SWATCH_GAP     LV_DPX(6)
 #define SWATCH_RING    LV_DPX(2)
 #define SWATCH_RING_PAD LV_DPX(2)
+#define SWATCH_LINE_GAP LV_DPX(8)
+#define LIGHTBAR_ROW_H LV_DPX(54)
 
 /* The settings column fits its pane, so it never scrolls and no scrollbar ever
  * shows. The TV draws the UI at 1920x1080, dpi = 1920 / 6 = 320, so one dpx is
@@ -68,19 +74,28 @@
  *   MODE eyebrow                                  34
  *   mode row                                      84
  *   "Locked for <game>" (one small line)          34
- *   LIGHTBAR eyebrow (pad 8)                      42
- *   swatches + "Game may change colour"           60
+ *   LIGHTBAR · <mode> eyebrow (pad 8)             42
+ *   two lines of swatches + "Game may change
+ *   colour" (LIGHTBAR_ROW_H)                     108
  *   AUDIO & HAPTICS eyebrow (pad 8)               42
  *   audio, speaker | headphones,
  *   haptics | soften triggers, latency: 4 x 60   240
  *   gaps: 10 x 8                                  80
  *                                                ---
- *                                                704
+ *                                                752
  *
- * which leaves 133 px (75 under the error bar). The audio advisory (two small
- * lines, pad 8, + a gap: 84) fits without the error bar: 788. A DualShock 4 is
- * 636 (no haptics pair), a Flydigi with its composite switch 290, a DualSense
- * on SDL with no bridge behind it 382.
+ * which leaves 85 px (27 under the error bar). The audio advisory (two small
+ * lines, pad 8, + a gap: 84) fits without the error bar: 836 of 837. A
+ * DualShock 4 is 684 (no haptics pair), a Flydigi with its composite switch
+ * 290, a DualSense on SDL with no bridge behind it 430.
+ *
+ * 1.7.31 gives the palette a second line of swatches: sixteen do not fit one
+ * line next to the switch (16 x 40 + 15 x 12 = 820 of the row's ~1020, and the
+ * switch and its label want ~440). Two lines of eight in one slab: 8 x 36 +
+ * 7 x 12 = 372 px wide, 108 high -- 48 more than the one line, where two slabs
+ * of 60 and a gap would have been 68 and pushed the advisory case to 856. The
+ * discs are 36 px instead of 40 for the same reason: at 40 the slab is 116 and
+ * the advisory case 844, over the pane.
  *
  * 1.7.30 took the auto-plug switch out (60 + a gap) and put in the lock line,
  * the LIGHTBAR heading and row (+160), which would have been 840 -- over the
@@ -89,9 +104,11 @@
  * PAIR_SLIDER_W track 124, a PAIR_VALUE_W number 96 ("100 %" is 87-90 px,
  * "200 %" 90) and the gaps 24, leaving the label 226 -- hence
  * "Speaker"/"Headphones"/"Haptics" there ("Soften triggers", the longest, is
- * 218-223), the section heading already says what they adjust. The LIGHTBAR row is one row
- * for the same reason: nine 40 px discs and their gaps take 468 of its 1020,
- * the switch 88, and the label keeps ~440 for its ~340.
+ * 218-223), the section heading already says what they adjust. The LIGHTBAR
+ * row was one row for the same reason, its switch beside the swatches; in
+ * 1.7.31 the switch ends the first of its two lines, where eight 36 px discs
+ * and their gaps take 372 of ~1020, the switch 88 and the gaps 24, and the
+ * label keeps ~536 for its ~340.
  * 1.7.29 measured 748 for the same DualSense (with the auto-plug switch); in
  * 1.7.28 it was 1020 mounted and 974 on SDL, and a DualShock 4 852 mounted
  * against 806 on SDL -- the 46 px of the "applies over SDL" caption were what
@@ -948,7 +965,8 @@ lv_obj_t *hid_pt_view_add_swatch(hid_pt_view_t *view, uint32_t rgb, const char *
         return NULL;
     }
     const int index = view->swatch_count;
-    lv_obj_t *swatch = lv_btn_create(view->lightbar_body);
+    lv_obj_t *line = view->lightbar_lines[index / HID_PT_SWATCHES_PER_LINE];
+    lv_obj_t *swatch = lv_btn_create(line);
     lv_obj_remove_style_all(swatch);
     lv_obj_set_size(swatch, SWATCH_D, SWATCH_D);
     lv_obj_set_style_radius(swatch, LV_RADIUS_CIRCLE, 0);
@@ -978,17 +996,22 @@ lv_obj_t *hid_pt_view_add_swatch(hid_pt_view_t *view, uint32_t rgb, const char *
     lv_obj_add_event_cb(swatch, swatch_clicked_cb, LV_EVENT_CLICKED, view);
     lv_obj_add_event_cb(swatch, key_cb, LV_EVENT_KEY, view);
     bind_slab_focus(swatch, view->lightbar_row);
-    /* In front of the game switch's label, which the row created first. */
-    lv_obj_move_to_index(swatch, index);
+    /* In front of the game switch's label, which the first line created
+     * first. */
+    lv_obj_move_to_index(swatch, index % HID_PT_SWATCHES_PER_LINE);
     view->swatches[index] = swatch;
     view->swatch_count++;
     return swatch;
 }
 
-void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, int lit, bool show_game, bool game_on)
+void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, const char *heading, int lit, bool show_game,
+                              bool game_on)
 {
     if (!view || !view->lightbar_row) {
         return;
+    }
+    if (view->lightbar_heading && heading && strcmp(lv_label_get_text(view->lightbar_heading), heading) != 0) {
+        lv_label_set_text(view->lightbar_heading, heading);
     }
     for (int i = 0; i < view->swatch_count; ++i) {
         set_obj_state(view->swatches[i], LV_STATE_CHECKED, i == lit);
@@ -1020,13 +1043,22 @@ lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, i
     if (!view || !from || dir == 0) {
         return NULL;
     }
-    /* The row left to right: the swatches, then the switch at its end. */
-    lv_obj_t *strip[HID_PT_MAX_SWATCHES + 1];
+    /* The line @p from is on, left to right: its swatches, and on the first
+     * line the switch at its end. */
+    const int swatch = hid_pt_view_swatch_of(view, from);
+    const int line = swatch >= 0 ? swatch / HID_PT_SWATCHES_PER_LINE : 0;
+    if (swatch < 0 && from != view->lightbar_game_cb) {
+        return NULL;
+    }
+    lv_obj_t *strip[HID_PT_SWATCHES_PER_LINE + 1];
     int n = 0;
-    for (int i = 0; i < view->swatch_count; ++i) {
+    for (int i = line * HID_PT_SWATCHES_PER_LINE;
+         i < view->swatch_count && i < (line + 1) * HID_PT_SWATCHES_PER_LINE; ++i) {
         strip[n++] = view->swatches[i];
     }
-    strip[n++] = view->lightbar_game_cb;
+    if (line == 0) {
+        strip[n++] = view->lightbar_game_cb;
+    }
     int at = -1;
     for (int i = 0; i < n; ++i) {
         if (strip[i] == from) {
@@ -1039,6 +1071,30 @@ lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, i
     for (int i = at + dir; i >= 0 && i < n; i += dir) {
         if (hid_pt_view_obj_is_focusable(view, strip[i])) {
             return strip[i];
+        }
+    }
+    return NULL;
+}
+
+lv_obj_t *hid_pt_view_step_lightbar_line(const hid_pt_view_t *view, lv_obj_t *from, int dir)
+{
+    const int swatch = hid_pt_view_swatch_of(view, from);
+    if (swatch < 0 || dir == 0) {
+        return NULL;
+    }
+    const int line = swatch / HID_PT_SWATCHES_PER_LINE + (dir > 0 ? 1 : -1);
+    const int first = line * HID_PT_SWATCHES_PER_LINE;
+    if (line < 0 || first >= view->swatch_count) {
+        return NULL;
+    }
+    /* The same column, or the line's last swatch when it is shorter. */
+    int to = first + swatch % HID_PT_SWATCHES_PER_LINE;
+    if (to >= view->swatch_count) {
+        to = view->swatch_count - 1;
+    }
+    for (int i = to; i >= first; --i) {
+        if (hid_pt_view_obj_is_focusable(view, view->swatches[i])) {
+            return view->swatches[i];
         }
     }
     return NULL;
@@ -1410,10 +1466,11 @@ static void pair_half(lv_obj_t *slab)
 }
 
 /**
- * The LIGHTBAR row: one slab, the swatches (hid_pt_view_add_swatch()) on the
- * left of its body, "Game may change colour" and its switch on the right. One
- * row rather than two is what the column's height allows, and the switch is
- * about the swatches, so it sits beside them. Starts hidden.
+ * The LIGHTBAR row: one slab, the swatches (hid_pt_view_add_swatch()) in two
+ * lines on the left of its body, "Game may change colour" and its switch at
+ * the end of the first. One slab for both lines is what the column's height
+ * allows (the arithmetic at the top), and the switch is about the swatches, so
+ * it sits beside them. Starts hidden.
  */
 static void lightbar_row(hid_pt_view_t *view, lv_obj_t *parent)
 {
@@ -1423,21 +1480,35 @@ static void lightbar_row(hid_pt_view_t *view, lv_obj_t *parent)
     lv_obj_add_flag(view->lightbar_heading, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *row = lv_obj_create(parent);
-    slab_style(row, OPT_ROW_H);
+    slab_style(row, LIGHTBAR_ROW_H);
     slab_rail(row);
     view->lightbar_row = row;
     view->lightbar_body = slab_body(row);
-    lv_obj_set_style_pad_gap(view->lightbar_body, SWATCH_GAP, 0);
+    lv_obj_set_flex_flow(view->lightbar_body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(view->lightbar_body, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(view->lightbar_body, SWATCH_LINE_GAP, 0);
     /* The swatches' rings reach past the disc; the body must not cut them. */
     lv_obj_add_flag(view->lightbar_body, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    for (int i = 0; i < HID_PT_SWATCH_LINES; ++i) {
+        lv_obj_t *line = lv_obj_create(view->lightbar_body);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_size(line, LV_PCT(100), SWATCH_D);
+        lv_obj_set_flex_flow(line, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(line, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_gap(line, SWATCH_GAP, 0);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(line, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        view->lightbar_lines[i] = line;
+    }
 
-    view->lightbar_game_label = body_text(view->lightbar_body, locstr("Game may change colour"));
+    view->lightbar_game_label = body_text(view->lightbar_lines[0], locstr("Game may change colour"));
     lv_label_set_long_mode(view->lightbar_game_label, LV_LABEL_LONG_DOT);
     lv_obj_set_flex_grow(view->lightbar_game_label, 1);
     lv_obj_set_style_text_align(view->lightbar_game_label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_pad_left(view->lightbar_game_label, LV_DPX(6), 0);
 
-    lv_obj_t *sw = lv_switch_create(view->lightbar_body);
+    lv_obj_t *sw = lv_switch_create(view->lightbar_lines[0]);
     style_switch(sw);
     bind_slab_focus(sw, row);
     bind_control(view, sw, HID_PT_CTL_LIGHTBAR_GAME);

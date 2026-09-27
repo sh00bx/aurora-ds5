@@ -28,6 +28,7 @@
 #include "hid_passthrough_panel.h"
 #include "hid_pt_panel_model.h"
 #include "hid_pt_panel_view.h"
+#include "lightbar_colour.h"
 #include "overlay_style.h"
 
 #include "hid_passthrough/hid_passthrough_manager.h"
@@ -89,12 +90,14 @@ static bool mode_is_hid(int i)
 _Static_assert(sizeof(MODES) / sizeof(MODES[0]) <= HID_PT_MAX_MODES, "the view holds HID_PT_MAX_MODES buttons");
 
 /**
- * The LIGHTBAR row, left to right: Automatic (the bar as it always was -- a
- * dark disc with an "A", since it is no colour), Off (a dark bar, painted like
- * a colour) and seven colours. Moderate on purpose: no channel above 0xC0, so
- * a DS4, whose bar is the hungriest thing on it, is spared the full-power
- * white-hot LED, and the colours still read from the couch. The discs show
- * the very values the bar gets.
+ * The LIGHTBAR row, two lines of eight: Automatic (the bar as it always was --
+ * a dark disc with an "A", since it is no colour), Off (a dark bar, painted
+ * like a colour) and thirteen colours. Dim on purpose: no channel above 0x04,
+ * the level the user picked for red (040000), the others about as bright --
+ * a DS4's bar is the hungriest thing on it, and a lightbar in a dark room
+ * needs little. A disc does not show that value, which would be black on
+ * screen, but the colour at full brightness (lightbar_colour_display():
+ * 040100 is drawn FF4000).
  */
 static const struct {
     bool automatic;
@@ -102,15 +105,21 @@ static const struct {
     const char *text;
     const char *glyph;
 } SWATCHES[] = {
-        {true,  OVERLAY_SLAB, "A",  NULL},
-        {false, 0x000000,     NULL, MAT_SYMBOL_CLOSE},
-        {false, 0xC00000,     NULL, NULL},    /* red */
-        {false, 0xC04000,     NULL, NULL},    /* orange */
-        {false, 0xA08000,     NULL, NULL},    /* yellow */
-        {false, 0x00A000,     NULL, NULL},    /* green */
-        {false, 0x00A0A0,     NULL, NULL},    /* cyan */
-        {false, 0x0000C0,     NULL, NULL},    /* blue */
-        {false, 0x6000C0,     NULL, NULL},    /* purple */
+        {true,  0,        "A",  NULL},
+        {false, 0x000000, NULL, MAT_SYMBOL_CLOSE},
+        {false, 0x040000, NULL, NULL},    /* red */
+        {false, 0x040100, NULL, NULL},    /* orange */
+        {false, 0x040300, NULL, NULL},    /* yellow */
+        {false, 0x020400, NULL, NULL},    /* lime */
+        {false, 0x000400, NULL, NULL},    /* green */
+        {false, 0x000402, NULL, NULL},    /* teal */
+        {false, 0x000304, NULL, NULL},    /* cyan */
+        {false, 0x000204, NULL, NULL},    /* sky */
+        {false, 0x000004, NULL, NULL},    /* blue */
+        {false, 0x020004, NULL, NULL},    /* violet */
+        {false, 0x040003, NULL, NULL},    /* magenta */
+        {false, 0x040102, NULL, NULL},    /* pink */
+        {false, 0x030303, NULL, NULL},    /* white */
 };
 
 #define SWATCH_COUNT ((int) (sizeof(SWATCHES) / sizeof(SWATCHES[0])))
@@ -359,8 +368,10 @@ static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj)
  *   LEFT        from a setting, back to the device — or, on a slider, DOWN a
  *               step, because a slider owns both horizontal keys outright
  *   LEFT/RIGHT  on the mode row, the next button that can be pressed; on the
- *               LIGHTBAR row the next swatch, and past the last one its
- *               switch; LEFT off the first is back to the device
+ *               LIGHTBAR row the next swatch of its line, and past the first
+ *               line's last its switch; LEFT off a line's first is back to the
+ *               device
+ *   UP/DOWN     on the LIGHTBAR row, the swatch in the other line first
  *   OK          plugs the focused device in or out; opens the dropdown;
  *               selects a mode
  *   BACK        from the settings, back to the devices; from there, closes
@@ -456,7 +467,16 @@ static void panel_control_key(void *userdata, lv_event_t *event)
                 } else if (key == LV_KEY_LEFT) {
                     panel_focus_selected_row(panel);
                 } else if (key == LV_KEY_UP || key == LV_KEY_DOWN) {
-                    lv_obj_t *next = hid_pt_view_step_option(&panel->view, target, dir);
+                    /* The LIGHTBAR row's two lines first: UP/DOWN goes to the
+                     * swatch above or below, and off the row from its first or
+                     * last line. */
+                    lv_obj_t *next = NULL;
+                    if (kind == HID_PT_WK_SWATCH) {
+                        next = hid_pt_view_step_lightbar_line(&panel->view, target, dir);
+                    }
+                    if (!next) {
+                        next = hid_pt_view_step_option(&panel->view, target, dir);
+                    }
                     if (next) {
                         panel_focus(panel, next);
                     } else if (key == LV_KEY_UP) {
@@ -834,8 +854,8 @@ static void update_mode_row(hid_pt_panel_t *panel)
     }
 }
 
-/* The swatch for @p lb, or -1 for a colour the palette has not (one written
- * into the ini by hand). */
+/* The swatch for @p lb, or -1 for a colour the palette has not (one of 1.7.30's
+ * brighter palette, or one written into the ini by hand). */
 static int lit_swatch(const lightbar_pref_t *lb)
 {
     for (int i = 0; i < SWATCH_COUNT; ++i) {
@@ -847,10 +867,12 @@ static int lit_swatch(const lightbar_pref_t *lb)
 }
 
 /**
- * The LIGHTBAR row: shown for a controller whose bar aurora can paint, its
- * colour ringed, and "Game may change colour" beside the swatches for
- * anything but Automatic -- Off included, which is a colour too (a dark bar
- * a game could otherwise light up).
+ * The LIGHTBAR row: shown for a controller whose bar aurora can paint, with
+ * the colour of the mode its mode row lights -- named in the heading,
+ * "LIGHTBAR · DS4" -- ringed, and "Game may change colour" at the end of the
+ * first line for anything but Automatic -- Off included, which is a colour too
+ * (a dark bar a game could otherwise light up). Under a game's lock that is
+ * the locked mode: the controller's own colour for it, never one per game.
  */
 static void update_lightbar_row(hid_pt_panel_t *panel)
 {
@@ -858,13 +880,22 @@ static void update_lightbar_row(hid_pt_panel_t *panel)
         return;
     }
     lightbar_pref_t lb;
+    gamepad_mode_t mode = GAMEPAD_MODE_NONE;
     const bool show = hid_pt_model_selected_has_lightbar(&panel->model) &&
-                      hid_pt_model_selected_lightbar(&panel->model, &lb, NULL);
+                      hid_pt_model_selected_lightbar(&panel->model, &lb, &mode);
     if (!show) {
         lb = lightbar_pref_automatic();
     }
+    /* Which of the controller's colours the swatches are: the lit mode's. */
+    char heading[48];
+    const char *mode_name = gamepad_mode_label(mode);
+    if (mode_name) {
+        snprintf(heading, sizeof(heading), "%s · %s", locstr("LIGHTBAR"), locstr(mode_name));
+    } else {
+        snprintf(heading, sizeof(heading), "%s", locstr("LIGHTBAR"));
+    }
     lv_obj_t *focused = panel->view.group ? lv_group_get_focused(panel->view.group) : NULL;
-    hid_pt_view_set_lightbar(&panel->view, show, lit_swatch(&lb), show && !lb.automatic, lb.game);
+    hid_pt_view_set_lightbar(&panel->view, show, heading, lit_swatch(&lb), show && !lb.automatic, lb.game);
     /* The switch just hidden under the cursor (Automatic picked, or another
      * controller): LVGL would keep handing it the keys. Back to the row's
      * entry, else the next setting, else the device's row. */
@@ -1396,7 +1427,10 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
         hid_pt_view_add_mode(&panel->view, MODES[i].glyph, locstr(MODES[i].label), mode_is_hid(i));
     }
     for (int i = 0; i < SWATCH_COUNT; ++i) {
-        hid_pt_view_add_swatch(&panel->view, SWATCHES[i].rgb, SWATCHES[i].text, SWATCHES[i].glyph);
+        /* The screen's version of the colour; Automatic, no colour, the slab's
+         * own dark. */
+        const uint32_t shown = SWATCHES[i].automatic ? OVERLAY_SLAB : lightbar_colour_display(SWATCHES[i].rgb);
+        hid_pt_view_add_swatch(&panel->view, shown, SWATCHES[i].text, SWATCHES[i].glyph);
     }
     hid_pt_view_rebuild_focus_order(&panel->view);
     panel->refresh_timer = lv_timer_create(refresh_timer_cb, 2000, panel);
