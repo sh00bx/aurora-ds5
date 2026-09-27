@@ -7,6 +7,9 @@
 #include "app.h"
 #include "stream/session_priv.h"
 #include "util/bus.h"
+#if defined(TARGET_WEBOS)
+#include "hid_passthrough/hid_pt_lightbar.h"
+#endif
 
 static session_t *current_session = NULL;
 
@@ -137,6 +140,11 @@ static void connection_set_controller_led(uint16_t controllerNumber, uint8_t r, 
     /* Pads, die per CTM als natives HID gebrueckt sind, bekommen Rumble/LED/Motion direkt
      * ueber die Bruecke — der Moonlight-Pfad wuerde sie doppelt ansteuern. */
     if (current_session->input.moonlightExcludedMask & (1u << controllerNumber)) {
+        return;
+    }
+    /* A colour chosen on the Controllers page decides what the game's colour
+     * does to the bar; on Automatic it passes as it always did. */
+    if (hid_pt_lightbar_host_led(&current_session->app->input, controllerNumber, r, g, b)) {
         return;
     }
 #endif

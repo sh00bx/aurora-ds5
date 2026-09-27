@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Arbiter for the DS5 lightbar colour ds5_txd paints while it considers a pad
  * IDLE (nobody feeding the daemon).
@@ -10,7 +11,8 @@
  * and sees a sparse passthrough session as indistinguishable from idle:
  *
  *   passthrough session owns the pad -> daemon must not paint (the host does)
- *   held open as one of our SDL pads  -> dark red
+ *   held open as one of our SDL pads  -> dark red, or the colour the user chose
+ *                                       for it (ds5_idle_lb_set_sdl_colour())
  *   connected but unused             -> no selection at all: a clear-selection
  *                                       datagram (ctrl 0x03) restores the
  *                                       daemon's boot-configured default
@@ -41,6 +43,21 @@ void ds5_idle_lb_set_owned(bool owned);
 
 /* We hold at least one DualSense open as an SDL gamepad. */
 void ds5_idle_lb_set_sdl_open(bool open);
+
+/* What the painter paints while we hold a DualSense over SDL. */
+typedef enum {
+    /* The dark red of old: no colour was chosen (Automatic). */
+    DS5_IDLE_LB_SDL_DEFAULT = 0,
+    /* @c rgb, the one the user chose (or the game's, while it owns the bar) --
+     * the colour SDL writes too, so the two writers agree. 0 is a dark bar,
+     * sent as "paint black": a plain 000000 would mean "paint nothing". */
+    DS5_IDLE_LB_SDL_COLOUR,
+    /* Nothing: the open pads want different colours, and one painter colour
+     * for every link would fight all but one of them. */
+    DS5_IDLE_LB_SDL_NONE,
+} ds5_idle_lb_sdl_t;
+
+void ds5_idle_lb_set_sdl_colour(ds5_idle_lb_sdl_t how, uint32_t rgb);
 
 /* Shutdown: drop every claim (the owned count resets to 0) and hand the bar
  * back to the daemon's own default. */

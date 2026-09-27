@@ -15,6 +15,7 @@
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_passthrough_manager.h"
+#include "hid_passthrough/hid_pt_lightbar.h"
 #endif
 
 #include <SDL.h>
@@ -550,6 +551,11 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
     battery_state_sent[gamepad->gs_id] = LI_BATTERY_STATE_UNKNOWN;
     battery_percentage_sent[gamepad->gs_id] = LI_BATTERY_PERCENTAGE_UNKNOWN;
     stream_input_send_gamepad_battery(input, gamepad);
+#if defined(TARGET_WEBOS)
+    /* A new host pad, whose game has painted nothing yet: the user's colour
+     * until it does. */
+    hid_pt_lightbar_pad_arrived(input->input, gamepad);
+#endif
 }
 
 void stream_input_send_gamepad_remove(stream_input_t *input, app_gamepad_state_t *gamepad) {

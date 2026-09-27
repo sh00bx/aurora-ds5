@@ -11,6 +11,9 @@
 #include "logging.h"
 #include "app_input.h"
 #include "ds5_idle_lightbar.h"
+#if defined(TARGET_WEBOS)
+#include "hid_passthrough/hid_pt_lightbar.h"
+#endif
 #if FEATURE_GAMEPAD_TOUCHPAD_GRAB
 #include "gamepad_touchpad.h"
 #endif
@@ -143,6 +146,12 @@ bool app_input_init_gamepad(app_input_t *input, int device_index) {
         if (joystick_is_ds5(joystick) && ++ds5_sdl_open_count == 1) {
             ds5_idle_lb_set_sdl_open(true);
         }
+#if defined(TARGET_WEBOS)
+        /* The colour chosen for it on the Controllers page, from the moment we
+         * hold it -- the menus included. After SDL's own player-index colour,
+         * which app_input_gamepad_state_init() set above, so it wins. */
+        hid_pt_lightbar_pad_opened(input, state);
+#endif
         return true;
     } else {
         commons_log_warn("Input", "Unrecognized game controller %s. GUID: %s", name, guidstr);
@@ -172,6 +181,9 @@ void app_input_close_gamepad(app_input_t *input, SDL_JoystickID sdl_id) {
 #if FEATURE_GAMEPAD_TOUCHPAD_GRAB
     gamepad_touchpad_release(state->touchpad);
     state->touchpad = NULL;
+#endif
+#if defined(TARGET_WEBOS)
+    hid_pt_lightbar_pad_closed(state);
 #endif
     /* Classify BEFORE the close: afterwards the joystick handle is gone. */
     bool was_ds5 = joystick_is_ds5(SDL_GameControllerGetJoystick(state->controller));
