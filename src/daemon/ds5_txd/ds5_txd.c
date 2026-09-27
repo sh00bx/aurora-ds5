@@ -249,6 +249,13 @@ static const unsigned GAPGE_EDGE[GAPGE_N] =
  * the app merely selects. (While an app IS feeding us the host owns the bar and
  * the painter is silent anyway, so this never competes with a live session.) */
 #define ACL_CTRL_IDLE_LB    0x02
+/* Optional 7th byte of 0x02, [A5][5C][02][R][G][B][flags]: bit 0 = PAINT BLACK.
+ * A selection of 000000 means "paint nothing" (the app owns the idle bar), so a
+ * user's "lightbar off" had no way to be said: nothing painted leaves the
+ * firmware's full-brightness blue. With the flag, 000000 is a colour like any
+ * other. A daemon without it reads the first six bytes and paints nothing --
+ * the old meaning, so an old daemon degrades to exactly what it did before. */
+#define ACL_CTRL_IDLE_LB_FLAG_BLACK 0x01
 /* Code 0x03 = clear the app's idle-lightbar selection, [A5][5C][03] (n>=3, no
  * payload). 0x02 used to OVERWRITE the daemon's one colour global, so a single
  * SDL open/close cycle in the app permanently discarded the operator's
@@ -384,6 +391,10 @@ static int ds4_report(uint8_t id){
  * wins regardless of any app selection; an app selection of 0 means "paint
  * nothing" (the app owns the idle bar) and is honored. All three are
  * main-thread-only (env parse, ctrl handler and painter run on main). */
+/* An app selection of "paint black" (ACL_CTRL_IDLE_LB_FLAG_BLACK): non-zero, so
+ * every "0 = do not paint" test below still paints it, and ds5_build_lightbar()
+ * takes the low 24 bits -- 000000. */
+#define IDLE_LB_BLACK 0x01000000u
 static uint32_t g_idle_lb_boot    = IDLE_LB_RGB_DEFAULT; /* DS5_IDLE_LIGHTBAR */
 static uint32_t g_idle_lb_app     = 0;  /* ctrl-0x02 selection (iff _set) */
 static int      g_idle_lb_app_set = 0;  /* cleared by ctrl-0x03 / restart */
@@ -4852,6 +4863,7 @@ int main(int argc,char**argv){
                          * EFFECTIVE colour moved (boot=off keeps the painter dead),
                          * so the change lands now, not at the next 30 s keep-alive. */
                         uint32_t nv=((uint32_t)rep[3]<<16)|((uint32_t)rep[4]<<8)|rep[5];
+                        if(nv==0 && n>=7 && (rep[6]&ACL_CTRL_IDLE_LB_FLAG_BLACK)) nv=IDLE_LB_BLACK;
                         if(!g_idle_lb_app_set || nv!=g_idle_lb_app){
                             uint32_t was=idle_lb_effective();
                             g_idle_lb_app=nv; g_idle_lb_app_set=1;
