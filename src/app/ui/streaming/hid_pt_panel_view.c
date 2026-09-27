@@ -1969,6 +1969,10 @@ static void hue_track_draw_cb(lv_event_t *event)
     lv_draw_img_dsc_init(&dsc);
     lv_draw_img(draw_ctx, &dsc, &area, &view->picker.hue_img);
     lv_draw_mask_remove_id(mask_id);
+    /* remove_id() only takes it off the list: the circle-cache reference the
+     * init took (or its temporary entry) is released here, as LVGL's own
+     * callers do -- else every redraw pins a cache slot for good. */
+    lv_draw_mask_free_param(&mask);
 }
 
 static bool picker_build_hue_image(hid_pt_view_t *view, lv_coord_t w, lv_coord_t h)
