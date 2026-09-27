@@ -55,9 +55,10 @@ void hid_pt_prefs_flush(void);
  * already-open ini writer. Used by settings_save() so a full-config rewrite
  * preserves the per-device prefs instead of truncating them. Only non-default
  * prefs are written: an opted-in auto-plug as `<id> = true`, a chosen SDL type
- * as `<id>.sdl_type = xbox|playstation|auto`, a chosen lightbar as
- * `<id>.lightbar = auto|off|rrggbb` (+ `<id>.lightbar_game = 0`), a game's fixed
- * mode as `<app> = hid|x360|ds4`. An absent key reads as the default. */
+ * as `<id>.sdl_type = xbox|playstation|dualsense|switch|auto`, a chosen
+ * lightbar as `<id>.lightbar = auto|off|rrggbb` (+ `<id>.lightbar_game = 0`),
+ * a game's fixed mode as `<app> = hid|x360|ds4|ds5|switch`. An absent key reads
+ * as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
@@ -103,11 +104,11 @@ lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item);
 /* ---- per-game mode ([controller_app_modes]) --------------------------------
  *
  * A game can fix the mode of every controller (Forza only takes an Xbox pad).
- * Stored per host app as `<app> = hid|x360|ds4`, keyed by the app's NAME passed
- * through hid_pt_stable_id(): app ids change whenever the host re-syncs its
- * library, the name does not. Only the app the running session launched is ever
- * looked up, so the table is read through "the current app" alone. Main thread
- * only, like the rest of this store. */
+ * Stored per host app as `<app> = hid|x360|ds4|ds5|switch`, keyed by the app's
+ * NAME passed through hid_pt_stable_id(): app ids change whenever the host
+ * re-syncs its library, the name does not. Only the app the running session
+ * launched is ever looked up, so the table is read through "the current app"
+ * alone. Main thread only, like the rest of this store. */
 
 /* The app the session streams, set at session create and cleared (NULL) at
  * destroy. Its name is kept as given for the Controllers page. */
@@ -132,8 +133,8 @@ bool hid_pt_prefs_set_current_app_mode(gamepad_mode_t mode);
 bool hid_pt_prefs_effective_hid(bool own_hid);
 
 /* A pad's own SDL type as the current app's lock has it: the lock's type under
- * X360/DS4, @p own otherwise (also under a HID lock, for a pad that cannot be
- * mounted and so stays on SDL). */
+ * an SDL-type lock, @p own otherwise (also under a HID lock, for a pad that
+ * cannot be mounted and so stays on SDL). */
 gamepad_type_pref_t hid_pt_prefs_effective_sdl_type(gamepad_type_pref_t own);
 
 /* INI parse hook for [hid_pt_devices] and [controller_app_modes]: return 1 on

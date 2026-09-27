@@ -374,7 +374,7 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
         return false;
     }
     /* A game that fixes the mode (hid_pt_prefs_current_app_mode()) replaces
-     * every pref below: X360/DS4 keeps every pad on SDL, HID takes every pad
+     * every pref below: an SDL type keeps every pad on SDL, HID takes every pad
      * that is a device the bridge can mount. Only the VID:PID guard against an
      * already-bridged model stays -- that one is about what IS mounted. */
     const gamepad_mode_t lock = hid_pt_prefs_current_app_mode();
@@ -418,7 +418,7 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
      * with no usable serial has nothing better available, so it may use the
      * VID:PID tiers. No binding is requested -- this predicate runs for every
      * pad, and a mere match must not rebind anything. */
-    if (lock == GAMEPAD_MODE_X360 || lock == GAMEPAD_MODE_DS4) {
+    if (gamepad_mode_is_sdl(lock)) {
         return false;
     }
     char sid[HID_PT_STABLE_ID_LEN];
@@ -621,7 +621,7 @@ gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepa
     if (!gamepad || !gamepad->controller) {
         return GAMEPAD_TYPE_PREF_AUTO;
     }
-    /* A game's X360/DS4 lock is the type of every pad in it -- this is what the
+    /* A game's SDL-type lock is the type of every pad in it -- this is what the
      * arrival announces, the page lights and the badge names. */
     return hid_pt_prefs_effective_sdl_type(pad_own_sdl_type(input, gamepad));
 }

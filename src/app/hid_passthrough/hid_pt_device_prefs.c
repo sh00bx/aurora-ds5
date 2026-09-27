@@ -26,7 +26,8 @@
  * a serial that happens to start with "sdl". */
 #define HID_PT_SYNTHETIC_PREFIX "sdl_"
 
-/* Key suffix of the SDL type pref: `<stable_id>.sdl_type = xbox|playstation|auto`.
+/* Key suffix of the SDL type pref:
+ * `<stable_id>.sdl_type = xbox|playstation|dualsense|switch|auto`.
  * A separate key rather than a new value for the auto-plug line, so a file
  * written by this build still reads correctly in an older one: there the whole
  * key normalises to an id no device has, and its value is not "true", so the
@@ -104,6 +105,10 @@ static const char *sdl_type_ini_value(gamepad_type_pref_t type)
             return "xbox";
         case GAMEPAD_TYPE_PREF_PLAYSTATION:
             return "playstation";
+        case GAMEPAD_TYPE_PREF_DUALSENSE:
+            return "dualsense";
+        case GAMEPAD_TYPE_PREF_SWITCH:
+            return "switch";
         case GAMEPAD_TYPE_PREF_AUTO:
             return "auto";
         default:
@@ -462,6 +467,10 @@ static const char *app_mode_ini_value(gamepad_mode_t mode)
             return "x360";
         case GAMEPAD_MODE_DS4:
             return "ds4";
+        case GAMEPAD_MODE_DS5:
+            return "ds5";
+        case GAMEPAD_MODE_SWITCH:
+            return "switch";
         case GAMEPAD_MODE_NONE:
         default:
             return NULL;
@@ -563,16 +572,11 @@ bool hid_pt_prefs_set_current_app_mode(gamepad_mode_t mode)
 
 bool hid_pt_prefs_effective_hid(bool own_hid)
 {
-    switch (hid_pt_prefs_current_app_mode()) {
-        case GAMEPAD_MODE_HID:
-            return true;
-        case GAMEPAD_MODE_X360:
-        case GAMEPAD_MODE_DS4:
-            return false;
-        case GAMEPAD_MODE_NONE:
-        default:
-            return own_hid;
+    const gamepad_mode_t lock = hid_pt_prefs_current_app_mode();
+    if (lock == GAMEPAD_MODE_HID) {
+        return true;
     }
+    return gamepad_mode_is_sdl(lock) ? false : own_hid;
 }
 
 gamepad_type_pref_t hid_pt_prefs_effective_sdl_type(gamepad_type_pref_t own)
@@ -581,8 +585,8 @@ gamepad_type_pref_t hid_pt_prefs_effective_sdl_type(gamepad_type_pref_t own)
     return forced != GAMEPAD_TYPE_PREF_AUTO ? forced : own;
 }
 
-/* `<app> = hid|x360|ds4`. The key is normalised again, so a hand-edited name
- * with spaces or capitals still finds its app. */
+/* `<app> = hid|x360|ds4|ds5|switch`. The key is normalised again, so a
+ * hand-edited name with spaces or capitals still finds its app. */
 static void app_mode_ini_entry(const char *name, const char *value)
 {
     char key[HID_PT_STABLE_ID_LEN];
@@ -590,14 +594,14 @@ static void app_mode_ini_entry(const char *name, const char *value)
     if (stable_id_is_blank(key) || !value) {
         return;
     }
-    gamepad_mode_t mode;
-    if (strcmp(value, "hid") == 0) {
-        mode = GAMEPAD_MODE_HID;
-    } else if (strcmp(value, "x360") == 0) {
-        mode = GAMEPAD_MODE_X360;
-    } else if (strcmp(value, "ds4") == 0) {
-        mode = GAMEPAD_MODE_DS4;
-    } else {
+    gamepad_mode_t mode = GAMEPAD_MODE_NONE;
+    for (int m = GAMEPAD_MODE_NONE + 1; m < GAMEPAD_MODE_COUNT; ++m) {
+        const char *word = app_mode_ini_value((gamepad_mode_t) m);
+        if (word && strcmp(value, word) == 0) {
+            mode = (gamepad_mode_t) m;
+        }
+    }
+    if (mode == GAMEPAD_MODE_NONE) {
         /* A word from a newer build reads as no lock rather than as a guess. */
         return;
     }
@@ -606,9 +610,9 @@ static void app_mode_ini_entry(const char *name, const char *value)
     }
 }
 
-/* `<stable_id>.sdl_type = xbox|playstation`. Split BEFORE normalising: '.' is
- * inside the id alphabet, so the suffix would otherwise just become part of an
- * id no device has. */
+/* `<stable_id>.sdl_type = xbox|playstation|dualsense|switch|auto`. Split
+ * BEFORE normalising: '.' is inside the id alphabet, so the suffix would
+ * otherwise just become part of an id no device has. */
 static void sdl_type_ini_entry(const char *name, size_t id_len, const char *value)
 {
     char raw[HID_PT_STABLE_ID_LEN];
@@ -622,14 +626,14 @@ static void sdl_type_ini_entry(const char *name, size_t id_len, const char *valu
     if (!id[0] || !value) {
         return;
     }
-    gamepad_type_pref_t type;
-    if (strcmp(value, "xbox") == 0) {
-        type = GAMEPAD_TYPE_PREF_XBOX;
-    } else if (strcmp(value, "playstation") == 0) {
-        type = GAMEPAD_TYPE_PREF_PLAYSTATION;
-    } else if (strcmp(value, "auto") == 0) {
-        type = GAMEPAD_TYPE_PREF_AUTO;
-    } else {
+    int type = -1;
+    for (int t = 0; t < GAMEPAD_TYPE_PREF_COUNT; ++t) {
+        const char *word = sdl_type_ini_value((gamepad_type_pref_t) t);
+        if (word && strcmp(value, word) == 0) {
+            type = t;
+        }
+    }
+    if (type < 0) {
         /* An unknown word from a newer build reads as no choice rather than as
          * a guess. */
         return;
@@ -640,7 +644,7 @@ static void sdl_type_ini_entry(const char *name, size_t id_len, const char *valu
         return;
     }
     e->sdl_type_set = true;
-    e->sdl_type = type;
+    e->sdl_type = (gamepad_type_pref_t) type;
 }
 
 /* The id part of `<id><suffix>`, normalised, into @p id. Split BEFORE

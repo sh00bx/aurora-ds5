@@ -513,25 +513,35 @@ void stream_input_send_gamepad_arrive(stream_input_t *input, app_gamepad_state_t
     }
 #endif
 #if defined(TARGET_WEBOS)
-    /* The user's per-controller choice from the Controllers page: only the type
-     * moves. The capabilities stay what the pad has -- the host ignores what an
-     * X360 target cannot use, and the touchpad-as-mouse path needs the touchpad
-     * bit on a DualShock announced as an Xbox pad. */
+    /* The user's per-controller choice from the Controllers page: the type
+     * moves, and the host is asked for exactly that virtual pad (the wire
+     * contract in gamepad_type_pref.h, bits 13-15). The capabilities stay what
+     * the pad has -- the host ignores what an X360 target cannot use, and the
+     * touchpad-as-mouse path needs the touchpad bit on a DualShock announced as
+     * an Xbox pad. */
     const uint8_t detected = type;
-    switch (hid_pt_gamepad_sdl_type(input->input, gamepad)) {
+    const gamepad_type_pref_t pref = hid_pt_gamepad_sdl_type(input->input, gamepad);
+    switch (pref) {
         case GAMEPAD_TYPE_PREF_XBOX:
             type = LI_CTYPE_XBOX;
             break;
         case GAMEPAD_TYPE_PREF_PLAYSTATION:
+        case GAMEPAD_TYPE_PREF_DUALSENSE:
             type = LI_CTYPE_PS;
+            break;
+        case GAMEPAD_TYPE_PREF_SWITCH:
+            type = LI_CTYPE_NINTENDO;
             break;
         case GAMEPAD_TYPE_PREF_AUTO:
         default:
             break;
     }
-    if (type != detected) {
-        commons_log_info("Input", "Controller %d type: %s (user choice, detected %s)", gamepad->gs_id,
-                         li_ctype_name(type), li_ctype_name(detected));
+    capabilities = (uint16_t) ((capabilities & ~GAMEPAD_WIRE_PAD_MASK) | gamepad_type_pref_wire_caps(pref));
+    if (pref != GAMEPAD_TYPE_PREF_AUTO) {
+        commons_log_info("Input", "Controller %d type: %s, host pad request %u (user choice, detected %s)",
+                         gamepad->gs_id, li_ctype_name(type),
+                         (unsigned) ((capabilities & GAMEPAD_WIRE_PAD_MASK) >> GAMEPAD_WIRE_PAD_SHIFT),
+                         li_ctype_name(detected));
     }
 #endif
     uint8_t battery_state, battery_percentage;

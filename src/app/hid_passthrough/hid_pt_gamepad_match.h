@@ -20,7 +20,7 @@ struct stream_input_t;
 
 /* True if the gamepad should be auto-bridged (and thus kept off the Moonlight
  * gamepad path): its mode is HID, or the current game fixes HID and the pad is
- * a device the bridge can mount; never under a game's X360/DS4 lock, unless
+ * a device the bridge can mount; never under a game's SDL-type lock, unless
  * its model is bridged already. Robust against a transiently-unreadable SDL
  * serial during stream churn / mid-session re-enumeration: a pad with no usable
  * serial may reach its logical device through the VID:PID tiers, while a pad
@@ -51,7 +51,7 @@ bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
                                           const app_gamepad_state_t *gamepad);
 
 /* The controller type to announce for this pad over SDL: the current game's
- * X360/DS4 lock if it has one, else what was chosen for the listed device the
+ * SDL-type lock if it has one, else what was chosen for the listed device the
  * pad is (hid_pt_gamepad_panel_peer()), else what was chosen for the pad's own
  * id, else AUTO. @p input is the app's pad table, which the one-pad-per-device
  * pairing needs; NULL skips that check. */
