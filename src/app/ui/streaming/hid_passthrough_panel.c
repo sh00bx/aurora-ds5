@@ -1264,6 +1264,10 @@ static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
     refresh_selected_row_state(panel);
     update_state_line(panel);
     update_mode_row(panel);
+    /* The swatches follow the lit mode at once: the pad already shows the new
+     * mode's colour, and a swatch pressed now edits that mode -- the heading
+     * and ring must not name the old one until the refresh timer. */
+    update_lightbar_row(panel);
 }
 
 /* The row is the button now: OK on a device, or a click anywhere on it, is the
