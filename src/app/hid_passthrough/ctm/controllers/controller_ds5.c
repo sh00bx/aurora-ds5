@@ -129,10 +129,72 @@ static int ds5_patch_trigger_reduce(uint8_t *data, size_t len, unsigned int leve
     return 1;
 }
 
+/* BT 0x31 effects report, host framing: [0x31][seq<<4][0x10][47-byte common]
+ * [pad][crc32], 78 bytes. In common[]: valid_flag1 at 1 (0x04 = lightbar
+ * control), valid_flag2 at 38 (0x02 = lightbar setup control), lightbar_setup
+ * at 41 (0x02 = LIGHT_OUT, the release the firmware wants over BT before it
+ * takes a colour at all), RGB at 44..46 (Linux hid-playstation). */
+#define DS5_BT_OUT_LEN         78
+#define DS5_FLAG1_LIGHTBAR     0x04u
+#define DS5_FLAG2_LIGHTBAR_SET 0x02u
+#define DS5_LIGHTBAR_LIGHT_OUT 0x02u
+#define DS5_COMMON_FLAG1       1
+#define DS5_COMMON_FLAG2       38
+#define DS5_COMMON_LB_SETUP    41
+#define DS5_COMMON_RGB         44
+
+static bool ds5_is_host_0x31(const uint8_t *data, size_t len)
+{
+    return len == DS5_BT_OUT_LEN && data[0] == 0x31 && (data[1] & 0x0fu) == 0 && data[2] == 0x10;
+}
+
+/* The colour this pad's bar is to show: the user's, or -- while the game owns
+ * the bar and may -- the game's. False on Automatic, where nothing of ours is
+ * written at all. */
+static bool ds5_lightbar_colour(ctm_controller_t *c, const tv_bridge_worker_settings_t *s, uint32_t *rgb,
+                                bool *game)
+{
+    if (!s->lightbar_user) return false;
+    *game = s->lightbar_game && ctm_controller_game_lightbar(c, rgb);
+    if (!*game) *rgb = s->lightbar_rgb & 0xFFFFFFu;
+    return true;
+}
+
+/* The lightbar on a host 0x31, the DS4's rule (ds4_patch_lightbar) on the
+ * DS5's bytes: learn the ownership from the host's reports -- valid_flag1 0x04
+ * with a non-black colour is the game owning the bar, with black handing it
+ * back, a report without the flag changes nothing -- and then, unless the game
+ * owns the bar and may, put the lightbar flag and the user's colour into the
+ * report. The lightbar-setup release bytes (valid_flag2 0x02, lightbar_setup)
+ * stay exactly as the host sent them. Returns 1 if the report changed; the
+ * caller signs it. */
+static int ds5_patch_lightbar(ctm_controller_t *c, const tv_bridge_worker_settings_t *s, uint8_t *data,
+                              size_t len)
+{
+    if (!ds5_is_host_0x31(data, len)) return 0;
+    uint8_t *common = data + 3;
+    if (!ctm_controller_own_output(c) && (common[DS5_COMMON_FLAG1] & DS5_FLAG1_LIGHTBAR)) {
+        ctm_controller_note_game_lightbar(c, ((uint32_t) common[DS5_COMMON_RGB] << 16) |
+                                             ((uint32_t) common[DS5_COMMON_RGB + 1] << 8) |
+                                             common[DS5_COMMON_RGB + 2]);
+    }
+    uint32_t rgb = 0;
+    bool game = false;
+    if (!ds5_lightbar_colour(c, s, &rgb, &game) || game) return 0;
+    const uint8_t want[3] = {(uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb};
+    const uint8_t flag1 = (uint8_t) (common[DS5_COMMON_FLAG1] | DS5_FLAG1_LIGHTBAR);
+    if (common[DS5_COMMON_FLAG1] == flag1 && memcmp(&common[DS5_COMMON_RGB], want, 3) == 0) return 0;
+    common[DS5_COMMON_FLAG1] = flag1;
+    memcpy(&common[DS5_COMMON_RGB], want, 3);
+    return 1;
+}
+
 /* patch_output: rewrite a DS5 0x36/0x32 BT output report in place per the live
  * settings — audio route (0x9x), volume + audio-ctrl bits (0x90), latency
  * (0x91), haptics gain (0x92) — then re-CRC. AUTO touches only the latency
- * block. A 0x31 gets only the trigger power reduction (above). When: every outbound report, from the pump. Returns 0 (never drops). */
+ * block. A 0x31 gets only the lightbar colour chosen on the Controllers page
+ * and the trigger power reduction (above). When: every outbound report, from
+ * the pump. Returns 0 (never drops). */
 static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 {
     tv_bridge_worker_settings_t s;
@@ -140,10 +202,15 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     const tv_bridge_worker_settings_t *settings = &s;
 
     size_t len = len_io ? *len_io : 0;
-    /* 0x31 carries the adaptive-trigger effects; the only thing we touch there
-     * is the trigger power reduction. */
+    /* 0x31 carries the adaptive-trigger effects and the lightbar; the only
+     * things we touch there are the user's lightbar colour and the trigger
+     * power reduction. The latter signs what it changed; a report only the
+     * lightbar changed is signed here. */
     if (data && len > 0 && data[0] == 0x31) {
-        (void)ds5_patch_trigger_reduce(data, len, settings->ds5_trigger_reduce);
+        const int lightbar = ds5_patch_lightbar(c, settings, data, len);
+        if (!ds5_patch_trigger_reduce(data, len, settings->ds5_trigger_reduce) && lightbar) {
+            ctm_bt_sign_output(data, len);
+        }
         return 0;
     }
     /* 0x39 is the batched audio/haptic report (two Opus frames + two coil blocks,
@@ -326,6 +393,44 @@ static int ds5_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
     return 0;
 }
 
+/* build_settings_report: a 0x31 that paints the lightbar colour chosen on the
+ * Controllers page (or the game's, while it owns the bar and may), so the
+ * colour is on the pad from link-up on -- a quiet game sends no 0x31 for the
+ * patch above to stamp it into -- and a change on the page lands at once.
+ * Nothing else: valid_flag1 claims the lightbar alone, so the pad keeps its
+ * motors and triggers as the game last set them. The lightbar-setup release
+ * rides along, as on every paint of the daemon's idle painter: over BT the
+ * firmware ignores a colour until the bar has been released, and a fresh link
+ * re-latches that gate. Host framing and signature, so it passes through
+ * patch_output like any host report. Automatic: nothing (0).
+ * When: session thread, at link-up and after a settings change. */
+static size_t ds5_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
+{
+    /* The pad reads the sequence nibble; hid-playstation and the daemon's
+     * painter each count their own. Shared by every pad's session thread,
+     * hence atomic -- which number a push gets does not matter. */
+    static unsigned seq;
+    if (!buf || cap < DS5_BT_OUT_LEN) return 0;
+    tv_bridge_worker_settings_t s;
+    ctm_controller_get_settings(c, &s);
+    uint32_t rgb = 0;
+    bool game = false;
+    if (!ds5_lightbar_colour(c, &s, &rgb, &game)) return 0;
+    memset(buf, 0, DS5_BT_OUT_LEN);
+    buf[0] = 0x31;
+    buf[1] = (uint8_t) ((__atomic_fetch_add(&seq, 1u, __ATOMIC_RELAXED) & 0x0fu) << 4);
+    buf[2] = 0x10;
+    uint8_t *common = buf + 3;
+    common[DS5_COMMON_FLAG1] = DS5_FLAG1_LIGHTBAR;
+    common[DS5_COMMON_FLAG2] = DS5_FLAG2_LIGHTBAR_SET;
+    common[DS5_COMMON_LB_SETUP] = DS5_LIGHTBAR_LIGHT_OUT;
+    common[DS5_COMMON_RGB] = (uint8_t) (rgb >> 16);
+    common[DS5_COMMON_RGB + 1] = (uint8_t) (rgb >> 8);
+    common[DS5_COMMON_RGB + 2] = (uint8_t) rgb;
+    ctm_bt_sign_output(buf, DS5_BT_OUT_LEN);
+    return DS5_BT_OUT_LEN;
+}
+
 static int ds5_on_plug_init(ctm_controller_t *c, ctm_transport_t *t)
 {
     (void)t;
@@ -478,6 +583,7 @@ const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .on_plug_init = ds5_on_plug_init,
     .patch_output = ds5_patch_output,
     .set_settings = NULL,   /* live values read via get_settings in patch_output */
+    .build_settings_report = ds5_build_settings_report,
     .on_input_report = ds5_on_input_report,
     .input_carries_state = ds5_input_carries_state,
     .neutralize_input = ds5_neutralize_input,

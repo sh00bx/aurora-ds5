@@ -24,6 +24,69 @@
  * — see ds4_patch_output. */
 #define DS4_POLL_INTERVAL_MS 0x04u
 
+/* BT 0x11 effects report, the bytes the lightbar lives in (the full layout is
+ * spelled out above DS4_BT_OUTPUT_LEN): [3] valid flags, [8..10] RGB, [11..12]
+ * flash on/off time. */
+#define DS4_FLAG_LIGHTBAR 0x02u
+#define DS4_FLAG_FLASH    0x04u
+#define DS4_OUT_RGB       8
+
+/* The colour this pad's bar is to show for a report the game has not painted:
+ * the user's, or -- while the game owns the bar and may -- the game's. False on
+ * Automatic, where nothing of ours is written at all. */
+static bool ds4_lightbar_colour(ctm_controller_t *c, const tv_bridge_worker_settings_t *s, uint32_t *rgb,
+                                bool *game)
+{
+    if (!s->lightbar_user) return false;
+    *game = s->lightbar_game && ctm_controller_game_lightbar(c, rgb);
+    if (!*game) *rgb = s->lightbar_rgb & 0xFFFFFFu;
+    return true;
+}
+
+/* Stamp @p rgb as the bar's colour into a 0x11 at @p data, and with
+ * @p no_flash drop a flash, so a game's blink cannot take the bar either.
+ * Returns 1 if a byte changed. */
+static int ds4_stamp_lightbar(uint8_t *data, uint32_t rgb, bool no_flash)
+{
+    uint8_t want[5] = {(uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb, 0, 0};
+    uint8_t flags = (uint8_t) (data[3] | DS4_FLAG_LIGHTBAR);
+    size_t n = 3;
+    if (no_flash) {
+        flags = (uint8_t) (flags & ~DS4_FLAG_FLASH);
+        n = 5;
+    }
+    if (data[3] == flags && memcmp(&data[DS4_OUT_RGB], want, n) == 0) return 0;
+    data[3] = flags;
+    memcpy(&data[DS4_OUT_RGB], want, n);
+    return 1;
+}
+
+/* The lightbar on a host 0x11 (len >= 30, checked by the caller).
+ *
+ * First the ownership rule, learnt from what the host sends -- never from a
+ * report of ours (ctm_controller_own_output()): the LED flag with a non-black
+ * colour is the game painting, and owning, the bar; with black it hands the
+ * bar back. A report without the flag changes nothing: a game's rumble-only
+ * write must not end its colour. The host paints no colour of its own (its
+ * synthetic lightbar is off from 1.7.30), so a coloured flag IS the game.
+ *
+ * Then the user's choice (Automatic: nothing). While the game owns the bar
+ * and may, the report goes as the game sent it. Otherwise the LED flag and
+ * the user's colour go into every 0x11 -- a rumble-only one too, so the next
+ * report can never leave the pad on another colour -- and a colour the game
+ * may not change also loses its flash. */
+static int ds4_patch_lightbar(ctm_controller_t *c, const tv_bridge_worker_settings_t *s, uint8_t *data)
+{
+    if (!ctm_controller_own_output(c) && (data[3] & DS4_FLAG_LIGHTBAR)) {
+        ctm_controller_note_game_lightbar(c, ((uint32_t) data[DS4_OUT_RGB] << 16) |
+                                             ((uint32_t) data[DS4_OUT_RGB + 1] << 8) | data[DS4_OUT_RGB + 2]);
+    }
+    uint32_t rgb = 0;
+    bool game = false;
+    if (!ds4_lightbar_colour(c, s, &rgb, &game) || game) return 0;
+    return ds4_stamp_lightbar(data, rgb, !s->lightbar_game);
+}
+
 /* matches: claim the DualShock 4 (either PID) over BT. When: classification. */
 static bool ds4_matches(const ctm_controller_dev_t *dev)
 {
@@ -77,6 +140,8 @@ static uint8_t ds4_volume_raw_byte(unsigned int value)
  *   default). BT[3] high bits 0x10/0x20/0x80 are the volume-valid flags —
  *   without them the pad ignores bytes 21/22/24; the low nibble
  *   (rumble/LED/flash valid) stays the game's. Rumble/LED bytes untouched.
+ * - 0x11 lightbar: the colour chosen on the Controllers page, unless the game
+ *   owns the bar and may (ds4_patch_lightbar). Automatic: untouched.
  * - 0x11/0x14/0x17: byte 1 carries the pad's input poll interval in its low
  *   six bits (ms, hid-playstation DS4_OUTPUT_HWCTL_BT_POLL_MASK) under the
  *   HID/CRC bits 0x80/0x40. A host before 2026-09-26 sends 0xC0/0x40, i.e.
@@ -140,6 +205,9 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
             data[24] = speaker_volume;
             patched = 1;
         }
+        if (ds4_patch_lightbar(c, settings, data)) {
+            patched = 1;
+        }
     }
 
     if (patched) ctm_bt_sign_output(data, len);
@@ -154,7 +222,6 @@ static int ds4_patch_output(ctm_controller_t *c, uint8_t *data, size_t *len_io)
 #define DS4_BT_OUTPUT_LEN 78
 #define DS4_OUT_STATE     6   /* motors, RGB, flash: [6..12] */
 #define DS4_OUT_STATE_LEN 7
-#define DS4_OUT_RGB       8
 /* BT 0x17 pure-audio report: [0x17][hwctl][0xa0][frame ctr LE16][route]
  * [436 B SBC][pad][crc32]; the counter advances by 4 (SBC frames) per report. */
 #define DS4_0X17_LEN      462
@@ -190,6 +257,11 @@ static void ds4_stamp_volumes(uint8_t *buf, const tv_bridge_worker_settings_t *s
  * Without one, the old form: low nibble 0, zeroed bytes behind it.
  * Volume bytes, poll bits and CRC exactly as ds4_patch_output writes them, so
  * the patch finds nothing to change.
+ * With a lightbar colour chosen on the Controllers page, the push carries it
+ * too -- or the game's, while the game owns the bar and may: the link-up push
+ * is what paints the bar when no game colour is known, and a change on the
+ * page reaches the pad through this push at once instead of waiting for the
+ * host's next 0x11.
  * When: session thread, at link-up and after a settings change; the pump sends
  * nothing when the result equals the last report it delivered. */
 static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_t cap)
@@ -205,6 +277,11 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     if (last_len == DS4_BT_OUTPUT_LEN) {
         buf[3] = (uint8_t) (last[3] & 0x0fu);
         memcpy(&buf[DS4_OUT_STATE], &last[DS4_OUT_STATE], DS4_OUT_STATE_LEN);
+    }
+    uint32_t rgb = 0;
+    bool game = false;
+    if (ds4_lightbar_colour(c, &s, &rgb, &game)) {
+        ds4_stamp_lightbar(buf, rgb, !s.lightbar_game);
     }
     ds4_stamp_volumes(buf, &s);
     ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);

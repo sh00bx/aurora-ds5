@@ -53,6 +53,18 @@ static bool item_is_flydigi(const logical_device_t *item)
            contains_ci(item->name, "apex");
 }
 
+/* The lightbar colour stored under the device's own id, into @p settings. Read
+ * when the record is made and again whenever its id changes -- the same
+ * enumeration race record_refresh_auto_plugin() describes: a pad whose MAC is
+ * not readable yet would otherwise keep Automatic for the whole connection. */
+static void record_read_lightbar(tv_bridge_worker_settings_t *settings, const logical_device_t *item)
+{
+    const lightbar_pref_t lb = hid_pt_prefs_lightbar_for_logical(item);
+    settings->lightbar_user = !lb.automatic;
+    settings->lightbar_rgb = lb.rgb;
+    settings->lightbar_game = lb.game;
+}
+
 tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *item)
 {
     tv_bridge_worker_settings_t settings;
@@ -95,8 +107,10 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     if (pad && (pad->flags & CTM_PAD_NO_HAPTICS)) {
         settings.haptics_gain_centi = 0;
     }
+    settings.lightbar_game = true;
     if (item) {
         settings.auto_plugin = hid_pt_prefs_auto_plugin_for_logical(item);
+        record_read_lightbar(&settings, item);
     }
     return settings;
 }
@@ -140,6 +154,9 @@ static void record_refresh_auto_plugin(ui_device_settings_t *record, const logic
     if (strcmp(id, record->pref_id) == 0) {
         return;
     }
+    /* The lightbar is the page's to write under either id, so the new one's
+     * value is simply read; only the auto-plug flag below needs migrating. */
+    record_read_lightbar(&record->settings, item);
     /* Only ever true between the user's toggle and this, the next identity
      * change, whichever way the migration below then goes. */
     bool migrate = record->pref_provisional && record->pref_id[0] != '\0';

@@ -253,6 +253,14 @@ struct ctm_controller {
      * SETTINGS_PUSH_RETRIES times per change. Session thread only. */
     uint64_t settings_retry_us;
     int settings_retries;
+    /* The lightbar ownership rule, learnt from the host's reports: the game
+     * painted lb_game_rgb (non-black) and has not handed the bar back by
+     * painting black. own_output is raised while this thread writes a report
+     * it built itself (settings push, quiesce), so those never count as the
+     * game's. Session thread only; cleared per session. */
+    bool lb_game_owned;
+    uint32_t lb_game_rgb;
+    int own_output;
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
     int evdev_grab_count;
@@ -1487,6 +1495,10 @@ static void session_state_reset(ctm_controller_t *c)
     c->settings_retry_us = 0;
     c->settings_retries = 0;
     if (c->ops && c->ops->build_settings_report) c->settings_push = 1;
+    /* A new link: the game has painted nothing on it yet. */
+    c->lb_game_owned = false;
+    c->lb_game_rgb = 0;
+    c->own_output = 0;
 }
 
 /* --- the pump's periodic work -----------------------------------------------
@@ -1919,7 +1931,9 @@ static uint64_t tick_settings_push(ctm_pump_t *p)
     size_t n = c->ops->build_settings_report(c, rep, sizeof(rep));
     if (n == 0 || n > sizeof(rep)) return 0;
     if (n == c->settings_last_len && memcmp(rep, c->settings_last, n) == 0) return 0;
+    c->own_output = 1;
     int rc = ctm_hid_io_write(c->io, rep, n);
+    c->own_output = 0;
     if (rc == 0) {
         memcpy(c->settings_last, rep, n);
         c->settings_last_len = n;
@@ -1954,7 +1968,9 @@ static void session_quiesce(ctm_controller_t *c)
     for (int i = 0; i < n; ++i) {
         if (len[i] == 0 || off + len[i] > sizeof(buf) ||
             ctm_now_us() - t0 > QUIESCE_BUDGET_US) break;
+        c->own_output = 1;
         if (ctm_hid_io_write(c->io, buf + off, len[i]) == 0) written++;
+        c->own_output = 0;
         tried++;
         off += len[i];
     }
@@ -2634,6 +2650,25 @@ void ctm_controller_get_status(ctm_controller_t *c, ctm_controller_status_t *out
     out->battery_level  = __atomic_load_n(&c->battery_level,  __ATOMIC_ACQUIRE);
     out->battery_status = __atomic_load_n(&c->battery_status, __ATOMIC_ACQUIRE);
     out->battery_valid  = (upd != 0 && (now - upd) < 5000000ull);
+}
+
+void ctm_controller_note_game_lightbar(ctm_controller_t *c, uint32_t rgb)
+{
+    if (!c) return;
+    c->lb_game_owned = rgb != 0;
+    if (rgb != 0) c->lb_game_rgb = rgb;
+}
+
+bool ctm_controller_game_lightbar(ctm_controller_t *c, uint32_t *rgb)
+{
+    if (!c || !c->lb_game_owned) return false;
+    if (rgb) *rgb = c->lb_game_rgb;
+    return true;
+}
+
+bool ctm_controller_own_output(ctm_controller_t *c)
+{
+    return c && c->own_output;
 }
 
 size_t ctm_controller_last_output(ctm_controller_t *c, uint8_t report_id,
