@@ -652,6 +652,86 @@ bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_ty
     return stored;
 }
 
+/* ---- the game's fixed mode ---------------------------------------------- */
+
+bool hid_pt_model_app_name(const hid_pt_model_t *model, char *buf, size_t len)
+{
+    return model && model->session && hid_pt_prefs_current_app_name(buf, len);
+}
+
+gamepad_mode_t hid_pt_model_app_mode(const hid_pt_model_t *model)
+{
+    return hid_pt_model_app_name(model, NULL, 0) ? hid_pt_prefs_current_app_mode() : GAMEPAD_MODE_NONE;
+}
+
+/* Mount or unmount every listed controller whose effective mode now says
+ * otherwise. Nothing but the page's own plug toggle, so a lock moves a pad
+ * exactly as its row's OK would; the reconcile then keeps it there, since it
+ * reads the same effective mode. */
+static void apply_effective_mounts(hid_pt_model_t *model)
+{
+    if (!model_lists_devices(model)) {
+        return;
+    }
+    char keys[MAX_DEVICES][HID_PT_PANEL_KEY_LEN];
+    int count = 0;
+    for (int i = 0; i < g_devices.count && count < MAX_DEVICES; ++i) {
+        logical_device_t *item = &g_devices.items[i];
+        const tv_bridge_worker_settings_t *settings = settings_for_item(item);
+        if (!item_is_bridgeable(item) || !settings ||
+            hid_pt_prefs_effective_hid(settings->auto_plugin) == item->plugged) {
+            continue;
+        }
+        /* Keys, not pointers: a plug-out can reap the session behind one. */
+        snprintf(keys[count++], sizeof(keys[0]), "%s", item->key);
+    }
+    char selected[HID_PT_PANEL_KEY_LEN];
+    snprintf(selected, sizeof(selected), "%s", model->selected_key);
+    for (int i = 0; i < count; ++i) {
+        hid_pt_model_toggle_plug(model, keys[i], model->session, NULL);
+    }
+    /* The toggle selects what it plugged; the page stays on its controller. */
+    hid_pt_model_set_selected_key(model, selected);
+}
+
+bool hid_pt_model_set_app_mode(hid_pt_model_t *model, gamepad_mode_t mode)
+{
+    char name[128];
+    if (!hid_pt_model_app_name(model, name, sizeof(name))) {
+        return false;
+    }
+    stream_input_t *input = session_get_input(model->session);
+    app_input_t *app_input = model_app_input(model);
+    short pad_count = app_input ? app_input_get_max_gamepads(app_input) : 0;
+    if (pad_count > HID_PT_MAX_PADS) {
+        pad_count = HID_PT_MAX_PADS;
+    }
+    /* Which pads the host has over SDL now, and as what: only those can need a
+     * re-announce. A pad the plug-out below hands back to SDL is announced by
+     * its slot restore with the new type already. */
+    gamepad_type_pref_t before[HID_PT_MAX_PADS];
+    bool on_sdl[HID_PT_MAX_PADS];
+    for (short i = 0; i < pad_count; ++i) {
+        const app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
+        const bool live = gp && gp->controller && gp->gs_id >= 0;
+        before[i] = live ? hid_pt_gamepad_sdl_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
+        on_sdl[i] = live && input && !hid_pt_gamepad_is_moonlight_excluded(input, gp) &&
+                    (input->announcedGamepadMask & (1u << (unsigned) gp->gs_id)) != 0;
+    }
+    if (!hid_pt_prefs_set_current_app_mode(mode)) {
+        ctm_set_plug_error("Controller mode for %s could not be saved", name);
+        return false;
+    }
+    apply_effective_mounts(model);
+    for (short i = 0; input && i < pad_count; ++i) {
+        app_gamepad_state_t *gp = app_input_gamepad_state_by_index(app_input, i);
+        if (on_sdl[i] && gp && gp->controller && hid_pt_gamepad_sdl_type(app_input, gp) != before[i]) {
+            stream_input_reannounce_gamepad(input, gp);
+        }
+    }
+    return true;
+}
+
 bool hid_pt_model_reset_selected(const hid_pt_model_t *model)
 {
     const logical_device_t *item = selected_item(model);

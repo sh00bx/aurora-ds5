@@ -17,9 +17,10 @@
 
 #define HID_PT_MAX_ROWS 64
 
-/* Buttons the mode row can hold: HID, and one per controller type the host can
- * emulate over SDL. The panel supplies them (hid_pt_view_add_mode()). */
-#define HID_PT_MAX_MODES 4
+/* Buttons the mode row can hold: HID, one per controller type the host can
+ * emulate over SDL, and the game lock. The panel supplies them
+ * (hid_pt_view_add_mode()). */
+#define HID_PT_MAX_MODES 5
 
 #define DS_LATENCY_MIN 0
 #define DS_LATENCY_MAX 200
@@ -120,6 +121,8 @@ typedef struct {
     lv_obj_t *mode_row;
     lv_obj_t *mode_btns[HID_PT_MAX_MODES];
     int mode_count;
+    /* One line under the mode row: which game fixes the mode. */
+    lv_obj_t *mode_caption;
     lv_obj_t *composite_row;
     lv_obj_t *composite_cb;
     lv_obj_t *customize_panel;
@@ -290,11 +293,15 @@ bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir);
 lv_obj_t *hid_pt_view_add_mode(hid_pt_view_t *view, const char *glyph, const char *label, bool live);
 
 /**
- * Show the mode row (with its heading) or hide it, light button @p lit (-1:
- * none) and enable exactly the buttons whose bit is set in @p enabled. A
- * disabled button is dimmed, takes no click, and the cursor passes it by.
+ * Show the mode row (with its heading) or hide it, and per button (bit i =
+ * button i): light the ones in @p lit, enable the ones in @p enabled, show the
+ * ones in @p visible. A disabled button is dimmed, takes no click, and the
+ * cursor passes it by; a hidden one gives its width to the others.
  */
-void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, int lit, unsigned enabled);
+void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, unsigned lit, unsigned enabled, unsigned visible);
+
+/** The line under the mode row, or hide it with NULL. Rewritten on change only. */
+void hid_pt_view_set_mode_caption(hid_pt_view_t *view, const char *text);
 
 /** The mode button @p obj is, or -1. */
 int hid_pt_view_mode_of(const hid_pt_view_t *view, lv_obj_t *obj);

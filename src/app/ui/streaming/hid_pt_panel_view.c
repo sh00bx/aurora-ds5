@@ -784,17 +784,29 @@ lv_obj_t *hid_pt_view_add_mode(hid_pt_view_t *view, const char *glyph, const cha
     return btn;
 }
 
-void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, int lit, unsigned enabled)
+void hid_pt_view_set_modes(hid_pt_view_t *view, bool show, unsigned lit, unsigned enabled, unsigned visible)
 {
     if (!view || !view->mode_row) {
         return;
     }
     for (int i = 0; i < view->mode_count; ++i) {
-        set_obj_state(view->mode_btns[i], LV_STATE_CHECKED, i == lit);
+        set_obj_state(view->mode_btns[i], LV_STATE_CHECKED, (lit & (1u << i)) != 0);
         set_obj_state(view->mode_btns[i], LV_STATE_DISABLED, (enabled & (1u << i)) == 0);
+        show_obj(view->mode_btns[i], (visible & (1u << i)) != 0);
     }
     show_obj(view->mode_heading, show);
     show_obj(view->mode_row, show);
+}
+
+void hid_pt_view_set_mode_caption(hid_pt_view_t *view, const char *text)
+{
+    if (!view || !view->mode_caption) {
+        return;
+    }
+    if (text && strcmp(lv_label_get_text(view->mode_caption), text) != 0) {
+        lv_label_set_text(view->mode_caption, text);
+    }
+    show_obj(view->mode_caption, text != NULL);
 }
 
 int hid_pt_view_mode_of(const hid_pt_view_t *view, lv_obj_t *obj)
@@ -1375,6 +1387,12 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
      * layout and scroll extent read the row's own box, not the bloom. */
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_add_flag(view->mode_row, LV_OBJ_FLAG_HIDDEN);
+    /* One line, cut with an ellipsis: a game's name is as long as the host
+     * says, and a second line would cost the column its height. */
+    view->mode_caption = caption(right_pane);
+    lv_label_set_long_mode(view->mode_caption, LV_LABEL_LONG_DOT);
+    lv_obj_set_height(view->mode_caption,
+                      lv_font_get_line_height(lv_obj_get_style_text_font(view->mode_caption, LV_PART_MAIN)));
 
     view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
                                      HID_PT_CTL_COMPOSITE, &view->composite_cb);

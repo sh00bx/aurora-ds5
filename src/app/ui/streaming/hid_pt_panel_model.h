@@ -203,6 +203,31 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
  */
 bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type);
 
+/* ---- the game's fixed mode ---------------------------------------------- */
+
+/**
+ * The game this session streams, for the lock's caption. False without a
+ * session or with a name there is nothing to key a lock by -- the page offers
+ * no lock then.
+ */
+bool hid_pt_model_app_name(const hid_pt_model_t *model, char *buf, size_t len);
+
+/** The current game's fixed mode; GAMEPAD_MODE_NONE when it has none. */
+gamepad_mode_t hid_pt_model_app_mode(const hid_pt_model_t *model);
+
+/**
+ * Fix the current game's mode to @p mode, or remove the lock with
+ * GAMEPAD_MODE_NONE, and bring every controller of the session to its new
+ * effective mode at once -- the lock's, or without one each controller's own:
+ * mounted or unmounted through the plain plug toggle, re-announced where its
+ * SDL type moved, and left alone where nothing changes. A mount that fails
+ * leaves its reason in the plug error and the others still go ahead.
+ *
+ * False when the lock could not be stored (no game, full table); the reason is
+ * then in the plug error, and no controller was touched. The selection is kept.
+ */
+bool hid_pt_model_set_app_mode(hid_pt_model_t *model, gamepad_mode_t mode);
+
 /**
  * Overwrite the selection's settings with the per-device defaults, without
  * publishing them. The caller re-reads them into its widgets and then calls

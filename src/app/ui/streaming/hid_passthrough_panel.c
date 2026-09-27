@@ -47,23 +47,35 @@
  * type the host can emulate for a pad over SDL. Vibepollo has virtual drivers
  * for exactly two, Xbox 360 and DualShock 4; a type it learns later (a Switch
  * Pro pad, once there is a driver for it) is one more line here -- and one
- * more gamepad_type_pref_t, which the arrival already maps to its LI_CTYPE.
+ * more gamepad_type_pref_t and gamepad_mode_t, which the arrival already maps
+ * to its LI_CTYPE. Last, GAME: not a mode but the lock that fixes the mode for
+ * the game being streamed (GAMEPAD_MODE_NONE marks it).
  *
  * The labels are also what a row's state line and the overlay's pad badge say.
  */
 static const struct {
     const char *glyph;
     const char *label;
-    /* The HID passthrough button; @c type is unused on it. */
-    bool hid;
-    gamepad_type_pref_t type;
+    gamepad_mode_t mode;
 } MODES[] = {
-        {MAT_SYMBOL_USB,        "HID",  true,  GAMEPAD_TYPE_PREF_AUTO},
-        {FA_SYMBOL_XBOX,        "X360", false, GAMEPAD_TYPE_PREF_XBOX},
-        {FA_SYMBOL_PLAYSTATION, "DS4",  false, GAMEPAD_TYPE_PREF_PLAYSTATION},
+        {MAT_SYMBOL_USB,        "HID",  GAMEPAD_MODE_HID},
+        {FA_SYMBOL_XBOX,        "X360", GAMEPAD_MODE_X360},
+        {FA_SYMBOL_PLAYSTATION, "DS4",  GAMEPAD_MODE_DS4},
+        {MAT_SYMBOL_LOCK,       "GAME", GAMEPAD_MODE_NONE},
 };
 
 #define MODE_COUNT ((int) (sizeof(MODES) / sizeof(MODES[0])))
+
+/* The lock button, as opposed to a mode. */
+static bool mode_is_lock(int i)
+{
+    return MODES[i].mode == GAMEPAD_MODE_NONE;
+}
+
+static bool mode_is_hid(int i)
+{
+    return MODES[i].mode == GAMEPAD_MODE_HID;
+}
 
 _Static_assert(sizeof(MODES) / sizeof(MODES[0]) <= HID_PT_MAX_MODES, "the view holds HID_PT_MAX_MODES buttons");
 
@@ -124,6 +136,7 @@ static void panel_select_device(hid_pt_panel_t *panel, int row);
 static void panel_focus_selected_row(hid_pt_panel_t *panel);
 static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused);
 static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj);
+static void refresh_devices(hid_pt_panel_t *panel, bool rescan);
 
 static void panel_request_close(hid_pt_panel_t *panel) {
     (void) panel;
@@ -476,7 +489,11 @@ static void update_audio_warning(hid_pt_panel_t *panel, const hid_pt_controls_t 
 static int lit_mode(const hid_pt_row_info_t *info)
 {
     for (int i = 0; i < MODE_COUNT && info->is_gamepad; ++i) {
-        if (MODES[i].hid ? info->plugged : (!info->plugged && MODES[i].type == info->effective_type)) {
+        if (mode_is_lock(i)) {
+            continue;
+        }
+        if (mode_is_hid(i) ? info->plugged
+                           : (!info->plugged && gamepad_mode_sdl_type(MODES[i].mode) == info->effective_type)) {
             return i;
         }
     }
@@ -726,7 +743,9 @@ static void update_composite_row(hid_pt_panel_t *panel) {
 /**
  * The MODE row: shown for a controller, the button of its current mode lit.
  * HID can be pressed only for a device the bridge can mount; an SDL-only pad,
- * or a device CTM classifies as plain HID, has nothing to mount.
+ * or a device CTM classifies as plain HID, has nothing to mount. GAME is there
+ * only while a game with a usable name is streamed, lit while it has a lock,
+ * and then the line under the row names it.
  */
 static void update_mode_row(hid_pt_panel_t *panel)
 {
@@ -736,14 +755,27 @@ static void update_mode_row(hid_pt_panel_t *panel)
     hid_pt_row_info_t info;
     const bool show = hid_pt_model_selected_row_info(&panel->model, &info) && info.is_gamepad;
     const bool bridgeable = show && hid_pt_model_selected_is_bridgeable(&panel->model);
+    char game[128];
+    const bool has_game = hid_pt_model_app_name(&panel->model, game, sizeof(game));
+    const bool locked = has_game && hid_pt_model_app_mode(&panel->model) != GAMEPAD_MODE_NONE;
+    const int lit_index = show ? lit_mode(&info) : -1;
+    unsigned lit = 0;
     unsigned enabled = 0;
+    unsigned visible = 0;
     for (int i = 0; i < MODE_COUNT; ++i) {
-        if (!MODES[i].hid || bridgeable) {
-            enabled |= 1u << i;
-        }
+        const bool on = mode_is_lock(i) ? has_game : (!mode_is_hid(i) || bridgeable);
+        const bool shown = !mode_is_lock(i) || has_game;
+        lit |= (mode_is_lock(i) ? locked : i == lit_index) ? 1u << i : 0u;
+        enabled |= on ? 1u << i : 0u;
+        visible |= shown ? 1u << i : 0u;
     }
     lv_obj_t *focused = panel->view.group ? lv_group_get_focused(panel->view.group) : NULL;
-    hid_pt_view_set_modes(&panel->view, show, show ? lit_mode(&info) : -1, enabled);
+    hid_pt_view_set_modes(&panel->view, show, lit, enabled, visible);
+    char caption[160];
+    if (show && locked) {
+        snprintf(caption, sizeof(caption), locstr("Locked for %s"), game);
+    }
+    hid_pt_view_set_mode_caption(&panel->view, show && locked ? caption : NULL);
     /* The cursor must never stay on a button this just disabled or hid: LVGL
      * hands a disabled focused object no key at all -- no arrow, no OK, not even
      * BACK -- so the page would be stuck on it. The row's entry (the lit button,
@@ -800,11 +832,35 @@ static void panel_toggle_plug(hid_pt_panel_t *panel, int row)
 static int mode_index(bool hid, gamepad_type_pref_t type)
 {
     for (int i = 0; i < MODE_COUNT; ++i) {
-        if (MODES[i].hid ? hid : (!hid && MODES[i].type == type)) {
+        if (!mode_is_lock(i) && (mode_is_hid(i) ? hid : (!hid && gamepad_mode_sdl_type(MODES[i].mode) == type))) {
             return i;
         }
     }
     return -1;
+}
+
+/**
+ * GAME: fix the streamed game's mode, or free it again.
+ *
+ * On, the lock takes the selected controller's mode as it runs now -- mounted
+ * is HID, else the pad the host builds for it -- so nothing moves for it; any
+ * other controller of the session in a different mode is brought to it at
+ * once, as the lock is the mode of every controller in that game. Off, every
+ * controller goes back to its own remembered mode, again at once and only
+ * where that differs (hid_pt_model_set_app_mode()).
+ */
+static void panel_toggle_lock(hid_pt_panel_t *panel, const hid_pt_row_info_t *info)
+{
+    gamepad_mode_t mode = GAMEPAD_MODE_NONE;
+    if (hid_pt_model_app_mode(&panel->model) == GAMEPAD_MODE_NONE) {
+        mode = info->plugged ? GAMEPAD_MODE_HID
+                             : info->effective_type == GAMEPAD_TYPE_PREF_XBOX ? GAMEPAD_MODE_X360 : GAMEPAD_MODE_DS4;
+    }
+    if (!hid_pt_model_set_app_mode(&panel->model, mode)) {
+        panel_update_status(panel);
+    }
+    /* Any controller may have moved, not just this one. */
+    refresh_devices(panel, false);
 }
 
 /**
@@ -821,6 +877,9 @@ static int mode_index(bool hid, gamepad_type_pref_t type)
  *   there and says so, leaving the controller where it is.
  * - The lit button: stored and nothing else, no plug and no re-announce -- it
  *   makes what is lit the mode the controller keeps.
+ * While the streamed game is locked, a button changes the lock instead -- the
+ * game's mode, for every controller in it -- and no controller's own mode is
+ * touched. GAME itself switches the lock (panel_toggle_lock()).
  */
 static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
 {
@@ -829,7 +888,25 @@ static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
         !hid_pt_model_selected_row_info(&panel->model, &info) || !info.is_gamepad) {
         return;
     }
-    if (MODES[mode].hid) {
+    if (mode_is_lock(mode)) {
+        panel_toggle_lock(panel, &info);
+        return;
+    }
+    const gamepad_mode_t lock = hid_pt_model_app_mode(&panel->model);
+    if (lock != GAMEPAD_MODE_NONE) {
+        /* While the game is locked a button changes the GAME's mode, for every
+         * controller in it; each controller's own mode stays as it was for
+         * when the lock goes. */
+        if (MODES[mode].mode != lock && (!mode_is_hid(mode) || hid_pt_model_selected_is_bridgeable(&panel->model))) {
+            if (!hid_pt_model_set_app_mode(&panel->model, MODES[mode].mode)) {
+                panel_update_status(panel);
+            }
+            refresh_devices(panel, false);
+        }
+        return;
+    }
+    const gamepad_type_pref_t type = gamepad_mode_sdl_type(MODES[mode].mode);
+    if (mode_is_hid(mode)) {
         if (!hid_pt_model_selected_is_bridgeable(&panel->model)) {
             return;
         }
@@ -838,10 +915,10 @@ static void panel_choose_mode(hid_pt_panel_t *panel, int mode)
         }
         /* After the plug: a plug-in clears the error line, and a refused
          * write here has to stay on it. */
-        if (!hid_pt_model_persist_mode(&panel->model, true, MODES[mode].type)) {
+        if (!hid_pt_model_persist_mode(&panel->model, true, type)) {
             panel_update_status(panel);
         }
-    } else if (!hid_pt_model_persist_mode(&panel->model, false, MODES[mode].type)) {
+    } else if (!hid_pt_model_persist_mode(&panel->model, false, type)) {
         panel_update_status(panel);
     } else if (info.plugged) {
         panel_toggle_plug(panel, panel->selected_index);
@@ -928,8 +1005,6 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
     }
     customize_setting_changed(panel);
 }
-
-static void refresh_devices(hid_pt_panel_t *panel, bool rescan);
 
 static void panel_clicked(void *userdata, hid_pt_ctl_t id)
 {
@@ -1184,7 +1259,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     }
     lv_obj_set_user_data(cont, panel);
     for (int i = 0; i < MODE_COUNT; ++i) {
-        hid_pt_view_add_mode(&panel->view, MODES[i].glyph, locstr(MODES[i].label), MODES[i].hid);
+        hid_pt_view_add_mode(&panel->view, MODES[i].glyph, locstr(MODES[i].label), mode_is_hid(i));
     }
     hid_pt_view_rebuild_focus_order(&panel->view);
     panel->refresh_timer = lv_timer_create(refresh_timer_cb, 2000, panel);
