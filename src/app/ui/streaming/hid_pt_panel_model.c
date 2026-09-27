@@ -7,6 +7,7 @@
 #include "hid_passthrough/hid_passthrough_manager.h"
 #include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
+#include "hid_passthrough/hid_pt_lightbar.h"
 #include "input/input_gamepad.h"
 #include "stream/session.h"
 #include "stream/input/session_input.h"
@@ -446,6 +447,34 @@ bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model)
     return selected_row(model, &ref) && !ref.item;
 }
 
+bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model)
+{
+    row_ref_t ref;
+    if (!selected_row(model, &ref)) {
+        return false;
+    }
+    const char *kind = ref.item ? bridge_kind_for_item(ref.item) : NULL;
+    if (kind && (strcmp(kind, "ds5") == 0 || strcmp(kind, "ds4") == 0)) {
+        return true;
+    }
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    return ref.pad && SDL_GameControllerHasLED(ref.pad->controller);
+#else
+    return false;
+#endif
+}
+
+bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out)
+{
+    row_ref_t ref;
+    if (!out || !selected_row(model, &ref)) {
+        return false;
+    }
+    *out = ref.pad ? hid_pt_gamepad_lightbar(model_app_input(model), ref.pad)
+                   : ref.item ? hid_pt_prefs_lightbar_for_logical(ref.item) : lightbar_pref_automatic();
+    return true;
+}
+
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model)
 {
     const logical_device_t *item = selected_item(model);
@@ -518,6 +547,33 @@ bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on)
     return true;
 }
 
+/* The ids a controller's own choices are written under, in the order
+ * hid_pt_gamepad_sdl_type() and hid_pt_gamepad_lightbar() read them: the
+ * listed device's (for an SDL-only row, the device its pad pairs with), then
+ * the pad's own -- except a synthetic per-model id next to a device, which is
+ * shared by every serial-less pad of that model, and one equal to the
+ * device's. Either may come back empty. */
+static const logical_device_t *choice_ids(const hid_pt_model_t *model, const row_ref_t *ref,
+                                          char device_id[HID_PT_STABLE_ID_LEN], char pad_id[HID_PT_STABLE_ID_LEN])
+{
+    const logical_device_t *device = ref->item;
+    if (!device && ref->pad) {
+        device = hid_pt_gamepad_panel_peer(model_app_input(model), ref->pad);
+    }
+    device_id[0] = '\0';
+    pad_id[0] = '\0';
+    if (device) {
+        hid_pt_stable_id_for_logical(device, device_id, HID_PT_STABLE_ID_LEN);
+    }
+    if (ref->pad) {
+        hid_pt_stable_id_for_gamepad(ref->pad, pad_id, HID_PT_STABLE_ID_LEN);
+        if ((device && hid_pt_stable_id_is_synthetic(pad_id)) || strcmp(pad_id, device_id) == 0) {
+            pad_id[0] = '\0';
+        }
+    }
+    return device;
+}
+
 static const char *sdl_type_log_name(gamepad_type_pref_t type)
 {
     switch (type) {
@@ -554,34 +610,17 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
         before[i] = (gp && gp->controller) ? hid_pt_gamepad_sdl_type(app_input, gp) : GAMEPAD_TYPE_PREF_AUTO;
     }
 
-    /* The ids hid_pt_gamepad_sdl_type() reads, in its order. The listed device
-     * first, "Automatic" kept as a choice of its own: that id is read before
-     * the pad's, and while the controller is mounted it is the only one this
-     * row has, so it must be able to outvote an older type under the pad's
-     * SDL serial (a USB DualShock's serial is not its hidraw id). For an
-     * SDL-only row it is the device the pad would pair with if the device list
-     * is not shown -- normally none. */
-    const logical_device_t *device = ref.item;
-    if (!device && ref.pad) {
-        device = hid_pt_gamepad_panel_peer(app_input, ref.pad);
-    }
-    char device_id[HID_PT_STABLE_ID_LEN] = "";
-    if (device) {
-        hid_pt_stable_id_for_logical(device, device_id, sizeof(device_id));
-    }
-    /* Then the pad's own id, kept in step so the choice also holds where the
-     * pad pairs with no device -- except the synthetic per-model form next to
-     * a device: it is shared by every serial-less pad of that model, and a
-     * device's choice written there would outlive any later change made while
-     * the serial was readable. Such a pad reaches the device's id anyway. Last
-     * in line, so "Automatic" here just erases. */
-    char pad_id[HID_PT_STABLE_ID_LEN] = "";
-    if (ref.pad) {
-        hid_pt_stable_id_for_gamepad(ref.pad, pad_id, sizeof(pad_id));
-        if ((device && hid_pt_stable_id_is_synthetic(pad_id)) || strcmp(pad_id, device_id) == 0) {
-            pad_id[0] = '\0';
-        }
-    }
+    /* The ids hid_pt_gamepad_sdl_type() reads, in its order (choice_ids()).
+     * The listed device's first, "Automatic" kept as a choice of its own: that
+     * id is read before the pad's, and while the controller is mounted it is
+     * the only one this row has, so it must be able to outvote an older type
+     * under the pad's SDL serial (a USB DualShock's serial is not its hidraw
+     * id). Then the pad's own, kept in step so the choice also holds where the
+     * pad pairs with no device; last in line, so "Automatic" there just
+     * erases. */
+    char device_id[HID_PT_STABLE_ID_LEN];
+    char pad_id[HID_PT_STABLE_ID_LEN];
+    choice_ids(model, &ref, device_id, pad_id);
 
     char name[HID_PT_PANEL_NAME_LEN];
     if (!hid_pt_model_selected_name(model, name, sizeof(name))) {
@@ -614,6 +653,53 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
             stream_input_reannounce_gamepad(input, gp);
         }
     }
+    return stored;
+}
+
+bool hid_pt_model_set_lightbar(const hid_pt_model_t *model, const lightbar_pref_t *lb)
+{
+    row_ref_t ref;
+    if (!lb || !selected_row(model, &ref)) {
+        return false;
+    }
+    char device_id[HID_PT_STABLE_ID_LEN];
+    char pad_id[HID_PT_STABLE_ID_LEN];
+    const logical_device_t *device = choice_ids(model, &ref, device_id, pad_id);
+    bool stored = device_id[0] || pad_id[0];
+    if (device_id[0]) {
+        stored = hid_pt_prefs_set_lightbar(device_id, lb, true) && stored;
+    }
+    if (pad_id[0]) {
+        stored = hid_pt_prefs_set_lightbar(pad_id, lb, false) && stored;
+    }
+    char name[HID_PT_PANEL_NAME_LEN];
+    if (!hid_pt_model_selected_name(model, name, sizeof(name))) {
+        name[0] = '\0';
+    }
+    if (stored) {
+        if (lb->automatic) {
+            commons_log_info("HID-PT", "lightbar for %s set to Automatic", name);
+        } else {
+            commons_log_info("HID-PT", "lightbar for %s set to %06x, game may change it: %s", name,
+                             (unsigned) lb->rgb, lb->game ? "yes" : "no");
+        }
+    } else {
+        ctm_set_plug_error("Lightbar colour for %s could not be saved", name);
+    }
+    /* Mounted: the record is what the bridge paints from, and setting it
+     * pushes a report at once. Not mounted, the record is what the next mount
+     * starts with. */
+    tv_bridge_worker_settings_t *settings = device ? settings_for_item(device) : NULL;
+    if (settings) {
+        settings->lightbar_user = !lb->automatic;
+        settings->lightbar_rgb = lb->automatic ? 0 : lb->rgb;
+        settings->lightbar_game = lb->automatic || lb->game;
+        apply_settings_to_session(device);
+    }
+    /* Over SDL: every pad, since pads sharing an id share the choice; a
+     * bridged slot is left to the bridge. */
+    stream_input_t *input = model->session ? session_get_input(model->session) : NULL;
+    hid_pt_lightbar_refresh(model_app_input(model), input ? input->moonlightExcludedMask : 0);
     return stored;
 }
 

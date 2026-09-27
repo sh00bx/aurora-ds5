@@ -14,6 +14,7 @@
 #include <lvgl.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #define HID_PT_MAX_ROWS 64
 
@@ -21,6 +22,10 @@
  * emulate over SDL, and the game lock. The panel supplies them
  * (hid_pt_view_add_mode()). */
 #define HID_PT_MAX_MODES 5
+
+/* Swatches the LIGHTBAR row can hold: Automatic, Off and the palette. The panel
+ * supplies them (hid_pt_view_add_swatch()). */
+#define HID_PT_MAX_SWATCHES 10
 
 #define DS_LATENCY_MIN 0
 #define DS_LATENCY_MAX 200
@@ -31,6 +36,8 @@
 /** The controls the option column carries, in focus order. */
 typedef enum {
     HID_PT_CTL_COMPOSITE = 0,
+    /** "Game may change colour", on the LIGHTBAR row. */
+    HID_PT_CTL_LIGHTBAR_GAME,
     HID_PT_CTL_LATENCY,
     HID_PT_CTL_AUDIO_MODE,
     HID_PT_CTL_SPEAKER,
@@ -61,6 +68,8 @@ typedef enum {
     HID_PT_WK_OPTION_BTN,
     /** A button of the mode row: LEFT/RIGHT walk the row, OK selects. */
     HID_PT_WK_MODE_BTN,
+    /** A colour of the LIGHTBAR row: walked and chosen like a mode button. */
+    HID_PT_WK_SWATCH,
 } hid_pt_widget_kind_t;
 
 static inline bool hid_pt_view_kind_is_option(hid_pt_widget_kind_t kind)
@@ -98,6 +107,8 @@ typedef struct {
     void (*row_clicked)(void *userdata, int row);
     /** Mode button @p mode (the order of hid_pt_view_add_mode()) was pressed. */
     void (*mode_clicked)(void *userdata, int mode);
+    /** Swatch @p swatch (the order of hid_pt_view_add_swatch()) was pressed. */
+    void (*swatch_clicked)(void *userdata, int swatch);
     void (*row_focused)(void *userdata, int row);
     /** LV_EVENT_KEY on any control, and on the sheet itself. */
     void (*key)(void *userdata, lv_event_t *event);
@@ -125,6 +136,14 @@ typedef struct {
     lv_obj_t *mode_caption;
     lv_obj_t *composite_row;
     lv_obj_t *composite_cb;
+    lv_obj_t *lightbar_heading;
+    lv_obj_t *lightbar_row;
+    /* The swatches sit in the row's body, left of the game switch's label. */
+    lv_obj_t *lightbar_body;
+    lv_obj_t *swatches[HID_PT_MAX_SWATCHES];
+    int swatch_count;
+    lv_obj_t *lightbar_game_label;
+    lv_obj_t *lightbar_game_cb;
     lv_obj_t *customize_panel;
     lv_obj_t *customize_title;
     lv_obj_t *customize_state;
@@ -135,6 +154,10 @@ typedef struct {
     lv_obj_t *latency_slider;
     lv_obj_t *audio_row;
     lv_obj_t *audio_dropdown;
+    /* Two sliders side by side each: speaker | headphone, haptics | soften
+     * triggers. The rows below are the halves. */
+    lv_obj_t *volume_pair;
+    lv_obj_t *haptics_pair;
     lv_obj_t *speaker_row;
     lv_obj_t *speaker_value;
     lv_obj_t *speaker_slider;
@@ -314,3 +337,30 @@ lv_obj_t *hid_pt_view_step_mode(const hid_pt_view_t *view, lv_obj_t *from, int d
  * disabled (a mode button the selection cannot use).
  */
 bool hid_pt_view_obj_is_focusable(const hid_pt_view_t *view, lv_obj_t *obj);
+
+/* ---- the LIGHTBAR row ------------------------------------------------------ */
+
+/**
+ * Append a swatch: a disc filled with @p rgb, with @p text on it (the "A" of
+ * Automatic), or with @p glyph from the icon font (Off's cross); both NULL for
+ * a plain colour. Call after hid_pt_view_create(), left to right; that order is
+ * the index hid_pt_view_cbs_t::swatch_clicked reports. NULL once
+ * HID_PT_MAX_SWATCHES are there.
+ */
+lv_obj_t *hid_pt_view_add_swatch(hid_pt_view_t *view, uint32_t rgb, const char *text, const char *glyph);
+
+/**
+ * Show the LIGHTBAR heading and row or hide them, ring swatch @p lit (-1:
+ * none), and show "Game may change colour" (@p show_game) switched to
+ * @p game_on. Writes only what changes -- this runs on the 2 s refresh.
+ */
+void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, int lit, bool show_game, bool game_on);
+
+/** The swatch @p obj is, or -1. */
+int hid_pt_view_swatch_of(const hid_pt_view_t *view, lv_obj_t *obj);
+
+/**
+ * LEFT/RIGHT on the LIGHTBAR row: from a swatch or the game switch to the next
+ * one of those the cursor may rest on in direction @p dir, or NULL at the end.
+ */
+lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, int dir);

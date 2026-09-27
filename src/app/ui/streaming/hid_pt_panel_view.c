@@ -38,32 +38,56 @@
 /* A mode button: the large icon (19dpx, a Material em is its line) over its
  * one-word name (a small line, 14dpx * 1.2 in Museo Sans) -- 36.8dpx of text. */
 #define MODE_BTN_H     LV_DPX(42)
+/* A slider in a paired row (two side by side): half a row leaves the track
+ * and the number this much, the label the rest. */
+#define PAIR_SLIDER_W  LV_DPX(70)
+#define PAIR_VALUE_W   LV_DPX(40)
+/* A lightbar swatch: a disc a little smaller than a switch is tall, so its
+ * ring (SWATCH_RING + SWATCH_RING_PAD a side) still fits the 30dpx row. */
+#define SWATCH_D       LV_DPX(20)
+#define SWATCH_GAP     LV_DPX(6)
+#define SWATCH_RING    LV_DPX(2)
+#define SWATCH_RING_PAD LV_DPX(2)
 
 /* The settings column fits its pane, so it never scrolls and no scrollbar ever
  * shows. The TV draws the UI at 1920x1080, dpi = 1920 / 6 = 320, so one dpx is
  * 2 px. The sheet is min(SHEET_H 1008, 92 % of 1080 = 993) = 993 px; less its
  * border (2 x 2), the header (104) and the body padding (2 x 24), a pane gets
  * 837 px, or 779 with the error bar up (58). Its tallest case, a DualSense
- * mounted, is ten children with nine OPT_GAPs of 8:
+ * mounted in a game with a fixed mode, is eleven children with ten OPT_GAPs
+ * of 8:
  *
  *   head (title 46 + 4 + state line 34, pad 4)   88
  *   MODE eyebrow                                  34
  *   mode row                                      84
+ *   "Locked for <game>" (one small line)          34
+ *   LIGHTBAR eyebrow (pad 8)                      42
+ *   swatches + "Game may change colour"           60
  *   AUDIO & HAPTICS eyebrow (pad 8)               42
- *   audio, speaker, headphone, haptics,
- *   soften triggers, latency: 6 x 60             360
- *   gaps: 9 x 8                                   72
+ *   audio, speaker | headphones,
+ *   haptics | soften triggers, latency: 4 x 60   240
+ *   gaps: 10 x 8                                  80
  *                                                ---
- *                                                680
+ *                                                704
  *
- * which leaves 157 px (99 under the error bar). The audio advisory (two small
- * lines, pad 8, + a gap: 84) fits under the error bar too: 764. A Flydigi with
- * its composite switch is 290. The auto-plug switch (60 + a gap) went in
- * 1.7.30, when a controller started keeping its mode. In 1.7.28 the same
- * DualSense measured 1020 mounted and 974 on SDL, and a DualShock 4 852
- * mounted against 806 on SDL -- the 46 px of the "applies over SDL" caption
- * were what tipped it into scrolling, which is the scrollbar a mounted pad
- * brought up. */
+ * which leaves 133 px (75 under the error bar). The audio advisory (two small
+ * lines, pad 8, + a gap: 84) fits without the error bar: 788. A DualShock 4 is
+ * 636 (no haptics pair), a Flydigi with its composite switch 290, a DualSense
+ * on SDL with no bridge behind it 382.
+ *
+ * 1.7.30 took the auto-plug switch out (60 + a gap) and put in the lock line,
+ * the LIGHTBAR heading and row (+160), which would have been 840 -- over the
+ * error-bar pane. The sliders pair up instead: two to a row, halves of
+ * (1084 - 8) / 2 = 538 px, of which the rail and padding take 64, a
+ * PAIR_SLIDER_W track 140, a PAIR_VALUE_W number 80 ("100 %") and the gaps 24,
+ * leaving the label 230 -- hence "Speaker"/"Headphones"/"Haptics" there, the
+ * section heading already says what they adjust. The LIGHTBAR row is one row
+ * for the same reason: nine 40 px discs and their gaps take 468 of its 1020,
+ * the switch 88, and the label keeps ~440 for its ~340.
+ * 1.7.29 measured 748 for the same DualSense (with the auto-plug switch); in
+ * 1.7.28 it was 1020 mounted and 974 on SDL, and a DualShock 4 852 mounted
+ * against 806 on SDL -- the 46 px of the "applies over SDL" caption were what
+ * tipped it into scrolling, which is the scrollbar a mounted pad brought up. */
 
 /* ---- event trampolines --------------------------------------------------
  *
@@ -145,6 +169,14 @@ static void mode_clicked_cb(lv_event_t *event)
     hid_pt_view_t *view = lv_event_get_user_data(event);
     if (view && view->cbs.mode_clicked) {
         view->cbs.mode_clicked(view->cbs.userdata, row_of(lv_event_get_current_target(event)));
+    }
+}
+
+static void swatch_clicked_cb(lv_event_t *event)
+{
+    hid_pt_view_t *view = lv_event_get_user_data(event);
+    if (view && view->cbs.swatch_clicked) {
+        view->cbs.swatch_clicked(view->cbs.userdata, row_of(lv_event_get_current_target(event)));
     }
 }
 
@@ -431,7 +463,10 @@ static void group_add(hid_pt_view_t *view, lv_obj_t *obj)
     lv_obj_add_event_cb(obj, scroll_into_view_cb, LV_EVENT_FOCUSED, view);
 }
 
-#define OPTION_CHAIN_LEN 9
+#define OPTION_CHAIN_LEN 10
+/* Where the two multi-control rows stand in option_chain(). */
+#define CHAIN_MODE     0
+#define CHAIN_LIGHTBAR 2
 
 /**
  * Where the cursor enters the mode row: the lit button, else the first enabled
@@ -457,24 +492,65 @@ static lv_obj_t *mode_entry(const hid_pt_view_t *view)
 }
 
 /**
+ * Where the cursor enters the LIGHTBAR row: the ringed swatch, else the first
+ * one it may rest on, else NULL.
+ */
+static lv_obj_t *lightbar_entry(const hid_pt_view_t *view)
+{
+    lv_obj_t *first = NULL;
+    for (int i = 0; i < view->swatch_count; ++i) {
+        lv_obj_t *swatch = view->swatches[i];
+        if (!swatch || lv_obj_has_state(swatch, LV_STATE_DISABLED)) {
+            continue;
+        }
+        if (lv_obj_has_state(swatch, LV_STATE_CHECKED)) {
+            return swatch;
+        }
+        if (!first) {
+            first = swatch;
+        }
+    }
+    return first;
+}
+
+/**
  * The option column, top to bottom, into @p out.
  *
  * One list, used for the focus group's order and for stepping the cursor, so the
  * two can't disagree. Entries that are hidden for the selected device are
- * skipped by the stepper, not removed from here. The mode row is one entry,
- * the button the cursor enters it on.
+ * skipped by the stepper, not removed from here. The mode row and the LIGHTBAR
+ * row are one entry each, the control the cursor enters it on; the two sliders
+ * of a pair are two, left before right, as they read.
  */
 static void option_chain(const hid_pt_view_t *view, lv_obj_t *out[OPTION_CHAIN_LEN])
 {
-    out[0] = mode_entry(view);
+    out[CHAIN_MODE] = mode_entry(view);
     out[1] = view->composite_cb;
-    out[2] = view->audio_dropdown;
-    out[3] = view->speaker_slider;
-    out[4] = view->headset_slider;
-    out[5] = view->haptics_slider;
-    out[6] = view->trigger_slider;
-    out[7] = view->latency_slider;
-    out[8] = view->reset_settings_btn;
+    out[CHAIN_LIGHTBAR] = lightbar_entry(view);
+    out[3] = view->audio_dropdown;
+    out[4] = view->speaker_slider;
+    out[5] = view->headset_slider;
+    out[6] = view->haptics_slider;
+    out[7] = view->trigger_slider;
+    out[8] = view->latency_slider;
+    out[9] = view->reset_settings_btn;
+}
+
+/* The chain index @p obj stands at: a row's every control at its row's. */
+static int chain_index_of(const hid_pt_view_t *view, lv_obj_t *obj, lv_obj_t *const chain[OPTION_CHAIN_LEN])
+{
+    if (hid_pt_view_mode_of(view, obj) >= 0) {
+        return CHAIN_MODE;
+    }
+    if (hid_pt_view_swatch_of(view, obj) >= 0 || (obj && obj == view->lightbar_game_cb)) {
+        return CHAIN_LIGHTBAR;
+    }
+    for (int i = 0; i < OPTION_CHAIN_LEN; ++i) {
+        if (chain[i] == obj) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /**
@@ -502,14 +578,23 @@ void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
             lv_group_add_obj(view->group, view->row_buttons[i]);
         }
     }
-    /* The whole mode row, in place of the one button the chain names for it. */
-    for (int i = 0; i < view->mode_count; ++i) {
-        group_add(view, view->mode_btns[i]);
-    }
+    /* The mode row and the LIGHTBAR row whole, in place of the one control
+     * the chain names for each. */
     lv_obj_t *chain[OPTION_CHAIN_LEN];
     option_chain(view, chain);
-    for (size_t i = 1; i < OPTION_CHAIN_LEN; ++i) {
-        group_add(view, chain[i]);
+    for (int i = 0; i < OPTION_CHAIN_LEN; ++i) {
+        if (i == CHAIN_MODE) {
+            for (int m = 0; m < view->mode_count; ++m) {
+                group_add(view, view->mode_btns[m]);
+            }
+        } else if (i == CHAIN_LIGHTBAR) {
+            for (int w = 0; w < view->swatch_count; ++w) {
+                group_add(view, view->swatches[w]);
+            }
+            group_add(view, view->lightbar_game_cb);
+        } else {
+            group_add(view, chain[i]);
+        }
     }
     group_add(view, view->refresh_btn);
     group_add(view, view->close_btn);
@@ -532,11 +617,15 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
     if (hid_pt_view_mode_of(view, obj) >= 0) {
         return HID_PT_WK_MODE_BTN;
     }
+    if (hid_pt_view_swatch_of(view, obj) >= 0) {
+        return HID_PT_WK_SWATCH;
+    }
     const struct {
         lv_obj_t *const *slot;
         hid_pt_widget_kind_t kind;
     } table[] = {
             {&view->composite_cb,       HID_PT_WK_SWITCH},
+            {&view->lightbar_game_cb,   HID_PT_WK_SWITCH},
             {&view->latency_slider,     HID_PT_WK_SLIDER},
             {&view->speaker_slider,     HID_PT_WK_SLIDER},
             {&view->headset_slider,     HID_PT_WK_SLIDER},
@@ -636,13 +725,9 @@ lv_obj_t *hid_pt_view_step_option(const hid_pt_view_t *view, lv_obj_t *from, int
     }
     lv_obj_t *chain[OPTION_CHAIN_LEN];
     option_chain(view, chain);
-    /* Any button of the mode row stands where the row's entry does. */
-    int at = hid_pt_view_mode_of(view, from) >= 0 ? 0 : -1;
-    for (size_t i = 0; i < OPTION_CHAIN_LEN && at < 0; ++i) {
-        if (chain[i] == from) {
-            at = (int) i;
-        }
-    }
+    /* Any control of the mode or LIGHTBAR row stands where its row's entry
+     * does. */
+    const int at = chain_index_of(view, from, chain);
     if (at < 0) {
         return NULL;
     }
@@ -831,6 +916,121 @@ lv_obj_t *hid_pt_view_step_mode(const hid_pt_view_t *view, lv_obj_t *from, int d
     for (int i = at + dir; i >= 0 && i < view->mode_count; i += dir) {
         if (hid_pt_view_obj_is_focusable(view, view->mode_btns[i])) {
             return view->mode_btns[i];
+        }
+    }
+    return NULL;
+}
+
+/* ---- the LIGHTBAR row ------------------------------------------------------ */
+
+/**
+ * A swatch is a disc in its own colour, with the row's two marks on it: lit,
+ * the colour chosen, is a chalk ring around the disc with a gap -- it must
+ * read on a black disc and on a white one alike -- and the cursor is a thick
+ * chalk edge on the disc itself, so both can be on one swatch and tell apart.
+ * The row's slab lights up behind whichever swatch has the cursor, as for
+ * every other control (bind_slab_focus()).
+ *
+ * Not LV_OBJ_FLAG_CHECKABLE, for the mode buttons' reason: a colour is chosen
+ * by OK alone, never by walking past it.
+ */
+lv_obj_t *hid_pt_view_add_swatch(hid_pt_view_t *view, uint32_t rgb, const char *text, const char *glyph)
+{
+    if (!view || !view->lightbar_body || view->swatch_count >= HID_PT_MAX_SWATCHES) {
+        return NULL;
+    }
+    const int index = view->swatch_count;
+    lv_obj_t *swatch = lv_btn_create(view->lightbar_body);
+    lv_obj_remove_style_all(swatch);
+    lv_obj_set_size(swatch, SWATCH_D, SWATCH_D);
+    lv_obj_set_style_radius(swatch, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(swatch, lv_color_hex(rgb), 0);
+    lv_obj_set_style_bg_opa(swatch, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(swatch, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(swatch, lv_color_hex(OVERLAY_CHALK), 0);
+    lv_obj_set_style_border_opa(swatch, OVERLAY_OPA_FAINT, 0);
+    lv_obj_set_style_outline_width(swatch, SWATCH_RING, LV_STATE_CHECKED);
+    lv_obj_set_style_outline_pad(swatch, SWATCH_RING_PAD, LV_STATE_CHECKED);
+    lv_obj_set_style_outline_color(swatch, lv_color_hex(OVERLAY_CHALK), LV_STATE_CHECKED);
+    lv_obj_set_style_outline_opa(swatch, LV_OPA_COVER, LV_STATE_CHECKED);
+    lv_obj_set_style_border_width(swatch, LV_DPX(3), LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_opa(swatch, LV_OPA_COVER, LV_STATE_FOCUS_KEY);
+    lv_obj_clear_flag(swatch, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(swatch, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+    if (text || glyph) {
+        lv_obj_t *mark = lv_label_create(swatch);
+        lv_obj_set_style_text_font(mark, glyph ? lv_theme_moonlight_get_iconfont_small(swatch)
+                                               : lv_theme_get_font_small(swatch), 0);
+        lv_obj_set_style_text_color(mark, lv_color_hex(OVERLAY_CHALK), 0);
+        lv_obj_set_style_text_opa(mark, OVERLAY_OPA_MUTED, 0);
+        lv_label_set_text(mark, glyph ? glyph : text);
+        lv_obj_center(mark);
+    }
+    lv_obj_set_user_data(swatch, (void *) (intptr_t) index);
+    lv_obj_add_event_cb(swatch, swatch_clicked_cb, LV_EVENT_CLICKED, view);
+    lv_obj_add_event_cb(swatch, key_cb, LV_EVENT_KEY, view);
+    bind_slab_focus(swatch, view->lightbar_row);
+    /* In front of the game switch's label, which the row created first. */
+    lv_obj_move_to_index(swatch, index);
+    view->swatches[index] = swatch;
+    view->swatch_count++;
+    return swatch;
+}
+
+void hid_pt_view_set_lightbar(hid_pt_view_t *view, bool show, int lit, bool show_game, bool game_on)
+{
+    if (!view || !view->lightbar_row) {
+        return;
+    }
+    for (int i = 0; i < view->swatch_count; ++i) {
+        set_obj_state(view->swatches[i], LV_STATE_CHECKED, i == lit);
+    }
+    if (view->lightbar_game_cb && lv_obj_has_state(view->lightbar_game_cb, LV_STATE_CHECKED) != game_on) {
+        set_obj_state(view->lightbar_game_cb, LV_STATE_CHECKED, game_on);
+    }
+    show_obj(view->lightbar_game_label, show_game);
+    show_obj(view->lightbar_game_cb, show_game);
+    show_obj(view->lightbar_heading, show);
+    show_obj(view->lightbar_row, show);
+}
+
+int hid_pt_view_swatch_of(const hid_pt_view_t *view, lv_obj_t *obj)
+{
+    if (!view || !obj) {
+        return -1;
+    }
+    for (int i = 0; i < view->swatch_count; ++i) {
+        if (view->swatches[i] == obj) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, int dir)
+{
+    if (!view || !from || dir == 0) {
+        return NULL;
+    }
+    /* The row left to right: the swatches, then the switch at its end. */
+    lv_obj_t *strip[HID_PT_MAX_SWATCHES + 1];
+    int n = 0;
+    for (int i = 0; i < view->swatch_count; ++i) {
+        strip[n++] = view->swatches[i];
+    }
+    strip[n++] = view->lightbar_game_cb;
+    int at = -1;
+    for (int i = 0; i < n; ++i) {
+        if (strip[i] == from) {
+            at = i;
+        }
+    }
+    if (at < 0) {
+        return NULL;
+    }
+    for (int i = at + dir; i >= 0 && i < n; i += dir) {
+        if (hid_pt_view_obj_is_focusable(view, strip[i])) {
+            return strip[i];
         }
     }
     return NULL;
@@ -1034,18 +1234,9 @@ static lv_obj_t *option_row(lv_obj_t *parent, const char *label, lv_obj_t **body
     return row;
 }
 
-/**
- * A settings row whose control is a switch, not a checkbox — it lands in the
- * same right-hand gutter as every other control, and it is a bigger target from
- * the couch. Starts hidden; the panel shows it for a device that has the setting.
- */
-static lv_obj_t *switch_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label,
-                            hid_pt_ctl_t id, lv_obj_t **switch_out)
+/** The sheet's switch: chalk track, teal when on. */
+static void style_switch(lv_obj_t *sw)
 {
-    lv_obj_t *body;
-    lv_obj_t *row = option_row(parent, label, &body, NULL);
-
-    lv_obj_t *sw = lv_switch_create(body);
     lv_obj_set_size(sw, LV_DPX(44), LV_DPX(22));
     lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_CHALK), 0);
     lv_obj_set_style_bg_opa(sw, 40, 0);
@@ -1059,6 +1250,21 @@ static lv_obj_t *switch_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     lv_obj_set_style_bg_opa(sw, 190, LV_PART_KNOB);
     lv_obj_set_style_bg_color(sw, lv_color_hex(OVERLAY_LIVE), LV_PART_KNOB | LV_STATE_CHECKED);
     lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_KNOB | LV_STATE_CHECKED);
+}
+
+/**
+ * A settings row whose control is a switch, not a checkbox — it lands in the
+ * same right-hand gutter as every other control, and it is a bigger target from
+ * the couch. Starts hidden; the panel shows it for a device that has the setting.
+ */
+static lv_obj_t *switch_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label,
+                            hid_pt_ctl_t id, lv_obj_t **switch_out)
+{
+    lv_obj_t *body;
+    lv_obj_t *row = option_row(parent, label, &body, NULL);
+
+    lv_obj_t *sw = lv_switch_create(body);
+    style_switch(sw);
     lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
     bind_slab_focus(sw, row);
     bind_control(view, sw, id);
@@ -1068,17 +1274,21 @@ static lv_obj_t *switch_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     return row;
 }
 
-/** A slider row: label, then the track and the number, both on the gutter. */
+/**
+ * A slider row: label, then the track (@p slider_w) and the number
+ * (@p value_w), both on the gutter -- or, in a pair_row(), on the right of its
+ * half.
+ */
 static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *label, int32_t min,
-                            int32_t max, hid_pt_ctl_t id, lv_obj_t **slider_out, lv_obj_t **value_out,
-                            lv_obj_t **label_out)
+                            int32_t max, hid_pt_ctl_t id, lv_coord_t slider_w, lv_coord_t value_w,
+                            lv_obj_t **slider_out, lv_obj_t **value_out, lv_obj_t **label_out)
 {
     lv_obj_t *body;
     lv_obj_t *row = option_row(parent, label, &body, label_out);
 
     lv_obj_t *slider = lv_slider_create(body);
     lv_slider_set_range(slider, min, max);
-    lv_obj_set_size(slider, SLIDER_W, LV_DPX(6));
+    lv_obj_set_size(slider, slider_w, LV_DPX(6));
     lv_obj_set_style_bg_color(slider, lv_color_hex(OVERLAY_CHALK), 0);
     lv_obj_set_style_bg_opa(slider, 40, 0);
     lv_obj_set_style_radius(slider, LV_DPX(3), 0);
@@ -1103,7 +1313,7 @@ static lv_obj_t *slider_row(hid_pt_view_t *view, lv_obj_t *parent, const char *l
     }
 
     lv_obj_t *value = body_text(body, "-");
-    lv_obj_set_width(value, VALUE_W);
+    lv_obj_set_width(value, value_w);
     lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
     if (value_out) {
         *value_out = value;
@@ -1163,6 +1373,68 @@ static lv_obj_t *dropdown_row(hid_pt_view_t *view, lv_obj_t *parent, const char 
         *dropdown_out = dd;
     }
     return row;
+}
+
+/**
+ * A row of two settings side by side, each a slab of its own (created into it
+ * by slider_row()) that takes half. One row's height for two sliders -- what
+ * lets the tallest column fit its pane (see the arithmetic at the top).
+ * Starts shown; hiding it hides both halves.
+ */
+static lv_obj_t *pair_row(lv_obj_t *parent)
+{
+    lv_obj_t *pair = lv_obj_create(parent);
+    lv_obj_remove_style_all(pair);
+    lv_obj_set_size(pair, LV_PCT(100), OPT_ROW_H);
+    lv_obj_set_flex_flow(pair, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_gap(pair, OPT_GAP, 0);
+    lv_obj_clear_flag(pair, LV_OBJ_FLAG_SCROLLABLE);
+    /* Drawing only, as on the mode row: the halves' focus bloom must not be
+     * clipped to the pair's box. */
+    lv_obj_add_flag(pair, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    return pair;
+}
+
+/** The half of a pair_row() that @p slab is: it shares the row with its twin. */
+static void pair_half(lv_obj_t *slab)
+{
+    lv_obj_set_flex_grow(slab, 1);
+}
+
+/**
+ * The LIGHTBAR row: one slab, the swatches (hid_pt_view_add_swatch()) on the
+ * left of its body, "Game may change colour" and its switch on the right. One
+ * row rather than two is what the column's height allows, and the switch is
+ * about the swatches, so it sits beside them. Starts hidden.
+ */
+static void lightbar_row(hid_pt_view_t *view, lv_obj_t *parent)
+{
+    view->lightbar_heading = eyebrow(parent, locstr("LIGHTBAR"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_set_style_pad_left(view->lightbar_heading, LV_DPX(3), 0);
+    lv_obj_set_style_pad_top(view->lightbar_heading, LV_DPX(4), 0);
+    lv_obj_add_flag(view->lightbar_heading, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *row = lv_obj_create(parent);
+    slab_style(row, OPT_ROW_H);
+    slab_rail(row);
+    view->lightbar_row = row;
+    view->lightbar_body = slab_body(row);
+    lv_obj_set_style_pad_gap(view->lightbar_body, SWATCH_GAP, 0);
+    /* The swatches' rings reach past the disc; the body must not cut them. */
+    lv_obj_add_flag(view->lightbar_body, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+
+    view->lightbar_game_label = body_text(view->lightbar_body, locstr("Game may change colour"));
+    lv_label_set_long_mode(view->lightbar_game_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(view->lightbar_game_label, 1);
+    lv_obj_set_style_text_align(view->lightbar_game_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_pad_left(view->lightbar_game_label, LV_DPX(6), 0);
+
+    lv_obj_t *sw = lv_switch_create(view->lightbar_body);
+    style_switch(sw);
+    bind_slab_focus(sw, row);
+    bind_control(view, sw, HID_PT_CTL_LIGHTBAR_GAME);
+    view->lightbar_game_cb = sw;
+    lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
 }
 
 /** One quiet, wrapping line under the settings it is about. Starts hidden. */
@@ -1397,6 +1669,8 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     view->composite_row = switch_row(view, right_pane, locstr("Recognize as native Flydigi on PC"),
                                      HID_PT_CTL_COMPOSITE, &view->composite_cb);
 
+    lightbar_row(view, right_pane);
+
     view->audio_heading = eyebrow(right_pane, locstr("AUDIO & HAPTICS"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
     lv_obj_set_style_pad_left(view->audio_heading, LV_DPX(3), 0);
     lv_obj_set_style_pad_top(view->audio_heading, LV_DPX(4), 0);
@@ -1405,17 +1679,30 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
                                    locstr("Auto (game decides)\nOff\nController speaker\nHeadphone jack\nSpeaker + jack"),
                                    HID_PT_CTL_AUDIO_MODE, &view->audio_dropdown);
 
-    view->speaker_row = slider_row(view, right_pane, locstr("Speaker volume"), 0, DS_VOLUME_MAX,
-                                   HID_PT_CTL_SPEAKER, &view->speaker_slider, &view->speaker_value, NULL);
-    view->headset_row = slider_row(view, right_pane, locstr("Headphone volume"), 0, DS_VOLUME_MAX,
-                                   HID_PT_CTL_HEADSET, &view->headset_slider, &view->headset_value, NULL);
-    view->haptics_row = slider_row(view, right_pane, locstr("Haptics strength"), 0, DS_HAPTICS_MAX,
-                                   HID_PT_CTL_HAPTICS, &view->haptics_slider, &view->haptics_value, NULL);
-    view->trigger_row = slider_row(view, right_pane, locstr("Soften triggers"), 0, DS_TRIGGER_REDUCE_MAX,
-                                   HID_PT_CTL_TRIGGER_REDUCE, &view->trigger_slider, &view->trigger_value, NULL);
+    /* Side by side in pairs, under the section heading that already says
+     * what they are about -- so a half says "Speaker", not "Speaker volume":
+     * the label has what the half leaves next to its track and number. */
+    view->volume_pair = pair_row(right_pane);
+    view->speaker_row = slider_row(view, view->volume_pair, locstr("Speaker"), 0, DS_VOLUME_MAX,
+                                   HID_PT_CTL_SPEAKER, PAIR_SLIDER_W, PAIR_VALUE_W, &view->speaker_slider,
+                                   &view->speaker_value, NULL);
+    pair_half(view->speaker_row);
+    view->headset_row = slider_row(view, view->volume_pair, locstr("Headphones"), 0, DS_VOLUME_MAX,
+                                   HID_PT_CTL_HEADSET, PAIR_SLIDER_W, PAIR_VALUE_W, &view->headset_slider,
+                                   &view->headset_value, NULL);
+    pair_half(view->headset_row);
+    view->haptics_pair = pair_row(right_pane);
+    view->haptics_row = slider_row(view, view->haptics_pair, locstr("Haptics"), 0, DS_HAPTICS_MAX,
+                                   HID_PT_CTL_HAPTICS, PAIR_SLIDER_W, PAIR_VALUE_W, &view->haptics_slider,
+                                   &view->haptics_value, NULL);
+    pair_half(view->haptics_row);
+    view->trigger_row = slider_row(view, view->haptics_pair, locstr("Soften triggers"), 0, DS_TRIGGER_REDUCE_MAX,
+                                   HID_PT_CTL_TRIGGER_REDUCE, PAIR_SLIDER_W, PAIR_VALUE_W, &view->trigger_slider,
+                                   &view->trigger_value, NULL);
+    pair_half(view->trigger_row);
     view->latency_row = slider_row(view, right_pane, locstr("Latency"), DS_LATENCY_MIN, DS_LATENCY_MAX,
-                                   HID_PT_CTL_LATENCY, &view->latency_slider, &view->latency_value,
-                                   &view->latency_label);
+                                   HID_PT_CTL_LATENCY, SLIDER_W, VALUE_W, &view->latency_slider,
+                                   &view->latency_value, &view->latency_label);
 
     /* The advisory sits under the settings it is about, one quiet line rather
      * than a coloured block: it is a consequence to know, not an error. */

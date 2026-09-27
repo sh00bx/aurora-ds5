@@ -11,16 +11,18 @@
  * meets a device.
  *
  * The two directions are kept apart:
- *   - sync_customize_ui_from_settings(), update_mode_row() and
- *     update_device_options() push the model into the widgets. They run on the
- *     2 s refresh as well as on a selection change, so they must not overwrite a
- *     control the user currently owns -- see the comment on
- *     sync_customize_ui_from_settings() for why the audio dropdown is the
- *     control where that is enforced, and why the sliders need no such guard.
- *   - customize_setting_changed(), the composite branch of
- *     panel_value_changed(), and panel_mode_clicked() push the widgets into the
- *     model. Every caller is a widget's LV_EVENT_VALUE_CHANGED or a button's
- *     click, i.e. a change the user just made.
+ *   - sync_customize_ui_from_settings(), update_mode_row(),
+ *     update_lightbar_row() and update_device_options() push the model into the
+ *     widgets. They run on the 2 s refresh as well as on a selection change, so
+ *     they must not overwrite a control the user currently owns -- see the
+ *     comment on sync_customize_ui_from_settings() for why the audio dropdown
+ *     is the control where that is enforced, and why the sliders need no such
+ *     guard.
+ *   - customize_setting_changed(), the composite and lightbar-game branches of
+ *     panel_value_changed(), panel_mode_clicked() and panel_swatch_clicked()
+ *     push the widgets into the model. Every caller is a widget's
+ *     LV_EVENT_VALUE_CHANGED or a button's click, i.e. a change the user just
+ *     made.
  */
 
 #include "hid_passthrough_panel.h"
@@ -78,6 +80,36 @@ static bool mode_is_hid(int i)
 }
 
 _Static_assert(sizeof(MODES) / sizeof(MODES[0]) <= HID_PT_MAX_MODES, "the view holds HID_PT_MAX_MODES buttons");
+
+/**
+ * The LIGHTBAR row, left to right: Automatic (the bar as it always was -- a
+ * dark disc with an "A", since it is no colour), Off (a dark bar, painted like
+ * a colour) and seven colours. Moderate on purpose: no channel above 0xC0, so
+ * a DS4, whose bar is the hungriest thing on it, is spared the full-power
+ * white-hot LED, and the colours still read from the couch. The discs show
+ * the very values the bar gets.
+ */
+static const struct {
+    bool automatic;
+    uint32_t rgb;
+    const char *text;
+    const char *glyph;
+} SWATCHES[] = {
+        {true,  OVERLAY_SLAB, "A",  NULL},
+        {false, 0x000000,     NULL, MAT_SYMBOL_CLOSE},
+        {false, 0xC00000,     NULL, NULL},    /* red */
+        {false, 0xC04000,     NULL, NULL},    /* orange */
+        {false, 0xA08000,     NULL, NULL},    /* yellow */
+        {false, 0x00A000,     NULL, NULL},    /* green */
+        {false, 0x00A0A0,     NULL, NULL},    /* cyan */
+        {false, 0x0000C0,     NULL, NULL},    /* blue */
+        {false, 0x6000C0,     NULL, NULL},    /* purple */
+};
+
+#define SWATCH_COUNT ((int) (sizeof(SWATCHES) / sizeof(SWATCHES[0])))
+
+_Static_assert(sizeof(SWATCHES) / sizeof(SWATCHES[0]) <= HID_PT_MAX_SWATCHES,
+               "the view holds HID_PT_MAX_SWATCHES swatches");
 
 typedef struct {
     hid_pt_view_t view;
@@ -216,7 +248,8 @@ static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused)
         return;
     }
     hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, focused);
-    if (hid_pt_view_kind_of(&panel->view, focused) == HID_PT_WK_MODE_BTN) {
+    const hid_pt_widget_kind_t kind = hid_pt_view_kind_of(&panel->view, focused);
+    if (kind == HID_PT_WK_MODE_BTN || kind == HID_PT_WK_SWATCH) {
         zone = HID_PT_ZONE_MODE;
     }
     hid_pt_view_set_hints(&panel->view, zone, hid_pt_model_selected_is_plugged(&panel->model));
@@ -318,8 +351,9 @@ static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj)
  *   RIGHT       from a device, into its settings
  *   LEFT        from a setting, back to the device — or, on a slider, DOWN a
  *               step, because a slider owns both horizontal keys outright
- *   LEFT/RIGHT  on the mode row, the next button that can be pressed; LEFT
- *               off its first one is back to the device
+ *   LEFT/RIGHT  on the mode row, the next button that can be pressed; on the
+ *               LIGHTBAR row the next swatch, and past the last one its
+ *               switch; LEFT off the first is back to the device
  *   OK          plugs the focused device in or out; opens the dropdown;
  *               selects a mode
  *   BACK        from the settings, back to the devices; from there, closes
@@ -400,10 +434,13 @@ static void panel_control_key(void *userdata, lv_event_t *event)
                     }
                 }
             } else if (zone == HID_PT_ZONE_OPTIONS) {
-                if (kind == HID_PT_WK_MODE_BTN && (key == LV_KEY_LEFT || key == LV_KEY_RIGHT)) {
-                    /* Only moves: a mode changes on OK alone. Walking the row
-                     * must never mount a pad or replace the host's one. */
-                    lv_obj_t *next = hid_pt_view_step_mode(&panel->view, target, dir);
+                const bool lightbar = kind == HID_PT_WK_SWATCH || target == panel->view.lightbar_game_cb;
+                if ((kind == HID_PT_WK_MODE_BTN || lightbar) && (key == LV_KEY_LEFT || key == LV_KEY_RIGHT)) {
+                    /* Only moves: a mode or a colour changes on OK alone.
+                     * Walking the row must never mount a pad, replace the
+                     * host's one or repaint a bar. */
+                    lv_obj_t *next = lightbar ? hid_pt_view_step_lightbar(&panel->view, target, dir)
+                                              : hid_pt_view_step_mode(&panel->view, target, dir);
                     if (next) {
                         panel_focus(panel, next);
                     } else if (key == LV_KEY_LEFT) {
@@ -633,8 +670,7 @@ static void sync_customize_ui_from_settings(hid_pt_panel_t *panel)
         lv_slider_set_value(v->trigger_slider, level, LV_ANIM_OFF);
         hid_pt_view_update_trigger_label(v);
     }
-    show_row(v->haptics_row, hid_pt_model_selected_is_ds5(&panel->model));
-    show_row(v->trigger_row, hid_pt_model_selected_is_ds5(&panel->model));
+    show_row(v->haptics_pair, hid_pt_model_selected_is_ds5(&panel->model));
     update_audio_warning(panel, &c);
 }
 
@@ -709,15 +745,13 @@ static void update_customize_panel(hid_pt_panel_t *panel)
     }
     show_row(v->audio_heading, has_audio);
     show_row(v->audio_row, has_audio);
-    show_row(v->speaker_row, has_audio);
-    show_row(v->headset_row, has_audio);
+    show_row(v->volume_pair, has_audio);
     show_row(v->latency_row, has_audio);
     show_row(v->reset_settings_btn, has_audio);
-    /* The haptics and trigger rows are hidden from inside sync_...(), which
-     * only runs for a device that has the settings record to read it from. */
+    /* The haptics pair is hidden from inside sync_...(), which only runs for a
+     * device that has the settings record to read it from. */
     if (!has_audio) {
-        show_row(v->haptics_row, false);
-        show_row(v->trigger_row, false);
+        show_row(v->haptics_pair, false);
         show_row(v->audio_warning_label, false);
     }
     show_row(v->customize_state, have_device);
@@ -793,10 +827,89 @@ static void update_mode_row(hid_pt_panel_t *panel)
     }
 }
 
+/* The swatch for @p lb, or -1 for a colour the palette has not (one written
+ * into the ini by hand). */
+static int lit_swatch(const lightbar_pref_t *lb)
+{
+    for (int i = 0; i < SWATCH_COUNT; ++i) {
+        if (SWATCHES[i].automatic ? lb->automatic : (!lb->automatic && SWATCHES[i].rgb == lb->rgb)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * The LIGHTBAR row: shown for a controller whose bar aurora can paint, its
+ * colour ringed, and "Game may change colour" beside the swatches for
+ * anything but Automatic -- Off included, which is a colour too (a dark bar
+ * a game could otherwise light up).
+ */
+static void update_lightbar_row(hid_pt_panel_t *panel)
+{
+    if (!panel) {
+        return;
+    }
+    lightbar_pref_t lb;
+    const bool show = hid_pt_model_selected_has_lightbar(&panel->model) &&
+                      hid_pt_model_selected_lightbar(&panel->model, &lb);
+    if (!show) {
+        lb = lightbar_pref_automatic();
+    }
+    lv_obj_t *focused = panel->view.group ? lv_group_get_focused(panel->view.group) : NULL;
+    hid_pt_view_set_lightbar(&panel->view, show, lit_swatch(&lb), show && !lb.automatic, lb.game);
+    /* The switch just hidden under the cursor (Automatic picked, or another
+     * controller): LVGL would keep handing it the keys. Back to the row's
+     * entry, else the next setting, else the device's row. */
+    if (focused == panel->view.lightbar_game_cb && !hid_pt_view_obj_is_focusable(&panel->view, focused)) {
+        lv_obj_t *to = hid_pt_view_first_option(&panel->view);
+        if (show) {
+            to = hid_pt_view_step_lightbar(&panel->view, focused, -1);
+        }
+        if (to) {
+            panel_focus(panel, to);
+        } else if (hid_pt_view_has_row(&panel->view, panel->selected_index)) {
+            hid_pt_view_focus_row(&panel->view, panel->selected_index);
+            panel_update_hints(panel, panel->view.row_buttons[panel->selected_index]);
+        }
+    }
+}
+
+/* Store @p lb for the selected controller, and say so if the store refused. */
+static void panel_set_lightbar(hid_pt_panel_t *panel, const lightbar_pref_t *lb)
+{
+    if (!hid_pt_model_set_lightbar(&panel->model, lb)) {
+        panel_update_status(panel);
+    }
+    update_lightbar_row(panel);
+}
+
+/* A swatch: that colour, or Automatic. A colour keeps the game switch where
+ * it was; coming from Automatic, where the switch is hidden, it starts on. */
+static void panel_swatch_clicked(void *userdata, int swatch)
+{
+    hid_pt_panel_t *panel = userdata;
+    lightbar_pref_t lb;
+    if (!panel || swatch < 0 || swatch >= SWATCH_COUNT || !hid_pt_model_selected_has_lightbar(&panel->model) ||
+        !hid_pt_model_selected_lightbar(&panel->model, &lb)) {
+        return;
+    }
+    lightbar_pref_t want = lightbar_pref_automatic();
+    if (!SWATCHES[swatch].automatic) {
+        want.automatic = false;
+        want.rgb = SWATCHES[swatch].rgb;
+        want.game = lb.automatic || lb.game;
+    }
+    if (!lightbar_pref_equal(&want, &lb)) {
+        panel_set_lightbar(panel, &want);
+    }
+}
+
 static void update_device_options(hid_pt_panel_t *panel)
 {
     update_mode_row(panel);
     update_composite_row(panel);
+    update_lightbar_row(panel);
     update_customize_panel(panel);
 }
 
@@ -983,6 +1096,15 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
              * 2 s refresh. */
             update_mode_row(panel);
             return;
+        case HID_PT_CTL_LIGHTBAR_GAME: {
+            lightbar_pref_t lb;
+            if (panel->view.lightbar_game_cb && hid_pt_model_selected_lightbar(&panel->model, &lb) &&
+                !lb.automatic) {
+                lb.game = lv_obj_has_state(panel->view.lightbar_game_cb, LV_STATE_CHECKED);
+                panel_set_lightbar(panel, &lb);
+            }
+            return;
+        }
         case HID_PT_CTL_LATENCY:
             hid_pt_view_update_latency_label(&panel->view, hid_pt_model_default_latency_ms(&panel->model));
             break;
@@ -1246,6 +1368,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
             .clicked = panel_clicked,
             .row_clicked = panel_row_clicked,
             .mode_clicked = panel_mode_clicked,
+            .swatch_clicked = panel_swatch_clicked,
             .row_focused = panel_row_focused,
             .key = panel_control_key,
             .dropdown_key = panel_dropdown_key,
@@ -1260,6 +1383,9 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
     lv_obj_set_user_data(cont, panel);
     for (int i = 0; i < MODE_COUNT; ++i) {
         hid_pt_view_add_mode(&panel->view, MODES[i].glyph, locstr(MODES[i].label), mode_is_hid(i));
+    }
+    for (int i = 0; i < SWATCH_COUNT; ++i) {
+        hid_pt_view_add_swatch(&panel->view, SWATCHES[i].rgb, SWATCHES[i].text, SWATCHES[i].glyph);
     }
     hid_pt_view_rebuild_focus_order(&panel->view);
     panel->refresh_timer = lv_timer_create(refresh_timer_cb, 2000, panel);

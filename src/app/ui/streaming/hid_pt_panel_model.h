@@ -28,6 +28,7 @@
 #include <stdint.h>
 
 #include "stream/input/gamepad_type_pref.h"
+#include "stream/input/lightbar_pref.h"
 
 typedef struct session_t session_t;
 
@@ -153,6 +154,19 @@ bool hid_pt_model_selected_row_info(const hid_pt_model_t *model, hid_pt_row_info
 /** An SDL pad with no CTM device behind it: no HID controls at all. */
 bool hid_pt_model_selected_is_sdl_only(const hid_pt_model_t *model);
 
+/**
+ * A controller whose lightbar aurora can paint: a DS4/DS5 the bridge knows (it
+ * paints mounted pads), or an SDL pad SDL can set an LED on.
+ */
+bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model);
+
+/**
+ * The selection's lightbar colour: what its pad resolves to
+ * (hid_pt_gamepad_lightbar()), or without a pad what the device's own id
+ * stores. Automatic when nothing was chosen; false when nothing is selected.
+ */
+bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out);
+
 /** default_settings_for_item()'s latency for the selection, or 60 with none. */
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model);
 
@@ -202,6 +216,16 @@ bool hid_pt_model_set_sdl_type(const hid_pt_model_t *model, gamepad_type_pref_t 
  * the status line shows.
  */
 bool hid_pt_model_persist_mode(const hid_pt_model_t *model, bool hid, gamepad_type_pref_t type);
+
+/**
+ * Store the selection's lightbar colour and paint it at once wherever the
+ * controller is: the bridge's settings record (pushed to a mounted pad through
+ * ctm_controller_set_settings()) and every SDL pad of the session
+ * (hid_pt_lightbar_refresh()). Written under the ids hid_pt_model_set_sdl_type()
+ * writes, by the same rules. False when the store refused it; the reason is
+ * then in the plug error, and the colour still applies until the app quits.
+ */
+bool hid_pt_model_set_lightbar(const hid_pt_model_t *model, const lightbar_pref_t *lb);
 
 /* ---- the game's fixed mode ---------------------------------------------- */
 
