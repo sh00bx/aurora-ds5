@@ -10,6 +10,7 @@
 #include "ctm/ctm_state.h"
 #include "input/app_input.h"
 #include "stream/input/gamepad_type_pref.h"
+#include "stream/input/lightbar_pref.h"
 
 /* Every buffer that holds a stable id is this long. */
 #define HID_PT_STABLE_ID_LEN 96
@@ -54,8 +55,9 @@ void hid_pt_prefs_flush(void);
  * already-open ini writer. Used by settings_save() so a full-config rewrite
  * preserves the per-device prefs instead of truncating them. Only non-default
  * prefs are written: an opted-in auto-plug as `<id> = true`, a chosen SDL type
- * as `<id>.sdl_type = xbox|playstation|auto`, a game's fixed mode as
- * `<app> = hid|x360|ds4`. An absent key reads as the default. */
+ * as `<id>.sdl_type = xbox|playstation|auto`, a chosen lightbar as
+ * `<id>.lightbar = auto|off|rrggbb` (+ `<id>.lightbar_game = 0`), a game's fixed
+ * mode as `<app> = hid|x360|ds4`. An absent key reads as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
@@ -83,6 +85,20 @@ bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type, 
 
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item);
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad);
+
+/* The lightbar colour chosen for this id, Automatic included: true when one
+ * was stored, and then *out is it. Shares the entry, the table, the flush and
+ * the explicit-Automatic rule with the SDL type above:
+ * `<id>.lightbar = auto|off|rrggbb`, `<id>.lightbar_game = 0` for a colour the
+ * game may not change. */
+bool hid_pt_prefs_lookup_lightbar(const char *stable_id, lightbar_pref_t *out);
+
+/* Store (and persist) the lightbar colour for one device. Same contract as
+ * hid_pt_prefs_set_sdl_type(), @p keep_auto included. */
+bool hid_pt_prefs_set_lightbar(const char *stable_id, const lightbar_pref_t *lb, bool keep_auto);
+
+/* What is stored under the device's own id, Automatic when nothing is. */
+lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item);
 
 /* ---- per-game mode ([controller_app_modes]) --------------------------------
  *

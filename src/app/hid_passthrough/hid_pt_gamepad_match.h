@@ -8,6 +8,7 @@
 #include "ctm/ctm_state.h"
 #include "input/app_input.h"
 #include "stream/input/gamepad_type_pref.h"
+#include "stream/input/lightbar_pref.h"
 
 struct stream_input_t;
 
@@ -55,6 +56,11 @@ bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
  * id, else AUTO. @p input is the app's pad table, which the one-pad-per-device
  * pairing needs; NULL skips that check. */
 gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad);
+
+/* The lightbar colour chosen for this pad: the listed device's choice, else the
+ * pad's own id's, else Automatic -- the same ids and order as
+ * hid_pt_gamepad_sdl_type(). */
+lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad);
 
 /* Which listed device this SDL pad is, for the Controllers page, or NULL. Pure:
  * it never binds a slot, so it may run on every render. Identity or a VID:PID

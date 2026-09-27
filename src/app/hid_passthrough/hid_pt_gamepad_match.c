@@ -585,6 +585,28 @@ gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepa
     return hid_pt_prefs_effective_sdl_type(pad_own_sdl_type(input, gamepad));
 }
 
+lightbar_pref_t hid_pt_gamepad_lightbar(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    lightbar_pref_t lb = lightbar_pref_automatic();
+    if (!gamepad || !gamepad->controller) {
+        return lb;
+    }
+    /* Exactly the SDL type's order and pairing (see pad_own_sdl_type()), and
+     * written by the page under the same ids: the listed device's choice,
+     * "Automatic" there included, then the pad's own. */
+    const logical_device_t *peer = pad_peer(input, gamepad);
+    char id[HID_PT_STABLE_ID_LEN];
+    if (peer) {
+        hid_pt_stable_id_for_logical(peer, id, sizeof(id));
+        if (hid_pt_prefs_lookup_lightbar(id, &lb)) {
+            return lb;
+        }
+    }
+    hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
+    hid_pt_prefs_lookup_lightbar(id, &lb);
+    return lb;
+}
+
 logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad)
 {
     return pad_peer(input, gamepad);
