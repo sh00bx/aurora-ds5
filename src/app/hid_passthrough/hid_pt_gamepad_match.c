@@ -344,6 +344,29 @@ static void record_slot_owner(const app_gamepad_state_t *gamepad)
     }
 }
 
+/* A controller of its own that stays on SDL: the pad IS, by identity (its real
+ * serial equals the device's stable id), a listed device the bridge has not
+ * mounted and whose effective mode is an SDL type -- or which nothing can
+ * mount. With a mode per controller, a second pad of a bridged model is
+ * exactly this (DualSense A on HID, DualSense B on DS4), and the VID:PID rules
+ * below, written for "every same-model pad gets auto-plugged", would swallow
+ * it. Only identity may exempt a pad: a serial-less one could be the bridged
+ * pad's own duplicate enumeration, which is what those rules exist for. */
+static bool pad_is_own_sdl_device(const app_gamepad_state_t *gamepad)
+{
+    char sid[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
+    if (!sid[0] || hid_pt_stable_id_is_synthetic(sid)) {
+        return false;
+    }
+    const hid_pt_logical_match_t m = resolve_logical(gamepad, HID_PT_CONF_EXACT, false);
+    if (!m.item || m.item->plugged) {
+        return false;
+    }
+    return strcmp(bridge_kind_for_item(m.item), "hid") == 0 ||
+           !hid_pt_prefs_effective_hid(hid_pt_prefs_auto_plugin_for_logical(m.item));
+}
+
 bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad)
 {
     (void) input;
@@ -355,15 +378,23 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
      * that is a device the bridge can mount. Only the VID:PID guard against an
      * already-bridged model stays -- that one is about what IS mounted. */
     const gamepad_mode_t lock = hid_pt_prefs_current_app_mode();
-    /* Primary: the pref keyed by this pad's own stable id. */
-    if (lock == GAMEPAD_MODE_NONE && hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
+    /* Primary: the pref keyed by this pad's own stable id -- under a HID lock
+     * too, where a pad whose own mode is HID must not wait for the rescan to
+     * list its device before it is kept off the host. */
+    if ((lock == GAMEPAD_MODE_NONE || lock == GAMEPAD_MODE_HID) && hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
         return true;
+    }
+    /* A second controller of a bridged model, in an SDL mode of its own: it
+     * comes back as that type, not swallowed by the guard below. */
+    if (pad_is_own_sdl_device(gamepad)) {
+        return false;
     }
     /* Matching-independent: a pad whose VID:PID matches an already BRIDGED
      * logical device never belongs in the Moonlight input path, whether or not
      * identity matching works right now (every same-model pad in this setup gets
-     * auto-plugged). This is what stops the announce when SDL enumerates the pad
-     * only after the bridge has claimed it. */
+     * auto-plugged -- a same-model pad with an SDL mode of its own was let
+     * through above). This is what stops the announce when SDL enumerates the
+     * pad only after the bridge has claimed it. */
     uint16_t gvid = 0, gpid = 0;
     if (gamepad_vid_pid(gamepad, &gvid, &gpid)) {
         for (int d = 0; d < g_devices.count; ++d) {
@@ -453,8 +484,10 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
     // physical pad — observed as an 18 s announced X360 twin that stage 1
     // never caught). A pad MODEL that is bridged must never keep feeding
     // Moonlight, so drop every still-announced gamepad that shares a plugged
-    // logical device's VID:PID. Every same-model pad in this setup gets
-    // auto-plugged, so this cannot orphan a legitimate Moonlight pad.
+    // logical device's VID:PID. A same-model pad that is, by identity, an
+    // unmounted device in an SDL mode of its own is the one legitimate
+    // Moonlight pad this could orphan: it is skipped, and announced here if
+    // the JOYDEVICEADDED guard swallowed it before its device was listed.
     static unsigned diag_tick = 0;
     diag_tick++;
     for (short i = 0; i < app_input_get_max_gamepads(input->input); ++i) {
@@ -463,6 +496,14 @@ void hid_pt_moonlight_reconcile_exclusions(stream_input_t *input)
             continue;
         }
         if (input->moonlightExcludedMask & (1u << (unsigned) gp->gs_id)) {
+            continue;
+        }
+        if (pad_is_own_sdl_device(gp)) {
+            if (input->started && (input->announcedGamepadMask & (1u << (unsigned) gp->gs_id)) == 0) {
+                commons_log_info("HID-PT", "sweep: slot %d is a controller of its own on SDL, announcing it",
+                                 gp->gs_id);
+                stream_input_send_gamepad_arrive(input, gp);
+            }
             continue;
         }
         SDL_Joystick *joy = SDL_GameControllerGetJoystick(gp->controller);
