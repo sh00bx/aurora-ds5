@@ -121,20 +121,7 @@ static bool pref_is_explicit_auto_only(const hid_pt_pref_entry_t *e)
 
 static const char *sdl_type_ini_value(gamepad_type_pref_t type)
 {
-    switch (type) {
-        case GAMEPAD_TYPE_PREF_XBOX:
-            return "xbox";
-        case GAMEPAD_TYPE_PREF_PLAYSTATION:
-            return "playstation";
-        case GAMEPAD_TYPE_PREF_DUALSENSE:
-            return "dualsense";
-        case GAMEPAD_TYPE_PREF_SWITCH:
-            return "switch";
-        case GAMEPAD_TYPE_PREF_AUTO:
-            return "auto";
-        default:
-            return NULL;
-    }
+    return gamepad_type_pref_word(type);
 }
 
 void hid_pt_stable_id(const char *raw, char *out, size_t out_len)

@@ -597,17 +597,12 @@ static const logical_device_t *choice_ids(const hid_pt_model_t *model, const row
     return device;
 }
 
+/* The ini's word for the type (gamepad_type_pref_word()), so the log names
+ * exactly what was stored. */
 static const char *sdl_type_log_name(gamepad_type_pref_t type)
 {
-    switch (type) {
-        case GAMEPAD_TYPE_PREF_XBOX:
-            return "xbox";
-        case GAMEPAD_TYPE_PREF_PLAYSTATION:
-            return "playstation";
-        case GAMEPAD_TYPE_PREF_AUTO:
-        default:
-            return "auto";
-    }
+    const char *word = gamepad_type_pref_word(type);
+    return word ? word : "?";
 }
 
 /* Bounds the before/after snapshot below; gs_ids are 0..15 anyway. */

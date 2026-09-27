@@ -32,6 +32,29 @@ typedef enum {
 #define GAMEPAD_TYPE_PREF_COUNT 5
 
 /**
+ * The word a type goes by in the ini (`<id>.sdl_type = ...`) and in the log --
+ * one table, so the two cannot drift apart when a type is added. NULL for a
+ * value outside the enum.
+ */
+static inline const char *gamepad_type_pref_word(gamepad_type_pref_t type)
+{
+    switch (type) {
+        case GAMEPAD_TYPE_PREF_XBOX:
+            return "xbox";
+        case GAMEPAD_TYPE_PREF_PLAYSTATION:
+            return "playstation";
+        case GAMEPAD_TYPE_PREF_DUALSENSE:
+            return "dualsense";
+        case GAMEPAD_TYPE_PREF_SWITCH:
+            return "switch";
+        case GAMEPAD_TYPE_PREF_AUTO:
+            return "auto";
+        default:
+            return NULL;
+    }
+}
+
+/**
  * The wire contract: which virtual pad the host is asked to build, carried in
  * the controller arrival (LiSendControllerArrivalEvent()) in bits 13-15 of
  * `capabilities`, which moonlight-common-c passes through unmasked and no
