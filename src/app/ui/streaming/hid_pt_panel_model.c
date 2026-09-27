@@ -169,13 +169,15 @@ static bool selected_row(const hid_pt_model_t *model, row_ref_t *out)
 
 /* The type the row's pad is announced with (hid_pt_gamepad_sdl_type(), which
  * is what the arrival reads), or -- no pad right now -- what the CTM device's
- * own id stores, which is what the next arrival reads first. */
+ * own id stores, which is what the next arrival reads first. Either way under
+ * the current game's lock, if it has one. */
 static gamepad_type_pref_t row_sdl_type(const hid_pt_model_t *model, const row_ref_t *ref)
 {
     if (ref->pad) {
         return hid_pt_gamepad_sdl_type(model_app_input(model), ref->pad);
     }
-    return ref->item ? hid_pt_prefs_sdl_type_for_logical(ref->item) : GAMEPAD_TYPE_PREF_AUTO;
+    return hid_pt_prefs_effective_sdl_type(ref->item ? hid_pt_prefs_sdl_type_for_logical(ref->item)
+                                                     : GAMEPAD_TYPE_PREF_AUTO);
 }
 
 /* Not the plain "hid" fallback kind: a pad the bridge can mount. */

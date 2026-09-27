@@ -41,3 +41,32 @@ static inline gamepad_type_pref_t gamepad_type_pref_effective(gamepad_type_pref_
     }
     return detected_playstation ? GAMEPAD_TYPE_PREF_PLAYSTATION : GAMEPAD_TYPE_PREF_XBOX;
 }
+
+/**
+ * A game's fixed controller mode: set on the Controllers page per host app
+ * (Forza only takes an Xbox pad), it replaces the remembered mode of every
+ * controller for as long as that app is streamed. NONE is no lock -- each
+ * controller runs in its own mode.
+ *
+ * X360 and DS4 are the two SDL types; HID mounts every controller the bridge
+ * can mount and leaves the others on SDL in their own type.
+ */
+typedef enum {
+    GAMEPAD_MODE_NONE = 0,
+    GAMEPAD_MODE_HID,
+    GAMEPAD_MODE_X360,
+    GAMEPAD_MODE_DS4,
+} gamepad_mode_t;
+
+/** The SDL type a locked mode forces, or AUTO for NONE and HID (no type forced). */
+static inline gamepad_type_pref_t gamepad_mode_sdl_type(gamepad_mode_t mode)
+{
+    switch (mode) {
+        case GAMEPAD_MODE_X360:
+            return GAMEPAD_TYPE_PREF_XBOX;
+        case GAMEPAD_MODE_DS4:
+            return GAMEPAD_TYPE_PREF_PLAYSTATION;
+        default:
+            return GAMEPAD_TYPE_PREF_AUTO;
+    }
+}

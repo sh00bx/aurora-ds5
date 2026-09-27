@@ -50,11 +50,12 @@ bool hid_pt_prefs_get_auto_plugin(const char *stable_id);
 bool hid_pt_prefs_set_auto_plugin(const char *stable_id, bool enabled);
 void hid_pt_prefs_flush(void);
 
-/* Emit the [hid_pt_devices] section into an already-open ini writer. Used by
- * settings_save() so a full-config rewrite preserves the per-device prefs
- * instead of truncating them. Only non-default prefs are written: an opted-in
- * auto-plug as `<id> = true`, a chosen SDL type as
- * `<id>.sdl_type = xbox|playstation|auto`. An absent key reads as the default. */
+/* Emit the [hid_pt_devices] and [controller_app_modes] sections into an
+ * already-open ini writer. Used by settings_save() so a full-config rewrite
+ * preserves the per-device prefs instead of truncating them. Only non-default
+ * prefs are written: an opted-in auto-plug as `<id> = true`, a chosen SDL type
+ * as `<id>.sdl_type = xbox|playstation|auto`, a game's fixed mode as
+ * `<app> = hid|x360|ds4`. An absent key reads as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
@@ -83,7 +84,44 @@ bool hid_pt_prefs_set_sdl_type(const char *stable_id, gamepad_type_pref_t type, 
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_logical(const logical_device_t *item);
 gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t *gamepad);
 
-/* INI parse hook: return 1 on handled entry. */
+/* ---- per-game mode ([controller_app_modes]) --------------------------------
+ *
+ * A game can fix the mode of every controller (Forza only takes an Xbox pad).
+ * Stored per host app as `<app> = hid|x360|ds4`, keyed by the app's NAME passed
+ * through hid_pt_stable_id(): app ids change whenever the host re-syncs its
+ * library, the name does not. Only the app the running session launched is ever
+ * looked up, so the table is read through "the current app" alone. Main thread
+ * only, like the rest of this store. */
+
+/* The app the session streams, set at session create and cleared (NULL) at
+ * destroy. Its name is kept as given for the Controllers page. */
+void hid_pt_prefs_set_current_app(const char *app_name);
+
+/* The current app's name as the host lists it. False with no session, or a
+ * name that normalises to nothing (no key to store a lock under). */
+bool hid_pt_prefs_current_app_name(char *buf, size_t len);
+
+/* The current app's fixed mode; GAMEPAD_MODE_NONE when it has none, or when no
+ * app is current. */
+gamepad_mode_t hid_pt_prefs_current_app_mode(void);
+
+/* Fix (and persist) the current app's mode; GAMEPAD_MODE_NONE removes it. False
+ * when it could not be stored: no current app, or a full table (removal never
+ * fails). The caller must say so. */
+bool hid_pt_prefs_set_current_app_mode(gamepad_mode_t mode);
+
+/* A device's own "mode HID" (its auto-plug flag) as the current app's lock has
+ * it: true under a HID lock, false under an SDL one, @p own_hid without. The
+ * one rule every auto-plug decision goes through. */
+bool hid_pt_prefs_effective_hid(bool own_hid);
+
+/* A pad's own SDL type as the current app's lock has it: the lock's type under
+ * X360/DS4, @p own otherwise (also under a HID lock, for a pad that cannot be
+ * mounted and so stays on SDL). */
+gamepad_type_pref_t hid_pt_prefs_effective_sdl_type(gamepad_type_pref_t own);
+
+/* INI parse hook for [hid_pt_devices] and [controller_app_modes]: return 1 on
+ * handled entry. */
 int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *value);
 
 #endif

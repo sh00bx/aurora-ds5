@@ -21,6 +21,7 @@
 #if defined(TARGET_WEBOS)
 #include <string.h>
 #include "hid_passthrough/ctm/ctm_state.h"
+#include "hid_passthrough/hid_pt_device_prefs.h"
 #include "hid_passthrough/hid_pt_gamepad_match.h"
 #include "platform/webos/tv_game_mode.h"
 #endif
@@ -93,6 +94,9 @@ session_t *session_create(app_t *app, const CONFIGURATION *config, const SERVER_
     session_input_init(&session->input, session, &app->input, &session->config);
     hid_passthrough_manager_init(&session->hid_pt);
 #if defined(TARGET_WEBOS)
+    /* The game a mode can be fixed for (Controllers page), before anything asks
+     * a pad's mode: the exclusion mask right below is the first to. */
+    hid_pt_prefs_set_current_app(session->app_name);
     if (session->config.hid_passthrough) {
         /* Which Moonlight slots the CTM bridge owns, decided HERE on the main
          * thread: the walk dereferences gp->controller through SDL, and on the
@@ -127,6 +131,9 @@ void session_destroy(session_t *session) {
     session_input_deinit(&session->input);
     hid_passthrough_manager_deinit(&session->hid_pt);
     SDL_WaitThread(session->thread, NULL);
+#if defined(TARGET_WEBOS)
+    hid_pt_prefs_set_current_app(NULL);
+#endif
     serverdata_free(session->server);
     SDL_DestroyCond(session->cond);
     SDL_DestroyMutex(session->mutex);

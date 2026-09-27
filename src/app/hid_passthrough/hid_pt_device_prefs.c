@@ -48,6 +48,22 @@ typedef struct {
 static hid_pt_pref_entry_t g_hid_pt_prefs[HID_PT_PREFS_MAX];
 static int g_hid_pt_pref_count;
 
+#define HID_PT_APP_MODES_SECTION "controller_app_modes"
+/* Games with a fixed mode. A lock is a deliberate act per game, so this fills
+ * slowly and a full table refuses rather than evicting someone's lock. */
+#define HID_PT_APP_MODES_MAX 32
+
+typedef struct {
+    char key[HID_PT_STABLE_ID_LEN];   /* the app name through hid_pt_stable_id() */
+    gamepad_mode_t mode;              /* never NONE: removing a lock drops the entry */
+} hid_pt_app_mode_entry_t;
+
+static hid_pt_app_mode_entry_t g_app_modes[HID_PT_APP_MODES_MAX];
+static int g_app_mode_count;
+/* The app the running session streams: its key ("" = none) and its name. */
+static char g_current_app_key[HID_PT_STABLE_ID_LEN];
+static char g_current_app_name[128];
+
 /* An entry every reader would answer exactly as it answers a missing one: no
  * auto-plug, no SDL type chosen. Such an entry carries no information, which is
  * what makes it the one a full table may reuse and the one the writer may
@@ -188,6 +204,7 @@ static hid_pt_pref_entry_t *pref_upsert(const char *stable_id, bool may_evict_ex
 void hid_pt_prefs_init(void)
 {
     g_hid_pt_pref_count = 0;
+    g_app_mode_count = 0;
 }
 
 void hid_pt_stable_id_for_logical(const logical_device_t *item, char *out, size_t out_len)
@@ -355,6 +372,161 @@ gamepad_type_pref_t hid_pt_prefs_sdl_type_for_gamepad(const app_gamepad_state_t 
     return hid_pt_prefs_get_sdl_type(id);
 }
 
+/* ---- per-game mode ------------------------------------------------------ */
+
+static const char *app_mode_ini_value(gamepad_mode_t mode)
+{
+    switch (mode) {
+        case GAMEPAD_MODE_HID:
+            return "hid";
+        case GAMEPAD_MODE_X360:
+            return "x360";
+        case GAMEPAD_MODE_DS4:
+            return "ds4";
+        case GAMEPAD_MODE_NONE:
+        default:
+            return NULL;
+    }
+}
+
+static hid_pt_app_mode_entry_t *app_mode_find(const char *key)
+{
+    if (!key || !key[0]) {
+        return NULL;
+    }
+    for (int i = 0; i < g_app_mode_count; ++i) {
+        if (strcmp(g_app_modes[i].key, key) == 0) {
+            return &g_app_modes[i];
+        }
+    }
+    return NULL;
+}
+
+/* Store @p mode under @p key, or drop the entry for NONE. False only for a
+ * full table. Does not flush. */
+static bool app_mode_put(const char *key, gamepad_mode_t mode)
+{
+    hid_pt_app_mode_entry_t *e = app_mode_find(key);
+    if (mode == GAMEPAD_MODE_NONE) {
+        if (e) {
+            /* Order carries nothing; the last entry fills the hole. */
+            *e = g_app_modes[--g_app_mode_count];
+        }
+        return true;
+    }
+    if (!e) {
+        if (g_app_mode_count >= HID_PT_APP_MODES_MAX) {
+            return false;
+        }
+        e = &g_app_modes[g_app_mode_count++];
+        snprintf(e->key, sizeof(e->key), "%s", key);
+    }
+    e->mode = mode;
+    return true;
+}
+
+void hid_pt_prefs_set_current_app(const char *app_name)
+{
+    g_current_app_key[0] = '\0';
+    g_current_app_name[0] = '\0';
+    if (!app_name) {
+        return;
+    }
+    hid_pt_stable_id(app_name, g_current_app_key, sizeof(g_current_app_key));
+    if (stable_id_is_blank(g_current_app_key)) {
+        /* A name of nothing but punctuation would share one lock with every
+         * other such name. */
+        g_current_app_key[0] = '\0';
+        return;
+    }
+    snprintf(g_current_app_name, sizeof(g_current_app_name), "%s", app_name);
+    const hid_pt_app_mode_entry_t *e = app_mode_find(g_current_app_key);
+    if (e) {
+        commons_log_info("HID-PT", "%s fixes every controller to mode %s", app_name, app_mode_ini_value(e->mode));
+    }
+}
+
+bool hid_pt_prefs_current_app_name(char *buf, size_t len)
+{
+    if (!g_current_app_key[0]) {
+        return false;
+    }
+    if (buf && len > 0) {
+        snprintf(buf, len, "%s", g_current_app_name);
+    }
+    return true;
+}
+
+gamepad_mode_t hid_pt_prefs_current_app_mode(void)
+{
+    const hid_pt_app_mode_entry_t *e = app_mode_find(g_current_app_key);
+    return e ? e->mode : GAMEPAD_MODE_NONE;
+}
+
+bool hid_pt_prefs_set_current_app_mode(gamepad_mode_t mode)
+{
+    if (!g_current_app_key[0]) {
+        return false;
+    }
+    if (hid_pt_prefs_current_app_mode() == mode) {
+        return true;
+    }
+    if (!app_mode_put(g_current_app_key, mode)) {
+        commons_log_warn("HID-PT", "mode for %s NOT stored: all %d game slots are taken", g_current_app_name,
+                         HID_PT_APP_MODES_MAX);
+        return false;
+    }
+    commons_log_info("HID-PT", "%s: every controller %s", g_current_app_name,
+                     mode == GAMEPAD_MODE_NONE ? "back in its own mode" : app_mode_ini_value(mode));
+    hid_pt_prefs_flush();
+    return true;
+}
+
+bool hid_pt_prefs_effective_hid(bool own_hid)
+{
+    switch (hid_pt_prefs_current_app_mode()) {
+        case GAMEPAD_MODE_HID:
+            return true;
+        case GAMEPAD_MODE_X360:
+        case GAMEPAD_MODE_DS4:
+            return false;
+        case GAMEPAD_MODE_NONE:
+        default:
+            return own_hid;
+    }
+}
+
+gamepad_type_pref_t hid_pt_prefs_effective_sdl_type(gamepad_type_pref_t own)
+{
+    const gamepad_type_pref_t forced = gamepad_mode_sdl_type(hid_pt_prefs_current_app_mode());
+    return forced != GAMEPAD_TYPE_PREF_AUTO ? forced : own;
+}
+
+/* `<app> = hid|x360|ds4`. The key is normalised again, so a hand-edited name
+ * with spaces or capitals still finds its app. */
+static void app_mode_ini_entry(const char *name, const char *value)
+{
+    char key[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id(name, key, sizeof(key));
+    if (stable_id_is_blank(key) || !value) {
+        return;
+    }
+    gamepad_mode_t mode;
+    if (strcmp(value, "hid") == 0) {
+        mode = GAMEPAD_MODE_HID;
+    } else if (strcmp(value, "x360") == 0) {
+        mode = GAMEPAD_MODE_X360;
+    } else if (strcmp(value, "ds4") == 0) {
+        mode = GAMEPAD_MODE_DS4;
+    } else {
+        /* A word from a newer build reads as no lock rather than as a guess. */
+        return;
+    }
+    if (!app_mode_put(key, mode)) {
+        commons_log_warn("HID-PT", "mode for %s dropped on load: table full", key);
+    }
+}
+
 /* `<stable_id>.sdl_type = xbox|playstation`. Split BEFORE normalising: '.' is
  * inside the id alphabet, so the suffix would otherwise just become part of an
  * id no device has. */
@@ -394,6 +566,10 @@ static void sdl_type_ini_entry(const char *name, size_t id_len, const char *valu
 
 int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *value)
 {
+    if (section && name && name[0] && strcmp(section, HID_PT_APP_MODES_SECTION) == 0) {
+        app_mode_ini_entry(name, value);
+        return 1;
+    }
     if (!section || strcmp(section, "hid_pt_devices") != 0) {
         return 0;
     }
@@ -460,6 +636,16 @@ void hid_pt_prefs_write_section(FILE *fp)
             ini_write_string(fp, key, sdl_type);
         }
     }
+    for (int i = 0; i < g_app_mode_count; ++i) {
+        const char *mode = app_mode_ini_value(g_app_modes[i].mode);
+        if (!mode) {
+            continue;
+        }
+        if (i == 0) {
+            ini_write_section(fp, HID_PT_APP_MODES_SECTION);
+        }
+        ini_write_string(fp, g_app_modes[i].key, mode);
+    }
 }
 
 void hid_pt_prefs_flush(void)
@@ -484,7 +670,8 @@ void hid_pt_prefs_flush(void)
             if (end) {
                 *end = '\0';
                 const char *sec = line + 1;
-                in_section = (strcmp(sec, "hid_pt_devices") == 0);
+                /* Both sections this store owns are rewritten below. */
+                in_section = (strcmp(sec, "hid_pt_devices") == 0 || strcmp(sec, HID_PT_APP_MODES_SECTION) == 0);
                 *end = ']'; /* restore: line is stored verbatim below */
                 skip_section = in_section;
                 if (in_section) {

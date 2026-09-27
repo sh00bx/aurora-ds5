@@ -18,10 +18,12 @@ struct stream_input_t;
  * one by one below, each with its floor fixed in here. */
 
 /* True if the gamepad should be auto-bridged (and thus kept off the Moonlight
- * gamepad path). Robust against a transiently-unreadable SDL serial during
- * stream churn / mid-session re-enumeration: a pad with no usable serial may
- * reach its logical device through the VID:PID tiers, while a pad WITH one is
- * only ever matched by exact identity — a weaker match would hand a
+ * gamepad path): its mode is HID, or the current game fixes HID and the pad is
+ * a device the bridge can mount; never under a game's X360/DS4 lock, unless
+ * its model is bridged already. Robust against a transiently-unreadable SDL
+ * serial during stream churn / mid-session re-enumeration: a pad with no usable
+ * serial may reach its logical device through the VID:PID tiers, while a pad
+ * WITH one is only ever matched by exact identity — a weaker match would hand a
  * genuinely-new controller another same-model pad's pref. */
 bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *gamepad);
 
@@ -47,10 +49,11 @@ void hid_pt_moonlight_reconcile_exclusions(struct stream_input_t *input);
 bool hid_pt_gamepad_is_moonlight_excluded(const struct stream_input_t *input,
                                           const app_gamepad_state_t *gamepad);
 
-/* The controller type to announce for this pad over SDL: what was chosen for
- * the listed device the pad is (hid_pt_gamepad_panel_peer()), else what was
- * chosen for the pad's own id, else AUTO. @p input is the app's pad table, which
- * the one-pad-per-device pairing needs; NULL skips that check. */
+/* The controller type to announce for this pad over SDL: the current game's
+ * X360/DS4 lock if it has one, else what was chosen for the listed device the
+ * pad is (hid_pt_gamepad_panel_peer()), else what was chosen for the pad's own
+ * id, else AUTO. @p input is the app's pad table, which the one-pad-per-device
+ * pairing needs; NULL skips that check. */
 gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad);
 
 /* Which listed device this SDL pad is, for the Controllers page, or NULL. Pure:

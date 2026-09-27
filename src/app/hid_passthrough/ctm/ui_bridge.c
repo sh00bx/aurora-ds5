@@ -1277,8 +1277,10 @@ void hid_pt_autoplug_reconcile(stream_input_t *input)
             autoplug_mark_done(item->key);
             continue;
         }
+        /* The device's own mode, unless the game being streamed fixes one for
+         * every controller (hid_pt_prefs_effective_hid()). */
         tv_bridge_worker_settings_t *settings = settings_for_item(item);
-        if (!settings || !settings->auto_plugin) {
+        if (!settings || !hid_pt_prefs_effective_hid(settings->auto_plugin)) {
             continue;
         }
         const char *kind = bridge_kind_for_item(item);

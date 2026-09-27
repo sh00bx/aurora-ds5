@@ -350,8 +350,13 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
     if (!gamepad) {
         return false;
     }
+    /* A game that fixes the mode (hid_pt_prefs_current_app_mode()) replaces
+     * every pref below: X360/DS4 keeps every pad on SDL, HID takes every pad
+     * that is a device the bridge can mount. Only the VID:PID guard against an
+     * already-bridged model stays -- that one is about what IS mounted. */
+    const gamepad_mode_t lock = hid_pt_prefs_current_app_mode();
     /* Primary: the pref keyed by this pad's own stable id. */
-    if (hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
+    if (lock == GAMEPAD_MODE_NONE && hid_pt_prefs_auto_plugin_for_gamepad(gamepad)) {
         return true;
     }
     /* Matching-independent: a pad whose VID:PID matches an already BRIDGED
@@ -382,12 +387,22 @@ bool hid_pt_gamepad_is_autoplug(app_input_t *input, const app_gamepad_state_t *g
      * with no usable serial has nothing better available, so it may use the
      * VID:PID tiers. No binding is requested -- this predicate runs for every
      * pad, and a mere match must not rebind anything. */
+    if (lock == GAMEPAD_MODE_X360 || lock == GAMEPAD_MODE_DS4) {
+        return false;
+    }
     char sid[HID_PT_STABLE_ID_LEN];
     hid_pt_stable_id_for_gamepad(gamepad, sid, sizeof(sid));
     const int floor_confidence =
         hid_pt_stable_id_is_synthetic(sid) ? HID_PT_CONF_FUZZY : HID_PT_CONF_EXACT;
     hid_pt_logical_match_t m = resolve_logical(gamepad, floor_confidence, false);
-    if (!m.item || !hid_pt_prefs_auto_plugin_for_logical(m.item)) {
+    /* Under a HID lock the same resolution answers, with "can be mounted" (a
+     * known controller kind, as the reconcile demands) in place of the flag.
+     * Before the first rescan of a stream there may be no device to resolve
+     * to; the pad is then announced and taken off again when the reconcile
+     * mounts it, the plug-time exclusion every late pad already goes through. */
+    const bool wants_hid = m.item && (lock == GAMEPAD_MODE_HID ? strcmp(bridge_kind_for_item(m.item), "hid") != 0
+                                                              : hid_pt_prefs_auto_plugin_for_logical(m.item));
+    if (!wants_hid) {
         return false;
     }
     commons_log_info("HID-PT", "autoplug fallback: %s matched logical auto-plug (%s)",
@@ -532,11 +547,9 @@ static logical_device_t *pad_peer(app_input_t *input, const app_gamepad_state_t 
     return m.item;
 }
 
-gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad)
+/* The pad's own SDL type, before a game's lock is applied. */
+static gamepad_type_pref_t pad_own_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad)
 {
-    if (!gamepad || !gamepad->controller) {
-        return GAMEPAD_TYPE_PREF_AUTO;
-    }
     gamepad_type_pref_t type = GAMEPAD_TYPE_PREF_AUTO;
     /* The listed device first. It is the one id every write reaches: the page
      * writes it for a mounted controller, which is not in SDL and so has no pad
@@ -560,6 +573,16 @@ gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepa
     hid_pt_stable_id_for_gamepad(gamepad, id, sizeof(id));
     hid_pt_prefs_lookup_sdl_type(id, &type);
     return type;
+}
+
+gamepad_type_pref_t hid_pt_gamepad_sdl_type(app_input_t *input, const app_gamepad_state_t *gamepad)
+{
+    if (!gamepad || !gamepad->controller) {
+        return GAMEPAD_TYPE_PREF_AUTO;
+    }
+    /* A game's X360/DS4 lock is the type of every pad in it -- this is what the
+     * arrival announces, the page lights and the badge names. */
+    return hid_pt_prefs_effective_sdl_type(pad_own_sdl_type(input, gamepad));
 }
 
 logical_device_t *hid_pt_gamepad_panel_peer(app_input_t *input, const app_gamepad_state_t *gamepad)
