@@ -180,13 +180,24 @@ static int ds5_patch_lightbar(ctm_controller_t *c, const tv_bridge_worker_settin
     }
     uint32_t rgb = 0;
     bool game = false;
-    if (!ds5_lightbar_colour(c, s, &rgb, &game) || game) return 0;
-    const uint8_t want[3] = {(uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb};
-    const uint8_t flag1 = (uint8_t) (common[DS5_COMMON_FLAG1] | DS5_FLAG1_LIGHTBAR);
-    if (common[DS5_COMMON_FLAG1] == flag1 && memcmp(&common[DS5_COMMON_RGB], want, 3) == 0) return 0;
-    common[DS5_COMMON_FLAG1] = flag1;
-    memcpy(&common[DS5_COMMON_RGB], want, 3);
-    return 1;
+    const bool ours = ds5_lightbar_colour(c, s, &rgb, &game) && !game;
+    int changed = 0;
+    if (ours) {
+        const uint8_t want[3] = {(uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb};
+        const uint8_t flag1 = (uint8_t) (common[DS5_COMMON_FLAG1] | DS5_FLAG1_LIGHTBAR);
+        if (common[DS5_COMMON_FLAG1] != flag1 || memcmp(&common[DS5_COMMON_RGB], want, 3) != 0) {
+            common[DS5_COMMON_FLAG1] = flag1;
+            memcpy(&common[DS5_COMMON_RGB], want, 3);
+            changed = 1;
+        }
+    }
+    if (common[DS5_COMMON_FLAG1] & DS5_FLAG1_LIGHTBAR) {
+        ctm_controller_note_lightbar_out(c, ((uint32_t) common[DS5_COMMON_RGB] << 16) |
+                                            ((uint32_t) common[DS5_COMMON_RGB + 1] << 8) |
+                                            common[DS5_COMMON_RGB + 2],
+                                         ours);
+    }
+    return changed;
 }
 
 /* patch_output: rewrite a DS5 0x36/0x32 BT output report in place per the live
@@ -418,7 +429,14 @@ static size_t ds5_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     ctm_controller_get_settings(c, &s);
     uint32_t rgb = 0;
     bool game = false;
-    if (!ds5_lightbar_colour(c, &s, &rgb, &game) && !ctm_controller_game_lightbar_last(c, &rgb)) return 0;
+    bool before_known = false;
+    /* Automatic: the game's last colour, else -- ours (a colour taken back, a
+     * cancelled preview) being what the bar was told last -- the colour it
+     * was told before ours, if this session told it one; else nothing. */
+    if (!ds5_lightbar_colour(c, &s, &rgb, &game) && !ctm_controller_game_lightbar_last(c, &rgb) &&
+        !(ctm_controller_lightbar_ours(c, &before_known, &rgb) && before_known)) {
+        return 0;
+    }
     memset(buf, 0, DS5_BT_OUT_LEN);
     buf[0] = 0x31;
     buf[1] = (uint8_t) ((__atomic_fetch_add(&seq, 1u, __ATOMIC_RELAXED) & 0x0fu) << 4);

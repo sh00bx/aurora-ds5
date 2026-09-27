@@ -264,6 +264,16 @@ struct ctm_controller {
      * black included: what Automatic puts back on the bar. */
     bool lb_game_seen;
     uint32_t lb_game_last;
+    /* What the bar was last told this session, by any report that carried a
+     * colour (lb_shown_known), and whether that was the user's colour -- a
+     * chosen one or the picker's preview (lb_ours). lb_before_*: the colour
+     * it was told before ours went on, when anything had told it one: what
+     * Automatic puts back when the game never painted. */
+    bool lb_shown_known;
+    uint32_t lb_shown_rgb;
+    bool lb_ours;
+    bool lb_before_known;
+    uint32_t lb_before_rgb;
     int own_output;
 
     evdev_grab_t evdev_grabs[MAX_EVDEV_GRABS];
@@ -1504,6 +1514,11 @@ static void session_state_reset(ctm_controller_t *c)
     c->lb_game_rgb = 0;
     c->lb_game_seen = false;
     c->lb_game_last = 0;
+    c->lb_shown_known = false;
+    c->lb_shown_rgb = 0;
+    c->lb_ours = false;
+    c->lb_before_known = false;
+    c->lb_before_rgb = 0;
     c->own_output = 0;
 }
 
@@ -2686,6 +2701,26 @@ bool ctm_controller_game_lightbar_last(ctm_controller_t *c, uint32_t *rgb)
 {
     if (!c || !c->lb_game_seen) return false;
     if (rgb) *rgb = c->lb_game_last;
+    return true;
+}
+
+void ctm_controller_note_lightbar_out(ctm_controller_t *c, uint32_t rgb, bool ours)
+{
+    if (!c) return;
+    if (ours && !c->lb_ours) {
+        c->lb_before_known = c->lb_shown_known;
+        c->lb_before_rgb = c->lb_shown_rgb;
+    }
+    c->lb_ours = ours;
+    c->lb_shown_known = true;
+    c->lb_shown_rgb = rgb & 0xFFFFFFu;
+}
+
+bool ctm_controller_lightbar_ours(ctm_controller_t *c, bool *before_known, uint32_t *before_rgb)
+{
+    if (!c || !c->lb_ours) return false;
+    if (before_known) *before_known = c->lb_before_known;
+    if (before_rgb) *before_rgb = c->lb_before_rgb;
     return true;
 }
 

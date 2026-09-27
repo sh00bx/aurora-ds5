@@ -233,6 +233,17 @@ void ctm_controller_note_game_lightbar(ctm_controller_t *c, uint32_t rgb);
 bool ctm_controller_game_lightbar(ctm_controller_t *c, uint32_t *rgb);
 bool ctm_controller_game_lightbar_last(ctm_controller_t *c, uint32_t *rgb);
 bool ctm_controller_own_output(ctm_controller_t *c);
+/* What the bar is being told: every outbound report that carries a lightbar
+ * colour, as it leaves patch_output -- @p ours when that colour is the user's
+ * (a chosen one, or the picker's preview), not the game's and not one
+ * Automatic restates. lightbar_ours() is true while the user's colour is the
+ * last the bar was told, and then says which colour it was told before ours
+ * went on, if any report this session had told it one (*before_known). What
+ * Automatic puts back when the game never painted: a cancelled preview or a
+ * colour taken back must not stay on the bar. Session-thread state, reset per
+ * session, like the rest above. */
+void ctm_controller_note_lightbar_out(ctm_controller_t *c, uint32_t rgb, bool ours);
+bool ctm_controller_lightbar_ours(ctm_controller_t *c, bool *before_known, uint32_t *before_rgb);
 /* Session thread exited while still plugged (zombie) — reconcile re-plugs. */
 bool ctm_controller_finished(ctm_controller_t *c);
 int  ctm_controller_write_feature(ctm_controller_t *c, const uint8_t *feature, size_t len);

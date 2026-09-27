@@ -87,8 +87,14 @@ static int ds4_patch_lightbar(ctm_controller_t *c, const tv_bridge_worker_settin
     }
     uint32_t rgb = 0;
     bool game = false;
-    if (!ds4_lightbar_colour(c, s, &rgb, &game) || game) return 0;
-    return ds4_stamp_lightbar(data, rgb, !s->lightbar_game);
+    const bool ours = ds4_lightbar_colour(c, s, &rgb, &game) && !game;
+    const int changed = ours ? ds4_stamp_lightbar(data, rgb, !s->lightbar_game) : 0;
+    if (data[3] & DS4_FLAG_LIGHTBAR) {
+        ctm_controller_note_lightbar_out(c, ((uint32_t) data[DS4_OUT_RGB] << 16) |
+                                            ((uint32_t) data[DS4_OUT_RGB + 1] << 8) | data[DS4_OUT_RGB + 2],
+                                         ours);
+    }
+    return changed;
 }
 
 /* matches: claim the DualShock 4 (either PID) over BT. When: classification. */
@@ -286,12 +292,23 @@ static size_t ds4_build_settings_report(ctm_controller_t *c, uint8_t *buf, size_
     }
     uint32_t rgb = 0;
     bool game = false;
+    bool before_known = false;
     if (ds4_lightbar_colour(c, &s, &rgb, &game)) {
         ds4_stamp_lightbar(buf, rgb, !s.lightbar_game);
     } else if (ctm_controller_game_lightbar_last(c, &rgb)) {
         /* Automatic: the bar as the game last painted it, not the colour of
          * ours the restated state may still carry. */
         ds4_stamp_lightbar(buf, rgb, false);
+    } else if (ctm_controller_lightbar_ours(c, &before_known, &rgb)) {
+        /* Automatic, the game never painted, and ours (a colour taken back,
+         * a cancelled preview) is what the bar was told last: the colour it
+         * was told before ours, if this session told it one. Otherwise the
+         * restated state must at least not say ours again. */
+        if (before_known) {
+            ds4_stamp_lightbar(buf, rgb, false);
+        } else {
+            buf[3] = (uint8_t) (buf[3] & ~(DS4_FLAG_LIGHTBAR | DS4_FLAG_FLASH));
+        }
     }
     ds4_stamp_volumes(buf, &s);
     ctm_bt_sign_output(buf, DS4_BT_OUTPUT_LEN);
