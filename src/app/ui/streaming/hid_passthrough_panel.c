@@ -19,10 +19,10 @@
  *     is the control where that is enforced, and why the sliders need no such
  *     guard.
  *   - customize_setting_changed(), the composite and lightbar-game branches of
- *     panel_value_changed(), panel_mode_clicked() and panel_swatch_clicked()
- *     push the widgets into the model. Every caller is a widget's
- *     LV_EVENT_VALUE_CHANGED or a button's click, i.e. a change the user just
- *     made.
+ *     panel_value_changed(), panel_mode_clicked(), panel_swatch_clicked() and
+ *     the colour picker's OK push the widgets into the model. Every caller is
+ *     a widget's LV_EVENT_VALUE_CHANGED or a button's click, i.e. a change the
+ *     user just made. The picker's sliders only preview (picker_changed()).
  */
 
 #include "hid_passthrough_panel.h"
@@ -97,7 +97,8 @@ _Static_assert(sizeof(MODES) / sizeof(MODES[0]) <= HID_PT_MAX_MODES, "the view h
  * a DS4's bar is the hungriest thing on it, and a lightbar in a dark room
  * needs little. A disc does not show that value, which would be black on
  * screen, but the colour at full brightness (lightbar_colour_display():
- * 040100 is drawn FF4000).
+ * 040100 is drawn FF4000). Last comes Custom (hid_pt_view_add_custom_swatch()),
+ * which opens the colour picker and stands for any colour not listed here.
  */
 static const struct {
     bool automatic;
@@ -124,8 +125,13 @@ static const struct {
 
 #define SWATCH_COUNT ((int) (sizeof(SWATCHES) / sizeof(SWATCHES[0])))
 
-_Static_assert(sizeof(SWATCHES) / sizeof(SWATCHES[0]) <= HID_PT_MAX_SWATCHES,
-               "the view holds HID_PT_MAX_SWATCHES swatches");
+_Static_assert(sizeof(SWATCHES) / sizeof(SWATCHES[0]) + 1 <= HID_PT_MAX_SWATCHES,
+               "the view holds HID_PT_MAX_SWATCHES swatches, Custom included");
+
+/* The picker's live preview goes out at most this often (10 Hz): every slider
+ * step would otherwise be a report to a mounted pad, or an LED write and a
+ * painter datagram. */
+#define PICKER_PREVIEW_MS 100
 
 typedef struct {
     hid_pt_view_t view;
@@ -146,6 +152,16 @@ typedef struct {
      * model index no longer names the device the user is looking at. Every
      * click and every settings write resolves this key instead. */
     char row_keys[HID_PT_MAX_ROWS][HID_PT_PANEL_KEY_LEN];
+    /* The colour picker, while it is open: the colour the controller had
+     * (what a cancel leaves stored), the colour the picker holds -- the stored
+     * one exactly until a slider moves -- and whether the preview still has to
+     * go out on the next tick of its timer. */
+    struct {
+        lightbar_pref_t from;
+        uint32_t rgb;
+        bool pending;
+        lv_timer_t *timer;
+    } picker;
     /* A ROW index into the view's rows and into row_keys — never an index into
      * the device model. The selected DEVICE is the model's key. */
     int selected_index;
@@ -185,6 +201,8 @@ static void panel_focus_selected_row(hid_pt_panel_t *panel);
 static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused);
 static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj);
 static void refresh_devices(hid_pt_panel_t *panel, bool rescan);
+static void picker_key(hid_pt_panel_t *panel, lv_event_t *event, lv_obj_t *target, uint32_t key,
+                       hid_pt_widget_kind_t kind);
 
 static void panel_request_close(hid_pt_panel_t *panel) {
     (void) panel;
@@ -267,6 +285,8 @@ static void panel_update_hints(hid_pt_panel_t *panel, lv_obj_t *focused)
     const hid_pt_widget_kind_t kind = hid_pt_view_kind_of(&panel->view, focused);
     if (kind == HID_PT_WK_MODE_BTN || kind == HID_PT_WK_SWATCH) {
         zone = HID_PT_ZONE_MODE;
+    } else if (kind == HID_PT_WK_PICKER_BTN) {
+        zone = HID_PT_ZONE_PICKER_BUTTONS;
     }
     hid_pt_view_set_hints(&panel->view, zone, hid_pt_model_selected_is_plugged(&panel->model));
 }
@@ -373,8 +393,12 @@ static void panel_focus(hid_pt_panel_t *panel, lv_obj_t *obj)
  *               device
  *   UP/DOWN     on the LIGHTBAR row, the swatch in the other line first
  *   OK          plugs the focused device in or out; opens the dropdown;
- *               selects a mode
+ *               selects a mode or a colour; on Custom, opens the picker
  *   BACK        from the settings, back to the devices; from there, closes
+ *
+ * The colour picker, while it is up, takes every key (picker_key()): UP/DOWN
+ * between its sliders and its buttons, LEFT/RIGHT move a slider (the hue by 5)
+ * or step between OK and Cancel, OK presses a button, BACK cancels.
  *
  * The sliders take LEFT/RIGHT with nothing in between. They used to want OK to
  * enter an edit mode, arrows to move, then OK or BACK to leave — three keys and
@@ -392,6 +416,10 @@ static void panel_control_key(void *userdata, lv_event_t *event)
     const hid_pt_widget_kind_t kind = hid_pt_view_kind_of(&panel->view, target);
     const hid_pt_zone_t zone = hid_pt_view_zone_of(&panel->view, target);
 
+    if (zone == HID_PT_ZONE_PICKER) {
+        picker_key(panel, event, target, key, kind);
+        return;
+    }
     switch (key) {
         case LV_KEY_ESC:
             if (kind == HID_PT_WK_DROPDOWN && panel->view.dropdown_esc_spent) {
@@ -854,16 +882,28 @@ static void update_mode_row(hid_pt_panel_t *panel)
     }
 }
 
-/* The swatch for @p lb, or -1 for a colour the palette has not (one of 1.7.30's
- * brighter palette, or one written into the ini by hand). */
-static int lit_swatch(const lightbar_pref_t *lb)
+/* The swatch for @p lb: its palette entry, else Custom -- a colour the picker
+ * made, one of 1.7.30's brighter palette, or one written into the ini by
+ * hand. */
+static int lit_swatch(const hid_pt_panel_t *panel, const lightbar_pref_t *lb)
 {
     for (int i = 0; i < SWATCH_COUNT; ++i) {
         if (SWATCHES[i].automatic ? lb->automatic : (!lb->automatic && SWATCHES[i].rgb == lb->rgb)) {
             return i;
         }
     }
-    return -1;
+    return panel->view.custom_swatch;
+}
+
+/* "LIGHTBAR · DS4": whose colour the swatches, and the picker, are. */
+static void lightbar_heading(gamepad_mode_t mode, char *buf, size_t len)
+{
+    const char *mode_name = gamepad_mode_label(mode);
+    if (mode_name) {
+        snprintf(buf, len, "%s · %s", locstr("LIGHTBAR"), locstr(mode_name));
+    } else {
+        snprintf(buf, len, "%s", locstr("LIGHTBAR"));
+    }
 }
 
 /**
@@ -888,14 +928,12 @@ static void update_lightbar_row(hid_pt_panel_t *panel)
     }
     /* Which of the controller's colours the swatches are: the lit mode's. */
     char heading[48];
-    const char *mode_name = gamepad_mode_label(mode);
-    if (mode_name) {
-        snprintf(heading, sizeof(heading), "%s · %s", locstr("LIGHTBAR"), locstr(mode_name));
-    } else {
-        snprintf(heading, sizeof(heading), "%s", locstr("LIGHTBAR"));
-    }
+    lightbar_heading(mode, heading, sizeof(heading));
     lv_obj_t *focused = panel->view.group ? lv_group_get_focused(panel->view.group) : NULL;
-    hid_pt_view_set_lightbar(&panel->view, show, heading, lit_swatch(&lb), show && !lb.automatic, lb.game);
+    const int lit = lit_swatch(panel, &lb);
+    const bool custom = lit >= 0 && lit == panel->view.custom_swatch;
+    hid_pt_view_set_custom_swatch(&panel->view, custom, custom ? lightbar_colour_display(lb.rgb) : 0);
+    hid_pt_view_set_lightbar(&panel->view, show, heading, lit, show && !lb.automatic, lb.game);
     /* The switch just hidden under the cursor (Automatic picked, or another
      * controller): LVGL would keep handing it the keys. Back to the row's
      * entry, else the next setting, else the device's row. */
@@ -922,14 +960,147 @@ static void panel_set_lightbar(hid_pt_panel_t *panel, const lightbar_pref_t *lb)
     update_lightbar_row(panel);
 }
 
+/* ---- the colour picker -------------------------------------------------- */
+
+/* Send the colour the sliders make to the controller, if it changed since the
+ * last tick: the throttle that keeps the preview at PICKER_PREVIEW_MS. */
+static void picker_timer_cb(lv_timer_t *timer)
+{
+    hid_pt_panel_t *panel = timer->user_data;
+    if (panel && panel->picker.pending) {
+        panel->picker.pending = false;
+        hid_pt_model_preview_lightbar(&panel->model, panel->picker.rgb);
+    }
+}
+
+/**
+ * OK on Custom: the picker, over the sheet. It starts on the colour the
+ * controller has in the lit mode -- hue and intensity as they are, brightness
+ * through the inverse of its curve -- or, from Automatic or Off, on the
+ * palette's red: hue 0, intensity 100, brightness 25.
+ */
+static void picker_open(hid_pt_panel_t *panel)
+{
+    lightbar_pref_t lb;
+    gamepad_mode_t mode = GAMEPAD_MODE_NONE;
+    if (hid_pt_view_picker_is_open(&panel->view) || !hid_pt_model_selected_lightbar(&panel->model, &lb, &mode)) {
+        return;
+    }
+    unsigned hue = 0;
+    unsigned intensity = LIGHTBAR_INTENSITY_MAX;
+    unsigned brightness = LIGHTBAR_BRIGHTNESS_PALETTE;
+    const bool from_colour = !lb.automatic && lb.rgb != 0;
+    if (from_colour) {
+        unsigned value = 0;
+        lightbar_colour_to_hsv(lb.rgb, &hue, &intensity, &value);
+        brightness = lightbar_colour_brightness(value);
+    }
+    char heading[48];
+    lightbar_heading(mode, heading, sizeof(heading));
+    panel->picker.from = lb;
+    panel->picker.pending = false;
+    /* Not moved yet, the picker shows -- and OK keeps -- the colour exactly as
+     * stored: the sliders' grid cannot always make it again. */
+    panel->picker.rgb = from_colour ? lb.rgb
+                                    : lightbar_colour_from_hsv(hue, intensity, lightbar_colour_value(brightness));
+    hid_pt_view_open_picker(&panel->view, heading, (int) hue, (int) brightness, (int) intensity);
+    hid_pt_view_picker_show(&panel->view, panel->picker.rgb);
+    panel->picker.timer = lv_timer_create(picker_timer_cb, PICKER_PREVIEW_MS, panel);
+}
+
+/**
+ * Close the picker. @p keep: its colour was just stored, and the preview's
+ * end must not put the old one back on a mounted pad's record; without, a
+ * cancel -- the stored colour goes back on the bar at once.
+ */
+static void picker_close(hid_pt_panel_t *panel, bool keep)
+{
+    if (!hid_pt_view_picker_is_open(&panel->view)) {
+        return;
+    }
+    if (panel->picker.timer) {
+        lv_timer_del(panel->picker.timer);
+        panel->picker.timer = NULL;
+    }
+    panel->picker.pending = false;
+    hid_pt_model_end_lightbar_preview(&panel->model, keep);
+    hid_pt_view_close_picker(&panel->view);
+    update_lightbar_row(panel);
+    panel_update_hints(panel, lv_group_get_focused(panel->view.group));
+}
+
+/* A slider moved: the colour it makes, shown at once and previewed on the
+ * controller on the next tick. */
+static void picker_changed(hid_pt_panel_t *panel)
+{
+    int hue = 0, brightness = LIGHTBAR_BRIGHTNESS_PALETTE, intensity = LIGHTBAR_INTENSITY_MAX;
+    hid_pt_view_picker_values(&panel->view, &hue, &brightness, &intensity);
+    panel->picker.rgb = lightbar_colour_from_hsv((unsigned) hue, (unsigned) intensity,
+                                                 lightbar_colour_value((unsigned) brightness));
+    panel->picker.pending = true;
+    hid_pt_view_picker_show(&panel->view, panel->picker.rgb);
+}
+
+/* OK: the colour is stored for the lit mode, as a swatch's would be -- the
+ * game switch kept, or on when it comes from Automatic. */
+static void picker_ok(hid_pt_panel_t *panel)
+{
+    const lightbar_pref_t from = panel->picker.from;
+    lightbar_pref_t want = {false, panel->picker.rgb, from.automatic || from.game};
+    const bool change = !lightbar_pref_equal(&want, &from);
+    if (change && !hid_pt_model_set_lightbar(&panel->model, &want)) {
+        panel_update_status(panel);
+    }
+    /* Unchanged, whatever the preview left on a mounted pad's record goes. */
+    picker_close(panel, change);
+}
+
+/* The picker's keys; it owns them all while it is up. */
+static void picker_key(hid_pt_panel_t *panel, lv_event_t *event, lv_obj_t *target, uint32_t key,
+                       hid_pt_widget_kind_t kind)
+{
+    const int dir = (key == LV_KEY_RIGHT || key == LV_KEY_DOWN) ? 1 : -1;
+    switch (key) {
+        case LV_KEY_ESC:
+            picker_close(panel, false);
+            break;
+        case LV_KEY_ENTER:
+            if (kind == HID_PT_WK_PICKER_BTN) {
+                /* LVGL turns it into the button's click. */
+                return;
+            }
+            break;
+        case LV_KEY_LEFT:
+        case LV_KEY_RIGHT:
+            if (!hid_pt_view_picker_nudge(&panel->view, target, dir)) {
+                panel_focus(panel, hid_pt_view_picker_step_button(&panel->view, target, dir));
+            }
+            break;
+        case LV_KEY_UP:
+        case LV_KEY_DOWN:
+            panel_focus(panel, hid_pt_view_picker_step(&panel->view, target, dir));
+            break;
+        default:
+            return;
+    }
+    lv_event_stop_processing(event);
+}
+
 /* A swatch: that colour, or Automatic. A colour keeps the game switch where
- * it was; coming from Automatic, where the switch is hidden, it starts on. */
+ * it was; coming from Automatic, where the switch is hidden, it starts on.
+ * Custom opens the picker instead, whether it is lit or not. */
 static void panel_swatch_clicked(void *userdata, int swatch)
 {
     hid_pt_panel_t *panel = userdata;
     lightbar_pref_t lb;
-    if (!panel || swatch < 0 || swatch >= SWATCH_COUNT || !hid_pt_model_selected_has_lightbar(&panel->model) ||
-        !hid_pt_model_selected_lightbar(&panel->model, &lb, NULL)) {
+    if (!panel || !hid_pt_model_selected_has_lightbar(&panel->model)) {
+        return;
+    }
+    if (swatch >= 0 && swatch == panel->view.custom_swatch) {
+        picker_open(panel);
+        return;
+    }
+    if (swatch < 0 || swatch >= SWATCH_COUNT || !hid_pt_model_selected_lightbar(&panel->model, &lb, NULL)) {
         return;
     }
     lightbar_pref_t want = lightbar_pref_automatic();
@@ -1164,6 +1335,11 @@ static void panel_value_changed(void *userdata, hid_pt_ctl_t id)
             break;
         case HID_PT_CTL_AUDIO_MODE:
             break;
+        case HID_PT_CTL_PICKER_HUE:
+        case HID_PT_CTL_PICKER_BRIGHTNESS:
+        case HID_PT_CTL_PICKER_INTENSITY:
+            picker_changed(panel);
+            return;
         default:
             return;
     }
@@ -1190,6 +1366,12 @@ static void panel_clicked(void *userdata, hid_pt_ctl_t id)
             return;
         case HID_PT_CTL_CLOSE:
             panel_request_close(panel);
+            return;
+        case HID_PT_CTL_PICKER_OK:
+            picker_ok(panel);
+            return;
+        case HID_PT_CTL_PICKER_CANCEL:
+            picker_close(panel, false);
             return;
         default:
             return;
@@ -1355,7 +1537,10 @@ static void refresh_devices(hid_pt_panel_t *panel, bool rescan) {
 
 static void refresh_timer_cb(lv_timer_t *timer) {
     hid_pt_panel_t *panel = timer->user_data;
-    if (panel && panel->view.container && lv_obj_is_valid(panel->view.container)) {
+    /* Not under the picker: a re-render rebuilds the focus group, and the
+     * picker is what the user is editing -- the sheet catches up on close. */
+    if (panel && panel->view.container && lv_obj_is_valid(panel->view.container) &&
+        !hid_pt_view_picker_is_open(&panel->view)) {
         refresh_devices(panel, false);
     }
 }
@@ -1369,20 +1554,30 @@ static void panel_deleted(void *userdata) {
         lv_timer_del(panel->refresh_timer);
         panel->refresh_timer = NULL;
     }
+    /* The page closing -- BACK out of the overlay, the stream ending -- with
+     * the picker up is a cancel: the stored colour goes back on the bar. Its
+     * widgets go with the page's tree. */
+    if (hid_pt_view_picker_is_open(&panel->view)) {
+        if (panel->picker.timer) {
+            lv_timer_del(panel->picker.timer);
+            panel->picker.timer = NULL;
+        }
+        hid_pt_model_end_lightbar_preview(&panel->model, false);
+    }
     hid_pt_view_destroy(&panel->view);
     free(panel);
 }
 
 void hid_passthrough_panel_refresh(lv_obj_t *panel_root) {
     hid_pt_panel_t *panel = lv_obj_get_user_data(panel_root);
-    if (panel) {
+    if (panel && !hid_pt_view_picker_is_open(&panel->view)) {
         refresh_devices(panel, true);
     }
 }
 
 void hid_passthrough_panel_focus_initial(lv_obj_t *panel_root) {
     hid_pt_panel_t *panel = lv_obj_get_user_data(panel_root);
-    if (panel) {
+    if (panel && !hid_pt_view_picker_is_open(&panel->view)) {
         focus_initial_target(panel);
     }
 }
@@ -1432,6 +1627,7 @@ lv_obj_t *hid_passthrough_panel_create(lv_obj_t *parent, session_t *session,
         const uint32_t shown = SWATCHES[i].automatic ? OVERLAY_SLAB : lightbar_colour_display(SWATCHES[i].rgb);
         hid_pt_view_add_swatch(&panel->view, shown, SWATCHES[i].text, SWATCHES[i].glyph);
     }
+    hid_pt_view_add_custom_swatch(&panel->view);
     hid_pt_view_rebuild_focus_order(&panel->view);
     panel->refresh_timer = lv_timer_create(refresh_timer_cb, 2000, panel);
 

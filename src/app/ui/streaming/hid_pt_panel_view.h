@@ -50,6 +50,12 @@ typedef enum {
     HID_PT_CTL_RESET,
     HID_PT_CTL_REFRESH,
     HID_PT_CTL_CLOSE,
+    /** The colour picker's sliders and buttons. */
+    HID_PT_CTL_PICKER_HUE,
+    HID_PT_CTL_PICKER_BRIGHTNESS,
+    HID_PT_CTL_PICKER_INTENSITY,
+    HID_PT_CTL_PICKER_OK,
+    HID_PT_CTL_PICKER_CANCEL,
 } hid_pt_ctl_t;
 
 /**
@@ -73,6 +79,10 @@ typedef enum {
     HID_PT_WK_MODE_BTN,
     /** A colour of the LIGHTBAR row: walked and chosen like a mode button. */
     HID_PT_WK_SWATCH,
+    /** A slider of the colour picker: LEFT/RIGHT move it, UP/DOWN leave it. */
+    HID_PT_WK_PICKER_SLIDER,
+    /** OK or Cancel under the picker's sliders. */
+    HID_PT_WK_PICKER_BTN,
 } hid_pt_widget_kind_t;
 
 static inline bool hid_pt_view_kind_is_option(hid_pt_widget_kind_t kind)
@@ -98,6 +108,11 @@ typedef enum {
     /** Not a place either: the cursor is on the mode row of the options
      * column, where LEFT/RIGHT pick a button rather than adjust a value. */
     HID_PT_ZONE_MODE,
+    /** The colour picker, a modal over the sheet that owns every key while it
+     * is up: its sliders... */
+    HID_PT_ZONE_PICKER,
+    /** ...and, for the footer line only, its OK / Cancel. */
+    HID_PT_ZONE_PICKER_BUTTONS,
 } hid_pt_zone_t;
 
 typedef struct {
@@ -149,6 +164,29 @@ typedef struct {
     int swatch_count;
     lv_obj_t *lightbar_game_label;
     lv_obj_t *lightbar_game_cb;
+    /* The Custom swatch (-1: none): a rainbow ring, generated once, around a
+     * disc that shows a colour the palette does not have. */
+    int custom_swatch;
+    lv_obj_t *custom_disc;
+    lv_img_dsc_t custom_ring;
+    lv_color_t *custom_ring_px;
+    /* The colour picker, while it is open (veil != NULL). */
+    struct {
+        lv_obj_t *veil;
+        lv_obj_t *heading;
+        lv_obj_t *preview;
+        lv_obj_t *hex;
+        lv_obj_t *sliders[3];   /* hue, brightness, intensity */
+        lv_obj_t *values[3];
+        lv_obj_t *ok_btn;
+        lv_obj_t *cancel_btn;
+        lv_obj_t *hint;
+        /* Where the cursor goes back to when it closes. */
+        lv_obj_t *return_focus;
+        /* The hue track: a rainbow the size of the slider, drawn under it. */
+        lv_img_dsc_t hue_img;
+        lv_color_t *hue_px;
+    } picker;
     lv_obj_t *customize_panel;
     lv_obj_t *customize_title;
     lv_obj_t *customize_state;
@@ -376,9 +414,57 @@ int hid_pt_view_swatch_of(const hid_pt_view_t *view, lv_obj_t *obj);
 lv_obj_t *hid_pt_view_step_lightbar(const hid_pt_view_t *view, lv_obj_t *from, int dir);
 
 /**
+ * Append the Custom swatch (last, after hid_pt_view_add_swatch()'s): a rainbow
+ * ring around a disc, which hid_pt_view_set_custom_swatch() fills. Walked and
+ * reported like any swatch.
+ */
+lv_obj_t *hid_pt_view_add_custom_swatch(hid_pt_view_t *view);
+
+/** The Custom swatch's disc: @p rgb (as the screen shows it) with
+ * @p has_colour, else the slab's dark. Writes only what changes. */
+void hid_pt_view_set_custom_swatch(hid_pt_view_t *view, bool has_colour, uint32_t rgb);
+
+/**
  * UP/DOWN on the LIGHTBAR row: from a swatch to the one above or below it in
  * the next line in direction @p dir (the line's last when it is shorter), or
  * NULL where the row ends -- the caller then leaves it for the next setting.
  * The switch has no line below it and answers NULL.
  */
 lv_obj_t *hid_pt_view_step_lightbar_line(const hid_pt_view_t *view, lv_obj_t *from, int dir);
+
+/* ---- the colour picker --------------------------------------------------- */
+
+/**
+ * Open the colour picker over the sheet, which stays behind a veil: @p heading
+ * above the title "Custom colour", a large preview of the colour and its hex,
+ * the sliders Colour (hue 0-359, drawn as a rainbow), Brightness (1-100) and
+ * Intensity (0-100) at the given values, and OK / Cancel. The focus group then
+ * holds the picker's controls alone, the cursor on Colour. Its sliders report
+ * HID_PT_CTL_PICKER_* through value_changed, its buttons through clicked.
+ */
+void hid_pt_view_open_picker(hid_pt_view_t *view, const char *heading, int hue, int brightness, int intensity);
+
+/** Close it, give the group back to the sheet and the cursor back to where it
+ * was. A no-op when it is not open. */
+void hid_pt_view_close_picker(hid_pt_view_t *view);
+
+bool hid_pt_view_picker_is_open(const hid_pt_view_t *view);
+
+/** The three sliders' values. */
+void hid_pt_view_picker_values(const hid_pt_view_t *view, int *hue, int *brightness, int *intensity);
+
+/** Show @p rgb, the bar's value, as the colour being picked: the preview (at
+ * full brightness), the hex (as it is), the numbers, and the brightness and
+ * intensity tracks' gradients for the current hue. */
+void hid_pt_view_picker_show(hid_pt_view_t *view, uint32_t rgb);
+
+/** LEFT/RIGHT on a picker slider: hue in steps of 5, the others 1. False when
+ * @p obj is not one. */
+bool hid_pt_view_picker_nudge(hid_pt_view_t *view, lv_obj_t *obj, int dir);
+
+/** UP/DOWN in the picker: Colour, Brightness, Intensity, then the buttons (OK
+ * first); NULL past either end. */
+lv_obj_t *hid_pt_view_picker_step(const hid_pt_view_t *view, lv_obj_t *from, int dir);
+
+/** LEFT/RIGHT between OK and Cancel; NULL past either. */
+lv_obj_t *hid_pt_view_picker_step_button(const hid_pt_view_t *view, lv_obj_t *from, int dir);

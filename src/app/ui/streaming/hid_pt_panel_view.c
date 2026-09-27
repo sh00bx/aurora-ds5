@@ -1,13 +1,16 @@
 #if defined(TARGET_WEBOS)
 
 #include "hid_pt_panel_view.h"
+#include "lightbar_colour.h"
 #include "overlay_style.h"
 
 #include "util/font.h"
 #include "lvgl/theme/lv_theme_moonlight.h"
 #include "util/i18n.h"
 
+#include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* The sheet's grid. Every actionable row is the same height and puts its control
@@ -596,6 +599,16 @@ void hid_pt_view_rebuild_focus_order(hid_pt_view_t *view)
     }
     view->rebuilding = true;
     lv_group_remove_all_objs(view->group);
+    if (view->picker.veil) {
+        /* The picker is modal: nothing behind it can take the cursor. */
+        for (int i = 0; i < 3; ++i) {
+            lv_group_add_obj(view->group, view->picker.sliders[i]);
+        }
+        lv_group_add_obj(view->group, view->picker.ok_btn);
+        lv_group_add_obj(view->group, view->picker.cancel_btn);
+        view->rebuilding = false;
+        return;
+    }
     for (int i = 0; i < HID_PT_MAX_ROWS; ++i) {
         if (view->row_buttons[i]) {
             /* Rows scroll the device list from their own FOCUSED handler, so
@@ -649,6 +662,11 @@ hid_pt_widget_kind_t hid_pt_view_kind_of(const hid_pt_view_t *view, lv_obj_t *ob
         lv_obj_t *const *slot;
         hid_pt_widget_kind_t kind;
     } table[] = {
+            {&view->picker.sliders[0],  HID_PT_WK_PICKER_SLIDER},
+            {&view->picker.sliders[1],  HID_PT_WK_PICKER_SLIDER},
+            {&view->picker.sliders[2],  HID_PT_WK_PICKER_SLIDER},
+            {&view->picker.ok_btn,      HID_PT_WK_PICKER_BTN},
+            {&view->picker.cancel_btn,  HID_PT_WK_PICKER_BTN},
             {&view->composite_cb,       HID_PT_WK_SWITCH},
             {&view->lightbar_game_cb,   HID_PT_WK_SWITCH},
             {&view->latency_slider,     HID_PT_WK_SLIDER},
@@ -674,6 +692,9 @@ hid_pt_zone_t hid_pt_view_zone_of(const hid_pt_view_t *view, lv_obj_t *obj)
     hid_pt_widget_kind_t kind = hid_pt_view_kind_of(view, obj);
     if (kind == HID_PT_WK_HEADER_BTN) {
         return HID_PT_ZONE_HEADER;
+    }
+    if (kind == HID_PT_WK_PICKER_SLIDER || kind == HID_PT_WK_PICKER_BTN) {
+        return HID_PT_ZONE_PICKER;
     }
     if (hid_pt_view_kind_is_option(kind)) {
         return HID_PT_ZONE_OPTIONS;
@@ -1198,7 +1219,21 @@ bool hid_pt_view_nudge_slider(hid_pt_view_t *view, lv_obj_t *obj, int dir)
 
 void hid_pt_view_set_hints(hid_pt_view_t *view, hid_pt_zone_t zone, bool plugged)
 {
-    if (!view || !view->hint_label) {
+    if (!view) {
+        return;
+    }
+    if (zone == HID_PT_ZONE_PICKER || zone == HID_PT_ZONE_PICKER_BUTTONS) {
+        /* The picker has a line of its own under its buttons: the sheet's
+         * footer is gone, and the veil would hide it anyway. */
+        const char *text = zone == HID_PT_ZONE_PICKER
+                               ? locstr("UP/DOWN  choose    LEFT/RIGHT  adjust    BACK  cancel")
+                               : locstr("LEFT/RIGHT  choose    OK  select    BACK  cancel");
+        if (view->picker.hint && strcmp(lv_label_get_text(view->picker.hint), text) != 0) {
+            lv_label_set_text(view->picker.hint, text);
+        }
+        return;
+    }
+    if (!view->hint_label) {
         return;
     }
     /* Every arrow key asks for the hints again, but only a move between zones —
@@ -1536,6 +1571,7 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
         return NULL;
     }
     view->cbs = *cbs;
+    view->custom_swatch = -1;
     view->group = lv_group_create();
     lv_group_set_wrap(view->group, false);
 
@@ -1801,11 +1837,414 @@ lv_obj_t *hid_pt_view_create(hid_pt_view_t *view, lv_obj_t *parent, const hid_pt
     return cont;
 }
 
+/* ---- the Custom swatch ---------------------------------------------------- */
+
+/* The fully saturated colour at @p hue degrees, as the screen shows it. */
+static lv_color_t hue_colour(unsigned hue)
+{
+    const uint32_t rgb = lightbar_colour_from_hsv(hue % 360, 100, 255);
+    return lv_color_make((uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb);
+}
+
+/**
+ * The Custom swatch: a disc of SWATCH_D whose outer third is a rainbow ring --
+ * hue by angle, red at the top, clockwise, as colour wheels go -- drawn once
+ * into an ARGB image (LVGL 8 has no conic gradient), with a disc in the middle
+ * for the custom colour. The swatch keeps the others' ring and cursor marks;
+ * its border is drawn after the image so the cursor's thick edge stays on top.
+ */
+lv_obj_t *hid_pt_view_add_custom_swatch(hid_pt_view_t *view)
+{
+    lv_obj_t *swatch = hid_pt_view_add_swatch(view, OVERLAY_SLAB, NULL, NULL);
+    if (!swatch) {
+        return NULL;
+    }
+    view->custom_swatch = view->swatch_count - 1;
+    lv_obj_set_style_bg_opa(swatch, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_post(swatch, true, 0);
+
+    const lv_coord_t d = SWATCH_D;
+    view->custom_ring_px = malloc((size_t) d * (size_t) d * sizeof(lv_color_t));
+    if (view->custom_ring_px) {
+        const float c = (float) d / 2.0f;
+        const float outer = c;
+        const float inner = c * 0.62f;
+        for (lv_coord_t y = 0; y < d; ++y) {
+            for (lv_coord_t x = 0; x < d; ++x) {
+                const float dx = (float) x + 0.5f - c;
+                const float dy = (float) y + 0.5f - c;
+                const float r = sqrtf(dx * dx + dy * dy);
+                /* One pixel of edge on both circles, for a smooth ring. */
+                float a = 1.0f;
+                if (r > outer - 1.0f) {
+                    a = outer - r;
+                } else if (r < inner + 1.0f) {
+                    a = r - inner;
+                }
+                a = a < 0.0f ? 0.0f : a > 1.0f ? 1.0f : a;
+                float deg = atan2f(dx, -dy) * (180.0f / (float) M_PI);
+                if (deg < 0.0f) {
+                    deg += 360.0f;
+                }
+                lv_color_t px = hue_colour((unsigned) deg);
+                px.ch.alpha = (uint8_t) (a * 255.0f + 0.5f);
+                view->custom_ring_px[y * d + x] = px;
+            }
+        }
+        memset(&view->custom_ring, 0, sizeof(view->custom_ring));
+        view->custom_ring.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+        view->custom_ring.header.w = (uint32_t) d;
+        view->custom_ring.header.h = (uint32_t) d;
+        view->custom_ring.data_size = (uint32_t) d * (uint32_t) d * sizeof(lv_color_t);
+        view->custom_ring.data = (const uint8_t *) view->custom_ring_px;
+        lv_obj_t *ring = lv_img_create(swatch);
+        lv_img_set_src(ring, &view->custom_ring);
+        lv_obj_center(ring);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_obj_t *disc = lv_obj_create(swatch);
+    lv_obj_remove_style_all(disc);
+    lv_obj_set_size(disc, d * 56 / 100, d * 56 / 100);
+    lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(disc, lv_color_hex(OVERLAY_SLAB), 0);
+    lv_obj_set_style_bg_opa(disc, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(disc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(disc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(disc);
+    view->custom_disc = disc;
+    return swatch;
+}
+
+void hid_pt_view_set_custom_swatch(hid_pt_view_t *view, bool has_colour, uint32_t rgb)
+{
+    if (!view || !view->custom_disc) {
+        return;
+    }
+    const lv_color_t want = lv_color_hex(has_colour ? rgb : OVERLAY_SLAB);
+    if (lv_obj_get_style_bg_color(view->custom_disc, LV_PART_MAIN).full != want.full) {
+        lv_obj_set_style_bg_color(view->custom_disc, want, 0);
+    }
+}
+
+/* ---- the colour picker --------------------------------------------------- */
+
+#define PICKER_W        LV_DPX(460)
+#define PICKER_SLIDER_W LV_DPX(200)
+#define PICKER_TRACK_H  LV_DPX(10)
+#define PICKER_PREVIEW  LV_DPX(56)
+
+enum { PICKER_HUE = 0, PICKER_BRIGHTNESS, PICKER_INTENSITY };
+
+/**
+ * The hue track: LVGL 8's gradients have two stops (LV_GRADIENT_MAX_STOPS 2,
+ * kept), so the rainbow is a small image generated once at the slider's own
+ * size -- a line of hues repeated down its height -- and drawn under the
+ * slider before its own parts, clipped to its rounded ends. The slider draws
+ * only its knob on top.
+ */
+static void hue_track_draw_cb(lv_event_t *event)
+{
+    hid_pt_view_t *view = lv_event_get_user_data(event);
+    lv_obj_t *slider = lv_event_get_target(event);
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(event);
+    if (!view || !view->picker.hue_px || !draw_ctx) {
+        return;
+    }
+    lv_area_t area;
+    lv_obj_get_coords(slider, &area);
+    /* The image is exactly the slider's box; any other box would read past it. */
+    if ((uint32_t) lv_area_get_width(&area) != view->picker.hue_img.header.w ||
+        (uint32_t) lv_area_get_height(&area) != view->picker.hue_img.header.h) {
+        return;
+    }
+    lv_draw_mask_radius_param_t mask;
+    lv_draw_mask_radius_init(&mask, &area, PICKER_TRACK_H / 2, false);
+    const int16_t mask_id = lv_draw_mask_add(&mask, NULL);
+    lv_draw_img_dsc_t dsc;
+    lv_draw_img_dsc_init(&dsc);
+    lv_draw_img(draw_ctx, &dsc, &area, &view->picker.hue_img);
+    lv_draw_mask_remove_id(mask_id);
+}
+
+static bool picker_build_hue_image(hid_pt_view_t *view, lv_coord_t w, lv_coord_t h)
+{
+    view->picker.hue_px = malloc((size_t) w * (size_t) h * sizeof(lv_color_t));
+    if (!view->picker.hue_px) {
+        return false;
+    }
+    for (lv_coord_t x = 0; x < w; ++x) {
+        view->picker.hue_px[x] = hue_colour((unsigned) ((x * (LIGHTBAR_HUE_MAX + 1) + w / 2) / w));
+    }
+    for (lv_coord_t y = 1; y < h; ++y) {
+        memcpy(&view->picker.hue_px[y * w], view->picker.hue_px, (size_t) w * sizeof(lv_color_t));
+    }
+    memset(&view->picker.hue_img, 0, sizeof(view->picker.hue_img));
+    view->picker.hue_img.header.cf = LV_IMG_CF_TRUE_COLOR;
+    view->picker.hue_img.header.w = (uint32_t) w;
+    view->picker.hue_img.header.h = (uint32_t) h;
+    view->picker.hue_img.data_size = (uint32_t) w * (uint32_t) h * sizeof(lv_color_t);
+    view->picker.hue_img.data = (const uint8_t *) view->picker.hue_px;
+    return true;
+}
+
+/* A picker slider: a slider_row() whose track is the colour it adjusts --
+ * a gradient, or the rainbow -- with no fill, just the knob. */
+static lv_obj_t *picker_slider(hid_pt_view_t *view, lv_obj_t *parent, const char *label, int32_t min, int32_t max,
+                               hid_pt_ctl_t id, int which)
+{
+    lv_obj_t *row = slider_row(view, parent, label, min, max, id, PICKER_SLIDER_W, VALUE_W,
+                               &view->picker.sliders[which], &view->picker.values[which], NULL);
+    lv_obj_t *slider = view->picker.sliders[which];
+    lv_obj_set_height(slider, PICKER_TRACK_H);
+    lv_obj_set_style_radius(slider, PICKER_TRACK_H / 2, 0);
+    lv_obj_set_style_bg_opa(slider, which == PICKER_HUE ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_grad_dir(slider, LV_GRAD_DIR_HOR, 0);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    if (which == PICKER_HUE && picker_build_hue_image(view, PICKER_SLIDER_W, PICKER_TRACK_H)) {
+        lv_obj_add_event_cb(slider, hue_track_draw_cb, LV_EVENT_DRAW_MAIN_BEGIN, view);
+    }
+    return row;
+}
+
+void hid_pt_view_open_picker(hid_pt_view_t *view, const char *heading, int hue, int brightness, int intensity)
+{
+    if (!view || !view->container || view->picker.veil) {
+        return;
+    }
+    view->picker.return_focus = view->group ? lv_group_get_focused(view->group) : NULL;
+
+    /* The veil takes the whole screen over the sheet, which stays visible
+     * behind it; it swallows a pointer click rather than pass it through. */
+    lv_obj_t *veil = lv_obj_create(view->container);
+    lv_obj_remove_style_all(veil);
+    lv_obj_set_size(veil, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(veil, lv_color_hex(OVERLAY_INK), 0);
+    lv_obj_set_style_bg_opa(veil, OVERLAY_OPA_VEIL, 0);
+    lv_obj_add_flag(veil, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(veil, LV_OBJ_FLAG_SCROLLABLE);
+    view->picker.veil = veil;
+
+    /* The sheet's look: ink, a hairline, a soft shadow. */
+    lv_obj_t *box = lv_obj_create(veil);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, PICKER_W, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(OVERLAY_INK), 0);
+    lv_obj_set_style_bg_opa(box, OVERLAY_OPA_SHEET, 0);
+    lv_obj_set_style_radius(box, LV_DPX(10), 0);
+    lv_obj_set_style_border_width(box, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(OVERLAY_SEAM), 0);
+    lv_obj_set_style_shadow_width(box, LV_DPX(30), 0);
+    lv_obj_set_style_shadow_opa(box, LV_OPA_60, 0);
+    lv_obj_set_style_shadow_color(box, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(box, LV_DPX(16), 0);
+    lv_obj_set_style_pad_gap(box, OPT_GAP, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+
+    view->picker.heading = eyebrow(box, heading ? heading : locstr("LIGHTBAR"), OVERLAY_CHALK, OVERLAY_OPA_MUTED);
+    lv_obj_set_style_pad_left(view->picker.heading, LV_DPX(3), 0);
+    lv_obj_t *title = body_text(box, locstr("Custom colour"));
+    lv_obj_set_style_text_font(title, lv_theme_get_font_large(box), 0);
+    lv_obj_set_style_pad_left(title, LV_DPX(3), 0);
+
+    /* The colour as the screen can show it, and the value the bar gets. */
+    lv_obj_t *preview_row = lv_obj_create(box);
+    lv_obj_remove_style_all(preview_row);
+    lv_obj_set_size(preview_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(preview_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(preview_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(preview_row, LV_DPX(3), 0);
+    lv_obj_set_style_pad_gap(preview_row, LV_DPX(12), 0);
+    lv_obj_clear_flag(preview_row, LV_OBJ_FLAG_SCROLLABLE);
+    view->picker.preview = lv_obj_create(preview_row);
+    lv_obj_remove_style_all(view->picker.preview);
+    lv_obj_set_size(view->picker.preview, PICKER_PREVIEW * 2, PICKER_PREVIEW);
+    lv_obj_set_style_radius(view->picker.preview, OVERLAY_RADIUS, 0);
+    lv_obj_set_style_bg_opa(view->picker.preview, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(view->picker.preview, LV_DPX(1), 0);
+    lv_obj_set_style_border_color(view->picker.preview, lv_color_hex(OVERLAY_SEAM), 0);
+    view->picker.hex = body_text(preview_row, "");
+    lv_obj_set_style_text_font(view->picker.hex, lv_theme_get_font_large(preview_row), 0);
+
+    picker_slider(view, box, locstr("Colour"), 0, LIGHTBAR_HUE_MAX, HID_PT_CTL_PICKER_HUE, PICKER_HUE);
+    picker_slider(view, box, locstr("Brightness"), LIGHTBAR_BRIGHTNESS_MIN, LIGHTBAR_BRIGHTNESS_MAX,
+                  HID_PT_CTL_PICKER_BRIGHTNESS, PICKER_BRIGHTNESS);
+    picker_slider(view, box, locstr("Intensity"), 0, LIGHTBAR_INTENSITY_MAX, HID_PT_CTL_PICKER_INTENSITY,
+                  PICKER_INTENSITY);
+    lv_slider_set_value(view->picker.sliders[PICKER_HUE], hue, LV_ANIM_OFF);
+    lv_slider_set_value(view->picker.sliders[PICKER_BRIGHTNESS], brightness, LV_ANIM_OFF);
+    lv_slider_set_value(view->picker.sliders[PICKER_INTENSITY], intensity, LV_ANIM_OFF);
+
+    lv_obj_t *buttons = lv_obj_create(box);
+    lv_obj_remove_style_all(buttons);
+    lv_obj_set_size(buttons, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(buttons, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(buttons, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(buttons, LV_DPX(4), 0);
+    lv_obj_set_style_pad_gap(buttons, LV_DPX(10), 0);
+    lv_obj_clear_flag(buttons, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(buttons, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    view->picker.ok_btn = ghost_button(view, buttons, locstr("OK"), HID_PT_CTL_PICKER_OK);
+    view->picker.cancel_btn = ghost_button(view, buttons, locstr("CANCEL"), HID_PT_CTL_PICKER_CANCEL);
+    /* What the keys do here, in the quiet voice of the sheet's captions: the
+     * sheet's own footer is gone, and the veil would dim it anyway. */
+    view->picker.hint = caption(box);
+    lv_obj_clear_flag(view->picker.hint, LV_OBJ_FLAG_HIDDEN);
+
+    hid_pt_view_rebuild_focus_order(view);
+    lv_group_focus_obj(view->picker.sliders[PICKER_HUE]);
+    hid_pt_view_set_hints(view, HID_PT_ZONE_PICKER, false);
+}
+
+void hid_pt_view_close_picker(hid_pt_view_t *view)
+{
+    if (!view || !view->picker.veil) {
+        return;
+    }
+    lv_obj_t *veil = view->picker.veil;
+    lv_obj_t *back = view->picker.return_focus;
+    lv_color_t *hue_px = view->picker.hue_px;
+    if (hue_px) {
+        lv_img_cache_invalidate_src(&view->picker.hue_img);
+    }
+    /* Deleted while its controls are still in the group: this runs inside
+     * one of their own events (BACK on a slider, OK's click), and LVGL resets
+     * the key input for a deleted object only when it is the focused one of
+     * the input's group -- out of the group first, the input would go on to
+     * send the rest of that key to a freed object. The group goes back to the
+     * sheet afterwards. */
+    lv_obj_del(veil);
+    memset(&view->picker, 0, sizeof(view->picker));
+    free(hue_px);
+    hid_pt_view_rebuild_focus_order(view);
+    if (back && lv_obj_is_valid(back) && hid_pt_view_obj_is_focusable(view, back)) {
+        lv_group_focus_obj(back);
+    }
+}
+
+bool hid_pt_view_picker_is_open(const hid_pt_view_t *view)
+{
+    return view && view->picker.veil != NULL;
+}
+
+void hid_pt_view_picker_values(const hid_pt_view_t *view, int *hue, int *brightness, int *intensity)
+{
+    if (!hid_pt_view_picker_is_open(view)) {
+        return;
+    }
+    *hue = (int) lv_slider_get_value(view->picker.sliders[PICKER_HUE]);
+    *brightness = (int) lv_slider_get_value(view->picker.sliders[PICKER_BRIGHTNESS]);
+    *intensity = (int) lv_slider_get_value(view->picker.sliders[PICKER_INTENSITY]);
+}
+
+static void set_text_if_changed(lv_obj_t *label, const char *text)
+{
+    if (label && strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
+void hid_pt_view_picker_show(hid_pt_view_t *view, uint32_t rgb)
+{
+    if (!hid_pt_view_picker_is_open(view)) {
+        return;
+    }
+    int hue = 0, brightness = 0, intensity = 0;
+    hid_pt_view_picker_values(view, &hue, &brightness, &intensity);
+    /* Black is Off's; a colour the picker makes is never black (V >= 1), but
+     * intensity 0 at the lowest brightness is a grey the screen shows white. */
+    lv_obj_set_style_bg_color(view->picker.preview, lv_color_hex(lightbar_colour_display(rgb)), 0);
+    char text[16];
+    snprintf(text, sizeof(text), "#%06X", (unsigned) (rgb & 0xFFFFFFu));
+    set_text_if_changed(view->picker.hex, text);
+    snprintf(text, sizeof(text), "%d°", hue);
+    set_text_if_changed(view->picker.values[PICKER_HUE], text);
+    snprintf(text, sizeof(text), "%d %%", brightness);
+    set_text_if_changed(view->picker.values[PICKER_BRIGHTNESS], text);
+    snprintf(text, sizeof(text), "%d %%", intensity);
+    set_text_if_changed(view->picker.values[PICKER_INTENSITY], text);
+    /* Brightness: dark to this hue and intensity at full; intensity: white to
+     * this hue fully saturated -- what moving the knob that way does. */
+    const uint32_t full = lightbar_colour_from_hsv((unsigned) hue, (unsigned) intensity, 255);
+    const uint32_t pure = lightbar_colour_from_hsv((unsigned) hue, LIGHTBAR_INTENSITY_MAX, 255);
+    lv_obj_t *b = view->picker.sliders[PICKER_BRIGHTNESS];
+    lv_obj_set_style_bg_color(b, lv_color_black(), 0);
+    lv_obj_set_style_bg_grad_color(b, lv_color_hex(full), 0);
+    lv_obj_t *s = view->picker.sliders[PICKER_INTENSITY];
+    lv_obj_set_style_bg_color(s, lv_color_white(), 0);
+    lv_obj_set_style_bg_grad_color(s, lv_color_hex(pure), 0);
+}
+
+bool hid_pt_view_picker_nudge(hid_pt_view_t *view, lv_obj_t *obj, int dir)
+{
+    if (!view || hid_pt_view_kind_of(view, obj) != HID_PT_WK_PICKER_SLIDER) {
+        return false;
+    }
+    const int32_t step = obj == view->picker.sliders[PICKER_HUE] ? 5 : 1;
+    const int32_t min = lv_slider_get_min_value(obj);
+    const int32_t max = lv_slider_get_max_value(obj);
+    int32_t next = lv_slider_get_value(obj) + (int32_t) dir * step;
+    next = next < min ? min : next > max ? max : next;
+    if (next != lv_slider_get_value(obj)) {
+        lv_slider_set_value(obj, next, LV_ANIM_OFF);
+        lv_event_send(obj, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+    return true;
+}
+
+lv_obj_t *hid_pt_view_picker_step(const hid_pt_view_t *view, lv_obj_t *from, int dir)
+{
+    if (!hid_pt_view_picker_is_open(view) || dir == 0) {
+        return NULL;
+    }
+    lv_obj_t *const chain[4] = {view->picker.sliders[PICKER_HUE], view->picker.sliders[PICKER_BRIGHTNESS],
+                                view->picker.sliders[PICKER_INTENSITY], view->picker.ok_btn};
+    int at = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (chain[i] == from) {
+            at = i;
+        }
+    }
+    if (from == view->picker.cancel_btn) {
+        at = 3;
+    }
+    const int to = at + (dir > 0 ? 1 : -1);
+    return at >= 0 && to >= 0 && to < 4 ? chain[to] : NULL;
+}
+
+lv_obj_t *hid_pt_view_picker_step_button(const hid_pt_view_t *view, lv_obj_t *from, int dir)
+{
+    if (!hid_pt_view_picker_is_open(view)) {
+        return NULL;
+    }
+    if (from == view->picker.ok_btn && dir > 0) {
+        return view->picker.cancel_btn;
+    }
+    if (from == view->picker.cancel_btn && dir < 0) {
+        return view->picker.ok_btn;
+    }
+    return NULL;
+}
+
 void hid_pt_view_destroy(hid_pt_view_t *view)
 {
     if (!view) {
         return;
     }
+    /* The objects that drew them are gone with the panel's tree. */
+    if (view->picker.hue_px) {
+        lv_img_cache_invalidate_src(&view->picker.hue_img);
+        free(view->picker.hue_px);
+        view->picker.hue_px = NULL;
+    }
+    if (view->custom_ring_px) {
+        lv_img_cache_invalidate_src(&view->custom_ring);
+        free(view->custom_ring_px);
+        view->custom_ring_px = NULL;
+    }
+    memset(&view->picker, 0, sizeof(view->picker));
     if (view->group) {
         lv_group_del(view->group);
         view->group = NULL;
