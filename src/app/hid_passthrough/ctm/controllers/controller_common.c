@@ -1908,7 +1908,8 @@ static uint64_t tick_net_log(ctm_pump_t *p)
  * waiting for the host to send a report patch_output can stamp them into.
  * Here rather than in set_settings because only this thread may write to the
  * device (ctm_hid_io.h). A report identical to the last delivered one is not
- * sent again. A failed write is retried every 200 ms, up to
+ * sent again -- unless the game has painted the lightbar since, which
+ * forgets the last one (ctm_controller_note_game_lightbar()). A failed write is retried every 200 ms, up to
  * SETTINGS_PUSH_RETRIES times: the link-up push is the one that matters when a
  * quiet game owns the lightbar, and nothing else would carry it. A report the
  * daemon drops after accepting it is not seen here; patch_output still stamps
@@ -2657,6 +2658,13 @@ void ctm_controller_note_game_lightbar(ctm_controller_t *c, uint32_t rgb)
     if (!c) return;
     c->lb_game_owned = rgb != 0;
     if (rgb != 0) c->lb_game_rgb = rgb;
+    /* The game has just told the pad a colour of its own (or handed the bar
+     * back), so the last push no longer says what the pad shows: a push that
+     * repeats it byte for byte -- the user's colour again, once the game may
+     * no longer change it -- must go out, not be skipped as unchanged. Same
+     * thread as tick_settings_push (patch_output runs in the session's
+     * writes). */
+    c->settings_last_len = 0;
 }
 
 bool ctm_controller_game_lightbar(ctm_controller_t *c, uint32_t *rgb)

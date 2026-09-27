@@ -44,15 +44,19 @@ static bool ds4_lightbar_colour(ctm_controller_t *c, const tv_bridge_worker_sett
 }
 
 /* Stamp @p rgb as the bar's colour into a 0x11 at @p data, and with
- * @p no_flash drop a flash, so a game's blink cannot take the bar either.
- * Returns 1 if a byte changed. */
+ * @p no_flash an explicit "no blink" (the flash flag with on/off 0/0), so a
+ * game's blink cannot take the bar either. Explicit, not the flag dropped: the
+ * pad only takes a blink state from a report that carries the flag
+ * (hid-playstation sends LED_BLINK only with it), so dropping it would leave a
+ * blink the game started earlier running -- in the user's colour, and past the
+ * game's own cancel. Returns 1 if a byte changed. */
 static int ds4_stamp_lightbar(uint8_t *data, uint32_t rgb, bool no_flash)
 {
     uint8_t want[5] = {(uint8_t) (rgb >> 16), (uint8_t) (rgb >> 8), (uint8_t) rgb, 0, 0};
     uint8_t flags = (uint8_t) (data[3] | DS4_FLAG_LIGHTBAR);
     size_t n = 3;
     if (no_flash) {
-        flags = (uint8_t) (flags & ~DS4_FLAG_FLASH);
+        flags = (uint8_t) (flags | DS4_FLAG_FLASH);
         n = 5;
     }
     if (data[3] == flags && memcmp(&data[DS4_OUT_RGB], want, n) == 0) return 0;
@@ -74,7 +78,7 @@ static int ds4_stamp_lightbar(uint8_t *data, uint32_t rgb, bool no_flash)
  * and may, the report goes as the game sent it. Otherwise the LED flag and
  * the user's colour go into every 0x11 -- a rumble-only one too, so the next
  * report can never leave the pad on another colour -- and a colour the game
- * may not change also loses its flash. */
+ * may not change also carries an explicit "no blink". */
 static int ds4_patch_lightbar(ctm_controller_t *c, const tv_bridge_worker_settings_t *s, uint8_t *data)
 {
     if (!ctm_controller_own_output(c) && (data[3] & DS4_FLAG_LIGHTBAR)) {

@@ -155,8 +155,20 @@ static void record_refresh_auto_plugin(ui_device_settings_t *record, const logic
         return;
     }
     /* The lightbar is the page's to write under either id, so the new one's
-     * value is simply read; only the auto-plug flag below needs migrating. */
+     * value is simply read; only the auto-plug flag below needs migrating. A
+     * controller already mounted under the old id (a HID lock or press inside
+     * the MAC-unreadable window) was handed the old value at plug time: a
+     * change goes to it now, and its settings push paints it at once. */
+    const tv_bridge_worker_settings_t lb_before = record->settings;
     record_read_lightbar(&record->settings, item);
+    if (lb_before.lightbar_user != record->settings.lightbar_user ||
+        lb_before.lightbar_rgb != record->settings.lightbar_rgb ||
+        lb_before.lightbar_game != record->settings.lightbar_game) {
+        int session = session_index_for_key(record->key);
+        if (session >= 0 && g_sessions[session].controller) {
+            ctm_controller_set_settings(g_sessions[session].controller, &record->settings);
+        }
+    }
     /* Only ever true between the user's toggle and this, the next identity
      * change, whichever way the migration below then goes. */
     bool migrate = record->pref_provisional && record->pref_id[0] != '\0';
