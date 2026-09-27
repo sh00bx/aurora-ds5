@@ -1061,9 +1061,19 @@ static void picker_key(hid_pt_panel_t *panel, lv_event_t *event, lv_obj_t *targe
 {
     const int dir = (key == LV_KEY_RIGHT || key == LV_KEY_DOWN) ? 1 : -1;
     switch (key) {
-        case LV_KEY_ESC:
+        case LV_KEY_ESC: {
+            /* The close deletes the focused widget in the middle of this key
+             * press, and LVGL's indev reset for that zeroes the long-press
+             * clocks while the key is still down: the held BACK would repeat
+             * into the sheet behind a few ms later (the cursor off Custom,
+             * then the whole page closed). The rest of this press is ours. */
+            lv_indev_t *indev = lv_indev_get_act();
             picker_close(panel, false);
+            if (indev) {
+                lv_indev_wait_release(indev);
+            }
             break;
+        }
         case LV_KEY_ENTER:
             if (kind == HID_PT_WK_PICKER_BTN) {
                 /* LVGL turns it into the button's click. */
