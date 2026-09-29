@@ -21,8 +21,10 @@
 #include "stream/session_priv.h"
 #include "stream/adaptive_bitrate.h"
 #include "app.h"
+#include "vrr_timing.h"
 
 #include <SDL.h>
+#include <time.h>
 
 /* Starting capacity for the decode-unit reassembly buffer. Grows on
  * demand to accommodate larger frames (e.g. 4K IDR frames at high
@@ -107,6 +109,9 @@ struct vdec_stream_state {
     /* First-packet receive time of the previous frame, for the arrival cadence stat. */
     uint64_t lastReceiveTimeUs;
     struct VIDEO_STATS temp_stats;
+    /* Pseudo-VRR armed for this stream: frames come from moonlight-common-c's decoder
+     * thread (no DIRECT_SUBMIT) and are held until their scheduled slot. */
+    bool vrr_active;
 #if defined(TARGET_WEBOS)
     Uint32 soft_rec_high_since;
     Uint32 soft_rec_cooldown_until;
@@ -129,6 +134,43 @@ struct vdec_reassembly {
 };
 
 static struct vdec_reassembly reasm;
+
+/*
+ * Pseudo-VRR. Where the hold happens, and why there:
+ *
+ * NDL presents a frame as soon as it is decoded, so the only way to move a frame's
+ * presentation is to move its feed. The feed ran on the RTP receive thread
+ * (CAPABILITY_DIRECT_SUBMIT). Sleeping there would stop the socket from being read
+ * for up to a reserve plus 6 ms — at 75-150 Mbit/s that is 60-110 KB piling up in
+ * the kernel's receive buffer, packet loss once it overflows, and it would also
+ * skew the first-packet receive times the arrival statistics and this scheduler's
+ * own offset estimate are built on. It also could not see the NEXT frame arriving
+ * while it slept, which is the one event that must end a hold early.
+ *
+ * So with Pseudo-VRR the client simply does not claim DIRECT_SUBMIT: moonlight-
+ * common-c then runs its own decoder thread ("VideoDec") behind a bounded queue
+ * (15 frames; overflow flushes and asks for an IDR) and calls submitDecodeUnit from
+ * there. The receive thread keeps depacketizing at full speed, the hold sleeps on
+ * the decoder thread, and LiGetPendingVideoFrames() tells the hold that a newer
+ * frame is waiting. Every feed still happens on exactly one thread, submit results
+ * still flow back synchronously (DR_NEED_IDR included), and the library joins that
+ * thread in stopVideoStream() before cleanup() runs, so no new lifetime rules.
+ *
+ * Frames are never dropped here. Every HEVC frame of a moonlight stream is a
+ * reference for the next one; skipping one to "take the newest" would decode
+ * garbage until the next IDR. Catching up after a stall therefore means feeding
+ * the backlog without holds, which the scheduler does by itself (the queued
+ * frames' slots are already in the past) and the pending-frame check enforces.
+ */
+static int vrr_prepared_profile;
+static vrr_timing_t vrr_ctl;
+static vrr_metrics_t vrr_metrics;
+static volatile int vrr_stopping;
+#define VRR_METRICS_WINDOW_US (10 * 1000000LL)
+/* Last 10 s window, published under the stats seqlock for the overlay. */
+static vrr_metrics_summary_t vrr_summary;
+static bool vrr_summary_valid;
+static int vrr_summary_delay_us;
 
 VIDEO_STATS vdec_summary_stats;
 /* Seqlock for vdec_summary_stats: odd while vdec_stat_submit is mid-write.
@@ -217,6 +259,12 @@ static int vdec_delegate_submit(PDECODE_UNIT decodeUnit);
 
 static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit);
 
+static void vdec_delegate_stop(void);
+
+static inline void vdec_stats_write_begin(void);
+
+static inline void vdec_stats_write_end(void);
+
 static void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now);
 
 static void stream_info_parse_size(PDECODE_UNIT decodeUnit, struct VIDEO_INFO *info);
@@ -227,13 +275,40 @@ static size_t vdec_buffer_initial_bytes(void) {
 
 DECODER_RENDERER_CALLBACKS ss4s_dec_callbacks = {
         .setup = vdec_delegate_setup,
+        .stop = vdec_delegate_stop,
         .cleanup = vdec_delegate_cleanup,
         .submitDecodeUnit = vdec_delegate_submit,
         .capabilities = CAPABILITY_DIRECT_SUBMIT,
 };
 
+int session_video_pseudo_vrr_profile(const app_settings_t *cfg) {
+#if defined(TARGET_WEBOS)
+    if (cfg == NULL || cfg->pseudo_vrr <= 0) {
+        return 0;
+    }
+    /* HEVC is the only codec this TV runs above 60 Hz (capability DB: H.265 120,
+     * H.264/AV1/VP9 60) and the only one presented on arrival. AV1 is offered ahead
+     * of HEVC when enabled and is locked to a 60 Hz scanout here, so pacing it to
+     * the game's cadence would only fight the fixed refresh. */
+    if (cfg->av1 || !cfg->hevc) {
+        return 0;
+    }
+    return cfg->pseudo_vrr > 3 ? 3 : cfg->pseudo_vrr;
+#else
+    (void) cfg;
+    return 0;
+#endif
+}
+
 void session_video_prepare_stream(void) {
-    int caps = CAPABILITY_DIRECT_SUBMIT;
+    vrr_prepared_profile = session_video_pseudo_vrr_profile(app_configuration);
+    if (app_configuration != NULL && app_configuration->pseudo_vrr > 0 && vrr_prepared_profile == 0) {
+        commons_log_warn("Session", "Pseudo-VRR requested but ignored: it needs HEVC with AV1 off "
+                                    "(AV1/H.264 are presented at a fixed 60 Hz on this TV)");
+    }
+    /* See the Pseudo-VRR note above vdec_summary_stats: no DIRECT_SUBMIT puts the
+     * feed on moonlight-common-c's decoder thread, where holding a frame is safe. */
+    int caps = vrr_prepared_profile ? 0 : CAPABILITY_DIRECT_SUBMIT;
     const bool hevc = app_configuration != NULL && app_configuration->hevc;
     const bool av1 = app_configuration != NULL && app_configuration->av1;
     if (hevc) {
@@ -250,8 +325,9 @@ void session_video_prepare_stream(void) {
                                             app_configuration->stream.fps);
         }
         caps |= CAPABILITY_SLICES_PER_FRAME(slices);
-        commons_log_info("Session", "Video SDP caps: RFI + %u slices/frame (HEVC=%d AV1=%d)",
-                         slices, hevc ? 1 : 0, av1 ? 1 : 0);
+        commons_log_info("Session", "Video SDP caps: RFI + %u slices/frame (HEVC=%d AV1=%d)%s",
+                         slices, hevc ? 1 : 0, av1 ? 1 : 0,
+                         vrr_prepared_profile ? ", decoder thread (Pseudo-VRR)" : ", direct submit");
     } else {
         commons_log_info("Session", "Video SDP caps: direct submit only (H.264)");
     }
@@ -361,6 +437,29 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
 
     switch (SS4S_PlayerVideoOpen(vs.player, &info)) {
         case SS4S_VIDEO_OPEN_OK: {
+            vrr_stopping = 0;
+            if (vrr_prepared_profile) {
+                if (info.codec == SS4S_VIDEO_H265) {
+                    const int fps_x100 = info.frameRateDenominator > 0
+                                         ? info.frameRateNumerator * 100 / info.frameRateDenominator
+                                         : vs.target_fps * 100;
+                    const bool judder = app_configuration == NULL || app_configuration->pseudo_vrr_reduce_judder;
+                    vrr_timing_init(&vrr_ctl, (vrr_timing_profile_t) vrr_prepared_profile, judder, fps_x100);
+                    vrr_metrics_reset(&vrr_metrics);
+                    vs.vrr_active = true;
+                    commons_log_info("Session", "Pseudo-VRR on: profile %s, reduce judder %s, %.2f fps nominal, "
+                                                "delay cap %.1f ms, hold cap %.1f ms, early release at %d queued",
+                                     vrr_timing_profile_name(vrr_ctl.profile), judder ? "on" : "off",
+                                     fps_x100 / 100.0, vrr_timing_delay_cap_us(&vrr_ctl) / 1000.0,
+                                     vrr_timing_max_hold_us(&vrr_ctl) / 1000.0, vrr_timing_queue_frames(&vrr_ctl));
+                } else {
+                    commons_log_warn("Session", "Pseudo-VRR: host negotiated %s, frames are fed on arrival",
+                                     vdec_stream_info.format);
+                }
+            }
+            vdec_stats_write_begin();
+            vrr_summary_valid = false;
+            vdec_stats_write_end();
             return 0;
         }
         case SS4S_VIDEO_OPEN_UNSUPPORTED_CODEC:
@@ -372,6 +471,13 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
             reasm.data = NULL;
             return CALLBACKS_SESSION_ERROR_VDEC_ERROR;
     }
+}
+
+/* moonlight-common-c calls this first in stopVideoStream(), before it interrupts
+ * and joins the decoder thread: a hold in progress ends at its next 1 ms check
+ * instead of sleeping out its slot. */
+static void vdec_delegate_stop(void) {
+    __atomic_store_n(&vrr_stopping, 1, __ATOMIC_RELEASE);
 }
 
 void vdec_delegate_cleanup(void) {
@@ -504,6 +610,93 @@ static int vdec_finish_feed(SS4S_VideoFeedResult result, PDECODE_UNIT decodeUnit
     }
 }
 
+/* Sleep until target_us, in steps of at most 1 ms so a newer frame arriving in the
+ * meantime (or the stream stopping) ends the hold. Returns true when it was cut short
+ * by a waiting frame. */
+static bool vdec_vrr_hold(int64_t target_us) {
+    const int queue = vrr_timing_queue_frames(&vrr_ctl);
+    for (;;) {
+        const int64_t remaining = target_us - (int64_t) LiGetMicroseconds();
+        /* Below the scheduler's own wake-up slack a sleep only overshoots. */
+        if (remaining <= 50) {
+            return false;
+        }
+        if (__atomic_load_n(&vrr_stopping, __ATOMIC_ACQUIRE)) {
+            return false;
+        }
+        if (LiGetPendingVideoFrames() >= queue) {
+            return true;
+        }
+        const int64_t step = remaining > 1000 ? 1000 : remaining;
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = (long) step * 1000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void vdec_vrr_publish(const vrr_metrics_summary_t *sum) {
+    vdec_stats_write_begin();
+    vrr_summary = *sum;
+    vrr_summary_valid = true;
+    vrr_summary_delay_us = (int) vrr_ctl.delay_us;
+    vdec_stats_write_end();
+    commons_log_info("Session", "Pseudo-VRR 10s: %u frames, spacing err p50/p90/p99 %.2f/%.2f/%.2f ms "
+                                "(on arrival would be %.2f/%.2f/%.2f), held p50 %.2f max %.2f ms, "
+                                "immediate %.1f%%, preempted %.1f%%, delay %.2f ms, period %.2f ms, "
+                                "resets epoch %u cadence %u",
+                     sum->frames, sum->spacing_p50_ms, sum->spacing_p90_ms, sum->spacing_p99_ms,
+                     sum->arrival_p50_ms, sum->arrival_p90_ms, sum->arrival_p99_ms, sum->held_p50_ms,
+                     sum->held_max_ms, sum->immediate_pct, sum->preempted_pct, vrr_ctl.delay_us / 1000.0,
+                     vrr_ctl.period_us / 1000.0, vrr_ctl.epoch_resets, vrr_ctl.cadence_resets);
+}
+
+/* Pseudo-VRR feed: schedule, hold, feed, account. Runs on the decoder thread. */
+static int vdec_vrr_feed(PDECODE_UNIT decodeUnit, size_t length, SS4S_VideoFeedFlags flags, int64_t pts_us) {
+    const int64_t ready_us = (int64_t) decodeUnit->enqueueTimeUs;
+    vrr_timing_decision_t d;
+    vrr_timing_schedule(&vrr_ctl, decodeUnit->rtpTimestamp, decodeUnit->frameNumber,
+                        decodeUnit->frameType == FRAME_TYPE_IDR, ready_us, &d);
+    const int64_t max_hold = vrr_timing_max_hold_us(&vrr_ctl);
+    int64_t target = d.target_us;
+    if (target > ready_us + max_hold) {
+        /* Cannot happen by construction (delay <= cap, retiming <= 6 ms, lateness >= 0
+         * relative to the window minimum); a clamp keeps a scheduler bug from ever
+         * turning into a frozen picture. */
+        target = ready_us + max_hold;
+    }
+    const bool immediate = target <= (int64_t) LiGetMicroseconds();
+    const bool preempted = immediate ? false : vdec_vrr_hold(target);
+    const int64_t feed_us = (int64_t) LiGetMicroseconds();
+    SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(vs.player, reasm.data, length, flags, pts_us);
+    if (result != SS4S_VIDEO_FEED_OK) {
+        /* A reload (HDR toggle, size change) or a failed feed: whatever the decoder
+         * shows next does not continue the cadence we were tracking. */
+        vrr_timing_break_cadence(&vrr_ctl);
+    }
+    vrr_metrics_record(&vrr_metrics, d.host_us, ready_us, feed_us,
+                       !d.cadence_break && !d.epoch_reset && result == SS4S_VIDEO_FEED_OK, immediate, preempted);
+    vrr_metrics_summary_t sum;
+    if (vrr_metrics_flush(&vrr_metrics, feed_us, VRR_METRICS_WINDOW_US, &sum)) {
+        vdec_vrr_publish(&sum);
+    }
+    return vdec_finish_feed(result, decodeUnit);
+}
+
+bool vdec_vrr_snapshot(vrr_metrics_summary_t *out, int *delay_us) {
+    unsigned s1, s2;
+    bool valid;
+    do {
+        s1 = __atomic_load_n(&vdec_stats_seq, __ATOMIC_ACQUIRE);
+        valid = vrr_summary_valid;
+        memcpy(out, &vrr_summary, sizeof(*out));
+        if (delay_us != NULL) {
+            *delay_us = vrr_summary_delay_us;
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        s2 = __atomic_load_n(&vdec_stats_seq, __ATOMIC_RELAXED);
+    } while ((s1 & 1u) != 0 || s1 != s2);
+    return valid;
+}
+
 int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     if ((size_t) decodeUnit->fullLength > reasm.size) {
         if ((size_t) decodeUnit->fullLength > DECODER_BUFFER_MAX_SIZE) {
@@ -595,6 +788,9 @@ int vdec_delegate_submit(PDECODE_UNIT decodeUnit) {
     /* Host capture PTS (RTP 90kHz → µs); -1 = no host PTS, ss4s falls back to
      * arrival wall-clock. Only takes effect when smooth pacing env is ON. */
     const int64_t pts_us = decodeUnit->presentationTimeUs > 0 ? (int64_t) decodeUnit->presentationTimeUs : -1;
+    if (vs.vrr_active) {
+        return vdec_vrr_feed(decodeUnit, length, flags, pts_us);
+    }
     SS4S_VideoFeedResult result = SS4S_PlayerVideoFeedWithPTS(vs.player, reasm.data, length, flags, pts_us);
     return vdec_finish_feed(result, decodeUnit);
 }

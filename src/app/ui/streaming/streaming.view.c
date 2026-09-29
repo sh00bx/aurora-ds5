@@ -613,6 +613,12 @@ static void throughput_columns(streaming_controller_t *controller, lv_obj_t *par
     controller->stats_items.render_queue = stat_label(controller, left, "Render queue", 0);
     controller->stats_items.bitrate = stat_label(controller, right, "Bitrate", 0);
     controller->stats_items.drop_rate = stat_label(controller, right, "Frame drop", 0);
+    /* Pseudo-VRR's own instrument, only when the mode is configured: how far the
+     * presented spacing departs from the host's (p50/p99), and what that cost in hold. */
+    if (app_configuration->pseudo_vrr > 0) {
+        controller->stats_items.vrr_spacing = stat_label(controller, left, "VRR spacing", 0);
+        controller->stats_items.vrr_hold = stat_label(controller, right, "VRR hold", 0);
+    }
 }
 
 /* One row per controller: what it is, how it reaches the host, how much charge is

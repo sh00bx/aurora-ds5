@@ -76,6 +76,23 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
                                  "arrival time. Takes effect on the next stream."),
                     false);
 
+    static const pref_dropdown_int_entry_t pseudo_vrr_entries[] = {
+            {translatable("Off"), 0, true},
+            {translatable("Low latency"), 1, false},
+            {translatable("Balanced"), 2, false},
+            {translatable("Smooth"), 3, false},
+    };
+    pref_title_label(view, locstr("Pacing: Pseudo-VRR (HEVC)"));
+    lv_obj_t *pseudo_vrr_dropdown = pref_dropdown_int(view, pseudo_vrr_entries, 4, &app_configuration->pseudo_vrr,
+                                                      NULL);
+    lv_obj_set_width(pseudo_vrr_dropdown, LV_PCT(100));
+    lv_obj_add_event_cb(pseudo_vrr_dropdown, reconnect_cb, LV_EVENT_VALUE_CHANGED, pane);
+    pref_desc_label(view, locstr("Hold each frame until the moment the host stamped it, so motion follows the "
+                                 "game's own frame rate instead of network jitter. Asks the host for "
+                                 "variable refresh. HEVC only, ignored while AV1 is on. Costs up to one, two or "
+                                 "four frames of delay. Takes effect on the next stream."),
+                    false);
+
     lv_obj_t *recovery_checkbox = pref_checkbox(view, locstr("Soft recovery (4K)"),
                                                 &app_configuration->soft_recovery, false);
     lv_obj_add_event_cb(recovery_checkbox, reconnect_cb, LV_EVENT_VALUE_CHANGED, pane);

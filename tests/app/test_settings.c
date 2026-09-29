@@ -22,6 +22,13 @@ void tearDown() {
     free(settings.conf_dir);
 }
 
+void testPseudoVrrDefault() {
+    /* Pseudo-VRR is opt-in; its cadence smoothing is on once the mode is. */
+    TEST_ASSERT_EQUAL_INT(0, settings.pseudo_vrr);
+    TEST_ASSERT_TRUE(settings.pseudo_vrr_reduce_judder);
+    TEST_ASSERT_FALSE(settings.vrr);
+}
+
 void testSmoothPacingDefault() {
     /* A/B baseline: host-PTS pacing must default OFF (ss4s env default is ON,
      * session_worker sets the env explicitly from this flag). */
@@ -166,5 +173,6 @@ int main() {
     RUN_TEST(testNtscRefreshRateMapping);
     RUN_TEST(testDefaultNtscAndSmoothFlags);
     RUN_TEST(testIdrRefreshIntervalMsDefaultAndClamp);
+    RUN_TEST(testPseudoVrrDefault);
     return UNITY_END();
 }

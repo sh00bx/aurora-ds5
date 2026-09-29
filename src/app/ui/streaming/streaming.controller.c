@@ -525,6 +525,12 @@ bool streaming_refresh_stats() {
                                 "%sEn %.1fms", first ? "" : " \xb7 ", hostMs);
             }
         }
+        /* Pseudo-VRR: presented-spacing error p99 against the host's, and median hold. */
+        vrr_metrics_summary_t vrr_sum;
+        if (vdec_vrr_snapshot(&vrr_sum, NULL) && len > 0 && (size_t) len < sizeof(stats_line)) {
+            len += snprintf(stats_line + len, sizeof(stats_line) - (size_t) len, " VRR %.1f/%.1fms H %.1f",
+                            vrr_sum.spacing_p99_ms, vrr_sum.arrival_p99_ms, vrr_sum.held_p50_ms);
+        }
         /* Silent audio gaps have no other symptom in the overlay — surface the count
          * (AF) and, once a feed gap of 40 ms or more was seen, the largest one (AG). */
         if ((audio_stream_info.feedFailures > 0 || audio_stream_info.maxGapMs >= 40) &&
@@ -580,6 +586,21 @@ bool streaming_refresh_stats() {
                               (float) dst->networkDroppedFrames / (float) dst->totalFrames * 100);
     } else {
         lv_label_set_text(controller->stats_items.drop_rate, "-");
+    }
+
+    if (controller->stats_items.vrr_spacing != NULL && controller->stats_items.vrr_hold != NULL) {
+        vrr_metrics_summary_t vrr_sum;
+        int delay_us = 0;
+        if (vdec_vrr_snapshot(&vrr_sum, &delay_us)) {
+            /* paced p50/p99 (on-arrival p99 for comparison) */
+            lv_label_set_text_fmt(controller->stats_items.vrr_spacing, "%.1f/%.1f (%.1f) ms",
+                                  vrr_sum.spacing_p50_ms, vrr_sum.spacing_p99_ms, vrr_sum.arrival_p99_ms);
+            lv_label_set_text_fmt(controller->stats_items.vrr_hold, "%.1f/%.1f ms \u00b7 %d%%",
+                                  vrr_sum.held_p50_ms, vrr_sum.held_max_ms, (int) (vrr_sum.immediate_pct + 0.5f));
+        } else {
+            lv_label_set_text(controller->stats_items.vrr_spacing, "-");
+            lv_label_set_text(controller->stats_items.vrr_hold, "-");
+        }
     }
 
     streaming_sample_device_load();

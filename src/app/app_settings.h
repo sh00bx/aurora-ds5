@@ -86,12 +86,26 @@ typedef struct app_settings_t {
     bool force_10bit;
     bool force_full_color_range; /* SDR only: request full-range YUV (0-255) from host. No effect when HDR is on. */
     /**
-     * Tell the host the display is variable-refresh, via clientVrrRequested on the launch URL.
-     * Sunshine forks that honour it keep their capture queue at minimum depth instead of letting
-     * it grow adaptively, which trades a little jitter tolerance for lower latency. Off by
-     * default: on a fixed-refresh panel the deeper queue is the better trade.
+     * Tell the host the display is variable-refresh, via clientVrrRequested on the launch URL,
+     * without changing anything on this side (ini-only, `[video] vrr`). Sunshine forks that
+     * honour it keep their capture queue at minimum depth; Vibepollo additionally switches its
+     * virtual display to 1000 Hz and stamps each frame with the game's real present time, un-
+     * rastered. Off by default: on a fixed-refresh panel fed on arrival, an un-rastered stream
+     * only moves the jitter around. `pseudo_vrr` below sets the same flag AND paces the frames
+     * on this side, which is the combination that makes sense; this flag alone is the A/B handle.
      */
     bool vrr;
+    /**
+     * Pseudo-VRR (webOS, HEVC only): hold each frame until the moment the host's RTP timestamp
+     * maps to, then hand it to NDL, which presents on arrival — so the presented spacing follows
+     * the game's cadence instead of the network's. 0 = off (feed on arrival, as always),
+     * 1 = low latency, 2 = balanced, 3 = smooth (reserve up to 1/2/4 source frames). Implies
+     * clientVrrRequested. See stream/video/vrr_timing.h.
+     */
+    int pseudo_vrr;
+    /** Pseudo-VRR cadence smoothing (85 % predicted slot / 15 % raw slot). ini-only A/B handle,
+     * default on. */
+    bool pseudo_vrr_reduce_judder;
     bool hevc;
     /** Sunshine/Apollo: negotiate AV1 Main8/Main10 when decoder exposes SS4S_VIDEO_AV1. */
     bool av1;

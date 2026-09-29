@@ -574,3 +574,20 @@ msgstr "Alle"
 #: src/app/ui/launcher/apps.controller.c
 msgid "Other"
 msgstr "Sonstige"
+
+#: src/app/ui/settings/panes/experimental.pane.c
+msgid "Pacing: Pseudo-VRR (HEVC)"
+msgstr "Pacing: Pseudo-VRR (HEVC)"
+
+#: src/app/ui/settings/panes/experimental.pane.c
+msgid ""
+"Hold each frame until the moment the host stamped it, so motion follows the "
+"game's own frame rate instead of network jitter. Asks the host for variable "
+"refresh. HEVC only, ignored while AV1 is on. Costs up to one, two or four "
+"frames of delay. Takes effect on the next stream."
+msgstr ""
+"Hält jedes Bild bis zu dem Zeitpunkt zurück, den der Host ihm gestempelt hat, "
+"damit die Bewegung der Bildrate des Spiels folgt statt dem Netzwerk-Jitter. "
+"Fordert beim Host variable Bildwiederholrate an. Nur HEVC, wird bei "
+"aktivem AV1 ignoriert. Kostet bis zu ein, zwei oder vier Bilder Verzögerung. "
+"Wirkt ab dem nächsten Stream."

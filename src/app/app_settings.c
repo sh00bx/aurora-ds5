@@ -175,6 +175,8 @@ void settings_initialize(app_settings_t *config, char *conf_dir) {
     config->force_10bit = false;
     config->force_full_color_range = false;
     config->vrr = false;
+    config->pseudo_vrr = 0;
+    config->pseudo_vrr_reduce_judder = true;
     config->hevc = true;
     config->av1 = false;
     config->idr_refresh_interval_ms = 0;
@@ -293,6 +295,8 @@ bool settings_save(app_settings_t *config) {
     ini_write_bool(fp, "force_10bit", config->force_10bit);
     ini_write_bool(fp, "force_full_color_range", config->force_full_color_range);
     ini_write_bool(fp, "vrr", config->vrr);
+    ini_write_int(fp, "pseudo_vrr", config->pseudo_vrr);
+    ini_write_bool(fp, "pseudo_vrr_reduce_judder", config->pseudo_vrr_reduce_judder);
     ini_write_bool(fp, "hevc", config->hevc);
     ini_write_bool(fp, "av1", config->av1);
     ini_write_int(fp, "idr_refresh_interval_ms", config->idr_refresh_interval_ms);
@@ -453,6 +457,13 @@ static int settings_parse(app_settings_t *config, const char *section, const cha
         config->hdr = INI_IS_TRUE(value);
     } else if (INI_NAME_MATCH("vrr")) {
         config->vrr = INI_IS_TRUE(value);
+    } else if (INI_FULL_MATCH("video", "pseudo_vrr")) {
+        set_int(&config->pseudo_vrr, value);
+        if (config->pseudo_vrr < 0 || config->pseudo_vrr > 3) {
+            config->pseudo_vrr = 0;
+        }
+    } else if (INI_FULL_MATCH("video", "pseudo_vrr_reduce_judder")) {
+        config->pseudo_vrr_reduce_judder = INI_IS_TRUE(value);
     } else if (INI_FULL_MATCH("video", "client_refresh_rate_x100")) {
         set_int(&config->client_refresh_rate_x100, value);
         if (config->client_refresh_rate_x100 < 0) {

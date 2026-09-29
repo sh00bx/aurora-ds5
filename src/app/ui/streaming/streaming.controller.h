@@ -64,6 +64,10 @@ typedef struct {
         lv_obj_t *render_queue;
         lv_obj_t *drop_rate;
         lv_obj_t *bitrate;
+        /** Pseudo-VRR, last 10 s: spacing error p50/p99 and hold p50/max. NULL unless the
+         * mode was on when the overlay was built. */
+        lv_obj_t *vrr_spacing;
+        lv_obj_t *vrr_hold;
         lv_obj_t *cpu_ram;
         struct {
             lv_obj_t *row;
