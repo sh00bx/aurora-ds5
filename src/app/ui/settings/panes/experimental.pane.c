@@ -89,7 +89,7 @@ static lv_obj_t *create_obj(lv_fragment_t *self, lv_obj_t *container) {
     lv_obj_add_event_cb(pseudo_vrr_dropdown, reconnect_cb, LV_EVENT_VALUE_CHANGED, pane);
     pref_desc_label(view, locstr("Hold each frame until the moment the host stamped it, so motion follows the "
                                  "game's own frame rate instead of network jitter. Asks the host for "
-                                 "variable refresh. HEVC only, ignored while AV1 is on. Costs up to one, two or "
+                                 "variable refresh. HEVC only; an AV1 stream is fed on arrival. Costs up to one, two or "
                                  "four frames of delay. Takes effect on the next stream."),
                     false);
 

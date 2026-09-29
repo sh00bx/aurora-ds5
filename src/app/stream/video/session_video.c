@@ -287,10 +287,10 @@ int session_video_pseudo_vrr_profile(const app_settings_t *cfg) {
         return 0;
     }
     /* HEVC is the only codec this TV runs above 60 Hz (capability DB: H.265 120,
-     * H.264/AV1/VP9 60) and the only one presented on arrival. AV1 is offered ahead
-     * of HEVC when enabled and is locked to a 60 Hz scanout here, so pacing it to
-     * the game's cadence would only fight the fixed refresh. */
-    if (cfg->av1 || !cfg->hevc) {
+     * H.264/AV1/VP9 60) and the only one presented on arrival, so HEVC must be on.
+     * AV1 may be enabled too: the host often still picks HEVC, and setup() checks the
+     * negotiated codec and feeds AV1 on arrival (only the decoder thread remains). */
+    if (!cfg->hevc) {
         return 0;
     }
     return cfg->pseudo_vrr > 3 ? 3 : cfg->pseudo_vrr;
@@ -303,8 +303,8 @@ int session_video_pseudo_vrr_profile(const app_settings_t *cfg) {
 void session_video_prepare_stream(void) {
     vrr_prepared_profile = session_video_pseudo_vrr_profile(app_configuration);
     if (app_configuration != NULL && app_configuration->pseudo_vrr > 0 && vrr_prepared_profile == 0) {
-        commons_log_warn("Session", "Pseudo-VRR requested but ignored: it needs HEVC with AV1 off "
-                                    "(AV1/H.264 are presented at a fixed 60 Hz on this TV)");
+        commons_log_warn("Session", "Pseudo-VRR requested but ignored: it needs HEVC enabled "
+                                    "(H.264/AV1 are presented at a fixed 60 Hz on this TV)");
     }
     /* See the Pseudo-VRR note above vdec_summary_stats: no DIRECT_SUBMIT puts the
      * feed on moonlight-common-c's decoder thread, where holding a frame is safe. */
