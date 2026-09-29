@@ -260,7 +260,11 @@ static bool interval_bounded(const vrr_timing_t *t, int64_t interval_us) {
     return (double) interval_us <= t->period_us * 2.5 && (double) (interval_us * 2 + 12) >= t->period_us;
 }
 
-static void period_observe(vrr_timing_t *t, int64_t interval_us) {
+/* Every continuous interval feeds the median fit, but only bounded ones step the EMA.
+ * Gating the fit too locked the period out: after a long 22 fps stretch the period
+ * sat near 45 ms, so 72 fps intervals (13.9 ms) failed interval_bounded() and were
+ * never observed again (seen on the TV 2026-09-30: period 41-45 ms at a steady 72). */
+static void period_observe(vrr_timing_t *t, int64_t interval_us, bool bounded) {
     t->fit[t->fit_idx] = interval_us;
     t->fit_idx = (t->fit_idx + 1) % VRR_TIMING_FIT_WINDOW;
     if (t->fit_len < VRR_TIMING_FIT_WINDOW) {
@@ -273,6 +277,9 @@ static void period_observe(vrr_timing_t *t, int64_t interval_us) {
     if (t->fit_len >= 5 && (t->period_us > fitted * 1.25 || t->period_us * 1.25 < fitted)) {
         /* A rate change the fit has absorbed, or a bad seed: follow the fit. */
         t->period_us = fitted;
+        return;
+    }
+    if (!bounded) {
         return;
     }
     t->period_us += ((double) interval_us - t->period_us) * PERIOD_ALPHA;
@@ -497,8 +504,8 @@ void vrr_timing_schedule(vrr_timing_t *t, uint32_t rtp_ts, int frame_number, boo
         }
     }
 
-    if (continuous && interval_bounded(t, interval_us)) {
-        period_observe(t, interval_us);
+    if (continuous) {
+        period_observe(t, interval_us, interval_bounded(t, interval_us));
     }
     delay_update(t, ready_us);
 

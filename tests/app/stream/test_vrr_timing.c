@@ -59,6 +59,32 @@ static uint32_t rtp_of_us(int64_t us, uint32_t base) {
 
 /* ---- unit tests ---- */
 
+static void testPeriodRecoversAfterLowRateStretch(void) {
+    /* 30 s at 22 fps, then 72 fps: the period must follow within about a second
+     * and smoothing must engage again (regression: it stayed near 45 ms). */
+    vrr_timing_init(&ctl, VRR_TIMING_PROFILE_BALANCED, true, 7200);
+    vrr_timing_decision_t d;
+    int64_t host = 0;
+    int frame = 0;
+    for (int i = 0; i < 22 * 30; i++, frame++) {
+        host += 1000000 / 22;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 5000), frame + 1, frame == 0, host + 20000, &d);
+    }
+    TEST_ASSERT_DOUBLE_WITHIN(3000.0, 1000000.0 / 22, ctl.period_us);
+    for (int i = 0; i < 72; i++, frame++) {
+        host += 1000000 / 72;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 5000), frame + 1, false, host + 20000, &d);
+    }
+    TEST_ASSERT_DOUBLE_WITHIN(500.0, 1000000.0 / 72, ctl.period_us);
+    TEST_ASSERT_TRUE(ctl.smoothing_engaged);
+    /* And back down below a third of the rate: 72 fps -> 20 fps. */
+    for (int i = 0; i < 40; i++, frame++) {
+        host += 1000000 / 20;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 5000), frame + 1, false, host + 20000, &d);
+    }
+    TEST_ASSERT_DOUBLE_WITHIN(3000.0, 1000000.0 / 20, ctl.period_us);
+}
+
 static void testSteadyStreamIsExact(void) {
     /* No jitter at all: every frame is held to host + offset + delay and the
      * presented spacing equals the host spacing to the microsecond. */
@@ -414,6 +440,7 @@ static void testSimulationCleanLink(void) {
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(testSteadyStreamIsExact);
+    RUN_TEST(testPeriodRecoversAfterLowRateStretch);
     RUN_TEST(testRtpWrapIsNotAnEpoch);
     RUN_TEST(testGapBreaksCadenceButKeepsOffset);
     RUN_TEST(testBackwardsTimestampIsAnEpoch);
