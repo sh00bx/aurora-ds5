@@ -11,6 +11,15 @@
 
 #include "vk.h"
 
+/* Extended-key bit (0xE0 scancode prefix) from moonlight-common-c f900dd476. Our
+ * pinned mcc predates it and must not be bumped for this (the haptics 0x04 pin), so
+ * define it here with the exact upstream value. It is what tells Numpad Enter from
+ * Enter, both being VK_RETURN. Sunshine-family hosts read it; our hosts are all
+ * Sunshine-family, and GFE (which upstream mcc strips it for) is end of life. */
+#ifndef MODIFIER_EXTENDED
+#define MODIFIER_EXTENDED 0x10
+#endif
+
 enum KeyCombo {
     KeyComboQuit,
     KeyComboUngrabInput,
@@ -44,6 +53,9 @@ enum KeyCombo _pending_key_combo = KeyComboMax;
 struct KeysDown {
     short keyCode;
     char keyFlags;
+    /* MODIFIER_EXTENDED or 0: Enter and Numpad Enter share keyCode, so the
+     * extended bit is part of a held key's identity and goes out on its release. */
+    char keyExtended;
     struct KeysDown *prev;
     struct KeysDown *next;
 };
@@ -86,7 +98,11 @@ bool stream_input_webos_intercept_remote_keys(stream_input_t *input, const SDL_K
 #endif
 
 static int keys_code_comparator(struct KeysDown *p, const void *fv) {
-    return p->keyCode - *((short *) fv);
+    const struct KeysDown *key = fv;
+    if (p->keyCode != key->keyCode) {
+        return p->keyCode - key->keyCode;
+    }
+    return p->keyExtended - key->keyExtended;
 }
 
 static bool isSystemKeyCaptureActive() {
@@ -303,7 +319,10 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
             case SDL_SCANCODE_CLEAR:
                 keyCode = VK_CLEAR;
                 break;
-            case SDL_SCANCODE_KP_ENTER: // FIXME: Is this correct?
+            case SDL_SCANCODE_KP_ENTER:
+                // Same VK as Enter; the extended bit is what sets it apart on the host.
+                modifiers |= MODIFIER_EXTENDED;
+                // fallthrough
             case SDL_SCANCODE_RETURN:
                 keyCode = VK_RETURN;
                 break;
@@ -321,27 +340,35 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
                 break;
             case SDL_SCANCODE_PAGEUP:
                 keyCode = VK_PRIOR;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_PAGEDOWN:
                 keyCode = VK_NEXT;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_END:
                 keyCode = VK_END;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_HOME:
                 keyCode = VK_HOME;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_LEFT:
                 keyCode = VK_LEFT;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_UP:
                 keyCode = VK_UP;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_RIGHT:
                 keyCode = VK_RIGHT;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_DOWN:
                 keyCode = VK_DOWN;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_SELECT:
                 keyCode = VK_SELECT;
@@ -351,12 +378,15 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
                 break;
             case SDL_SCANCODE_PRINTSCREEN:
                 keyCode = VK_SNAPSHOT;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_INSERT:
                 keyCode = VK_INSERT;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_DELETE:
                 keyCode = VK_DELETE;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_HELP:
                 keyCode = VK_HELP;
@@ -386,6 +416,7 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
                 break;
             case SDL_SCANCODE_KP_DIVIDE:
                 keyCode = VK_DIVIDE;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_NUMLOCKCLEAR:
                 keyCode = VK_NUMLOCK;
@@ -404,45 +435,56 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
                 break;
             case SDL_SCANCODE_RCTRL:
                 keyCode = VK_RCONTROL;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_LALT:
                 keyCode = VK_LMENU;
                 break;
             case SDL_SCANCODE_RALT:
                 keyCode = VK_RMENU;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_LGUI:
                 if (!isSystemKeyCaptureActive()) {
                     return;
                 }
                 keyCode = VK_LWIN;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_RGUI:
                 if (!isSystemKeyCaptureActive()) {
                     return;
                 }
                 keyCode = VK_RWIN;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_BACK:
                 keyCode = VK_BROWSER_BACK;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_FORWARD:
                 keyCode = VK_BROWSER_FORWARD;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_REFRESH:
                 keyCode = VK_BROWSER_REFRESH;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_STOP:
                 keyCode = VK_BROWSER_STOP;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_SEARCH:
                 keyCode = VK_BROWSER_SEARCH;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_BOOKMARKS:
                 keyCode = VK_BROWSER_FAVORITES;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_AC_HOME:
                 keyCode = VK_BROWSER_HOME;
+                modifiers |= MODIFIER_EXTENDED;
                 break;
             case SDL_SCANCODE_SEMICOLON:
                 keyCode = VK_OEM_1;
@@ -507,9 +549,11 @@ void stream_input_handle_key(stream_input_t *input, const SDL_KeyboardEvent *eve
     if (event->state == SDL_PRESSED) {
         added->keyCode = keyCode;
         added->keyFlags = keyFlags;
+        added->keyExtended = (char) (modifiers & MODIFIER_EXTENDED);
         _pressed_keys = keys_append(_pressed_keys, added);
     } else {
-        removed = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
+        struct KeysDown key = {.keyCode = keyCode, .keyExtended = (char) (modifiers & MODIFIER_EXTENDED)};
+        removed = keys_find_by(_pressed_keys, &key, &keys_code_comparator);
         if (removed) {
             _pressed_keys = keys_remove(_pressed_keys, removed);
         }
@@ -574,7 +618,8 @@ void stream_input_send_key_event(stream_input_t *input, short keyCode, bool keyD
         _pressed_keys = keys_append(_pressed_keys, added);
         keydown_count++;
     } else {
-        removed = keys_find_by(_pressed_keys, &keyCode, &keys_code_comparator);
+        struct KeysDown key = {.keyCode = keyCode};
+        removed = keys_find_by(_pressed_keys, &key, &keys_code_comparator);
         if (removed) {
             _pressed_keys = keys_remove(_pressed_keys, removed);
             keydown_count--;
@@ -606,8 +651,9 @@ void stream_input_flush_pressed_keys(stream_input_t *input) {
         short kc = n->keyCode;
         // Release with the same flags byte the press went out with: Sunshine keys
         // its pressed-key map on the (vk, flags) pair, so a flags=0 release for a
-        // NON_NORMALIZED press is discarded and the key auto-repeats forever.
-        LiSendKeyboardEvent2(0x8000 | kc, KEY_ACTION_UP, 0, n->keyFlags);
+        // NON_NORMALIZED press is discarded and the key auto-repeats forever. The
+        // extended bit goes back too, or a held Numpad Enter comes up as Enter.
+        LiSendKeyboardEvent2(0x8000 | kc, KEY_ACTION_UP, n->keyExtended, n->keyFlags);
         pressed = keys_remove(pressed, n);
         free(n);
     }
