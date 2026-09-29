@@ -6,7 +6,6 @@
 #if defined(TARGET_WEBOS) && !defined(DEBUG)
 
 #include <sys/resource.h>
-#include <sys/mman.h>
 
 #endif
 
@@ -25,26 +24,15 @@ int main(int argc, char *argv[]) {
     struct rlimit rlim = {0, 0};
     setrlimit(RLIMIT_CORE, &rlim);
 
-    /* Best-effort mlockall: pin current and future pages to avoid soft/major
-     * page faults during streaming. Fails silently with EPERM on stock webOS
-     * (no CAP_IPC_LOCK), which is fine — this just tightens worst-case jitter
-     * when the capability is granted (e.g. under memory pressure).
-     *
-     * MCL_ONFAULT (Linux 4.4+) locks pages only as they are faulted in instead
-     * of pre-committing all reserved-but-untouched memory. Without it, mlockall
-     * pins every worker-thread stack (glibc default 8MB each; ~44 threads) fully
-     * resident even though they are >95% empty => ~350MB of locked dead RAM, the
-     * dominant memory-pressure / OOM driver on this 2GB TV. With ONFAULT the
-     * latency intent is preserved (hot-path pages get touched early and stay
-     * locked, no swap) but the empty stack tails are never committed -> aurora
-     * RSS drops from ~500MB to its real working set (~170MB). Fall back to the
-     * plain flags if the kernel/headers lack ONFAULT, so we never lose locking. */
-#ifndef MCL_ONFAULT
-#define MCL_ONFAULT 4
-#endif
-    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0) {
-        (void) mlockall(MCL_CURRENT | MCL_FUTURE);
-    }
+    /* No mlockall here any more (upstream aurora-tv 35c1cc0aa, issue #75).
+     * MCL_FUTURE also pins every NDL/decoder mapping the process touches later;
+     * upstream measured VmLck 288 MB and system Mlocked 421 MB right after the
+     * NDL load, MemFree fell to 91 MB and the watchdog rebooted the set. On our
+     * G4 the same lock showed VmLck 320 MB (09-27) and pushed Unevictable up,
+     * which lowers the memchute emergency threshold that kills the home app.
+     * The old fallback without MCL_ONFAULT was the exact upstream failure mode.
+     * Latency-critical first touches are pre-faulted where they matter
+     * (session_video.c), so nothing on the hot path depends on the lock. */
 #endif
 #endif
     app_t app;

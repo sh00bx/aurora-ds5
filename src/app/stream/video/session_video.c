@@ -296,7 +296,7 @@ int vdec_delegate_setup(int videoFormat, int width, int height, int redrawRate, 
         reasm.data = malloc(reasm.size);
         if (reasm.data) {
             /* Pre-fault the pages here (one-time, off the frame deadline) so the
-             * first big IDR doesn't pay first-touch faults under MCL_ONFAULT.
+             * first big IDR doesn't pay first-touch page faults.
              * NOT done on the grow-on-demand realloc path, which runs in
              * vdec_delegate_submit under the frame deadline. */
             memset(reasm.data, 0, reasm.size);
