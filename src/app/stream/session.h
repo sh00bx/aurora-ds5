@@ -66,6 +66,8 @@ typedef struct AUDIO_INFO {
     const char *channels;
     /** Cumulative SS4S audio feed rejections this session — each one is a silent gap. */
     uint32_t feedFailures;
+    /** Largest gap between two aud_feed() calls this session (ms): host silence or loss. */
+    uint32_t maxGapMs;
 } AUDIO_INFO;
 
 typedef struct session_config_t {

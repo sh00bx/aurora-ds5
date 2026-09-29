@@ -525,10 +525,13 @@ bool streaming_refresh_stats() {
                                 "%sEn %.1fms", first ? "" : " \xb7 ", hostMs);
             }
         }
-        /* Silent audio gaps have no other symptom in the overlay — surface the count. */
-        if (audio_stream_info.feedFailures > 0 && len > 0 && (size_t) len < sizeof(stats_line)) {
+        /* Silent audio gaps have no other symptom in the overlay — surface the count
+         * (AF) and, once a feed gap of 40 ms or more was seen, the largest one (AG). */
+        if ((audio_stream_info.feedFailures > 0 || audio_stream_info.maxGapMs >= 40) &&
+            len > 0 && (size_t) len < sizeof(stats_line)) {
             snprintf(stats_line + len, sizeof(stats_line) - (size_t) len,
-                     " AF %u", (unsigned) audio_stream_info.feedFailures);
+                     " AF %u AG %u", (unsigned) audio_stream_info.feedFailures,
+                     (unsigned) audio_stream_info.maxGapMs);
         }
         lv_label_set_text(controller->stats_compact_label, stats_line);
         /* Quality dot: green ≤25ms, yellow ≤30ms, red >30ms */
