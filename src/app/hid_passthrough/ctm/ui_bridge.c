@@ -139,6 +139,16 @@ static ui_device_settings_t *settings_record_to_evict(void)
     return oldest;
 }
 
+/* Any of the fields the Controllers page stores per controller differs. */
+static bool pad_settings_differ(const tv_bridge_worker_settings_t *a, const tv_bridge_worker_settings_t *b)
+{
+    return a->latency_ms != b->latency_ms || a->audio_mode != b->audio_mode ||
+           a->speaker_volume_percent != b->speaker_volume_percent ||
+           a->headset_volume_percent != b->headset_volume_percent ||
+           a->haptics_gain_centi != b->haptics_gain_centi || a->ds5_trigger_reduce != b->ds5_trigger_reduce ||
+           a->composite_passthrough != b->composite_passthrough;
+}
+
 /* The auto-plug pref is keyed by the pad's MAC, but the record can be created
  * while the MAC is not readable yet: the stream-start rescan right after boot
  * and the SDL-hotplug rescan on reconnect both run inside the window where the
@@ -162,9 +172,13 @@ static void record_refresh_auto_plugin(ui_device_settings_t *record, const logic
      * change goes to it now, and its settings push paints it at once. */
     const tv_bridge_worker_settings_t lb_before = record->settings;
     record_read_lightbar(&record->settings, item);
+    /* The page's own settings the same way, where the new id has any: a
+     * reconnect inside the MAC-unreadable window came up on the defaults. */
+    hid_pt_prefs_apply_pad_settings(id, &record->settings);
     if (lb_before.lightbar_user != record->settings.lightbar_user ||
         lb_before.lightbar_rgb != record->settings.lightbar_rgb ||
-        lb_before.lightbar_game != record->settings.lightbar_game) {
+        lb_before.lightbar_game != record->settings.lightbar_game ||
+        pad_settings_differ(&lb_before, &record->settings)) {
         int session = session_index_for_key(record->key);
         if (session >= 0 && g_sessions[session].controller) {
             ctm_controller_set_settings(g_sessions[session].controller, &record->settings);
@@ -250,12 +264,18 @@ ui_device_settings_t *ui_record_for_item(const logical_device_t *item)
     record->seq = ++seq;
     snprintf(record->key, sizeof(record->key), "%s", item->key);
     record->settings = default_settings_for_item(item);
+    hid_pt_stable_id_for_logical(item, record->pref_id, sizeof(record->pref_id));
+    /* What the user last set on the Controllers page for this controller --
+     * here, not in default_settings_for_item(): Reset and the latency label's
+     * "default" mark read that one as the defaults. Every plug, re-attach and
+     * reconnect (a new hidraw key is a new record) starts from this record. */
+    const bool stored = hid_pt_prefs_apply_pad_settings(record->pref_id, &record->settings);
     record->headset_volume_percent = record->settings.headset_volume_percent;
     record->speaker_volume_percent = record->settings.speaker_volume_percent;
-    hid_pt_stable_id_for_logical(item, record->pref_id, sizeof(record->pref_id));
-    log_append("settings record for %s (id=%s): auto-plug %s",
+    log_append("settings record for %s (id=%s): auto-plug %s%s",
                item->name, record->pref_id,
-               record->settings.auto_plugin ? "on" : "off");
+               record->settings.auto_plugin ? "on" : "off",
+               stored ? ", saved controller settings applied" : "");
     return record;
 }
 
@@ -273,6 +293,29 @@ void apply_settings_to_session(const logical_device_t *item)
     if (session >= 0 && g_sessions[session].controller) {
         ctm_controller_set_settings(g_sessions[session].controller, settings);
     }
+}
+
+void hid_pt_store_pad_settings(const logical_device_t *item, unsigned mask)
+{
+    const tv_bridge_worker_settings_t *settings = settings_for_item(item);
+    if (!item || !settings) {
+        return;
+    }
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_logical(item, id, sizeof(id));
+    if (!hid_pt_prefs_store_pad_settings(id, settings, mask)) {
+        ctm_set_plug_error("Settings for %s could not be saved", item->name);
+    }
+}
+
+void hid_pt_forget_pad_settings(const logical_device_t *item)
+{
+    if (!item) {
+        return;
+    }
+    char id[HID_PT_STABLE_ID_LEN];
+    hid_pt_stable_id_for_logical(item, id, sizeof(id));
+    hid_pt_prefs_forget_pad_settings(id);
 }
 
 void hid_pt_sync_auto_plugin_pref(const logical_device_t *item)

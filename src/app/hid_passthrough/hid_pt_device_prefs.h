@@ -11,6 +11,7 @@
 #include "input/app_input.h"
 #include "stream/input/gamepad_type_pref.h"
 #include "stream/input/lightbar_pref.h"
+#include "hid_pt_pad_settings.h"
 
 /* Every buffer that holds a stable id is this long. */
 #define HID_PT_STABLE_ID_LEN 96
@@ -58,8 +59,9 @@ void hid_pt_prefs_flush(void);
  * as `<id>.sdl_type = xbox|playstation|dualsense|switch|auto`, a chosen
  * lightbar per mode as `<id>.lightbar.<mode> = auto|off|rrggbb` (+ 1.7.30's
  * `<id>.lightbar` where it was read, + `<id>.lightbar_game = 0`),
- * a game's fixed mode as `<app> = hid|x360|ds4|ds5|switch`. An absent key reads
- * as the default. */
+ * the page's own settings the user changed as `<id>.latency = 60` and the like
+ * (hid_pt_pad_settings.h), a game's fixed mode as
+ * `<app> = hid|x360|ds4|ds5|switch`. An absent key reads as the default. */
 void hid_pt_prefs_write_section(FILE *fp);
 
 bool hid_pt_prefs_auto_plugin_for_logical(const logical_device_t *item);
@@ -115,6 +117,32 @@ bool hid_pt_prefs_set_lightbar(const char *stable_id, gamepad_mode_t mode, const
 /* What is stored under the device's own id for @p mode, Automatic when
  * nothing is -- with the controller's game switch either way. */
 lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, gamepad_mode_t mode);
+
+/* ---- the page's own settings per controller --------------------------------
+ *
+ * Latency, audio route, speaker/headphone volume, haptics, trigger softening and
+ * the Flydigi composite switch, as the user last set them for this id:
+ * `<id>.latency|audio|speaker|headset|haptics|triggers|composite = ...`, each
+ * key only once that setting was changed (hid_pt_pad_settings.h has the words
+ * and ranges). Same entry and table as the mode and the lightbar. */
+
+/* Remember the fields in @p mask (PAD_SETTING_BIT()s) of @p from for this id.
+ * Does NOT write the file: a slider stores on every step, so this only marks
+ * the store and hid_pt_prefs_flush_pending() writes it. False when it could not
+ * be stored (no id, full table); the caller must say so. */
+bool hid_pt_prefs_store_pad_settings(const char *stable_id, const tv_bridge_worker_settings_t *from,
+                                     unsigned mask);
+
+/* Forget every stored page setting of this id (Reset), and write the file. */
+void hid_pt_prefs_forget_pad_settings(const char *stable_id);
+
+/* Overlay what is stored for this id onto @p to; false when nothing is. */
+bool hid_pt_prefs_apply_pad_settings(const char *stable_id, tv_bridge_worker_settings_t *to);
+
+/* Write the file if a page setting changed since it was last written. Main
+ * thread, like every call here; the Controllers page runs it on its refresh
+ * timer and when it closes. */
+void hid_pt_prefs_flush_pending(void);
 
 /* ---- per-game mode ([controller_app_modes]) --------------------------------
  *

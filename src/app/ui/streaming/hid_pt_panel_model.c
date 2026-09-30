@@ -550,11 +550,15 @@ bool hid_pt_model_write_controls(const hid_pt_model_t *model, const hid_pt_contr
     settings->audio_mode = (tv_bridge_audio_mode_t) collapse_ds4_audio_mode(model, in->audio_mode);
     settings->speaker_volume_percent = in->speaker_volume_percent;
     settings->headset_volume_percent = in->headset_volume_percent;
+    unsigned stored = PAD_SETTINGS_AUDIO;
     if (hid_pt_model_selected_is_ds5(model)) {
         settings->haptics_gain_centi = in->haptics_gain_centi;
         settings->ds5_trigger_reduce = in->trigger_reduce;
+        stored |= PAD_SETTINGS_DS5;
     }
     apply_settings_to_session(item);
+    /* Remembered for this controller, and back on it at its next connect. */
+    hid_pt_store_pad_settings(item, stored);
     return true;
 }
 
@@ -567,6 +571,8 @@ bool hid_pt_model_set_composite(const hid_pt_model_t *model, bool on)
     }
     settings->composite_passthrough = on;
     apply_settings_to_session(item);
+    hid_pt_store_pad_settings(item, PAD_SETTING_BIT(PAD_SETTING_COMPOSITE));
+    hid_pt_prefs_flush_pending();
     return true;
 }
 
@@ -952,6 +958,10 @@ bool hid_pt_model_reset_selected(const hid_pt_model_t *model)
     if (!item || !settings) {
         return false;
     }
+    /* The defaults, and nothing of the controller's own left to come back at
+     * its next connect. Mode and lightbar are not reset (the defaults re-read
+     * them). */
+    hid_pt_forget_pad_settings(item);
     *settings = default_settings_for_item(item);
     return true;
 }

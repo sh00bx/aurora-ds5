@@ -32,6 +32,7 @@
 #include "overlay_style.h"
 
 #include "hid_passthrough/hid_passthrough_manager.h"
+#include "hid_passthrough/hid_pt_device_prefs.h"
 #include "lvgl/font/fa_brands_400_symbols.h"
 #include "lvgl/font/material_icons_regular_symbols.h"
 #include "stream/session.h"
@@ -1559,6 +1560,9 @@ static void refresh_timer_cb(lv_timer_t *timer) {
         !hid_pt_view_picker_is_open(&panel->view)) {
         refresh_devices(panel, false);
     }
+    /* A slider's steps only mark the pref store; this is where they reach the
+     * file, at most one tick after the last one. */
+    hid_pt_prefs_flush_pending();
 }
 
 static void panel_deleted(void *userdata) {
@@ -1570,6 +1574,7 @@ static void panel_deleted(void *userdata) {
         lv_timer_del(panel->refresh_timer);
         panel->refresh_timer = NULL;
     }
+    hid_pt_prefs_flush_pending();
     /* The page closing -- BACK out of the overlay, the stream ending -- with
      * the picker up is a cancel: the stored colour goes back on the bar. Its
      * widgets go with the page's tree. */

@@ -4,6 +4,7 @@ if (TARGET_WEBOS)
             enet_transport.c
             ctm_transport.c
             hid_pt_device_prefs.c
+            hid_pt_pad_settings.c
             hid_pt_gamepad_match.c
             hid_pt_lightbar.c
             hid_passthrough_manager.c

@@ -67,10 +67,17 @@ typedef struct {
     /* Stored inverted, so a zeroed entry means the default: the game may. One
      * for every mode's colour. */
     bool lightbar_game_off;
+    /* The page's own settings (latency, audio, volumes, haptics, triggers,
+     * composite) the user changed for this controller; hid_pt_pad_settings.h. */
+    pad_settings_t pad;
 } hid_pt_pref_entry_t;
 
 static hid_pt_pref_entry_t g_hid_pt_prefs[HID_PT_PREFS_MAX];
 static int g_hid_pt_pref_count;
+/* A pad setting changed since the last flush. Sliders store on every step, so
+ * those writes only mark the table and hid_pt_prefs_flush_pending() writes the
+ * file a moment later; every other pref still flushes at once. */
+static bool g_hid_pt_prefs_dirty;
 
 #define HID_PT_APP_MODES_SECTION "controller_app_modes"
 /* Games with a fixed mode. A lock is a deliberate act per game, so this fills
@@ -106,13 +113,13 @@ static bool pref_has_lightbar(const hid_pt_pref_entry_t *e, bool colour_only)
  * one the writer may skip. */
 static bool pref_is_default(const hid_pt_pref_entry_t *e)
 {
-    return !e->auto_plugin && !e->sdl_type_set && !pref_has_lightbar(e, false);
+    return !e->auto_plugin && !e->sdl_type_set && !pref_has_lightbar(e, false) && !e->pad.set;
 }
 
-/* Holds nothing but explicit "Automatic"s (SDL type, lightbar or both). Worth
- * keeping (see sdl_type_set), but the least of what a full table holds: it is
- * taken only when no default entry is left, and never to make room for another
- * one of its kind. */
+/* Holds nothing but explicit "Automatic"s (SDL type, lightbar or both) and page
+ * settings -- no mode, no colour. Worth keeping (see sdl_type_set), but the
+ * least of what a full table holds: it is taken only when no default entry is
+ * left, and never to make room for an explicit Automatic. */
 static bool pref_is_explicit_auto_only(const hid_pt_pref_entry_t *e)
 {
     const bool sdl_auto = !e->sdl_type_set || e->sdl_type == GAMEPAD_TYPE_PREF_AUTO;
@@ -491,6 +498,53 @@ lightbar_pref_t hid_pt_prefs_lightbar_for_logical(const logical_device_t *item, 
     return lb;
 }
 
+bool hid_pt_prefs_store_pad_settings(const char *stable_id, const tv_bridge_worker_settings_t *from, unsigned mask)
+{
+    if (!stable_id || !stable_id[0] || !from) {
+        commons_log_warn("HID-PT", "controller settings dropped: device has no stable id");
+        return false;
+    }
+    mask &= PAD_SETTINGS_ALL;
+    if (!mask) {
+        return true;
+    }
+    hid_pt_pref_entry_t *e = pref_upsert(stable_id, true);
+    if (!e) {
+        commons_log_warn("HID-PT", "controller settings for %s NOT stored: all %d slots hold non-default prefs",
+                         stable_id, HID_PT_PREFS_MAX);
+        return false;
+    }
+    const pad_settings_t before = e->pad;
+    pad_settings_capture(&e->pad, from, mask);
+    if (memcmp(&before, &e->pad, sizeof(before)) != 0) {
+        g_hid_pt_prefs_dirty = true;
+    }
+    return true;
+}
+
+void hid_pt_prefs_forget_pad_settings(const char *stable_id)
+{
+    hid_pt_pref_entry_t *e = pref_find(stable_id);
+    if (!e || !e->pad.set) {
+        return;
+    }
+    memset(&e->pad, 0, sizeof(e->pad));
+    hid_pt_prefs_flush();
+}
+
+bool hid_pt_prefs_apply_pad_settings(const char *stable_id, tv_bridge_worker_settings_t *to)
+{
+    const hid_pt_pref_entry_t *e = pref_find(stable_id);
+    return e && pad_settings_apply(&e->pad, to);
+}
+
+void hid_pt_prefs_flush_pending(void)
+{
+    if (g_hid_pt_prefs_dirty) {
+        hid_pt_prefs_flush();
+    }
+}
+
 /* ---- per-game mode ------------------------------------------------------ */
 
 static const char *app_mode_ini_value(gamepad_mode_t mode)
@@ -753,6 +807,25 @@ static void lightbar_game_ini_entry(const char *name, size_t id_len, const char 
 }
 
 /* Whether @p name ends in @p suffix with something in front; *id_len = that. */
+/* `<id>.<setting> = value`, range-checked by pad_setting_parse(): a value it
+ * refuses is dropped and the controller keeps that setting's default. */
+static void pad_setting_ini_entry(const char *name, size_t id_len, pad_setting_t setting, const char *value)
+{
+    char id[HID_PT_STABLE_ID_LEN];
+    uint16_t v = 0;
+    if (!suffixed_ini_id(name, id_len, id) || !pad_setting_parse(setting, value, &v)) {
+        commons_log_warn("HID-PT", "controller setting %s = %s ignored on load", name, value ? value : "");
+        return;
+    }
+    hid_pt_pref_entry_t *e = pref_upsert(id, true);
+    if (!e) {
+        commons_log_warn("HID-PT", "controller settings for %s dropped on load: table full", id);
+        return;
+    }
+    e->pad.value[setting] = v;
+    e->pad.set |= (uint8_t) PAD_SETTING_BIT(setting);
+}
+
 static bool ini_name_has_suffix(const char *name, const char *suffix, size_t *id_len)
 {
     const size_t name_len = strlen(name);
@@ -797,6 +870,12 @@ int hid_pt_prefs_ini_handler(const char *section, const char *name, const char *
         lightbar_game_ini_entry(name, id_len, value);
         return 1;
     }
+    for (int p = 0; p < PAD_SETTING_COUNT; ++p) {
+        if (ini_name_has_suffix(name, pad_setting_suffix((pad_setting_t) p), &id_len)) {
+            pad_setting_ini_entry(name, id_len, (pad_setting_t) p, value);
+            return 1;
+        }
+    }
     /* Normalise on load, so keys written by an older build in one of the two
      * pre-unification forms (a raw SDL serial, or a verbatim `hid:hidraw3` /
      * `flydigi:1-1.2` enumeration key) resolve to the id the running code now
@@ -828,6 +907,8 @@ void hid_pt_prefs_write_section(FILE *fp)
     if (!fp) {
         return;
     }
+    /* Both callers (the flush, settings_save()) are writing the file now. */
+    g_hid_pt_prefs_dirty = false;
     /* Only non-default prefs go to disk. A `= false` line said exactly what its
      * absence says, and writing them back made the section grow by one entry per
      * controller that had ever been toggled, forever. */
@@ -872,6 +953,19 @@ void hid_pt_prefs_write_section(FILE *fp)
             char key[HID_PT_STABLE_ID_LEN + sizeof(HID_PT_LIGHTBAR_GAME_SUFFIX)];
             snprintf(key, sizeof(key), "%s" HID_PT_LIGHTBAR_GAME_SUFFIX, e->id);
             ini_write_string(fp, key, "0");
+        }
+        for (int p = 0; p < PAD_SETTING_COUNT; ++p) {
+            char value[16];
+            if (!(e->pad.set & PAD_SETTING_BIT(p))) {
+                continue;
+            }
+            pad_setting_format((pad_setting_t) p, e->pad.value[p], value, sizeof(value));
+            if (!value[0]) {
+                continue;
+            }
+            char key[HID_PT_STABLE_ID_LEN + 16];
+            snprintf(key, sizeof(key), "%s%s", e->id, pad_setting_suffix((pad_setting_t) p));
+            ini_write_string(fp, key, value);
         }
     }
     for (int i = 0; i < g_app_mode_count; ++i) {

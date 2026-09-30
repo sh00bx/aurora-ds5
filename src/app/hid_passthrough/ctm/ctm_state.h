@@ -352,6 +352,11 @@ ui_device_settings_t *ui_record_for_item(const logical_device_t *item);
 tv_bridge_worker_settings_t *settings_for_item(const logical_device_t *item);
 void apply_settings_to_session(const logical_device_t *item);
 void hid_pt_sync_auto_plugin_pref(const logical_device_t *item);
+/* Remember the record's PAD_SETTING_BIT()s in @p mask for this controller
+ * (hid_pt_prefs_store_pad_settings()); a refusal lands in the plug error. */
+void hid_pt_store_pad_settings(const logical_device_t *item, unsigned mask);
+/* Forget them all again (Reset). */
+void hid_pt_forget_pad_settings(const logical_device_t *item);
 int run_child_wait(char *const argv[]);
 void stop_sniff_once(const char *mac);
 void *stop_sniff_worker(void *arg);
