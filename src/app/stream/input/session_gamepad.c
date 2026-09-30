@@ -26,7 +26,9 @@
 /** Moonlight slots we can index: app_input_t keeps gamepads[16] and the announce mask is 16 bit. */
 #define GAMEPAD_SLOTS 16
 
-static bool quit_combo_pressed = false;
+/* The pad holding the quit chord, from the press that completes it until its last
+ * button is up; NULL otherwise. */
+static const app_gamepad_state_t *quit_combo_pad = NULL;
 
 /*
  * Last battery reading each slot was told to the host. LiSendControllerBatteryEvent() queues
@@ -197,16 +199,27 @@ void stream_input_handle_cbutton(stream_input_t *input, const SDL_ControllerButt
         gamepad->buttons &= ~button;
     }
 
-    /* Quit overlay combo still uses chord + release. */
+    /* Quit overlay combo still uses chord + release. The chord is the TV's, not
+     * the game's: the press that completes it lets the pad go on the host, and
+     * nothing more is sent until every button is up again -- the partial
+     * releases on the way would otherwise put chord buttons back on the host.
+     * A bridged pad's own reports are held back by the bridge itself
+     * (ctm_ctl_quit_chord()). */
     if (gamepad_combo_check(gamepad->buttons, QUIT_BUTTONS)) {
         cancel_all_holds();
-        quit_combo_pressed = true;
+        if (quit_combo_pad != gamepad && stream_input_gamepad_sends_moonlight(input, gamepad)) {
+            LiSendMultiControllerEvent(gamepad->gs_id, (short) stream_input_moonlight_active_mask(input), 0,
+                                       0, 0, 0, 0, 0, 0);
+        }
+        quit_combo_pad = gamepad;
         return;
     }
-    if (gamepad->buttons == 0 && quit_combo_pressed) {
-        quit_combo_pressed = false;
-        release_buttons(input, gamepad);
-        bus_pushevent(USER_OPEN_OVERLAY, NULL, NULL);
+    if (quit_combo_pad == gamepad) {
+        if (gamepad->buttons == 0) {
+            quit_combo_pad = NULL;
+            release_buttons(input, gamepad);
+            bus_pushevent(USER_OPEN_OVERLAY, NULL, NULL);
+        }
         return;
     }
 
@@ -272,6 +285,11 @@ void stream_input_handle_caxis(stream_input_t *input, const SDL_ControllerAxisEv
     }
 
     if (!stream_input_gamepad_sends_moonlight(input, gamepad)) {
+        return;
+    }
+    /* A stick or trigger moved while the quit chord is held would carry the
+     * chord's buttons to the host with it. */
+    if (quit_combo_pad == gamepad) {
         return;
     }
 

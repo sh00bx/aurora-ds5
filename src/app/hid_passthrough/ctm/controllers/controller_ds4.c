@@ -442,6 +442,18 @@ static void ds4_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
     }
 }
 
+/* The quit chord in the same layout: buttons[1] (common byte 5) holds L1 0x01,
+ * R1 0x02, Share 0x10 and Options 0x20. */
+static int ds4_quit_chord(const uint8_t *buf, size_t len)
+{
+    if (!buf || len < 36 || buf[0] != 0x11) {
+        return -1;
+    }
+    const uint8_t b = buf[3 + 5];
+    return ((b & 0x20) ? CTM_CHORD_START : 0) | ((b & 0x10) ? CTM_CHORD_BACK : 0) |
+           ((b & 0x01) ? CTM_CHORD_LB : 0) | ((b & 0x02) ? CTM_CHORD_RB : 0);
+}
+
 /* Pump policy. The DS4 shares the DS5's BT premise — a connected pad streams
  * input continuously, and the jail hidraw node never signals the drop — so it
  * gets the same 2 s liveness watchdog. Identical consecutive 0x11 effect
@@ -482,4 +494,5 @@ const ctm_controller_ops_t ctm_controller_ds4_ops = {
     .build_quiesce_reports = ds4_build_quiesce_reports,
     .on_input_report = ds4_on_input_report,
     .neutralize_input = ds4_neutralize_input,
+    .quit_chord = ds4_quit_chord,
 };

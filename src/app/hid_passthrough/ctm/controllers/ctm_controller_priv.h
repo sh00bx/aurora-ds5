@@ -76,6 +76,15 @@ int ctm_ctl_send(ctm_controller_t *c, uint16_t type, uint32_t flags,
  * last_rx_us and updates it directly. */
 void ctm_ctl_note_input_report(ctm_controller_t *c);
 
+/* Track the quit-overlay chord on a bridged pad. @p held is the CTM_CHORD_*
+ * set the current input report holds (-1: a report without button state).
+ * From the report that completes the chord until the one that releases its
+ * last button, returns true: the caller neutralizes those reports, so the host
+ * sees the pad let go instead of the chord. On that release it opens the
+ * overlay, as SDL's chord does for a pad it can see. Call from the one thread
+ * that produces the pad's input state. */
+bool ctm_ctl_quit_chord(ctm_controller_t *c, int held);
+
 /* Count one output report accepted by the device (or its injector). */
 void ctm_ctl_note_output_report(ctm_controller_t *c);
 

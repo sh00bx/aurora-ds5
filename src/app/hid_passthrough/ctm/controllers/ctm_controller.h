@@ -172,12 +172,29 @@ typedef struct {
      * into the game. Reports keep flowing at the native rate (battery, seq and
      * timestamps stay live), which avoids stuck-input edge cases that dropping
      * reports would create. Both DS pads implement this (their input layouts
-     * are known from hid-sony/hid-playstation). NULL => reports forward
+     * are known from hid-sony/hid-playstation), and so does the BT Xbox pad
+     * (SDL's HIDAPI Xbox One Bluetooth driver). NULL => reports forward
      * unmodified — the remaining types without a known input layout keep the
      * leaky behavior on purpose: a wrongly guessed offset or a dropped release
      * event is worse than the leak. */
     void (*neutralize_input)(ctm_controller_t *c, uint8_t *buf, size_t len);
+
+    /* Which buttons of the quit-overlay chord (Start + Back + LB + RB, the
+     * QUIT_BUTTONS of session_gamepad.c) this input report holds, as
+     * CTM_CHORD_* bits; -1 for a report that carries no button state. The
+     * reader feeds it to ctm_ctl_quit_chord(), which holds the chord back from
+     * the host and opens the overlay on its release -- the pad's evdev nodes
+     * are grabbed for DS4/DS5, so SDL never sees the chord there. Only
+     * meaningful together with neutralize_input. NULL => no chord detection. */
+    int (*quit_chord)(const uint8_t *buf, size_t len);
 } ctm_controller_ops_t;
+
+/* The quit-overlay chord's buttons, as ops->quit_chord reports them. */
+#define CTM_CHORD_START 0x1
+#define CTM_CHORD_BACK  0x2
+#define CTM_CHORD_LB    0x4
+#define CTM_CHORD_RB    0x8
+#define CTM_CHORD_ALL   (CTM_CHORD_START | CTM_CHORD_BACK | CTM_CHORD_LB | CTM_CHORD_RB)
 
 /* Live bridging status — read-only snapshot for the UI status panel. */
 typedef struct {

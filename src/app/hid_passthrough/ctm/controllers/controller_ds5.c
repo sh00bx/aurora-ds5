@@ -546,6 +546,18 @@ static void ds5_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
     p[36] |= 0x80;                    /* touch finger 2 up */
 }
 
+/* The quit chord in the same layout: buttons[1] (payload byte 8) holds
+ * L1 0x01, R1 0x02, Create 0x10 and Options 0x20. */
+static int ds5_quit_chord(const uint8_t *buf, size_t len)
+{
+    if (!buf || len < 55 || buf[0] != 0x31) {
+        return -1;
+    }
+    const uint8_t b = buf[2 + 8];
+    return ((b & 0x20) ? CTM_CHORD_START : 0) | ((b & 0x10) ? CTM_CHORD_BACK : 0) |
+           ((b & 0x01) ? CTM_CHORD_LB : 0) | ((b & 0x02) ? CTM_CHORD_RB : 0);
+}
+
 /* Pump policy. The DualSense is the type every one of these knobs was written
  * for, so this literal is where their measured defaults live; the env vars in
  * controller_common.c's k_knobs[] override them per session.
@@ -608,4 +620,5 @@ const ctm_controller_ops_t ctm_controller_ds5_ops = {
     .on_input_report = ds5_on_input_report,
     .input_carries_state = ds5_input_carries_state,
     .neutralize_input = ds5_neutralize_input,
+    .quit_chord = ds5_quit_chord,
 };

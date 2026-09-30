@@ -51,6 +51,54 @@ static const ctm_pump_policy_t xbox_policy = {
     .input_idle_timeout_ms = 2000,
 };
 
+/* Input report 0x01, per SDL's HIDAPI Xbox One Bluetooth driver
+ * (HIDAPI_DriverXboxOneBluetooth_HandleStatePacket): sticks LX LY RX RY as
+ * u16 at 1/3/5/7 (centre 0x8000), triggers 10 bit at 9/11, hat at 13 (0 =
+ * centred), buttons from 14. Two button layouts, told apart by length:
+ *   16 bytes (Xbox One S fw 3.1): 14 = A B X Y LB RB Back Start (bit 0..7),
+ *                                 15 = LS RS;
+ *   longer (fw 4.8+, Series):     14 = A 0x01 B 0x02 X 0x08 Y 0x10 LB 0x40
+ *                                 RB 0x80, 15 = Back 0x04 Start 0x08 Guide
+ *                                 0x10 LS 0x20 RS 0x40, 16 bit 0 = Back
+ *                                 (fw 4.8) or Share (Series).
+ * Anything shorter, or another report id (0x02 guide, 0x04 battery), is left
+ * alone. */
+#define XBOX_BT_STATE_MIN 16
+
+static void xbox_neutralize_input(ctm_controller_t *c, uint8_t *buf, size_t len)
+{
+    (void) c;
+    if (!buf || len < XBOX_BT_STATE_MIN || buf[0] != 0x01) {
+        return;
+    }
+    for (int i = 1; i <= 7; i += 2) {
+        buf[i] = 0x00;                /* sticks centred: 0x8000 little endian */
+        buf[i + 1] = 0x80;
+    }
+    memset(&buf[9], 0, 4);            /* LT RT released */
+    buf[13] = 0;                      /* hat centred */
+    buf[14] = 0;
+    buf[15] = 0;
+    if (len > XBOX_BT_STATE_MIN) {
+        buf[16] = 0;
+    }
+}
+
+static int xbox_quit_chord(const uint8_t *buf, size_t len)
+{
+    if (!buf || len < XBOX_BT_STATE_MIN || buf[0] != 0x01) {
+        return -1;
+    }
+    if (len == XBOX_BT_STATE_MIN) {
+        const uint8_t b = buf[14];
+        return ((b & 0x80) ? CTM_CHORD_START : 0) | ((b & 0x40) ? CTM_CHORD_BACK : 0) |
+               ((b & 0x10) ? CTM_CHORD_LB : 0) | ((b & 0x20) ? CTM_CHORD_RB : 0);
+    }
+    return ((buf[15] & 0x08) ? CTM_CHORD_START : 0) |
+           (((buf[15] & 0x04) || (buf[16] & 0x01)) ? CTM_CHORD_BACK : 0) |
+           ((buf[14] & 0x40) ? CTM_CHORD_LB : 0) | ((buf[14] & 0x80) ? CTM_CHORD_RB : 0);
+}
+
 const ctm_controller_ops_t ctm_controller_xbox_ops = {
     .kind = "xbox",
     .policy = &xbox_policy,
@@ -59,4 +107,6 @@ const ctm_controller_ops_t ctm_controller_xbox_ops = {
     .on_plug_init = NULL,   /* STAGE 2: reserved for BT init/handshake if needed */
     .patch_output = NULL,   /* none: verbatim relay, Windows map does GIP */
     .set_settings = NULL,
+    .neutralize_input = xbox_neutralize_input,
+    .quit_chord = xbox_quit_chord,
 };

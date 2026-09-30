@@ -32,6 +32,8 @@
 #include "ds5_hidfd.h"
 #include "ds5_mic_rx.h"
 #include "logging.h"   /* commons_log: the DS4/60s pmlog mirror (survives a TV reboot) */
+#include "util/bus.h"
+#include "util/user_event.h" /* USER_OPEN_OVERLAY: the quit chord of a bridged pad */
 
 #include <dirent.h>
 #include <errno.h>
@@ -294,6 +296,10 @@ struct ctm_controller {
                                             * by input_thread_main, zeroed by
                                             * session_state_reset (which the pump
                                             * runs before that thread is created) */
+    int quit_chord_held;                   /* the quit chord is being held back from
+                                            * the host (ctm_ctl_quit_chord); written
+                                            * by the one thread producing the pad's
+                                            * state, zeroed with ui_gated_logged */
     char st_last_event[96];
 
     uint8_t battery_level;
@@ -396,6 +402,31 @@ void ctm_ctl_note_input_report(ctm_controller_t *c)
 {
     ctm_stat_add(&c->stats.reports_in, 1);
     __atomic_store_n(&c->rx_tick, 1u, __ATOMIC_RELAXED);
+}
+
+bool ctm_ctl_quit_chord(ctm_controller_t *c, int held)
+{
+    if (held < 0) {
+        return c->quit_chord_held != 0;
+    }
+    if ((held & CTM_CHORD_ALL) == CTM_CHORD_ALL) {
+        if (!c->quit_chord_held) {
+            ctm_ctl_log(c, "overlay chord held: kept from the host");
+        }
+        c->quit_chord_held = 1;
+        return true;
+    }
+    if (!c->quit_chord_held) {
+        return false;
+    }
+    if ((held & CTM_CHORD_ALL) == 0) {
+        /* SDL may have seen the same chord (a pad whose evdev nodes are not
+         * grabbed) and ask too; showing the overlay twice is a no-op. */
+        c->quit_chord_held = 0;
+        bus_pushevent(USER_OPEN_OVERLAY, NULL, NULL);
+        ctm_ctl_log(c, "overlay chord released: opening the overlay");
+    }
+    return true;
 }
 
 /* Count one output report the device (or its injector) accepted. */
@@ -1202,7 +1233,12 @@ static void *input_thread_main(void *arg)
             ctm_ctl_log(c, "input %s by overlay gate", ui_blocked ? "neutralized" : "released");
         }
         for (int i = 0; i < coal_n && !__atomic_load_n(&c->stop, __ATOMIC_RELAXED); ++i) {
-            if (ui_blocked && c->ops->neutralize_input) {
+            /* The quit chord never reaches the host: from the report that
+             * completes it until its last button is up, the pad reads as let
+             * go. Checked on the raw report, before any neutralizing. */
+            const bool chord = c->ops->quit_chord && c->ops->neutralize_input &&
+                               ctm_ctl_quit_chord(c, c->ops->quit_chord(coal_buf[i], coal_len[i]));
+            if ((ui_blocked || chord) && c->ops->neutralize_input) {
                 c->ops->neutralize_input(c, coal_buf[i], coal_len[i]);
                 ctm_stat_add(&c->stats.ui_neutralized, 1);
             }
@@ -1503,6 +1539,7 @@ static void session_state_reset(ctm_controller_t *c)
     c->st_net_skew_min = c->st_net_skew_max = c->st_net_skew_sum = 0;
     /* Re-announce the overlay gate state on the first burst of the session. */
     c->ui_gated_logged = 0;
+    c->quit_chord_held = 0;
     /* A new link has heard nothing yet: push the settings report once the pump
      * runs, even if it matches what the previous session sent. */
     c->settings_last_len = 0;

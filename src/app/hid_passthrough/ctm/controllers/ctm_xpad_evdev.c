@@ -321,11 +321,18 @@ static void xpad_send_report(ctm_xpad_t *x, const xpad_evdev_state_t *st)
 {
     if (!x || x->in_ep == 0) return;
     uint8_t buf[20];
+    /* The quit chord (Start 0x0010, Back 0x0020, LB 0x0100, RB 0x0200): this
+     * node is grabbed, so only this feeder can see it, and the host must not. */
+    const int chord = ((st->buttons & 0x0010u) ? CTM_CHORD_START : 0) |
+                      ((st->buttons & 0x0020u) ? CTM_CHORD_BACK : 0) |
+                      ((st->buttons & 0x0100u) ? CTM_CHORD_LB : 0) |
+                      ((st->buttons & 0x0200u) ? CTM_CHORD_RB : 0);
+    const bool chord_held = ctm_ctl_quit_chord(x->owner, chord);
     /* Overlay gate (event-driven flavor): while the overlay owns input, send a
      * neutral report per event instead of the real state. Stick jitter fires
      * evdev events continuously, so a press held across the gate edge is
      * released host-side within a few events. */
-    if (ui_should_block_input()) {
+    if (chord_held || ui_should_block_input()) {
         xpad_evdev_state_t neutral;
         memset(&neutral, 0, sizeof(neutral));
         xpad_build_hid_report(&neutral, buf);
