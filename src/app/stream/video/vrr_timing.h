@@ -83,6 +83,8 @@ typedef struct vrr_timing_t {
     double last_basis_us;
     double last_retiming_us;
     bool smoothing_engaged;
+    /* Below ~40 fps the hold costs more than it smooths: frames go out on arrival. */
+    bool suspended;
 
     /* Playout delay (the reserve that absorbs arrival jitter). */
     double delay_us;
@@ -98,6 +100,7 @@ typedef struct vrr_timing_t {
     /* Counters for the log. */
     uint32_t epoch_resets;
     uint32_t cadence_resets;
+    uint32_t suspends;
 } vrr_timing_t;
 
 typedef struct vrr_timing_decision_t {
@@ -118,6 +121,8 @@ typedef struct vrr_timing_decision_t {
     bool cadence_break;
     /** Cadence smoothing moved this frame. */
     bool smoothed;
+    /** Source rate below the pacing floor: target is the arrival time, no hold. */
+    bool suspended;
 } vrr_timing_decision_t;
 
 /** fps_x100: the negotiated stream rate (e.g. 7200), used to seed the period. */
@@ -169,6 +174,7 @@ typedef struct vrr_metrics_t {
     unsigned frames;
     unsigned immediate;
     unsigned preempted;
+    unsigned suspended;
     int64_t window_start_us;
     bool have_prev;
     int64_t prev_host_us, prev_ready_us, prev_present_us;
@@ -184,13 +190,15 @@ typedef struct vrr_metrics_summary_t {
     float immediate_pct;
     /** Share of frames whose hold was cut short by a newer frame waiting. */
     float preempted_pct;
+    /** Share of frames fed on arrival because the source rate was below the floor. */
+    float suspended_pct;
 } vrr_metrics_summary_t;
 
 void vrr_metrics_reset(vrr_metrics_t *m);
 
 /** pair_valid=false (epoch/cadence break) keeps this frame out of the spacing pairs. */
 void vrr_metrics_record(vrr_metrics_t *m, int64_t host_us, int64_t ready_us, int64_t present_us, bool pair_valid,
-                        bool immediate, bool preempted);
+                        bool immediate, bool preempted, bool suspended);
 
 /** When window_us has passed since the window began: fill *out, start a new window
  * and return true. The first call only opens the window. */

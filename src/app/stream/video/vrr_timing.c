@@ -67,6 +67,15 @@
 /* Frames after a stall arrive bunched; keep them out of the jitter statistic. */
 #define BURST_EXCLUDE_FRAMES 3
 
+/* Pacing floor. Below ~40 fps the hold made spacing worse than feeding on arrival
+ * (TV 2026-10-01, low latency: menu/desktop at ~28 fps p90/p99 6.1/13.6 ms against
+ * 4.7/12.3 on arrival; 2026-09-30 balanced 20-40 fps p99 16.7 against 7.5), while
+ * from 55 fps up it still won. Frames go out on arrival below 38 fps and pacing
+ * resumes above 42; the gap keeps a rate hovering at 40 from flapping. The
+ * period, offset and delay keep learning meanwhile, so pacing resumes warm. */
+#define SUSPEND_PERIOD_US (US_PER_S / 38.0)
+#define RESUME_PERIOD_US (US_PER_S / 42.0)
+
 typedef struct profile_params_t {
     double cap_frames;
     double cap_ceiling_us;
@@ -509,7 +518,28 @@ void vrr_timing_schedule(vrr_timing_t *t, uint32_t rtp_ts, int frame_number, boo
     }
     delay_update(t, ready_us);
 
+    if (!t->suspended && t->period_us > SUSPEND_PERIOD_US) {
+        t->suspended = true;
+        t->suspends++;
+    } else if (t->suspended && t->period_us < RESUME_PERIOD_US) {
+        t->suspended = false;
+    }
+
     const double raw_slot = (double) mapped + t->delay_us;
+    if (t->suspended) {
+        /* No hold and no smoothing; the cadence starts over when pacing resumes. */
+        reset_cadence(t);
+        t->last_retiming_us = 0;
+        out->target_us = ready_us;
+        out->host_us = host_us;
+        out->raw_slot_us = (int64_t) llround(raw_slot);
+        out->delay_us = (int64_t) llround(t->delay_us);
+        out->lateness_us = lateness;
+        out->epoch_reset = epoch;
+        out->cadence_break = !continuous;
+        out->suspended = true;
+        return;
+    }
     bool engaged = false;
     double retiming = smoothing_adjust(t, continuous, interval_us, raw_slot, &engaged);
     t->last_retiming_us = retiming;
@@ -542,7 +572,7 @@ void vrr_metrics_reset(vrr_metrics_t *m) {
 }
 
 void vrr_metrics_record(vrr_metrics_t *m, int64_t host_us, int64_t ready_us, int64_t present_us, bool pair_valid,
-                        bool immediate, bool preempted) {
+                        bool immediate, bool preempted, bool suspended) {
     if (pair_valid && m->have_prev && m->pairs < VRR_METRICS_CAP) {
         const int64_t dhost = host_us - m->prev_host_us;
         m->spacing_us[m->pairs] = clamp_u16((present_us - m->prev_present_us) - dhost);
@@ -559,6 +589,9 @@ void vrr_metrics_record(vrr_metrics_t *m, int64_t host_us, int64_t ready_us, int
     }
     if (preempted) {
         m->preempted++;
+    }
+    if (suspended) {
+        m->suspended++;
     }
     m->have_prev = true;
     m->prev_host_us = host_us;
@@ -609,6 +642,7 @@ bool vrr_metrics_flush(vrr_metrics_t *m, int64_t now_us, int64_t window_us, vrr_
     if (m->frames > 0) {
         out->immediate_pct = 100.0f * (float) m->immediate / (float) m->frames;
         out->preempted_pct = 100.0f * (float) m->preempted / (float) m->frames;
+        out->suspended_pct = 100.0f * (float) m->suspended / (float) m->frames;
     }
     /* New window; the pair chain continues across it. */
     const bool have_prev = m->have_prev;

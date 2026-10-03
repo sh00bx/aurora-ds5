@@ -641,11 +641,12 @@ static void vdec_vrr_publish(const vrr_metrics_summary_t *sum) {
     vdec_stats_write_end();
     commons_log_info("Session", "Pseudo-VRR 10s: %u frames, spacing err p50/p90/p99 %.2f/%.2f/%.2f ms "
                                 "(on arrival would be %.2f/%.2f/%.2f), held p50 %.2f max %.2f ms, "
-                                "immediate %.1f%%, preempted %.1f%%, delay %.2f ms, period %.2f ms, "
-                                "resets epoch %u cadence %u",
+                                "immediate %.1f%%, preempted %.1f%%, suspended %.1f%% (%u), delay %.2f ms, "
+                                "period %.2f ms, resets epoch %u cadence %u",
                      sum->frames, sum->spacing_p50_ms, sum->spacing_p90_ms, sum->spacing_p99_ms,
                      sum->arrival_p50_ms, sum->arrival_p90_ms, sum->arrival_p99_ms, sum->held_p50_ms,
-                     sum->held_max_ms, sum->immediate_pct, sum->preempted_pct, vrr_ctl.delay_us / 1000.0,
+                     sum->held_max_ms, sum->immediate_pct, sum->preempted_pct, sum->suspended_pct,
+                     vrr_ctl.suspends, vrr_ctl.delay_us / 1000.0,
                      vrr_ctl.period_us / 1000.0, vrr_ctl.epoch_resets, vrr_ctl.cadence_resets);
 }
 
@@ -673,7 +674,8 @@ static int vdec_vrr_feed(PDECODE_UNIT decodeUnit, size_t length, SS4S_VideoFeedF
         vrr_timing_break_cadence(&vrr_ctl);
     }
     vrr_metrics_record(&vrr_metrics, d.host_us, ready_us, feed_us,
-                       !d.cadence_break && !d.epoch_reset && result == SS4S_VIDEO_FEED_OK, immediate, preempted);
+                       !d.cadence_break && !d.epoch_reset && result == SS4S_VIDEO_FEED_OK, immediate, preempted,
+                       d.suspended);
     vrr_metrics_summary_t sum;
     if (vrr_metrics_flush(&vrr_metrics, feed_us, VRR_METRICS_WINDOW_US, &sum)) {
         vdec_vrr_publish(&sum);

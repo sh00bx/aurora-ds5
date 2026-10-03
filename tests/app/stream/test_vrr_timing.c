@@ -85,6 +85,47 @@ static void testPeriodRecoversAfterLowRateStretch(void) {
     TEST_ASSERT_DOUBLE_WITHIN(3000.0, 1000000.0 / 20, ctl.period_us);
 }
 
+static void testSuspendsBelowFloorAndResumes(void) {
+    /* Menu/desktop at 28 fps: frames go out on arrival. 40 fps sits inside the
+     * hysteresis band and must not flip pacing back on; 72 fps resumes it and
+     * smoothing qualifies again. */
+    vrr_timing_init(&ctl, VRR_TIMING_PROFILE_LOW_LATENCY, true, 7200);
+    vrr_timing_decision_t d;
+    int64_t host = 0;
+    int frame = 0;
+    for (int i = 0; i < 72 * 2; i++, frame++) {
+        host += 1000000 / 72;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 7), frame + 1, frame == 0, host + 20000, &d);
+    }
+    TEST_ASSERT_FALSE(d.suspended);
+    TEST_ASSERT_TRUE(d.target_us > host + 20000);
+    for (int i = 0; i < 28 * 5; i++, frame++) {
+        host += 1000000 / 28;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 7), frame + 1, false, host + 20000, &d);
+    }
+    TEST_ASSERT_TRUE(d.suspended);
+    TEST_ASSERT_EQUAL_INT64(host + 20000, d.target_us);
+    TEST_ASSERT_EQUAL_UINT32(1, ctl.suspends);
+    for (int i = 0; i < 40 * 3; i++, frame++) {
+        host += 1000000 / 40;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 7), frame + 1, false, host + 20000, &d);
+    }
+    TEST_ASSERT_TRUE(d.suspended);
+    int resumed_after = -1;
+    for (int i = 0; i < 72 * 2; i++, frame++) {
+        host += 1000000 / 72;
+        vrr_timing_schedule(&ctl, rtp_of_us(host, 7), frame + 1, false, host + 20000, &d);
+        if (resumed_after < 0 && !d.suspended) {
+            resumed_after = i;
+        }
+    }
+    TEST_ASSERT_TRUE(resumed_after >= 0 && resumed_after < 72);
+    TEST_ASSERT_FALSE(d.suspended);
+    TEST_ASSERT_TRUE(ctl.smoothing_engaged);
+    TEST_ASSERT_TRUE(d.target_us >= host + 20000);
+    TEST_ASSERT_EQUAL_UINT32(1, ctl.suspends);
+}
+
 static void testSteadyStreamIsExact(void) {
     /* No jitter at all: every frame is held to host + offset + delay and the
      * presented spacing equals the host spacing to the microsecond. */
@@ -204,7 +245,7 @@ static void testMetricsQuantiles(void) {
         /* host spacing 10 ms, present spacing 10 ms + i us, arrival exact */
         int64_t host = (int64_t) i * 10000;
         int64_t present = host + (int64_t) i * (i + 1) / 2;
-        vrr_metrics_record(&m, host, host, present, true, i % 4 == 0, false);
+        vrr_metrics_record(&m, host, host, present, true, i % 4 == 0, false, false);
     }
     TEST_ASSERT_TRUE(vrr_metrics_flush(&m, 20000000, 10000000, &s));
     TEST_ASSERT_EQUAL_UINT(99, s.pairs);
@@ -441,6 +482,7 @@ int main(void) {
     UNITY_BEGIN();
     RUN_TEST(testSteadyStreamIsExact);
     RUN_TEST(testPeriodRecoversAfterLowRateStretch);
+    RUN_TEST(testSuspendsBelowFloorAndResumes);
     RUN_TEST(testRtpWrapIsNotAnEpoch);
     RUN_TEST(testGapBreaksCadenceButKeepsOffset);
     RUN_TEST(testBackwardsTimestampIsAnEpoch);
