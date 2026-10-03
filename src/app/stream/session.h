@@ -49,7 +49,7 @@ typedef struct VIDEO_STATS {
     int videoRenderQueue;
     uint32_t rtt, rttVariance;
     uint64_t receivedBytes;
-    uint32_t currentBitrateKbps;
+    uint32_t currentBitrateKbps;   /* despite the name: bits per second, as every reader assumes */
 } VIDEO_STATS;
 
 typedef struct VIDEO_INFO {

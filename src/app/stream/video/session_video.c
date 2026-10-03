@@ -874,8 +874,8 @@ void vdec_stat_submit(const struct VIDEO_STATS *src, unsigned long now) {
     if (dst->receivedFrames > 0) {
         /* One line per stats window so the pacing spread and arrival jitter can be
          * read off pmlog without the overlay (host-side pacer tuning is judged here). */
-        commons_log_info("Session", "video window %lums: rx %u fps %.1f kbps %u reasm avg %.1f max %.1f ms arrival avg %.2f max %.1f ms (%u gaps) net-drop %u rq %d",
-                         delta, dst->receivedFrames, dst->receivedFps, dst->currentBitrateKbps,
+        commons_log_info("Session", "video window %lums: rx %u fps %.1f mbps %.1f reasm avg %.1f max %.1f ms arrival avg %.2f max %.1f ms (%u gaps) net-drop %u rq %d",
+                         delta, dst->receivedFrames, dst->receivedFps, (float) dst->currentBitrateKbps / 1000000.0f,
                          (float) dst->totalReassemblyTimeUs / (float) dst->receivedFrames / 1000.0f,
                          (float) dst->maxReassemblyTimeUs / 1000.0f,
                          dst->arrivalIntervals ? (float) dst->totalArrivalIntervalUs / (float) dst->arrivalIntervals / 1000.0f : 0.0f,
