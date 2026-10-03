@@ -102,6 +102,118 @@ void usb_busid_from_input_path(const char *input_path, char *out, size_t out_len
     }
 }
 
+/* What one open of a hidraw node yields, independent of what the sysfs walk
+ * already filled in. Kept apart from device_info_t so a cached probe can be
+ * applied with exactly the precedence a fresh one gets. */
+typedef struct {
+    bool have_info;
+    struct hidraw_devinfo info;
+    bool have_name, have_phys, have_uniq;
+    char name[TEXT_LEN];
+    char phys[TEXT_LEN];
+    char uniq[64];
+    int desc_size;
+    bool have_iface;
+    uint16_t usage_page;
+    uint16_t usage;
+    char iface[20];
+} hidraw_probe_t;
+
+/* Probe cache, one slot per hidraw name.
+ *
+ * The auto-plug poll re-enumerates every second on the LVGL thread, and the
+ * open + five ioctls + report-descriptor read per node is what that costs: ~20 ms
+ * per node on the G4 (60 ms for one Logitech receiver's three interfaces, idle),
+ * roughly doubled under a 4K decode -- the 1 s "Input stall: ~120 ms" with a key
+ * held. None of it changes while the device stays attached, so it is read once.
+ *
+ * The identity must change whenever a different device can sit behind the same
+ * name. Minors are recycled, so the name alone is not enough: the key adds the
+ * node's rdev/inode/ctime (a re-created node gets a new inode or ctime) and the
+ * sysfs input list, whose inputN numbers only ever count up -- a reconnect,
+ * even of the same pad on the same minor, gets new ones. Only the permission
+ * bits are re-read every pass (access() is a syscall, not a device round trip),
+ * since the jail's mirror can chmod a node after it appears. A node that could
+ * not be opened is never cached, so it is retried. */
+typedef struct {
+    char hidraw[32];
+    dev_t rdev;
+    ino_t ino;
+    struct timespec ctim;
+    char inputs[TEXT_LEN];
+    hidraw_probe_t probe;
+} hidraw_probe_cache_t;
+
+static hidraw_probe_cache_t g_probe_cache[MAX_DEVICES];
+
+static bool probe_cache_matches(const hidraw_probe_cache_t *c, const device_info_t *dev,
+                                const struct stat *st)
+{
+    return strcmp(c->hidraw, dev->hidraw) == 0 && c->rdev == st->st_rdev &&
+           c->ino == st->st_ino && c->ctim.tv_sec == st->st_ctim.tv_sec &&
+           c->ctim.tv_nsec == st->st_ctim.tv_nsec && strcmp(c->inputs, dev->inputs) == 0;
+}
+
+static hidraw_probe_cache_t *probe_cache_slot(const char *hidraw)
+{
+    hidraw_probe_cache_t *free_slot = NULL;
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        if (strcmp(g_probe_cache[i].hidraw, hidraw) == 0) {
+            return &g_probe_cache[i];
+        }
+        if (!free_slot && !g_probe_cache[i].hidraw[0]) {
+            free_slot = &g_probe_cache[i];
+        }
+    }
+    return free_slot;   /* NULL when full: the node is just probed every pass */
+}
+
+static void probe_hidraw_fd(int fd, hidraw_probe_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    p->have_info = ioctl(fd, HIDIOCGRAWINFO, &p->info) == 0;
+    p->have_name = ioctl(fd, HIDIOCGRAWNAME(sizeof(p->name) - 1), p->name) >= 0;
+    p->have_phys = ioctl(fd, HIDIOCGRAWPHYS(sizeof(p->phys) - 1), p->phys) >= 0;
+    p->have_uniq = ioctl(fd, HIDIOCGRAWUNIQ(sizeof(p->uniq) - 1), p->uniq) >= 0;
+    if (ioctl(fd, HIDIOCGRDESCSIZE, &p->desc_size) != 0) {
+        p->desc_size = 0;
+    }
+
+    /* Classify the interface from its report descriptor (top-level usage), so
+     * composite devices (Steam Controller: keyboard/mouse/vendor) are legible
+     * and we can pick the gamepad-bearing (vendor) interface. */
+    uint8_t desc[4096];
+    uint32_t dlen = read_report_descriptor(fd, desc, sizeof(desc));
+    if (dlen) {
+        uint32_t mb = 0;
+        ctm_hid_top_usage(desc, dlen, &p->usage_page, &p->usage, &mb);
+        snprintf(p->iface, sizeof(p->iface), "%s %uB",
+                 ctm_hid_usage_label(p->usage_page, p->usage), (unsigned)mb);
+        p->have_iface = true;
+    }
+}
+
+/* Fields the sysfs walk already set win, as they always did. */
+static void apply_hidraw_probe(device_info_t *dev, const hidraw_probe_t *p)
+{
+    if (p->have_info) {
+        if (!dev->bus[0]) snprintf(dev->bus, sizeof(dev->bus), "%04x", p->info.bustype);
+        if (!dev->vid[0]) snprintf(dev->vid, sizeof(dev->vid), "%04x", (unsigned short)p->info.vendor);
+        if (!dev->pid[0]) snprintf(dev->pid, sizeof(dev->pid), "%04x", (unsigned short)p->info.product);
+    }
+    if (!dev->name[0] && p->have_name) snprintf(dev->name, sizeof(dev->name), "%s", p->name);
+    if (!dev->phys[0] && p->have_phys) snprintf(dev->phys, sizeof(dev->phys), "%s", p->phys);
+    if (!dev->mac[0] && p->have_uniq) snprintf(dev->mac, sizeof(dev->mac), "%s", p->uniq);
+    if (dev->report_descriptor_bytes <= 0 && p->desc_size > 0) {
+        dev->report_descriptor_bytes = p->desc_size;
+    }
+    if (!dev->iface[0] && p->have_iface) {
+        dev->usage_page = p->usage_page;
+        dev->usage = p->usage;
+        snprintf(dev->iface, sizeof(dev->iface), "%s", p->iface);
+    }
+}
+
 void inspect_hidraw(device_info_t *dev)
 {
     if (!dev || !dev->node[0]) {
@@ -122,6 +234,20 @@ void inspect_hidraw(device_info_t *dev)
         return;
     }
 
+    hidraw_probe_cache_t *slot = dev->hidraw[0] ? probe_cache_slot(dev->hidraw) : NULL;
+    if (slot && slot->hidraw[0] && probe_cache_matches(slot, dev, &st)) {
+        if (access(dev->node, R_OK | W_OK) == 0) {
+            dev->readable = true;
+            dev->writable = true;
+        } else if (access(dev->node, R_OK) == 0) {
+            dev->readable = true;
+        } else {
+            return;   /* same as a failed open: nothing from the node itself */
+        }
+        apply_hidraw_probe(dev, &slot->probe);
+        return;
+    }
+
     int fd = open(dev->node, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd >= 0) {
         dev->readable = true;
@@ -133,55 +259,25 @@ void inspect_hidraw(device_info_t *dev)
         }
     }
     if (fd < 0) {
+        if (slot) {
+            slot->hidraw[0] = '\0';
+        }
         return;
     }
 
-    struct hidraw_devinfo info;
-    memset(&info, 0, sizeof(info));
-    if (ioctl(fd, HIDIOCGRAWINFO, &info) == 0) {
-        if (!dev->bus[0]) snprintf(dev->bus, sizeof(dev->bus), "%04x", info.bustype);
-        if (!dev->vid[0]) snprintf(dev->vid, sizeof(dev->vid), "%04x", (unsigned short)info.vendor);
-        if (!dev->pid[0]) snprintf(dev->pid, sizeof(dev->pid), "%04x", (unsigned short)info.product);
-    }
-
-    char raw_name[TEXT_LEN] = {0};
-    if (!dev->name[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(raw_name) - 1), raw_name) >= 0) {
-        snprintf(dev->name, sizeof(dev->name), "%s", raw_name);
-    }
-
-    char raw_phys[TEXT_LEN] = {0};
-    if (!dev->phys[0] && ioctl(fd, HIDIOCGRAWPHYS(sizeof(raw_phys) - 1), raw_phys) >= 0) {
-        snprintf(dev->phys, sizeof(dev->phys), "%s", raw_phys);
-    }
-
-    char raw_uniq[64] = {0};
-    if (!dev->mac[0] && ioctl(fd, HIDIOCGRAWUNIQ(sizeof(raw_uniq) - 1), raw_uniq) >= 0) {
-        snprintf(dev->mac, sizeof(dev->mac), "%s", raw_uniq);
-    }
-
-    int desc_size = 0;
-    if (dev->report_descriptor_bytes <= 0 && ioctl(fd, HIDIOCGRDESCSIZE, &desc_size) == 0 && desc_size > 0) {
-        dev->report_descriptor_bytes = desc_size;
-    }
-
-    /* Classify the interface from its report descriptor (top-level usage), so
-     * composite devices (Steam Controller: keyboard/mouse/vendor) are legible
-     * and we can pick the gamepad-bearing (vendor) interface. */
-    if (!dev->iface[0]) {
-        uint8_t desc[4096];
-        uint32_t dlen = read_report_descriptor(fd, desc, sizeof(desc));
-        if (dlen) {
-            uint16_t up = 0, us = 0;
-            uint32_t mb = 0;
-            ctm_hid_top_usage(desc, dlen, &up, &us, &mb);
-            dev->usage_page = up;
-            dev->usage = us;
-            snprintf(dev->iface, sizeof(dev->iface), "%s %uB",
-                     ctm_hid_usage_label(up, us), (unsigned)mb);
-        }
-    }
-
+    hidraw_probe_t probe;
+    probe_hidraw_fd(fd, &probe);
     close(fd);
+    apply_hidraw_probe(dev, &probe);
+
+    if (slot) {
+        snprintf(slot->hidraw, sizeof(slot->hidraw), "%s", dev->hidraw);
+        slot->rdev = st.st_rdev;
+        slot->ino = st.st_ino;
+        slot->ctim = st.st_ctim;
+        snprintf(slot->inputs, sizeof(slot->inputs), "%s", dev->inputs);
+        slot->probe = probe;
+    }
 }
 
 static void usb_busid_from_sysfs_realpath(const char *real, char *out, size_t out_len)

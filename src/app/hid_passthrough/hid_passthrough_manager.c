@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static uint16_t parse_hex16(const char *text) {
     return (uint16_t) strtoul(text ? text : "0", NULL, 16);
@@ -163,8 +164,25 @@ void hid_passthrough_manager_request_rescan(hid_passthrough_manager_t *manager,
     hid_pt_autoplug_reconcile(input ? input : manager->stream_input);
 }
 
+static uint64_t poll_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000u + (uint64_t) ts.tv_nsec / 1000u;
+}
+
+/* Runs every second on the LVGL thread, so anything slow here is felt as a
+ * stalled key press. Say so when it happens instead of leaving the user's
+ * "Input stall" lines without a cause. */
+#define HID_PT_POLL_SLOW_US 20000u
+
 void hid_passthrough_manager_poll(hid_passthrough_manager_t *manager) {
+    uint64_t start = poll_now_us();
     hid_passthrough_manager_request_rescan(manager, NULL);
+    uint64_t took = poll_now_us() - start;
+    if (took >= HID_PT_POLL_SLOW_US) {
+        commons_log_warn("HidPassthrough", "auto-plug poll took %u ms on the UI thread",
+                         (unsigned) (took / 1000u));
+    }
 }
 
 #endif
