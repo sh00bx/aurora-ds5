@@ -23,7 +23,6 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
 device_info_t *find_or_add_device(scan_result_t *result, const char *hidraw)
@@ -146,14 +145,13 @@ typedef struct {
     /* USB bus id, resolved by usb_busid_for_scan_device(). Outside the jail it
      * comes from one realpath; inside, /sys/class/hidraw is missing and the
      * fallback re-opens the node for its phys and walks every input -- another
-     * ~20 ms per node per pass. A miss is retried after BUSID_RETRY_MS, since the
-     * jail's sysfs gap can close later. */
+     * ~20 ms per node per pass. A miss is kept as well: retrying it every 10 s
+     * still cost a 60 ms hitch per retry on the G4 (a receiver's vendor
+     * interface never resolves in the jail), and the identity changes with
+     * every reconnect anyway, which is when a different answer could appear. */
     bool busid_known;
-    uint64_t busid_at_ms;
     char usb_busid[64];
 } hidraw_probe_cache_t;
-
-#define BUSID_RETRY_MS 10000u
 
 static hidraw_probe_cache_t g_probe_cache[MAX_DEVICES];
 
@@ -494,13 +492,6 @@ static void usb_busid_resolve_uncached(const char *hidraw, char *out, size_t out
     close(fd);
 }
 
-static uint64_t enum_mono_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t) ts.tv_sec * 1000u + (uint64_t) ts.tv_nsec / 1000000u;
-}
-
 /* The probe-cache slot for @p dev if it still describes the same device. */
 static hidraw_probe_cache_t *probe_cache_current(const device_info_t *dev)
 {
@@ -522,15 +513,12 @@ void usb_busid_for_scan_device(const device_info_t *dev, char *out, size_t out_l
         return;
     }
     hidraw_probe_cache_t *slot = probe_cache_current(dev);
-    const uint64_t now = enum_mono_ms();
-    if (slot && slot->busid_known &&
-        (slot->usb_busid[0] || now - slot->busid_at_ms < BUSID_RETRY_MS)) {
+    if (slot && slot->busid_known) {
         snprintf(out, out_len, "%s", slot->usb_busid);
     } else {
         usb_busid_resolve_uncached(dev->hidraw, out, out_len);
         if (slot) {
             slot->busid_known = true;
-            slot->busid_at_ms = now;
             snprintf(slot->usb_busid, sizeof(slot->usb_busid), "%s", out);
         }
     }
