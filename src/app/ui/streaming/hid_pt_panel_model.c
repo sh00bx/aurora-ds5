@@ -501,7 +501,7 @@ bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model)
 {
     const logical_device_t *item = selected_item(model);
-    return item ? (int) default_settings_for_item(item).latency_ms : 60;
+    return item ? (int) default_settings_for_item(item).latency_ms : 35;
 }
 
 /* ---- settings ----------------------------------------------------------- */

@@ -72,7 +72,7 @@ tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *it
     memset(&settings, 0, sizeof(settings));
     settings.kind = TV_BRIDGE_KIND_HID;
     settings.audio_mode = TV_BRIDGE_AUDIO_AUTO;
-    settings.latency_ms = 60;
+    settings.latency_ms = 35;
     settings.haptics_gain_centi = 100;
     /* PERCENT, not raw bytes. The values that once sat in the ds5 branch below
      * (0x4d/0x41) were raw bytes carried over verbatim from the tv_bridge_worker

@@ -2169,6 +2169,119 @@ static void scan_reconcile(void){
     }
 }
 
+/* ---- LE auto-connect scan duty while a session runs ------------------------
+ * The TV's Bluetooth stack (Fluoride/MTK, libbluetooth.so inside
+ * webos-bluetooth) keeps an LE auto-connect pending for the sleeping Magic
+ * Remote: LE_Extended_Create_Connection with a 30 ms scan window every 100 ms,
+ * both hardcoded in btm_ble_start_auto_conn. The controller serves those
+ * windows ahead of the pad's ACL link. Measured 2026-10-04 with the pad's own
+ * mirrored host timestamp: ~17 radio blackouts a second of ~20 ms each (a third
+ * of the airtime), audio reports reaching the pad up to 71 ms after they were
+ * handed to the controller. That, not the pad, is why the speaker needed a
+ * 65-70 ms buffer. With a 2.5 ms window every 159 ms the longest blackout is
+ * 12 ms, delivery tops out at 18 ms and a 35 ms buffer plays clean.
+ *
+ * There is no setting for the two values and no stack API to drop the pending
+ * connect, and replacing it behind the stack's back cannot be done cleanly:
+ * the stack re-issues its own command within 10 ms of our cancel, the kernel
+ * lets a raw socket send one command every 2 s. So the two immediates are
+ * changed in the RUNNING stack's memory (nothing on disk; a restart of the
+ * Bluetooth service brings the originals back) and the stack is made to
+ * restart its auto-connect by a plain LE_Create_Connection_Cancel, which it
+ * answers by calling btm_ble_start_auto_conn again -- its own state stays
+ * consistent throughout. Restored the same way when the session ends, so the
+ * remote reconnects at full speed outside sessions; during one it takes a
+ * little longer to wake.
+ *
+ * The code is found by signature, never by a fixed address: a firmware with a
+ * different libbluetooth.so simply does not match and nothing is touched.
+ * `touch /tmp/ds5_leconn_off` disables the whole mechanism. */
+#define OP_LE_CREATE_CONN_CANCEL 0x200e
+#define LECONN_OFF_FILE "/tmp/ds5_leconn_off"
+#define LECONN_WIN_ORIG 0x30   /* 30 ms   (0.625 ms units) */
+#define LECONN_INT_ORIG 0xa0   /* 100 ms */
+#define LECONN_WIN_SESS 0x04   /* 2.5 ms */
+#define LECONN_INT_SESS 0xff   /* 159 ms: the largest a Thumb `movs` immediate holds */
+/* strd..; movs r1,#WIN; strd..; ldr; movs r3,#0; str; movs r0,#INT */
+static const uint8_t LECONN_SIG[22]={0xcd,0xe9,0x04,0x21,0x01,0x22,0x08,0x97,0x30,0x21,0xcd,
+    0xe9,0x02,0x55,0xf0,0x58,0x00,0x23,0x00,0x90,0xa0,0x20};
+#define LECONN_SIG_WIN 8
+#define LECONN_SIG_INT 20
+static int      g_le_sess = 0;       /* what this instance last wrote: 1 session values, 0 originals */
+static int      g_le_warned = 0;
+static int      g_le_cancel = 0;     /* a cancel is still owed so the stack re-arms with the new values */
+static uint64_t g_le_try = 0;
+
+/* Write the pair into the running stack. 0 = written (or already there),
+ * -1 = stack not found / code not recognised / write refused. */
+static int leconn_poke(uint8_t win, uint8_t itv){
+    DIR *d=opendir("/proc"); if(!d) return -1;
+    struct dirent *e; int rc=-1;
+    while(rc<0 && (e=readdir(d))){
+        if(e->d_name[0]<'0'||e->d_name[0]>'9') continue;
+        char p[NAME_MAX+16], line[512]; unsigned long lo=0,hi=0;
+        snprintf(p,sizeof p,"/proc/%s/comm",e->d_name);
+        FILE *f=fopen(p,"r"); if(!f) continue;
+        int is_bt=fgets(line,sizeof line,f)&&!strncmp(line,"webos-bluetooth",15);
+        fclose(f); if(!is_bt) continue;
+        snprintf(p,sizeof p,"/proc/%s/maps",e->d_name);
+        if(!(f=fopen(p,"r"))) continue;
+        while(fgets(line,sizeof line,f)){
+            if(strstr(line,"libbluetooth.so")&&strstr(line," r-xp ")&&
+               sscanf(line,"%lx-%lx",&lo,&hi)==2) break;
+            lo=hi=0;
+        }
+        fclose(f);
+        if(!lo||hi<=lo||hi-lo>(16ul<<20)) continue;
+        snprintf(p,sizeof p,"/proc/%s/mem",e->d_name);
+        int fd=open(p,O_RDWR|O_CLOEXEC); if(fd<0) continue;
+        size_t n=hi-lo; uint8_t *b=malloc(n);
+        /* pread64: the stack maps above 2 GiB, a 32-bit off_t would go negative */
+        if(b && pread64(fd,b,n,(off64_t)lo)==(ssize_t)n){
+            for(size_t i=0;i+sizeof LECONN_SIG<=n;i+=2){
+                size_t k=0;
+                for(;k<sizeof LECONN_SIG;k++){
+                    uint8_t v=b[i+k];
+                    if(k==LECONN_SIG_WIN){ if(v!=LECONN_WIN_ORIG&&v!=LECONN_WIN_SESS) break; }
+                    else if(k==LECONN_SIG_INT){ if(v!=LECONN_INT_ORIG&&v!=LECONN_INT_SESS) break; }
+                    else if(v!=LECONN_SIG[k]) break;
+                }
+                if(k<sizeof LECONN_SIG) continue;
+                if(pwrite64(fd,&win,1,(off64_t)(lo+i+LECONN_SIG_WIN))==1 &&
+                   pwrite64(fd,&itv,1,(off64_t)(lo+i+LECONN_SIG_INT))==1) rc=0;
+                break;
+            }
+        }
+        free(b); close(fd);
+    }
+    closedir(d);
+    return rc;
+}
+
+static void leconn_reconcile(void){
+    if(g_scan_want==0xff) return;                 /* no session seen yet: leave the TV alone */
+    int want=(g_scan_want==0) && access(LECONN_OFF_FILE,F_OK)!=0;
+    uint64_t t=now_ms();
+    if(want!=g_le_sess && (!g_le_try || t-g_le_try>=10000)){
+        g_le_try=t;
+        if(leconn_poke(want?LECONN_WIN_SESS:LECONN_WIN_ORIG,
+                       want?LECONN_INT_SESS:LECONN_INT_ORIG)==0){
+            g_le_sess=want; g_le_cancel=1; g_le_warned=0;
+            fprintf(stderr,"[txd] LE auto-connect scan: %s\n",
+                    want?"2.5 ms / 159 ms for the session":"30 ms / 100 ms restored");
+        } else if(!g_le_warned){
+            g_le_warned=1;                         /* say it once, keep retrying quietly */
+            fprintf(stderr,"[txd] LE auto-connect scan: stack code not found, left alone\n");
+        }
+    }
+    if(g_le_cancel){
+        /* Command Disallowed (the remote is connected, nothing pending) is fine:
+         * the next auto-connect the stack starts picks the values up anyway. */
+        uint8_t cmd[4]={0x01,OP_LE_CREATE_CONN_CANCEL&0xff,OP_LE_CREATE_CONN_CANCEL>>8,0};
+        if(cmd_send(cmd,sizeof cmd,OP_LE_CREATE_CONN_CANCEL,0,0)==0) g_le_cancel=0;
+    }
+}
+
 /* Write `len` bytes to `path` atomically (temp+rename), never following a symlink.
  *
  * We are ROOT writing into the JAILED app's own tmp (the jail uid creates files there
@@ -4053,6 +4166,7 @@ static void *capture_thread(void *arg){
         }
         /* Converge the actual scan mode toward the desired one (shared limiter). */
         scan_reconcile();
+        leconn_reconcile();
         /* Command health: no ON-AIR Command Complete (monitor-observed) for the
          * OLDEST unacked command by its enqueue-time deadline (6s + 2s per queue
          * position — the kernel drains 1 cmd / 2s in user-channel mode, so a

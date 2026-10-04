@@ -243,6 +243,7 @@ exactly the most interesting event class. De-duplicate on the whole line.
 Reference build (this is what the CMake rule reproduces byte for byte):
 
     arm-webos-linux-gnueabi-gcc -O2 -Wall -Wextra ds5_txd.c -o ds5_txd -lpthread
+    # md5 34ce5a26af5f526786b7e38249f2bf7a, 82560 bytes   (LE auto-connect scan 2.5 ms / 159 ms while a pad is bound, leconn_reconcile, 1.7.40)
     # md5 90b786319986266f89318b9f93d14dca, 82120 bytes   (ctrl 0x02 optional 7th byte: paint black, IDLE_LB_BLACK, for the Controllers page's lightbar "Off", 1.7.30)
     # md5 4d1cc2012d118cbc9f0442272207cc4c, 82120 bytes   (mlockall MCL_ONFAULT: lock pages on fault, not every 8 MB thread stack, 1.7.29)
     # md5 b1b7483ef0009adf771f22b7e4d5e1bc, 82120 bytes   (DS4 0x11 effect slot + NOCP kick, DS4 phantom-outstanding self-heal, per-pad audio-FIFO depth ctrl 0x07, 1.7.27)
