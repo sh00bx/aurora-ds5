@@ -2207,19 +2207,45 @@ static const uint8_t LECONN_SIG[22]={0xcd,0xe9,0x04,0x21,0x01,0x22,0x08,0x97,0x3
     0xe9,0x02,0x55,0xf0,0x58,0x00,0x23,0x00,0x90,0xa0,0x20};
 #define LECONN_SIG_WIN 8
 #define LECONN_SIG_INT 20
-static int      g_le_sess = 0;       /* what this instance last wrote: 1 session values, 0 originals */
+static int      g_le_sess = -1;      /* what the stack holds: 1 session values, 0 originals, -1 not read yet */
+static int      g_le_ok = -1;        /* published verdict: 1 fix usable, 0 not, -1 nothing published yet */
 static int      g_le_warned = 0;
 static int      g_le_cancel = 0;     /* a cancel is still owed so the stack re-arms with the new values */
 static uint64_t g_le_try = 0;
+static int      g_le_dead = 0;       /* the code is there but cannot be written: stop for good */
+static uint32_t g_le_wait = 0;       /* ms to the next look at a stack that did not match */
 
-/* Write the pair into the running stack. 0 = written (or already there),
- * -1 = stack not found / code not recognised / write refused. */
-static int leconn_poke(uint8_t win, uint8_t itv){
+/* Where the code sits in `b`, or -1. It has to be there exactly ONCE: a second
+ * hit means this is not the build the signature was taken from. */
+static long leconn_match(const uint8_t *b, size_t n){
+    long at=-1;
+    for(size_t i=0;i+sizeof LECONN_SIG<=n;i+=2){
+        size_t k=0;
+        for(;k<sizeof LECONN_SIG;k++){
+            uint8_t v=b[i+k];
+            if(k==LECONN_SIG_WIN){ if(v!=LECONN_WIN_ORIG&&v!=LECONN_WIN_SESS) break; }
+            else if(k==LECONN_SIG_INT){ if(v!=LECONN_INT_ORIG&&v!=LECONN_INT_SESS) break; }
+            else if(v!=LECONN_SIG[k]) break;
+        }
+        if(k<sizeof LECONN_SIG) continue;
+        if(at>=0) return -1;
+        at=(long)i;
+    }
+    return at;
+}
+
+static int                g_le_pid = 0;   /* where the last search found the code: */
+static unsigned long long g_le_addr = 0;  /* its process and address */
+
+/* Search the running stack for the code and remember where it is. 0 = found.
+ * Reads a few MB and takes tens of ms, so only ever called with no pad bound. */
+static int leconn_find(void){
     DIR *d=opendir("/proc"); if(!d) return -1;
     struct dirent *e; int rc=-1;
+    g_le_pid=0; g_le_addr=0;
     while(rc<0 && (e=readdir(d))){
         if(e->d_name[0]<'0'||e->d_name[0]>'9') continue;
-        char p[NAME_MAX+16], line[512]; unsigned long lo=0,hi=0;
+        char p[NAME_MAX+16], line[512]; unsigned long long lo=0,hi=0;
         snprintf(p,sizeof p,"/proc/%s/comm",e->d_name);
         FILE *f=fopen(p,"r"); if(!f) continue;
         int is_bt=fgets(line,sizeof line,f)&&!strncmp(line,"webos-bluetooth",15);
@@ -2228,29 +2254,19 @@ static int leconn_poke(uint8_t win, uint8_t itv){
         if(!(f=fopen(p,"r"))) continue;
         while(fgets(line,sizeof line,f)){
             if(strstr(line,"libbluetooth.so")&&strstr(line," r-xp ")&&
-               sscanf(line,"%lx-%lx",&lo,&hi)==2) break;
+               sscanf(line,"%llx-%llx",&lo,&hi)==2) break;
             lo=hi=0;
         }
         fclose(f);
-        if(!lo||hi<=lo||hi-lo>(16ul<<20)) continue;
+        /* 32-bit Thumb code only: a 64-bit stack maps above 4 GiB and is not ours */
+        if(!lo||hi<=lo||hi-lo>(16ull<<20)||hi>0xffffffffull) continue;
         snprintf(p,sizeof p,"/proc/%s/mem",e->d_name);
-        int fd=open(p,O_RDWR|O_CLOEXEC); if(fd<0) continue;
-        size_t n=hi-lo; uint8_t *b=malloc(n);
+        int fd=open(p,O_RDONLY|O_CLOEXEC); if(fd<0) continue;
+        size_t n=(size_t)(hi-lo); uint8_t *b=malloc(n);
         /* pread64: the stack maps above 2 GiB, a 32-bit off_t would go negative */
         if(b && pread64(fd,b,n,(off64_t)lo)==(ssize_t)n){
-            for(size_t i=0;i+sizeof LECONN_SIG<=n;i+=2){
-                size_t k=0;
-                for(;k<sizeof LECONN_SIG;k++){
-                    uint8_t v=b[i+k];
-                    if(k==LECONN_SIG_WIN){ if(v!=LECONN_WIN_ORIG&&v!=LECONN_WIN_SESS) break; }
-                    else if(k==LECONN_SIG_INT){ if(v!=LECONN_INT_ORIG&&v!=LECONN_INT_SESS) break; }
-                    else if(v!=LECONN_SIG[k]) break;
-                }
-                if(k<sizeof LECONN_SIG) continue;
-                if(pwrite64(fd,&win,1,(off64_t)(lo+i+LECONN_SIG_WIN))==1 &&
-                   pwrite64(fd,&itv,1,(off64_t)(lo+i+LECONN_SIG_INT))==1) rc=0;
-                break;
-            }
+            long at=leconn_match(b,n);
+            if(at>=0){ g_le_pid=atoi(e->d_name); g_le_addr=lo+(unsigned long long)at; rc=0; }
         }
         free(b); close(fd);
     }
@@ -2258,22 +2274,80 @@ static int leconn_poke(uint8_t win, uint8_t itv){
     return rc;
 }
 
+/* Look at the code where leconn_find() left it and, with `wr`, write the pair.
+ * A few syscalls, safe at any time. -1 = not there any more (the Bluetooth
+ * service restarted) or the write was refused; nothing is written unless the
+ * 22 bytes at that address are still the code. -2 = the code is there but
+ * this kernel does not let us write it. Else what the stack holds now:
+ * 0 the originals, 1 session values. */
+static int leconn_stack(int wr, uint8_t win, uint8_t itv){
+    if(!g_le_pid) return -1;
+    char p[40]; uint8_t b[sizeof LECONN_SIG]; int rc=-1;
+    snprintf(p,sizeof p,"/proc/%d/mem",g_le_pid);
+    int fd=open(p,(wr?O_RDWR:O_RDONLY)|O_CLOEXEC); if(fd<0) return -1;
+    if(pread64(fd,b,sizeof b,(off64_t)g_le_addr)==(ssize_t)sizeof b && leconn_match(b,sizeof b)==0){
+        if(!wr){ win=b[LECONN_SIG_WIN]; itv=b[LECONN_SIG_INT]; rc=0; }
+        else if(pwrite64(fd,&win,1,(off64_t)(g_le_addr+LECONN_SIG_WIN))==1 &&
+                pwrite64(fd,&itv,1,(off64_t)(g_le_addr+LECONN_SIG_INT))==1) rc=0;
+        else rc=-2;
+        if(rc==0) rc=!(win==LECONN_WIN_ORIG&&itv==LECONN_INT_ORIG);
+    }
+    close(fd);
+    return rc;
+}
+
+static void write_record_atomic(const char *path, const uint8_t *rec, size_t len);
+
+/* Tell the app whether the fix works on this TV: "<jail tmp>/ds5_leconn_ok"
+ * holds '1' or '0'. Its default pad latency is 35 ms with it and 70 ms without. */
+static void leconn_publish(int ok){
+    if(ok==g_le_ok) return;
+    g_le_ok=ok;
+    char path[640]; snprintf(path,sizeof path,"%s",g_tmpl_path?g_tmpl_path:"");
+    char *slash=strrchr(path,'/'); if(!slash) return;
+    if(snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"ds5_leconn_ok")>=(int)(sizeof path-(size_t)(slash+1-path))) return;
+    uint8_t rec[2]={(uint8_t)(ok?'1':'0'),'\n'};
+    write_record_atomic(path,rec,sizeof rec);
+}
+
 static void leconn_reconcile(void){
-    if(g_scan_want==0xff) return;                 /* no session seen yet: leave the TV alone */
-    int want=(g_scan_want==0) && access(LECONN_OFF_FILE,F_OK)!=0;
+    int off=access(LECONN_OFF_FILE,F_OK)==0;
+    int bound=(g_scan_want==0);                   /* no session seen yet counts as none */
+    int want=bound && !off;
     uint64_t t=now_ms();
-    if(want!=g_le_sess && (!g_le_try || t-g_le_try>=10000)){
+    /* The search runs on this thread, which also feeds the pads: never while one
+     * is bound. It runs at start, and on a stack it does not know ever more
+     * rarely (10 s .. 5 min) for as long as no pad is bound. */
+    if(g_le_dead){ leconn_publish(0); return; }
+    if(!g_le_pid && !bound && (!g_le_try || t-g_le_try>=g_le_wait)){
         g_le_try=t;
-        if(leconn_poke(want?LECONN_WIN_SESS:LECONN_WIN_ORIG,
-                       want?LECONN_INT_SESS:LECONN_INT_ORIG)==0){
-            g_le_sess=want; g_le_cancel=1; g_le_warned=0;
-            fprintf(stderr,"[txd] LE auto-connect scan: %s\n",
-                    want?"2.5 ms / 159 ms for the session":"30 ms / 100 ms restored");
-        } else if(!g_le_warned){
-            g_le_warned=1;                         /* say it once, keep retrying quietly */
-            fprintf(stderr,"[txd] LE auto-connect scan: stack code not found, left alone\n");
+        if(leconn_find()==0){ g_le_wait=0; g_le_warned=0; g_le_sess=-1; }
+        else {
+            g_le_wait=g_le_wait?(g_le_wait<150000?g_le_wait*2:300000):10000;
+            if(!g_le_warned){
+                g_le_warned=1;
+                fprintf(stderr,"[txd] LE auto-connect scan: stack code not found, left alone\n");
+            }
         }
     }
+    if(g_le_pid && want!=g_le_sess){
+        int st=leconn_stack(0,0,0);               /* also finds what a killed daemon left behind */
+        if(st>=0 && st!=want){
+            st=leconn_stack(1,want?LECONN_WIN_SESS:LECONN_WIN_ORIG,
+                              want?LECONN_INT_SESS:LECONN_INT_ORIG);
+            if(st>=0){
+                g_le_cancel=1;
+                fprintf(stderr,"[txd] LE auto-connect scan: %s\n",
+                        st?"2.5 ms / 159 ms for the session":"30 ms / 100 ms restored");
+            }
+        }
+        if(st>=0) g_le_sess=st;
+        else if(st==-2){
+            g_le_dead=1;                           /* would otherwise promise 35 ms before every session */
+            fprintf(stderr,"[txd] LE auto-connect scan: stack memory not writable, giving up\n");
+        } else { g_le_pid=0; g_le_try=t; g_le_wait=10000; }   /* stack gone: search again later */
+    }
+    leconn_publish(g_le_pid && !g_le_dead && !off);
     if(g_le_cancel){
         /* Command Disallowed (the remote is connected, nothing pending) is fine:
          * the next auto-connect the stack starts picks the values up anyway. */
@@ -4467,6 +4541,14 @@ int main(int argc,char**argv){
     signal(SIGTERM, on_term_restore_scan);
     signal(SIGINT,  on_term_restore_scan);
 
+    if(argc==3 && !strcmp(argv[1],"--leconn-scan")){
+        /* run the stack matcher over a file: prints the offset or -1 */
+        FILE *f=fopen(argv[2],"rb"); if(!f){ perror(argv[2]); return 2; }
+        fseek(f,0,SEEK_END); long n=ftell(f); rewind(f);
+        uint8_t *b=n>0?malloc((size_t)n):NULL;
+        long at=(b&&fread(b,1,(size_t)n,f)==(size_t)n)?leconn_match(b,(size_t)n):-1;
+        printf("%ld\n",at); return at<0;
+    }
     const char *sock_path = argc>1?argv[1]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl.sock";
     g_tmpl_path           = argc>2?argv[2]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_acl_tmpl";
     const char *hidfd_path= argc>3?argv[3]:"/var/palm/jail/com.aurora.gamestream/tmp/ds5_hidfd.sock";

@@ -182,7 +182,7 @@ bool hid_pt_model_selected_has_lightbar(const hid_pt_model_t *model);
  */
 bool hid_pt_model_selected_lightbar(const hid_pt_model_t *model, lightbar_pref_t *out, gamepad_mode_t *mode_out);
 
-/** default_settings_for_item()'s latency for the selection, or 60 with none. */
+/** default_settings_for_item()'s latency for the selection, or 70 with none. */
 int hid_pt_model_default_latency_ms(const hid_pt_model_t *model);
 
 /* ---- settings ----------------------------------------------------------- */

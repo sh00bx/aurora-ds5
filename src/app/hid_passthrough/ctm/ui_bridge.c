@@ -66,13 +66,38 @@ static void record_read_lightbar(tv_bridge_worker_settings_t *settings, const lo
     settings->lightbar_game = lb.game;
 }
 
+/* 35 ms needs the daemon's LE-scan fix: without it the TV's own scan for the
+ * sleeping remote holds pad audio back by up to 70 ms. ds5_txd says whether the
+ * fix works on this TV in "ds5_leconn_ok" next to its template files; no file
+ * (older daemon, or none) reads as no. */
+static unsigned default_latency_ms(void)
+{
+    char path[512];
+    const char *tp = getenv("DS5_ACL_TMPL");
+    snprintf(path, sizeof(path), "%s", (tp && tp[0]) ? tp : "/tmp/ds5_acl_tmpl");
+    char *slash = strrchr(path, '/');
+    if (!slash || (size_t) (slash + 1 - path) + sizeof("ds5_leconn_ok") > sizeof(path)) {
+        return 70;
+    }
+    strcpy(slash + 1, "ds5_leconn_ok");
+    char ok = '0';
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &ok, 1) != 1) {
+            ok = '0';
+        }
+        close(fd);
+    }
+    return ok == '1' ? 35 : 70;
+}
+
 tv_bridge_worker_settings_t default_settings_for_item(const logical_device_t *item)
 {
     tv_bridge_worker_settings_t settings;
     memset(&settings, 0, sizeof(settings));
     settings.kind = TV_BRIDGE_KIND_HID;
     settings.audio_mode = TV_BRIDGE_AUDIO_AUTO;
-    settings.latency_ms = 35;
+    settings.latency_ms = default_latency_ms();
     settings.haptics_gain_centi = 100;
     /* PERCENT, not raw bytes. The values that once sat in the ds5 branch below
      * (0x4d/0x41) were raw bytes carried over verbatim from the tv_bridge_worker
